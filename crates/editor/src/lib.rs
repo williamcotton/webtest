@@ -9,7 +9,22 @@ use webtest_analysis::{
 use webtest_browser::{BrowserError, BrowserHost, Locator};
 use webtest_observation::{ObservationStore, RuntimeObservationKind};
 use webtest_runtime::{RunResult, Runner};
-use webtest_text::FileId;
+use webtest_syntax::SyntaxKind;
+use webtest_text::{FileId, TextRange};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SemanticTokenKind {
+    Keyword,
+    String,
+    Comment,
+    Function,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SemanticToken {
+    pub range: TextRange,
+    pub kind: SemanticTokenKind,
+}
 
 #[derive(Debug, Error)]
 pub enum EditorError {
@@ -90,6 +105,31 @@ impl EditorService {
     pub fn format(&self, file: FileId) -> Result<String, EditorError> {
         let parse = self.write_database().parse(file)?;
         Ok(webtest_format::format_file(&parse))
+    }
+
+    pub fn semantic_tokens(&self, file: FileId) -> Result<Vec<SemanticToken>, EditorError> {
+        let parse = self.write_database().parse(file)?;
+        Ok(parse
+            .syntax()
+            .descendants_with_tokens()
+            .filter_map(|element| element.into_token())
+            .filter_map(|token| {
+                let kind = match token.kind() {
+                    SyntaxKind::TestKw
+                    | SyntaxKind::BrowserKw
+                    | SyntaxKind::OpenKw
+                    | SyntaxKind::ClickKw => SemanticTokenKind::Keyword,
+                    SyntaxKind::IdKw => SemanticTokenKind::Function,
+                    SyntaxKind::String => SemanticTokenKind::String,
+                    SyntaxKind::LineComment => SemanticTokenKind::Comment,
+                    _ => return None,
+                };
+                Some(SemanticToken {
+                    range: token.text_range(),
+                    kind,
+                })
+            })
+            .collect())
     }
 
     pub async fn run_file(
@@ -208,6 +248,27 @@ mod tests {
                 .iter()
                 .all(|diagnostic| diagnostic.source != DiagnosticSource::Runtime)
         );
+    }
+
+    #[test]
+    fn semantic_tokens_are_views_over_cst_tokens() {
+        let editor = EditorService::new();
+        let source =
+            "test \"x\" { // note\n browser { open \"about:blank\" click id(\"submit\") } }";
+        let file = editor.open_document("file:///tokens.webtest", source);
+        let tokens = editor.semantic_tokens(file).expect("semantic tokens");
+        let rendered: Vec<_> = tokens
+            .iter()
+            .map(|token| {
+                let start = u32::from(token.range.start()) as usize;
+                let end = u32::from(token.range.end()) as usize;
+                (&source[start..end], token.kind)
+            })
+            .collect();
+        assert!(rendered.contains(&("test", SemanticTokenKind::Keyword)));
+        assert!(rendered.contains(&("// note", SemanticTokenKind::Comment)));
+        assert!(rendered.contains(&("id", SemanticTokenKind::Function)));
+        assert!(rendered.contains(&("\"submit\"", SemanticTokenKind::String)));
     }
 
     #[tokio::test]

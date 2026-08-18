@@ -25,15 +25,17 @@ target/debug/webtest lsp
 
 The examples expect a site on port 3000. Automated browser tests instead start a fixture server on a random loopback port and skip gracefully when Chrome is unavailable.
 
-## VS Code extension development
+## Cursor / VS Code extension development
 
 ```sh
 cd editors/vscode
 npm install
 npm run compile
+npm run package
+cursor --install-extension webtest-vscode-0.1.1.vsix --force
 ```
 
-Open `editors/vscode` in VS Code, set `webtest.serverPath` to the absolute path of `target/debug/webtest`, and press F5. The command **WebTest: Run Current File** asks the language server to run the currently synchronized buffer, including unsaved changes.
+Reload Cursor after installing the VSIX, then open the repository and a `.webtest` file. The extension discovers `target/debug/webtest` in the workspace automatically. The command **WebTest: Run Current File** asks the language server to run the currently synchronized buffer, including unsaved changes. Set `webtest.serverPath` explicitly when the executable lives elsewhere.
 
 ## Architecture
 
@@ -55,4 +57,3 @@ cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
-

@@ -2,29 +2,79 @@
   "name": "webtest-vscode",
   "displayName": "WebTest",
   "description": "Language support and runtime diagnostics for WebTest",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "webtest",
   "engines": {
     "vscode": "^1.96.0"
   },
-  "categories": ["Programming Languages", "Testing"],
-  "activationEvents": ["onLanguage:webtest", "onCommand:webtest.runFile"],
+  "categories": [
+    "Programming Languages",
+    "Testing"
+  ],
+  "keywords": [
+    "webtest",
+    "testing",
+    "browser",
+    "lsp"
+  ],
+  "activationEvents": [
+    "onLanguage:webtest",
+    "onCommand:webtest.runCurrentFile"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "languages": [
       {
         "id": "webtest",
-        "aliases": ["WebTest", "webtest"],
-        "extensions": [".webtest"],
+        "aliases": [
+          "WebTest",
+          "webtest"
+        ],
+        "extensions": [
+          ".webtest"
+        ],
         "configuration": "./language-configuration.json"
       }
     ],
     "commands": [
       {
-        "command": "webtest.runFile",
+        "command": "webtest.runCurrentFile",
         "title": "WebTest: Run Current File"
       }
     ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "webtest.runCurrentFile",
+          "when": "editorLangId == webtest",
+          "group": "navigation"
+        }
+      ]
+    },
+    "semanticTokenScopes": [
+      {
+        "language": "webtest",
+        "scopes": {
+          "keyword": [
+            "keyword.control.webtest"
+          ],
+          "string": [
+            "string.quoted.double.webtest"
+          ],
+          "comment": [
+            "comment.line.double-slash.webtest"
+          ],
+          "function": [
+            "support.function.locator.webtest"
+          ]
+        }
+      }
+    ],
+    "configurationDefaults": {
+      "[webtest]": {
+        "editor.semanticHighlighting.enabled": true
+      }
+    },
     "configuration": {
       "title": "WebTest",
       "properties": {
@@ -32,14 +82,16 @@
           "type": "string",
           "default": "webtest",
           "scope": "resource",
-          "description": "Path to the WebTest executable."
+          "description": "Path to the WebTest executable. When unset, the extension first checks target/debug/webtest in the open workspace, then PATH."
         }
       }
     }
   },
   "scripts": {
+    "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./"
+    "watch": "tsc -watch -p ./",
+    "package": "npm run compile && vsce package --out webtest-vscode-0.1.1.vsix"
   },
   "dependencies": {
     "vscode-languageclient": "^10.0.0"
@@ -47,7 +99,7 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@types/vscode": "^1.96.0",
+    "@vscode/vsce": "^3.9.2",
     "typescript": "^5.7.0"
   }
 }
-

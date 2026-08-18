@@ -12,7 +12,9 @@ use tower_lsp_server::{
 };
 use webtest_analysis::{Diagnostic as CoreDiagnostic, DiagnosticSeverity, DiagnosticSource};
 use webtest_browser::BrowserHost;
-use webtest_editor::EditorService;
+use webtest_editor::{
+    EditorService, SemanticToken as CoreSemanticToken, SemanticTokenKind as CoreSemanticTokenKind,
+};
 use webtest_text::{FileId, TextRange, TextSize};
 
 #[derive(Clone)]
@@ -109,6 +111,23 @@ impl LanguageServer for Backend {
                     TextDocumentSyncKind::FULL,
                 )),
                 document_formatting_provider: Some(OneOf::Left(true)),
+                semantic_tokens_provider: Some(
+                    SemanticTokensOptions {
+                        work_done_progress_options: WorkDoneProgressOptions::default(),
+                        legend: SemanticTokensLegend {
+                            token_types: vec![
+                                SemanticTokenType::KEYWORD,
+                                SemanticTokenType::STRING,
+                                SemanticTokenType::COMMENT,
+                                SemanticTokenType::FUNCTION,
+                            ],
+                            token_modifiers: Vec::new(),
+                        },
+                        range: None,
+                        full: Some(SemanticTokensFullOptions::Bool(true)),
+                    }
+                    .into(),
+                ),
                 execute_command_provider: Some(ExecuteCommandOptions {
                     commands: vec!["webtest.runFile".into()],
                     ..Default::default()
@@ -181,6 +200,27 @@ impl LanguageServer for Backend {
             TextRange::new(TextSize::new(0), TextSize::from(source.len() as u32)),
         );
         Ok(Some(vec![TextEdit::new(full_range, formatted)]))
+    }
+
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> Result<Option<SemanticTokensResult>> {
+        let Some(document) = self.documents.get(&params.text_document.uri) else {
+            return Ok(None);
+        };
+        let source = self
+            .editor
+            .source(document.file)
+            .map_err(|error| Error::invalid_params(error.to_string()))?;
+        let tokens = self
+            .editor
+            .semantic_tokens(document.file)
+            .map_err(|error| Error::invalid_params(error.to_string()))?;
+        Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+            result_id: None,
+            data: semantic_tokens_to_lsp(&source, &tokens),
+        })))
     }
 
     async fn execute_command(&self, params: ExecuteCommandParams) -> Result<Option<LSPAny>> {
@@ -271,6 +311,53 @@ fn diagnostic_to_lsp(text: &str, diagnostic: CoreDiagnostic) -> Diagnostic {
     }
 }
 
+fn semantic_tokens_to_lsp(text: &str, tokens: &[CoreSemanticToken]) -> Vec<SemanticToken> {
+    let mut result = Vec::new();
+    let mut previous_line = 0u32;
+    let mut previous_start = 0u32;
+
+    for token in tokens {
+        let start = u32::from(token.range.start()) as usize;
+        let end = u32::from(token.range.end()) as usize;
+        let mut segment_start = start.min(text.len());
+        let token_end = end.min(text.len());
+
+        while segment_start < token_end {
+            let newline = text[segment_start..token_end]
+                .find('\n')
+                .map(|offset| segment_start + offset);
+            let segment_end = newline.unwrap_or(token_end);
+            if segment_end > segment_start {
+                let start_position = offset_to_position(text, segment_start);
+                let end_position = offset_to_position(text, segment_end);
+                let delta_line = start_position.line - previous_line;
+                let delta_start = if delta_line == 0 {
+                    start_position.character - previous_start
+                } else {
+                    start_position.character
+                };
+                result.push(SemanticToken {
+                    delta_line,
+                    delta_start,
+                    length: end_position.character - start_position.character,
+                    token_type: match token.kind {
+                        CoreSemanticTokenKind::Keyword => 0,
+                        CoreSemanticTokenKind::String => 1,
+                        CoreSemanticTokenKind::Comment => 2,
+                        CoreSemanticTokenKind::Function => 3,
+                    },
+                    token_modifiers_bitset: 0,
+                });
+                previous_line = start_position.line;
+                previous_start = start_position.character;
+            }
+            segment_start = newline.map_or(token_end, |offset| offset + 1);
+        }
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,5 +375,37 @@ mod tests {
             Range::new(Position::new(1, 0), Position::new(1, 1))
         );
         assert_eq!(offset_to_position(text, "a😀".len()), Position::new(0, 3));
+    }
+
+    #[test]
+    fn encodes_cst_semantic_tokens_with_utf16_deltas() {
+        let text = "test \"😀\"\n// note\nid(\"x\")";
+        let ranges = [
+            ("test", CoreSemanticTokenKind::Keyword),
+            ("\"😀\"", CoreSemanticTokenKind::String),
+            ("// note", CoreSemanticTokenKind::Comment),
+            ("id", CoreSemanticTokenKind::Function),
+        ];
+        let tokens: Vec<_> = ranges
+            .into_iter()
+            .map(|(needle, kind)| {
+                let start = text.find(needle).expect("token offset");
+                CoreSemanticToken {
+                    range: TextRange::new(
+                        TextSize::from(start as u32),
+                        TextSize::from((start + needle.len()) as u32),
+                    ),
+                    kind,
+                }
+            })
+            .collect();
+        let encoded = semantic_tokens_to_lsp(text, &tokens);
+        assert_eq!(encoded.len(), 4);
+        assert_eq!(encoded[0].delta_line, 0);
+        assert_eq!(encoded[0].delta_start, 0);
+        assert_eq!(encoded[1].length, 4);
+        assert_eq!(encoded[2].delta_line, 1);
+        assert_eq!(encoded[3].delta_line, 1);
+        assert_eq!(encoded[3].token_type, 3);
     }
 }

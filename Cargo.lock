@@ -1282,6 +1282,7 @@ dependencies = [
  "webtest-observation",
  "webtest-plan",
  "webtest-runtime",
+ "webtest-syntax",
  "webtest-text",
 ]
 
