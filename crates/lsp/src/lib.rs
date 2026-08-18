@@ -1,0 +1,292 @@
+//! Thin Tower-based LSP adapter over protocol-independent editor services.
+
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
+
+use tower_lsp_server::{
+    Client, LanguageServer, LspService, Server,
+    jsonrpc::{Error, Result},
+    ls_types::*,
+};
+use webtest_analysis::{Diagnostic as CoreDiagnostic, DiagnosticSeverity, DiagnosticSource};
+use webtest_browser::BrowserHost;
+use webtest_editor::EditorService;
+use webtest_text::{FileId, TextRange, TextSize};
+
+#[derive(Clone)]
+struct Document {
+    file: FileId,
+    uri: Uri,
+    version: i32,
+}
+
+#[derive(Default)]
+struct DocumentStore {
+    documents: Mutex<HashMap<String, Document>>,
+}
+
+impl DocumentStore {
+    fn insert(&self, document: Document) {
+        self.lock()
+            .insert(document.uri.as_str().to_owned(), document);
+    }
+
+    fn get(&self, uri: &Uri) -> Option<Document> {
+        self.lock().get(uri.as_str()).cloned()
+    }
+
+    fn remove(&self, uri: &Uri) -> Option<Document> {
+        self.lock().remove(uri.as_str())
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Document>> {
+        self.documents
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+struct Backend {
+    client: Client,
+    editor: Arc<EditorService>,
+    documents: Arc<DocumentStore>,
+    browser: Arc<dyn BrowserHost>,
+}
+
+impl Backend {
+    fn new(client: Client, browser: Arc<dyn BrowserHost>) -> Self {
+        Self {
+            client,
+            editor: Arc::new(EditorService::new()),
+            documents: Arc::new(DocumentStore::default()),
+            browser,
+        }
+    }
+
+    async fn publish(&self, uri: &Uri) {
+        let Some(document) = self.documents.get(uri) else {
+            return;
+        };
+        let source = match self.editor.source(document.file) {
+            Ok(source) => source,
+            Err(error) => {
+                self.client
+                    .log_message(MessageType::ERROR, error.to_string())
+                    .await;
+                return;
+            }
+        };
+        let diagnostics = match self.editor.diagnostics(document.file) {
+            Ok(diagnostics) => diagnostics
+                .into_iter()
+                .map(|diagnostic| diagnostic_to_lsp(&source, diagnostic))
+                .collect(),
+            Err(error) => {
+                self.client
+                    .log_message(MessageType::ERROR, error.to_string())
+                    .await;
+                Vec::new()
+            }
+        };
+        self.client
+            .publish_diagnostics(document.uri, diagnostics, Some(document.version))
+            .await;
+    }
+}
+
+impl LanguageServer for Backend {
+    async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
+        Ok(InitializeResult {
+            server_info: Some(ServerInfo {
+                name: "webtest".into(),
+                version: Some(env!("CARGO_PKG_VERSION").into()),
+            }),
+            capabilities: ServerCapabilities {
+                position_encoding: Some(PositionEncodingKind::UTF16),
+                text_document_sync: Some(TextDocumentSyncCapability::Kind(
+                    TextDocumentSyncKind::FULL,
+                )),
+                document_formatting_provider: Some(OneOf::Left(true)),
+                execute_command_provider: Some(ExecuteCommandOptions {
+                    commands: vec!["webtest.runFile".into()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            offset_encoding: None,
+        })
+    }
+
+    async fn initialized(&self, _: InitializedParams) {
+        self.client
+            .log_message(MessageType::INFO, "WebTest language server initialized")
+            .await;
+    }
+
+    async fn shutdown(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn did_open(&self, params: DidOpenTextDocumentParams) {
+        let document = params.text_document;
+        let file = self
+            .editor
+            .open_document(document.uri.as_str(), document.text);
+        self.documents.insert(Document {
+            file,
+            uri: document.uri.clone(),
+            version: document.version,
+        });
+        self.publish(&document.uri).await;
+    }
+
+    async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        let uri = params.text_document.uri;
+        let Some(mut document) = self.documents.get(&uri) else {
+            return;
+        };
+        if let Some(change) = params.content_changes.into_iter().last() {
+            self.editor.update_document(document.file, change.text);
+        }
+        document.version = params.text_document.version;
+        self.documents.insert(document);
+        self.publish(&uri).await;
+    }
+
+    async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        if let Some(document) = self.documents.remove(&params.text_document.uri) {
+            self.editor.close_document(document.file);
+            self.client
+                .publish_diagnostics(document.uri, Vec::new(), None)
+                .await;
+        }
+    }
+
+    async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
+        let Some(document) = self.documents.get(&params.text_document.uri) else {
+            return Ok(None);
+        };
+        let source = self
+            .editor
+            .source(document.file)
+            .map_err(|error| Error::invalid_params(error.to_string()))?;
+        let formatted = self
+            .editor
+            .format(document.file)
+            .map_err(|error| Error::invalid_params(error.to_string()))?;
+        let full_range = text_range_to_lsp(
+            &source,
+            TextRange::new(TextSize::new(0), TextSize::from(source.len() as u32)),
+        );
+        Ok(Some(vec![TextEdit::new(full_range, formatted)]))
+    }
+
+    async fn execute_command(&self, params: ExecuteCommandParams) -> Result<Option<LSPAny>> {
+        if params.command != "webtest.runFile" {
+            return Err(Error::invalid_request());
+        }
+        let uri_text = params
+            .arguments
+            .first()
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| Error::invalid_params("webtest.runFile expects a document URI"))?;
+        let uri: Uri = uri_text
+            .parse()
+            .map_err(|_| Error::invalid_params("invalid document URI"))?;
+        let document = self
+            .documents
+            .get(&uri)
+            .ok_or_else(|| Error::invalid_params("document is not open"))?;
+
+        if let Err(error) = self
+            .editor
+            .run_file(document.file, self.browser.as_ref())
+            .await
+        {
+            self.client
+                .show_message(MessageType::ERROR, error.to_string())
+                .await;
+        }
+        self.publish(&uri).await;
+        Ok(None)
+    }
+}
+
+pub async fn serve(browser: Arc<dyn BrowserHost>) {
+    let stdin = tokio::io::stdin();
+    let stdout = tokio::io::stdout();
+    let (service, socket) = LspService::new(|client| Backend::new(client, browser));
+    Server::new(stdin, stdout, socket).serve(service).await;
+}
+
+pub fn text_range_to_lsp(text: &str, range: TextRange) -> Range {
+    Range::new(
+        offset_to_position(text, u32::from(range.start()) as usize),
+        offset_to_position(text, u32::from(range.end()) as usize),
+    )
+}
+
+fn offset_to_position(text: &str, requested_offset: usize) -> Position {
+    let mut offset = requested_offset.min(text.len());
+    while offset > 0 && !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    let mut line = 0u32;
+    let mut character = 0u32;
+    for value in text[..offset].chars() {
+        if value == '\n' {
+            line += 1;
+            character = 0;
+        } else {
+            character += value.len_utf16() as u32;
+        }
+    }
+    Position::new(line, character)
+}
+
+fn diagnostic_to_lsp(text: &str, diagnostic: CoreDiagnostic) -> Diagnostic {
+    Diagnostic {
+        range: text_range_to_lsp(text, diagnostic.range),
+        severity: Some(match diagnostic.severity {
+            DiagnosticSeverity::Error => tower_lsp_server::ls_types::DiagnosticSeverity::ERROR,
+            DiagnosticSeverity::Warning => tower_lsp_server::ls_types::DiagnosticSeverity::WARNING,
+            DiagnosticSeverity::Information => {
+                tower_lsp_server::ls_types::DiagnosticSeverity::INFORMATION
+            }
+            DiagnosticSeverity::Hint => tower_lsp_server::ls_types::DiagnosticSeverity::HINT,
+        }),
+        code: Some(NumberOrString::String(diagnostic.code.into())),
+        source: Some(
+            match diagnostic.source {
+                DiagnosticSource::Syntax => "webtest.syntax",
+                DiagnosticSource::Semantic => "webtest.semantic",
+                DiagnosticSource::Runtime => "webtest.runtime",
+            }
+            .into(),
+        ),
+        message: diagnostic.message,
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converts_byte_offsets_to_utf16_positions() {
+        let text = "a😀\nβ";
+        let beta = text.find('β').expect("beta offset");
+        let range = TextRange::new(
+            TextSize::from(beta as u32),
+            TextSize::from(text.len() as u32),
+        );
+        assert_eq!(
+            text_range_to_lsp(text, range),
+            Range::new(Position::new(1, 0), Position::new(1, 1))
+        );
+        assert_eq!(offset_to_position(text, "a😀".len()), Position::new(0, 3));
+    }
+}

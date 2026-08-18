@@ -1,0 +1,17 @@
+[package]
+name = "webtest-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tracing.workspace = true
+webtest-browser.workspace = true
+webtest-hir.workspace = true
+webtest-observation.workspace = true
+webtest-plan.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+tokio.workspace = true
+webtest-text.workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "webtest-hir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rowan.workspace = true
+serde.workspace = true
+webtest-syntax.workspace = true
+webtest-text.workspace = true
+

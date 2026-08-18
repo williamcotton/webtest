@@ -1,0 +1,10 @@
+[package]
+name = "webtest-syntax"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rowan.workspace = true
+webtest-text.workspace = true
+

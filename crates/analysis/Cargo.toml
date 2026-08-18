@@ -1,0 +1,13 @@
+[package]
+name = "webtest-analysis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+webtest-hir.workspace = true
+webtest-plan.workspace = true
+webtest-syntax.workspace = true
+webtest-text.workspace = true
+

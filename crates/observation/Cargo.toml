@@ -1,0 +1,11 @@
+[package]
+name = "webtest-observation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+webtest-browser.workspace = true
+webtest-hir.workspace = true
+webtest-text.workspace = true
+

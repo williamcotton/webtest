@@ -1,0 +1,53 @@
+{
+  "name": "webtest-vscode",
+  "displayName": "WebTest",
+  "description": "Language support and runtime diagnostics for WebTest",
+  "version": "0.1.0",
+  "publisher": "webtest",
+  "engines": {
+    "vscode": "^1.96.0"
+  },
+  "categories": ["Programming Languages", "Testing"],
+  "activationEvents": ["onLanguage:webtest", "onCommand:webtest.runFile"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "webtest",
+        "aliases": ["WebTest", "webtest"],
+        "extensions": [".webtest"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "webtest.runFile",
+        "title": "WebTest: Run Current File"
+      }
+    ],
+    "configuration": {
+      "title": "WebTest",
+      "properties": {
+        "webtest.serverPath": {
+          "type": "string",
+          "default": "webtest",
+          "scope": "resource",
+          "description": "Path to the WebTest executable."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^10.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.96.0",
+    "typescript": "^5.7.0"
+  }
+}
+

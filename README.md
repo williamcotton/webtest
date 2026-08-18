@@ -1,0 +1,58 @@
+# WebTest
+
+WebTest is a small, statically analyzable language for browser tests. This repository contains the first complete vertical slice: one lossless parser feeds checking, formatting, execution, and editor diagnostics, while a direct Chrome DevTools Protocol backend runs the browser steps.
+
+```webtest
+test "submit button" {
+    browser {
+        open "http://127.0.0.1:3000"
+        click id("submit")
+    }
+}
+```
+
+## Build and use
+
+Rust stable and Chrome/Chromium are required. WebTest searches standard Chrome locations; use `WEBTEST_CHROME_PATH` or `--chrome-path` to override it.
+
+```sh
+cargo build
+target/debug/webtest check examples/minimal/passing.webtest
+target/debug/webtest fmt examples/minimal/passing.webtest
+target/debug/webtest test examples/minimal/passing.webtest
+target/debug/webtest lsp
+```
+
+The examples expect a site on port 3000. Automated browser tests instead start a fixture server on a random loopback port and skip gracefully when Chrome is unavailable.
+
+## VS Code extension development
+
+```sh
+cd editors/vscode
+npm install
+npm run compile
+```
+
+Open `editors/vscode` in VS Code, set `webtest.serverPath` to the absolute path of `target/debug/webtest`, and press F5. The command **WebTest: Run Current File** asks the language server to run the currently synchronized buffer, including unsaved changes.
+
+## Architecture
+
+The architectural invariants are deliberate:
+
+- one lexer and parser produce the canonical, lossless Rowan CST;
+- typed AST nodes are CST views and HIR has one lowering path;
+- the formatter consumes CST tokens so comments are retained;
+- runtime executes a source-mapped `TestPlan`, never syntax nodes;
+- browser behavior is protocol-neutral and CDP is only one backend;
+- runtime failures remain structured observations tagged with a BLAKE3 source revision;
+- editor services contain no LSP types; Tower LSP and VS Code are adapters;
+- stdout belongs exclusively to LSP while `webtest lsp` is running.
+
+Run the complete quality suite with:
+
+```sh
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+

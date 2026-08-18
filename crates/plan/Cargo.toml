@@ -1,0 +1,13 @@
+[package]
+name = "webtest-plan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+webtest-hir.workspace = true
+webtest-text.workspace = true
+
+[dev-dependencies]
+webtest-syntax.workspace = true

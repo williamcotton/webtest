@@ -1,0 +1,9 @@
+[package]
+name = "webtest-format"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+webtest-syntax.workspace = true
+

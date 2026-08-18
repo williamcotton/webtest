@@ -1,0 +1,20 @@
+[package]
+name = "webtest-editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+webtest-analysis.workspace = true
+webtest-browser.workspace = true
+webtest-format.workspace = true
+webtest-observation.workspace = true
+webtest-plan.workspace = true
+webtest-runtime.workspace = true
+webtest-text.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+tokio.workspace = true
+webtest-browser-cdp.workspace = true
