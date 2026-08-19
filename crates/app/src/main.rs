@@ -44,6 +44,14 @@ enum Command {
         #[arg(long, env = "WEBTEST_CHROME_PATH")]
         chrome_path: Option<PathBuf>,
     },
+    /// Run the debug adapter protocol server over stdio.
+    Dap {
+        #[arg(long, env = "WEBTEST_CHROME_PATH")]
+        chrome_path: Option<PathBuf>,
+        /// Hide Chrome while debugging. Debug sessions are headed by default.
+        #[arg(long)]
+        headless: bool,
+    },
 }
 
 #[tokio::main]
@@ -77,6 +85,14 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         } => test(&file, chrome_path, headed).await,
         Command::Lsp { chrome_path } => {
             webtest_lsp::serve(Arc::new(ChromeHost::new(chrome_path))).await;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Dap {
+            chrome_path,
+            headless,
+        } => {
+            let browser = ChromeHost::new(chrome_path).with_headed(!headless);
+            webtest_dap::serve(Arc::new(browser)).await?;
             Ok(ExitCode::SUCCESS)
         }
     }
@@ -285,5 +301,24 @@ mod tests {
         let cli = Cli::try_parse_from(["webtest", "test", "example.webtest", "--headed"])
             .expect("parse headed test command");
         assert!(matches!(cli.command, Command::Test { headed: true, .. }));
+    }
+
+    #[test]
+    fn dap_is_headed_by_default_and_accepts_headless_mode() {
+        let headed = Cli::try_parse_from(["webtest", "dap"]).expect("parse headed DAP command");
+        assert!(matches!(
+            headed.command,
+            Command::Dap {
+                headless: false,
+                ..
+            }
+        ));
+
+        let headless =
+            Cli::try_parse_from(["webtest", "dap", "--headless"]).expect("parse headless DAP");
+        assert!(matches!(
+            headless.command,
+            Command::Dap { headless: true, .. }
+        ));
     }
 }

@@ -1223,6 +1223,7 @@ dependencies = [
  "webtest-analysis",
  "webtest-browser",
  "webtest-browser-cdp",
+ "webtest-dap",
  "webtest-editor",
  "webtest-format",
  "webtest-lsp",
@@ -1266,6 +1267,24 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "webtest-browser",
+]
+
+[[package]]
+name = "webtest-dap"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "webtest-analysis",
+ "webtest-browser",
+ "webtest-observation",
+ "webtest-plan",
+ "webtest-runtime",
+ "webtest-text",
 ]
 
 [[package]]

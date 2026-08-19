@@ -1,17 +1,21 @@
 [package]
-name = "webtest-runtime"
+name = "webtest-dap"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 async-trait.workspace = true
-tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+webtest-analysis.workspace = true
 webtest-browser.workspace = true
-webtest-hir.workspace = true
 webtest-observation.workspace = true
 webtest-plan.workspace = true
+webtest-runtime.workspace = true
+webtest-text.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
-webtest-text.workspace = true
+tempfile.workspace = true

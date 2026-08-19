@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use tracing::instrument;
 use webtest_browser::{BrowserError, BrowserHost, Locator as BrowserLocator, Page};
 use webtest_observation::{
@@ -46,6 +47,11 @@ pub struct Runner {
     observations: Arc<ObservationStore>,
 }
 
+#[async_trait]
+pub trait RunControl: Send + Sync {
+    async fn before_step(&self, test: &webtest_plan::PlannedTest, step: &PlannedStep);
+}
+
 impl Runner {
     pub fn new(observations: Arc<ObservationStore>) -> Self {
         Self { observations }
@@ -56,6 +62,16 @@ impl Runner {
         &self,
         plan: &TestPlan,
         browser: &dyn BrowserHost,
+    ) -> Result<RunResult, BrowserError> {
+        self.run_with_control(plan, browser, None).await
+    }
+
+    #[instrument(skip_all, fields(file = plan.file.get()))]
+    pub async fn run_with_control(
+        &self,
+        plan: &TestPlan,
+        browser: &dyn BrowserHost,
+        control: Option<&dyn RunControl>,
     ) -> Result<RunResult, BrowserError> {
         self.observations.clear_for_file(plan.file);
         let execution_id = ExecutionId::next();
@@ -72,6 +88,9 @@ impl Runner {
             let mut page = session.new_page().await?;
             let mut failure = None;
             for step in &test.steps {
+                if let Some(control) = control {
+                    control.before_step(test, step).await;
+                }
                 events.push(ExecutionEvent::StepStarted {
                     execution_id,
                     test_id: test.id,

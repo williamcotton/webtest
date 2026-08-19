@@ -2,14 +2,15 @@
   "name": "webtest-vscode",
   "displayName": "WebTest",
   "description": "Language support and runtime diagnostics for WebTest",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "publisher": "webtest",
   "engines": {
     "vscode": "^1.96.0"
   },
   "categories": [
     "Programming Languages",
-    "Testing"
+    "Testing",
+    "Debuggers"
   ],
   "keywords": [
     "webtest",
@@ -19,7 +20,9 @@
   ],
   "activationEvents": [
     "onLanguage:webtest",
-    "onCommand:webtest.runCurrentFile"
+    "onCommand:webtest.runCurrentFile",
+    "onCommand:webtest.debugCurrentFile",
+    "onDebug"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -40,6 +43,11 @@
       {
         "command": "webtest.runCurrentFile",
         "title": "WebTest: Run Current File"
+      },
+      {
+        "command": "webtest.debugCurrentFile",
+        "title": "WebTest: Debug Current File",
+        "icon": "$(debug-alt)"
       }
     ],
     "menus": {
@@ -48,9 +56,80 @@
           "command": "webtest.runCurrentFile",
           "when": "editorLangId == webtest",
           "group": "navigation"
+        },
+        {
+          "command": "webtest.debugCurrentFile",
+          "when": "editorLangId == webtest",
+          "group": "navigation"
         }
       ]
     },
+    "breakpoints": [
+      {
+        "language": "webtest"
+      }
+    ],
+    "debuggers": [
+      {
+        "type": "webtest",
+        "label": "WebTest Debug",
+        "languages": [
+          "webtest"
+        ],
+        "configurationAttributes": {
+          "launch": {
+            "required": [
+              "program"
+            ],
+            "properties": {
+              "program": {
+                "type": "string",
+                "description": "Path to the .webtest file to debug.",
+                "default": "${file}"
+              },
+              "stopOnEntry": {
+                "type": "boolean",
+                "description": "Pause before the first test step.",
+                "default": false
+              },
+              "headed": {
+                "type": "boolean",
+                "description": "Show Chrome while debugging.",
+                "default": true
+              },
+              "chromePath": {
+                "type": "string",
+                "description": "Optional Chrome executable override."
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "webtest",
+            "request": "launch",
+            "name": "Debug WebTest",
+            "program": "${file}",
+            "headed": true,
+            "stopOnEntry": false
+          }
+        ],
+        "configurationSnippets": [
+          {
+            "label": "WebTest: Debug",
+            "description": "Debug the active WebTest file in headed Chrome.",
+            "body": {
+              "type": "webtest",
+              "request": "launch",
+              "name": "Debug WebTest",
+              "program": "${file}",
+              "headed": true,
+              "stopOnEntry": false
+            }
+          }
+        ]
+      }
+    ],
     "semanticTokenScopes": [
       {
         "language": "webtest",
@@ -83,6 +162,12 @@
           "default": "webtest",
           "scope": "resource",
           "description": "Path to the WebTest executable. When unset, the extension first checks target/debug/webtest in the open workspace, then PATH."
+        },
+        "webtest.chromePath": {
+          "type": "string",
+          "default": "",
+          "scope": "resource",
+          "description": "Optional Chrome executable used by WebTest debug sessions."
         }
       }
     }
@@ -91,7 +176,7 @@
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "package": "npm run compile && vsce package --out webtest-vscode-0.1.1.vsix"
+    "package": "npm run compile && vsce package --out webtest-vscode-0.2.0.vsix"
   },
   "dependencies": {
     "vscode-languageclient": "^10.0.0"

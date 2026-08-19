@@ -17,6 +17,7 @@ tracing-subscriber.workspace = true
 webtest-analysis.workspace = true
 webtest-browser.workspace = true
 webtest-browser-cdp.workspace = true
+webtest-dap.workspace = true
 webtest-editor.workspace = true
 webtest-format.workspace = true
 webtest-lsp.workspace = true

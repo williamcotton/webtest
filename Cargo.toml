@@ -13,6 +13,7 @@ members = [
     "crates/runtime",
     "crates/editor",
     "crates/lsp",
+    "crates/dap",
     "crates/wasm",
     "crates/app",
 ]
@@ -36,6 +37,7 @@ webtest-browser-cdp = { path = "crates/browser-cdp" }
 webtest-runtime = { path = "crates/runtime" }
 webtest-editor = { path = "crates/editor" }
 webtest-lsp = { path = "crates/lsp" }
+webtest-dap = { path = "crates/dap" }
 
 anyhow = "1"
 async-trait = "0.1"
