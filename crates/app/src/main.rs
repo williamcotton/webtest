@@ -233,6 +233,7 @@ fn runtime_code(error: &BrowserError) -> &'static str {
     match error {
         BrowserError::LocatorNotFound { .. } => "runtime.locator_not_found",
         BrowserError::LocatorAmbiguous { .. } => "runtime.locator_ambiguous",
+        BrowserError::LocatorNotVisible { .. } => "runtime.locator_not_visible",
         BrowserError::NavigationFailed { .. } => "runtime.navigation_failed",
         BrowserError::BrowserDisconnected => "runtime.browser_disconnected",
         BrowserError::Protocol { .. } => "runtime.browser_protocol",
@@ -242,12 +243,24 @@ fn runtime_code(error: &BrowserError) -> &'static str {
 
 fn runtime_message(error: &BrowserError) -> String {
     match error {
-        BrowserError::LocatorNotFound {
-            locator: Locator::Id(value),
-        } => {
-            format!("No element with id {value:?} was found.")
+        BrowserError::LocatorNotFound { locator } => {
+            format!(
+                "No element with {} was found.",
+                locator_description(locator)
+            )
         }
+        BrowserError::LocatorNotVisible { locator } => format!(
+            "The element with {} was not visible.",
+            locator_description(locator)
+        ),
         _ => error.to_string(),
+    }
+}
+
+fn locator_description(locator: &Locator) -> String {
+    match locator {
+        Locator::Id(value) => format!("id {value:?}"),
+        Locator::Text(value) => format!("text {value:?}"),
     }
 }
 

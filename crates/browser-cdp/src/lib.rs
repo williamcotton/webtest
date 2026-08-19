@@ -371,33 +371,86 @@ impl Page for CdpPage {
     }
 
     async fn click(&mut self, locator: &Locator) -> Result<(), BrowserError> {
-        let Locator::Id(id) = locator;
-        let id_json = serde_json::to_string(id).map_err(|error| BrowserError::Protocol {
-            method: "Runtime.evaluate".into(),
-            message: error.to_string(),
-        })?;
+        let elements = locator_expression(locator)?;
         let expression = format!(
-            "(() => {{ const element = document.getElementById({id_json}); if (!element) return {{ found: false }}; element.click(); return {{ found: true }}; }})()"
+            "(() => {{ const elements = {elements}; if (elements.length !== 1) return {{ matches: elements.length }}; elements[0].click(); return {{ matches: 1 }}; }})()"
         );
-        let result = self
-            .connection
+        let result = self.evaluate(expression).await?;
+        match result_field(&result, "matches")?.as_u64() {
+            Some(1) => Ok(()),
+            Some(0) => Err(BrowserError::LocatorNotFound {
+                locator: locator.clone(),
+            }),
+            Some(matches) => Err(BrowserError::LocatorAmbiguous {
+                locator: locator.clone(),
+                matches: matches as usize,
+            }),
+            None => Err(invalid_evaluation("`matches` was not an integer")),
+        }
+    }
+
+    async fn expect_visible(&mut self, locator: &Locator) -> Result<(), BrowserError> {
+        let elements = locator_expression(locator)?;
+        let expression = format!(
+            "(() => {{ const elements = {elements}; if (elements.length !== 1) return {{ matches: elements.length }}; const element = elements[0]; const style = getComputedStyle(element); const bounds = element.getBoundingClientRect(); const visible = style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity) !== 0 && bounds.width > 0 && bounds.height > 0; return {{ matches: 1, visible }}; }})()"
+        );
+        let result = self.evaluate(expression).await?;
+        match result_field(&result, "matches")?.as_u64() {
+            Some(0) => Err(BrowserError::LocatorNotFound {
+                locator: locator.clone(),
+            }),
+            Some(1) => match result_field(&result, "visible")?.as_bool() {
+                Some(true) => Ok(()),
+                Some(false) => Err(BrowserError::LocatorNotVisible {
+                    locator: locator.clone(),
+                }),
+                None => Err(invalid_evaluation("`visible` was not a boolean")),
+            },
+            Some(matches) => Err(BrowserError::LocatorAmbiguous {
+                locator: locator.clone(),
+                matches: matches as usize,
+            }),
+            None => Err(invalid_evaluation("`matches` was not an integer")),
+        }
+    }
+}
+
+impl CdpPage {
+    async fn evaluate(&self, expression: String) -> Result<Value, BrowserError> {
+        self.connection
             .command(
                 "Runtime.evaluate",
                 Some(json!({ "expression": expression, "returnByValue": true })),
                 Some(&self.session_id),
             )
-            .await?;
-        let found = result
-            .pointer("/result/value/found")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if found {
-            Ok(())
-        } else {
-            Err(BrowserError::LocatorNotFound {
-                locator: locator.clone(),
-            })
-        }
+            .await
+    }
+}
+
+fn locator_expression(locator: &Locator) -> Result<String, BrowserError> {
+    let (property, value) = match locator {
+        Locator::Id(value) => ("element.id", value),
+        Locator::Text(value) => ("element.textContent.trim()", value),
+    };
+    let value = serde_json::to_string(value).map_err(|error| BrowserError::Protocol {
+        method: "Runtime.evaluate".into(),
+        message: error.to_string(),
+    })?;
+    Ok(format!(
+        "Array.from(document.querySelectorAll('body *')).filter((element) => {property} === {value})"
+    ))
+}
+
+fn result_field<'a>(result: &'a Value, field: &str) -> Result<&'a Value, BrowserError> {
+    result
+        .pointer(&format!("/result/value/{field}"))
+        .ok_or_else(|| invalid_evaluation(&format!("result did not contain `{field}`")))
+}
+
+fn invalid_evaluation(message: &str) -> BrowserError {
+    BrowserError::Protocol {
+        method: "Runtime.evaluate".into(),
+        message: message.into(),
     }
 }
 
@@ -450,7 +503,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn real_chrome_clicks_and_reports_missing_ids_when_available() {
+    async fn real_chrome_clicks_and_checks_visible_text_when_available() {
         let host = ChromeHost::default();
         if host.locate().is_none() {
             return;
@@ -465,8 +518,7 @@ mod tests {
             let (mut stream, _) = listener.accept().await.expect("accept fixture request");
             let mut request = [0u8; 2048];
             let _ = stream.read(&mut request).await;
-            let body =
-                "<!doctype html><html><body><button id=\"submit\">Submit</button></body></html>";
+            let body = "<!doctype html><html><body><button id=\"submit\" onclick=\"const result=document.createElement('div');result.textContent='submitted';document.body.append(result)\">Submit</button><div style=\"display:none\">hidden</div></body></html>";
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
@@ -484,6 +536,14 @@ mod tests {
         page.click(&Locator::Id("submit".into()))
             .await
             .expect("click existing");
+        page.expect_visible(&Locator::Text("submitted".into()))
+            .await
+            .expect("submitted text is visible");
+        let hidden = page.expect_visible(&Locator::Text("hidden".into())).await;
+        assert!(matches!(
+            hidden,
+            Err(BrowserError::LocatorNotVisible { .. })
+        ));
         let missing = page.click(&Locator::Id("missing".into())).await;
         assert!(matches!(missing, Err(BrowserError::LocatorNotFound { .. })));
     }

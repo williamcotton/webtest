@@ -29,6 +29,7 @@ pub struct PlannedStep {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TestOperation {
     Browser(BrowserOperation),
+    Assertion(AssertionOperation),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,9 +38,15 @@ pub enum BrowserOperation {
     Click { locator: Locator },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AssertionOperation {
+    Visible { locator: Locator },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Locator {
     Id(String),
+    Text(String),
 }
 
 pub fn lower(file: FileId, source_revision: SourceRevision, hir: &HirFile) -> TestPlan {
@@ -60,14 +67,18 @@ pub fn lower(file: FileId, source_revision: SourceRevision, hir: &HirFile) -> Te
                             open.origin,
                         ),
                         HirBrowserOp::Click(click) => {
-                            let locator = match &click.locator.kind {
-                                HirLocatorKind::Id(value) => Locator::Id(value.clone()),
-                            };
+                            let locator = lower_locator(&click.locator.kind);
                             (
                                 TestOperation::Browser(BrowserOperation::Click { locator }),
                                 click.locator.origin,
                             )
                         }
+                        HirBrowserOp::ExpectVisible(expectation) => (
+                            TestOperation::Assertion(AssertionOperation::Visible {
+                                locator: lower_locator(&expectation.locator.kind),
+                            }),
+                            expectation.locator.origin,
+                        ),
                     };
                     steps.push(PlannedStep {
                         id: StepId(next_step),
@@ -92,13 +103,20 @@ pub fn lower(file: FileId, source_revision: SourceRevision, hir: &HirFile) -> Te
     }
 }
 
+fn lower_locator(locator: &HirLocatorKind) -> Locator {
+    match locator {
+        HirLocatorKind::Id(value) => Locator::Id(value.clone()),
+        HirLocatorKind::Text(value) => Locator::Text(value.clone()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn plan_has_deterministic_steps_revision_and_locator_range() {
-        let source = "test \"x\" { browser { open \"about:blank\" click id(\"foo\") } }";
+        let source = "test \"x\" { browser { open \"about:blank\" click id(\"foo\") expect text(\"done\").visible } }";
         let file = FileId::new(4);
         let revision = SourceRevision::of(source);
         let parsed = webtest_syntax::parse(source);
@@ -107,10 +125,17 @@ mod tests {
         assert_eq!(plan.source_revision, revision);
         assert_eq!(plan.tests[0].steps[0].id, StepId(0));
         assert_eq!(plan.tests[0].steps[1].id, StepId(1));
+        assert_eq!(plan.tests[0].steps[2].id, StepId(2));
         let range = plan.tests[0].steps[1].origin.range;
         assert_eq!(
             &source[u32::from(range.start()) as usize..u32::from(range.end()) as usize],
             "id(\"foo\")"
+        );
+        assert_eq!(
+            plan.tests[0].steps[2].operation,
+            TestOperation::Assertion(AssertionOperation::Visible {
+                locator: Locator::Text("done".into())
+            })
         );
     }
 }

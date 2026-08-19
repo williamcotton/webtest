@@ -81,6 +81,15 @@ pub enum RuntimeObservationKind {
         locator: Locator,
         page_url: Option<String>,
     },
+    LocatorAmbiguous {
+        locator: Locator,
+        matches: usize,
+        page_url: Option<String>,
+    },
+    LocatorNotVisible {
+        locator: Locator,
+        page_url: Option<String>,
+    },
 }
 
 #[derive(Default)]

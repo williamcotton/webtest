@@ -9,5 +9,12 @@
     <h1>WebTest Manual Fixture</h1>
     <p>This page contains the button used by the example tests.</p>
     <button id="submit" type="button">Submit</button>
+    <script>
+        document.getElementById("submit").addEventListener("click", () => {
+            const result = document.createElement("div");
+            result.textContent = "submitted";
+            document.body.append(result);
+        });
+    </script>
 </body>
 </html>

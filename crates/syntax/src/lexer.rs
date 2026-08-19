@@ -69,6 +69,10 @@ pub(crate) fn lex(source: &str) -> Vec<Token> {
                 offset += 1;
                 SyntaxKind::RParen
             }
+            b'.' => {
+                offset += 1;
+                SyntaxKind::Dot
+            }
             byte if is_ident_start(byte) => {
                 offset += 1;
                 while offset < bytes.len() && is_ident_continue(bytes[offset]) {
@@ -80,6 +84,9 @@ pub(crate) fn lex(source: &str) -> Vec<Token> {
                     "open" => SyntaxKind::OpenKw,
                     "click" => SyntaxKind::ClickKw,
                     "id" => SyntaxKind::IdKw,
+                    "expect" => SyntaxKind::ExpectKw,
+                    "text" => SyntaxKind::TextKw,
+                    "visible" => SyntaxKind::VisibleKw,
                     _ => SyntaxKind::Ident,
                 }
             }

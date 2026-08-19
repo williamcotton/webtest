@@ -21,6 +21,7 @@ mod tests {
     browser {
         open "http://example.test"
         click id("foo")
+        expect text("submitted").visible
     }
 }
 "#;
@@ -42,7 +43,7 @@ mod tests {
         );
         let block = test.browser_blocks().next().expect("browser block");
         let operations: Vec<_> = block.operations().collect();
-        assert_eq!(operations.len(), 2);
+        assert_eq!(operations.len(), 3);
         match &operations[1] {
             ast::BrowserOperation::Click(click) => match click.locator().expect("locator") {
                 ast::Locator::Id(locator) => {
@@ -51,8 +52,21 @@ mod tests {
                         Some("foo")
                     );
                 }
+                ast::Locator::Text(_) => panic!("expected id locator"),
             },
             _ => panic!("expected click"),
+        }
+        match &operations[2] {
+            ast::BrowserOperation::ExpectVisible(expectation) => {
+                match expectation.locator().expect("locator") {
+                    ast::Locator::Text(locator) => assert_eq!(
+                        locator.value().and_then(|token| token.value()).as_deref(),
+                        Some("submitted")
+                    ),
+                    ast::Locator::Id(_) => panic!("expected text locator"),
+                }
+            }
+            _ => panic!("expected visible expectation"),
         }
     }
 

@@ -61,6 +61,13 @@ pub fn format_file(parse: &Parse) -> String {
                 output.push(')');
                 line_start = false;
             }
+            SyntaxKind::Dot => {
+                while output.ends_with(' ') {
+                    output.pop();
+                }
+                output.push('.');
+                line_start = false;
+            }
             _ => {
                 let starts_statement = matches!(
                     kind,
@@ -68,6 +75,7 @@ pub fn format_file(parse: &Parse) -> String {
                         | SyntaxKind::BrowserKw
                         | SyntaxKind::OpenKw
                         | SyntaxKind::ClickKw
+                        | SyntaxKind::ExpectKw
                 );
                 if starts_statement && !line_start {
                     output.push('\n');
@@ -103,8 +111,10 @@ fn push_indent(output: &mut String, indent: usize) {
 }
 
 fn needs_space(previous: Option<SyntaxKind>, current: SyntaxKind) -> bool {
-    !matches!(current, SyntaxKind::LParen | SyntaxKind::RParen)
-        && !matches!(previous, None | Some(SyntaxKind::LParen))
+    !matches!(
+        current,
+        SyntaxKind::LParen | SyntaxKind::RParen | SyntaxKind::Dot
+    ) && !matches!(previous, None | Some(SyntaxKind::LParen | SyntaxKind::Dot))
 }
 
 #[cfg(test)]
@@ -113,8 +123,8 @@ mod tests {
 
     #[test]
     fn formats_and_preserves_comments() {
-        let source = "test   \"x\"{// hello\nbrowser{open \"u\" click id ( \"x\" )}}";
-        let expected = "test \"x\" {\n    // hello\n    browser {\n        open \"u\"\n        click id(\"x\")\n    }\n}\n";
+        let source = "test   \"x\"{// hello\nbrowser{open \"u\" click id ( \"x\" ) expect text ( \"done\" ) . visible}}";
+        let expected = "test \"x\" {\n    // hello\n    browser {\n        open \"u\"\n        click id(\"x\")\n        expect text(\"done\").visible\n    }\n}\n";
         let formatted = format_file(&webtest_syntax::parse(source));
         assert_eq!(formatted, expected);
         assert_eq!(format_file(&webtest_syntax::parse(&formatted)), expected);

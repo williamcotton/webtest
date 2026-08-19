@@ -7,12 +7,14 @@ use thiserror::Error;
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Locator {
     Id(String),
+    Text(String),
 }
 
 impl std::fmt::Display for Locator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Id(value) => write!(f, "id({value:?})"),
+            Self::Text(value) => write!(f, "text({value:?})"),
         }
     }
 }
@@ -23,6 +25,8 @@ pub enum BrowserError {
     LocatorNotFound { locator: Locator },
     #[error("locator {locator} matched {matches} elements")]
     LocatorAmbiguous { locator: Locator, matches: usize },
+    #[error("element matching {locator} is not visible")]
+    LocatorNotVisible { locator: Locator },
     #[error("navigation to {url} failed: {reason}")]
     NavigationFailed { url: String, reason: String },
     #[error("the browser disconnected")]
@@ -47,4 +51,5 @@ pub trait BrowserSession: Send {
 pub trait Page: Send {
     async fn open(&mut self, url: &str) -> Result<(), BrowserError>;
     async fn click(&mut self, locator: &Locator) -> Result<(), BrowserError>;
+    async fn expect_visible(&mut self, locator: &Locator) -> Result<(), BrowserError>;
 }

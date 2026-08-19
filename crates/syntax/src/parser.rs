@@ -129,6 +129,7 @@ impl<'a> Parser<'a> {
             match self.current() {
                 SyntaxKind::OpenKw => self.open_statement(),
                 SyntaxKind::ClickKw => self.click_statement(),
+                SyntaxKind::ExpectKw => self.expect_visible_statement(),
                 SyntaxKind::RBrace => {
                     self.bump();
                     break;
@@ -142,7 +143,7 @@ impl<'a> Parser<'a> {
                 }
                 _ => self.unexpected(
                     "syntax.expected_browser_statement",
-                    "expected `open` or `click` in browser block",
+                    "expected `open`, `click`, or `expect` in browser block",
                 ),
             }
         }
@@ -164,9 +165,7 @@ impl<'a> Parser<'a> {
         self.start(SyntaxKind::ClickStmt);
         self.bump();
         self.eat_trivia();
-        if self.current() == SyntaxKind::IdKw {
-            self.id_locator();
-        } else {
+        if !self.locator() {
             self.error_here("syntax.expected_locator", "expected locator after `click`");
             if !matches!(self.current(), SyntaxKind::RBrace | SyntaxKind::Eof) {
                 self.unexpected("syntax.invalid_locator", "invalid locator");
@@ -175,25 +174,51 @@ impl<'a> Parser<'a> {
         self.finish();
     }
 
-    fn id_locator(&mut self) {
-        self.start(SyntaxKind::IdLocator);
+    fn expect_visible_statement(&mut self) {
+        self.start(SyntaxKind::ExpectVisibleStmt);
+        self.bump();
+        self.eat_trivia();
+        if !self.locator() {
+            self.error_here("syntax.expected_locator", "expected locator after `expect`");
+        }
+        self.expect(
+            SyntaxKind::Dot,
+            "syntax.expected_dot",
+            "expected `.` after locator",
+        );
+        self.expect(
+            SyntaxKind::VisibleKw,
+            "syntax.expected_visible",
+            "expected `visible` after locator",
+        );
+        self.finish();
+    }
+
+    fn locator(&mut self) -> bool {
+        let node_kind = match self.current() {
+            SyntaxKind::IdKw => SyntaxKind::IdLocator,
+            SyntaxKind::TextKw => SyntaxKind::TextLocator,
+            _ => return false,
+        };
+        self.start(node_kind);
         self.bump();
         self.expect(
             SyntaxKind::LParen,
             "syntax.expected_lparen",
-            "expected `(` after `id`",
+            "expected `(` after locator name",
         );
         self.expect(
             SyntaxKind::String,
             "syntax.expected_locator_string",
-            "expected string in `id` locator",
+            "expected string in locator",
         );
         self.expect(
             SyntaxKind::RParen,
             "syntax.expected_rparen",
-            "expected `)` after `id` locator",
+            "expected `)` after locator",
         );
         self.finish();
+        true
     }
 
     fn expect(&mut self, kind: SyntaxKind, code: &'static str, message: &'static str) -> bool {

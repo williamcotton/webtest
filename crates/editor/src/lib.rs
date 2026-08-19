@@ -85,18 +85,37 @@ impl EditorService {
                 .observations_for(file, revision)
                 .into_iter()
                 .map(|observation| match observation.kind {
-                    RuntimeObservationKind::LocatorNotFound { locator, .. } => {
-                        let Locator::Id(value) = locator;
-                        Diagnostic {
-                            range: observation.range,
-                            severity: DiagnosticSeverity::Error,
-                            code: "runtime.locator_not_found",
-                            message: format!(
-                                "No element with id {value:?} was found during the last test run."
-                            ),
-                            source: DiagnosticSource::Runtime,
-                        }
-                    }
+                    RuntimeObservationKind::LocatorNotFound { locator, .. } => Diagnostic {
+                        range: observation.range,
+                        severity: DiagnosticSeverity::Error,
+                        code: "runtime.locator_not_found",
+                        message: format!(
+                            "No element with {} was found during the last test run.",
+                            locator_description(&locator)
+                        ),
+                        source: DiagnosticSource::Runtime,
+                    },
+                    RuntimeObservationKind::LocatorAmbiguous {
+                        locator, matches, ..
+                    } => Diagnostic {
+                        range: observation.range,
+                        severity: DiagnosticSeverity::Error,
+                        code: "runtime.locator_ambiguous",
+                        message: format!(
+                            "The locator {locator} matched {matches} elements during the last test run."
+                        ),
+                        source: DiagnosticSource::Runtime,
+                    },
+                    RuntimeObservationKind::LocatorNotVisible { locator, .. } => Diagnostic {
+                        range: observation.range,
+                        severity: DiagnosticSeverity::Error,
+                        code: "runtime.locator_not_visible",
+                        message: format!(
+                            "The element with {} was not visible during the last test run.",
+                            locator_description(&locator)
+                        ),
+                        source: DiagnosticSource::Runtime,
+                    },
                 }),
         );
         Ok(diagnostics)
@@ -118,8 +137,10 @@ impl EditorService {
                     SyntaxKind::TestKw
                     | SyntaxKind::BrowserKw
                     | SyntaxKind::OpenKw
-                    | SyntaxKind::ClickKw => SemanticTokenKind::Keyword,
-                    SyntaxKind::IdKw => SemanticTokenKind::Function,
+                    | SyntaxKind::ClickKw
+                    | SyntaxKind::ExpectKw
+                    | SyntaxKind::VisibleKw => SemanticTokenKind::Keyword,
+                    SyntaxKind::IdKw | SyntaxKind::TextKw => SemanticTokenKind::Function,
                     SyntaxKind::String => SemanticTokenKind::String,
                     SyntaxKind::LineComment => SemanticTokenKind::Comment,
                     _ => return None,
@@ -165,6 +186,13 @@ impl EditorService {
     }
 }
 
+fn locator_description(locator: &Locator) -> String {
+    match locator {
+        Locator::Id(value) => format!("id {value:?}"),
+        Locator::Text(value) => format!("text {value:?}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use async_trait::async_trait;
@@ -198,6 +226,16 @@ mod tests {
         }
 
         async fn click(&mut self, locator: &Locator) -> Result<(), BrowserError> {
+            if self.0 {
+                Ok(())
+            } else {
+                Err(BrowserError::LocatorNotFound {
+                    locator: locator.clone(),
+                })
+            }
+        }
+
+        async fn expect_visible(&mut self, locator: &Locator) -> Result<(), BrowserError> {
             if self.0 {
                 Ok(())
             } else {
@@ -250,11 +288,36 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn missing_visible_text_produces_a_precise_runtime_diagnostic() {
+        let editor = EditorService::new();
+        let source = "test \"x\" { browser { expect text(\"submitted\").visible } }";
+        let file = editor.open_document("file:///expect.webtest", source);
+        editor
+            .run_file(file, &FakeHost(false))
+            .await
+            .expect("failed expectation is a valid run");
+
+        let runtime = editor
+            .diagnostics(file)
+            .expect("diagnostics")
+            .into_iter()
+            .find(|diagnostic| diagnostic.source == DiagnosticSource::Runtime)
+            .expect("runtime diagnostic");
+        let start = u32::from(runtime.range.start()) as usize;
+        let end = u32::from(runtime.range.end()) as usize;
+        assert_eq!(&source[start..end], "text(\"submitted\")");
+        assert_eq!(runtime.code, "runtime.locator_not_found");
+        assert_eq!(
+            runtime.message,
+            "No element with text \"submitted\" was found during the last test run."
+        );
+    }
+
     #[test]
     fn semantic_tokens_are_views_over_cst_tokens() {
         let editor = EditorService::new();
-        let source =
-            "test \"x\" { // note\n browser { open \"about:blank\" click id(\"submit\") } }";
+        let source = "test \"x\" { // note\n browser { open \"about:blank\" click id(\"submit\") expect text(\"submitted\").visible } }";
         let file = editor.open_document("file:///tokens.webtest", source);
         let tokens = editor.semantic_tokens(file).expect("semantic tokens");
         let rendered: Vec<_> = tokens
@@ -268,6 +331,9 @@ mod tests {
         assert!(rendered.contains(&("test", SemanticTokenKind::Keyword)));
         assert!(rendered.contains(&("// note", SemanticTokenKind::Comment)));
         assert!(rendered.contains(&("id", SemanticTokenKind::Function)));
+        assert!(rendered.contains(&("expect", SemanticTokenKind::Keyword)));
+        assert!(rendered.contains(&("text", SemanticTokenKind::Function)));
+        assert!(rendered.contains(&("visible", SemanticTokenKind::Keyword)));
         assert!(rendered.contains(&("\"submit\"", SemanticTokenKind::String)));
     }
 
@@ -287,7 +353,7 @@ mod tests {
 
                 let mut request = [0u8; 2048];
                 let _ = stream.read(&mut request).await;
-                let body = "<!doctype html><html><body><button id=\"submit\">Submit</button></body></html>";
+                let body = "<!doctype html><html><body><button id=\"submit\" onclick=\"const result=document.createElement('div');result.textContent='submitted';document.body.append(result)\">Submit</button></body></html>";
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
@@ -298,7 +364,7 @@ mod tests {
 
         let editor = EditorService::new();
         let failing = format!(
-            "test \"missing\" {{ browser {{ open \"http://{address}\" click id(\"missing\") }} }}"
+            "test \"missing\" {{ browser {{ open \"http://{address}\" click id(\"missing\") expect text(\"submitted\").visible }} }}"
         );
         let file = editor.open_document("file:///vertical.webtest", &failing);
         let failed = editor

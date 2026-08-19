@@ -39,6 +39,7 @@ pub struct HirBrowserBlock {
 pub enum HirBrowserOp {
     Open(HirOpen),
     Click(HirClick),
+    ExpectVisible(HirExpectVisible),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,6 +55,12 @@ pub struct HirClick {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HirExpectVisible {
+    pub locator: HirLocator,
+    pub origin: SyntaxOrigin,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HirLocator {
     pub kind: HirLocatorKind,
     pub origin: SyntaxOrigin,
@@ -62,6 +69,7 @@ pub struct HirLocator {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HirLocatorKind {
     Id(String),
+    Text(String),
 }
 
 pub fn lower(file: FileId, parsed: &webtest_syntax::Parse) -> HirFile {
@@ -103,13 +111,15 @@ fn lower_browser_block(file: FileId, block: ast::BrowserBlock) -> HirBrowserBloc
                 }))
             }
             BrowserOperation::Click(statement) => {
-                let locator = match statement.locator()? {
-                    ast::Locator::Id(locator) => HirLocator {
-                        kind: HirLocatorKind::Id(locator.value()?.value()?),
-                        origin: SyntaxOrigin::new(file, locator.syntax().text_range()),
-                    },
-                };
+                let locator = lower_locator(file, statement.locator()?)?;
                 Some(HirBrowserOp::Click(HirClick {
+                    locator,
+                    origin: SyntaxOrigin::new(file, statement.syntax().text_range()),
+                }))
+            }
+            BrowserOperation::ExpectVisible(statement) => {
+                let locator = lower_locator(file, statement.locator()?)?;
+                Some(HirBrowserOp::ExpectVisible(HirExpectVisible {
                     locator,
                     origin: SyntaxOrigin::new(file, statement.syntax().text_range()),
                 }))
@@ -120,6 +130,19 @@ fn lower_browser_block(file: FileId, block: ast::BrowserBlock) -> HirBrowserBloc
     HirBrowserBlock {
         operations,
         origin: SyntaxOrigin::new(file, block.syntax().text_range()),
+    }
+}
+
+fn lower_locator(file: FileId, locator: ast::Locator) -> Option<HirLocator> {
+    match locator {
+        ast::Locator::Id(locator) => Some(HirLocator {
+            kind: HirLocatorKind::Id(locator.value()?.value()?),
+            origin: SyntaxOrigin::new(file, locator.syntax().text_range()),
+        }),
+        ast::Locator::Text(locator) => Some(HirLocator {
+            kind: HirLocatorKind::Text(locator.value()?.value()?),
+            origin: SyntaxOrigin::new(file, locator.syntax().text_range()),
+        }),
     }
 }
 
@@ -139,6 +162,25 @@ mod tests {
         assert_eq!(
             &source[u32::from(range.start()) as usize..u32::from(range.end()) as usize],
             "id(\"foo\")"
+        );
+    }
+
+    #[test]
+    fn visible_text_expectation_is_lowered_with_precise_origin() {
+        let source = "test \"x\" { browser { expect text(\"submitted\").visible } }";
+        let hir = lower(FileId::new(8), &webtest_syntax::parse(source));
+        let HirStmt::Browser(block) = &hir.tests[0].body[0];
+        let HirBrowserOp::ExpectVisible(expectation) = &block.operations[0] else {
+            panic!("expected visible expectation");
+        };
+        assert_eq!(
+            expectation.locator.kind,
+            HirLocatorKind::Text("submitted".into())
+        );
+        let range = expectation.locator.origin.range;
+        assert_eq!(
+            &source[u32::from(range.start()) as usize..u32::from(range.end()) as usize],
+            "text(\"submitted\")"
         );
     }
 }

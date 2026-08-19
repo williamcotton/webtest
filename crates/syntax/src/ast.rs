@@ -32,7 +32,9 @@ ast_node!(TestDecl, TestDecl);
 ast_node!(BrowserBlock, BrowserBlock);
 ast_node!(OpenStmt, OpenStmt);
 ast_node!(ClickStmt, ClickStmt);
+ast_node!(ExpectVisibleStmt, ExpectVisibleStmt);
 ast_node!(IdLocator, IdLocator);
+ast_node!(TextLocator, TextLocator);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct StringToken(SyntaxToken);
@@ -88,7 +90,19 @@ impl ClickStmt {
     }
 }
 
+impl ExpectVisibleStmt {
+    pub fn locator(&self) -> Option<Locator> {
+        self.syntax.children().find_map(Locator::cast)
+    }
+}
+
 impl IdLocator {
+    pub fn value(&self) -> Option<StringToken> {
+        string_token(&self.syntax)
+    }
+}
+
+impl TextLocator {
     pub fn value(&self) -> Option<StringToken> {
         string_token(&self.syntax)
     }
@@ -98,6 +112,7 @@ impl IdLocator {
 pub enum BrowserOperation {
     Open(OpenStmt),
     Click(ClickStmt),
+    ExpectVisible(ExpectVisibleStmt),
 }
 
 impl BrowserOperation {
@@ -105,6 +120,7 @@ impl BrowserOperation {
         match node.kind() {
             SyntaxKind::OpenStmt => OpenStmt::cast(node).map(Self::Open),
             SyntaxKind::ClickStmt => ClickStmt::cast(node).map(Self::Click),
+            SyntaxKind::ExpectVisibleStmt => ExpectVisibleStmt::cast(node).map(Self::ExpectVisible),
             _ => None,
         }
     }
@@ -113,11 +129,16 @@ impl BrowserOperation {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Locator {
     Id(IdLocator),
+    Text(TextLocator),
 }
 
 impl Locator {
     fn cast(node: SyntaxNode) -> Option<Self> {
-        IdLocator::cast(node).map(Self::Id)
+        match node.kind() {
+            SyntaxKind::IdLocator => IdLocator::cast(node).map(Self::Id),
+            SyntaxKind::TextLocator => TextLocator::cast(node).map(Self::Text),
+            _ => None,
+        }
     }
 }
 

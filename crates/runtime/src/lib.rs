@@ -8,7 +8,9 @@ use webtest_observation::{
     ExecutionEvent, ExecutionId, ObservationStore, RuntimeFailure, RuntimeObservation,
     RuntimeObservationKind,
 };
-use webtest_plan::{BrowserOperation, Locator, PlannedStep, TestOperation, TestPlan};
+use webtest_plan::{
+    AssertionOperation, BrowserOperation, Locator, PlannedStep, TestOperation, TestPlan,
+};
 
 #[derive(Clone, Debug)]
 pub struct StepFailure {
@@ -82,7 +84,7 @@ impl Runner {
                         step_id: step.id,
                     }),
                     Err(error) => {
-                        if let BrowserError::LocatorNotFound { locator } = &error {
+                        if let Some(kind) = runtime_observation(&error) {
                             self.observations.record(RuntimeObservation {
                                 execution_id,
                                 file: plan.file,
@@ -90,10 +92,7 @@ impl Runner {
                                 test_id: test.id,
                                 step_id: step.id,
                                 range: step.origin.range,
-                                kind: RuntimeObservationKind::LocatorNotFound {
-                                    locator: locator.clone(),
-                                    page_url: None,
-                                },
+                                kind,
                             });
                         }
                         events.push(ExecutionEvent::StepFailed {
@@ -135,11 +134,48 @@ async fn execute_step(page: &mut dyn Page, step: &PlannedStep) -> Result<(), Bro
     match &step.operation {
         TestOperation::Browser(BrowserOperation::Open { url }) => page.open(url).await,
         TestOperation::Browser(BrowserOperation::Click { locator }) => {
-            let locator = match locator {
-                Locator::Id(value) => BrowserLocator::Id(value.clone()),
-            };
+            let locator = browser_locator(locator);
             page.click(&locator).await
         }
+        TestOperation::Assertion(AssertionOperation::Visible { locator }) => {
+            let locator = browser_locator(locator);
+            page.expect_visible(&locator).await
+        }
+    }
+}
+
+fn browser_locator(locator: &Locator) -> BrowserLocator {
+    match locator {
+        Locator::Id(value) => BrowserLocator::Id(value.clone()),
+        Locator::Text(value) => BrowserLocator::Text(value.clone()),
+    }
+}
+
+fn runtime_observation(error: &BrowserError) -> Option<RuntimeObservationKind> {
+    match error {
+        BrowserError::LocatorNotFound { locator } => {
+            Some(RuntimeObservationKind::LocatorNotFound {
+                locator: locator.clone(),
+                page_url: None,
+            })
+        }
+        BrowserError::LocatorAmbiguous { locator, matches } => {
+            Some(RuntimeObservationKind::LocatorAmbiguous {
+                locator: locator.clone(),
+                matches: *matches,
+                page_url: None,
+            })
+        }
+        BrowserError::LocatorNotVisible { locator } => {
+            Some(RuntimeObservationKind::LocatorNotVisible {
+                locator: locator.clone(),
+                page_url: None,
+            })
+        }
+        BrowserError::NavigationFailed { .. }
+        | BrowserError::BrowserDisconnected
+        | BrowserError::Protocol { .. }
+        | BrowserError::Launch(_) => None,
     }
 }
 
@@ -193,6 +229,10 @@ mod tests {
         async fn click(&mut self, _locator: &BrowserLocator) -> Result<(), BrowserError> {
             self.click.lock().unwrap_or_else(|p| p.into_inner()).clone()
         }
+
+        async fn expect_visible(&mut self, _locator: &BrowserLocator) -> Result<(), BrowserError> {
+            self.click.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        }
     }
 
     fn plan(revision: SourceRevision) -> TestPlan {
@@ -234,5 +274,32 @@ mod tests {
         let passed = FakeHost { click: Ok(()) };
         runner.run(&plan(revision), &passed).await.expect("run");
         assert!(store.observations_for(FileId::new(0), revision).is_empty());
+    }
+
+    #[tokio::test]
+    async fn visible_expectation_failure_records_the_locator_range() {
+        let store = Arc::new(ObservationStore::default());
+        let runner = Runner::new(Arc::clone(&store));
+        let revision = SourceRevision::of("expectation");
+        let mut plan = plan(revision);
+        plan.tests[0].steps[0].operation = TestOperation::Assertion(AssertionOperation::Visible {
+            locator: Locator::Text("submitted".into()),
+        });
+        let locator = BrowserLocator::Text("submitted".into());
+        let failed = FakeHost {
+            click: Err(BrowserError::LocatorNotFound { locator }),
+        };
+
+        let result = runner.run(&plan, &failed).await.expect("run");
+
+        assert_eq!(result.failed(), 1);
+        let observations = store.observations_for(FileId::new(0), revision);
+        assert!(matches!(
+            observations[0].kind,
+            RuntimeObservationKind::LocatorNotFound {
+                locator: BrowserLocator::Text(_),
+                ..
+            }
+        ));
     }
 }

@@ -7,6 +7,7 @@ test "submit button" {
     browser {
         open "http://127.0.0.1:3000"
         click id("submit")
+        expect text("submitted").visible
     }
 }
 ```

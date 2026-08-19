@@ -25,6 +25,12 @@ pub enum SyntaxKind {
     IdLocator,
     Error,
     Eof,
+    Dot,
+    ExpectKw,
+    TextKw,
+    VisibleKw,
+    ExpectVisibleStmt,
+    TextLocator,
 }
 
 impl SyntaxKind {
@@ -35,7 +41,14 @@ impl SyntaxKind {
     pub const fn is_keyword(self) -> bool {
         matches!(
             self,
-            Self::TestKw | Self::BrowserKw | Self::OpenKw | Self::ClickKw | Self::IdKw
+            Self::TestKw
+                | Self::BrowserKw
+                | Self::OpenKw
+                | Self::ClickKw
+                | Self::IdKw
+                | Self::ExpectKw
+                | Self::TextKw
+                | Self::VisibleKw
         )
     }
 }
@@ -70,6 +83,12 @@ impl Language for WebtestLanguage {
             19 => SyntaxKind::IdLocator,
             20 => SyntaxKind::Error,
             21 => SyntaxKind::Eof,
+            22 => SyntaxKind::Dot,
+            23 => SyntaxKind::ExpectKw,
+            24 => SyntaxKind::TextKw,
+            25 => SyntaxKind::VisibleKw,
+            26 => SyntaxKind::ExpectVisibleStmt,
+            27 => SyntaxKind::TextLocator,
             _ => SyntaxKind::Error,
         }
     }
