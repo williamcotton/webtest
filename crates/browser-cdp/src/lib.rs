@@ -24,14 +24,23 @@ use webtest_browser::{BrowserError, BrowserHost, BrowserSession, Locator, Page};
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const LOAD_TIMEOUT: Duration = Duration::from_secs(15);
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct ChromeHost {
     executable: Option<PathBuf>,
+    headless: bool,
 }
 
 impl ChromeHost {
     pub fn new(executable: Option<PathBuf>) -> Self {
-        Self { executable }
+        Self {
+            executable,
+            headless: true,
+        }
+    }
+
+    pub fn with_headed(mut self, headed: bool) -> Self {
+        self.headless = !headed;
+        self
     }
 
     pub fn locate(&self) -> Option<PathBuf> {
@@ -51,12 +60,18 @@ impl BrowserHost for ChromeHost {
                 "Chrome was not found; set WEBTEST_CHROME_PATH or pass --chrome-path".into(),
             )
         })?;
-        let (process, websocket_url) = ChromeProcess::launch(&executable).await?;
+        let (process, websocket_url) = ChromeProcess::launch(&executable, self.headless).await?;
         let connection = CdpConnection::connect(&websocket_url).await?;
         Ok(Box::new(CdpBrowserSession {
             _process: process,
             connection,
         }))
+    }
+}
+
+impl Default for ChromeHost {
+    fn default() -> Self {
+        Self::new(None)
     }
 }
 
@@ -66,11 +81,14 @@ struct ChromeProcess {
 }
 
 impl ChromeProcess {
-    async fn launch(executable: &Path) -> Result<(Self, String), BrowserError> {
+    async fn launch(executable: &Path, headless: bool) -> Result<(Self, String), BrowserError> {
         let profile =
             tempfile::tempdir().map_err(|error| BrowserError::Launch(error.to_string()))?;
-        let mut child = ProcessCommand::new(executable)
-            .arg("--headless=new")
+        let mut command = ProcessCommand::new(executable);
+        if headless {
+            command.arg("--headless=new");
+        }
+        let mut child = command
             .arg("--remote-debugging-address=127.0.0.1")
             .arg("--remote-debugging-port=0")
             .arg(format!("--user-data-dir={}", profile.path().display()))
@@ -423,6 +441,13 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
+
+    #[test]
+    fn chrome_is_headless_by_default_and_can_be_headed() {
+        assert!(ChromeHost::default().headless);
+        assert!(!ChromeHost::default().with_headed(true).headless);
+        assert!(ChromeHost::default().with_headed(false).headless);
+    }
 
     #[tokio::test]
     async fn real_chrome_clicks_and_reports_missing_ids_when_available() {

@@ -30,11 +30,14 @@ enum Command {
     Check { file: PathBuf },
     /// Rewrite a WebTest file using the canonical formatter.
     Fmt { file: PathBuf },
-    /// Execute a WebTest file in headless Chrome.
+    /// Execute a WebTest file in Chrome.
     Test {
         file: PathBuf,
         #[arg(long, env = "WEBTEST_CHROME_PATH")]
         chrome_path: Option<PathBuf>,
+        /// Show the Chrome window while the test runs.
+        #[arg(long)]
+        headed: bool,
     },
     /// Run the language server over stdio.
     Lsp {
@@ -67,7 +70,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     match cli.command {
         Command::Check { file } => check(&file),
         Command::Fmt { file } => format(&file),
-        Command::Test { file, chrome_path } => test(&file, chrome_path).await,
+        Command::Test {
+            file,
+            chrome_path,
+            headed,
+        } => test(&file, chrome_path, headed).await,
         Command::Lsp { chrome_path } => {
             webtest_lsp::serve(Arc::new(ChromeHost::new(chrome_path))).await;
             Ok(ExitCode::SUCCESS)
@@ -101,7 +108,7 @@ fn format(path: &Path) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-async fn test(path: &Path, chrome_path: Option<PathBuf>) -> Result<ExitCode> {
+async fn test(path: &Path, chrome_path: Option<PathBuf>, headed: bool) -> Result<ExitCode> {
     let source = read(path)?;
     let (mut database, file) = database_for(path, &source);
     let diagnostics = database.diagnostics(file)?;
@@ -120,7 +127,7 @@ async fn test(path: &Path, chrome_path: Option<PathBuf>) -> Result<ExitCode> {
     );
     let observations = Arc::new(ObservationStore::default());
     let runner = Runner::new(observations);
-    let browser = ChromeHost::new(chrome_path);
+    let browser = ChromeHost::new(chrome_path).with_headed(headed);
     let result = match runner.run(&plan, &browser).await {
         Ok(result) => result,
         Err(error) => {
@@ -258,5 +265,12 @@ mod tests {
         );
         let (line, column, text, width) = line_details(source, range);
         assert_eq!((line, column, text, width), (1, 6, "click id(\"x\")", 7));
+    }
+
+    #[test]
+    fn test_command_accepts_headed_mode() {
+        let cli = Cli::try_parse_from(["webtest", "test", "example.webtest", "--headed"])
+            .expect("parse headed test command");
+        assert!(matches!(cli.command, Command::Test { headed: true, .. }));
     }
 }

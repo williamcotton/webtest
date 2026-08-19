@@ -14,6 +14,7 @@ Keep unit tests beside their implementation in `#[cfg(test)]` modules. Tests nee
 - `cargo clippy --workspace --all-targets -- -D warnings`: enforce lint-clean code.
 - `target/debug/webtest check examples/minimal/passing.webtest`: check DSL source.
 - `target/debug/webtest test examples/minimal/passing.webtest`: run through headless Chrome.
+- `target/debug/webtest test examples/minimal/passing.webtest --headed`: run with a visible Chrome window.
 - `cd editors/vscode && npm install && npm run compile`: build the VS Code adapter.
 
 Set `WEBTEST_CHROME_PATH` when Chrome is not discovered automatically.

@@ -20,10 +20,11 @@ cargo build
 target/debug/webtest check examples/minimal/passing.webtest
 target/debug/webtest fmt examples/minimal/passing.webtest
 target/debug/webtest test examples/minimal/passing.webtest
+target/debug/webtest test examples/minimal/passing.webtest --headed
 target/debug/webtest lsp
 ```
 
-The examples expect a site on port 3000. Automated browser tests instead start a fixture server on a random loopback port and skip gracefully when Chrome is unavailable.
+Tests run headlessly by default. Pass `--headed` to watch Chrome execute the test. The examples expect a site on port 3000. Automated browser tests instead start a fixture server on a random loopback port and skip gracefully when Chrome is unavailable.
 
 ## Cursor / VS Code extension development
 
