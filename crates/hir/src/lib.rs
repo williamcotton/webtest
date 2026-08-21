@@ -1,4 +1,6 @@
-//! Semantic representation lowered exclusively from the canonical CST.
+//! Semantic representation lowered exclusively from the canonical typed AST.
+
+use std::time::Duration;
 
 use rowan::ast::AstNode;
 use serde::{Deserialize, Serialize};
@@ -38,25 +40,57 @@ pub struct HirBrowserBlock {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HirBrowserOp {
     Open(HirOpen),
-    Click(HirClick),
-    ExpectVisible(HirExpectVisible),
+    Click(HirLocatorAction),
+    Fill(HirValueAction),
+    Type(HirValueAction),
+    Press(HirValueAction),
+    Check(HirLocatorAction),
+    Uncheck(HirLocatorAction),
+    Select(HirValueAction),
+    Hover(HirLocatorAction),
+    WaitLocator(HirLocatorExpectation),
+    WaitUrl(HirUrlExpectation),
+    ExpectLocator(HirLocatorExpectation),
+    ExpectUrl(HirUrlExpectation),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HirOpen {
-    pub url: String,
+    pub url: HirString,
     pub origin: SyntaxOrigin,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HirClick {
+pub struct HirLocatorAction {
     pub locator: HirLocator,
     pub origin: SyntaxOrigin,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HirExpectVisible {
+pub struct HirValueAction {
     pub locator: HirLocator,
+    pub value: HirString,
+    pub origin: SyntaxOrigin,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HirLocatorExpectation {
+    pub locator: HirLocator,
+    pub state: LocatorState,
+    pub timeout: Option<Duration>,
+    pub origin: SyntaxOrigin,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HirUrlExpectation {
+    pub url: HirString,
+    pub timeout: Option<Duration>,
+    pub origin: SyntaxOrigin,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HirString {
+    pub value: String,
     pub origin: SyntaxOrigin,
 }
 
@@ -69,20 +103,53 @@ pub struct HirLocator {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HirLocatorKind {
     Id(String),
+    Role { role: String, name: Option<String> },
+    Label(String),
     Text(String),
+    Placeholder(String),
+    TestId(String),
+    Css(String),
+    XPath(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LocatorState {
+    Visible,
+    Hidden,
+    Attached,
+    Detached,
+    Enabled,
+    Disabled,
+    Checked,
+    Unchecked,
+}
+
+impl From<ast::LocatorState> for LocatorState {
+    fn from(value: ast::LocatorState) -> Self {
+        match value {
+            ast::LocatorState::Visible => Self::Visible,
+            ast::LocatorState::Hidden => Self::Hidden,
+            ast::LocatorState::Attached => Self::Attached,
+            ast::LocatorState::Detached => Self::Detached,
+            ast::LocatorState::Enabled => Self::Enabled,
+            ast::LocatorState::Disabled => Self::Disabled,
+            ast::LocatorState::Checked => Self::Checked,
+            ast::LocatorState::Unchecked => Self::Unchecked,
+        }
+    }
 }
 
 pub fn lower(file: FileId, parsed: &webtest_syntax::Parse) -> HirFile {
     let Some(root) = ast::Root::cast(parsed.syntax()) else {
         return HirFile::default();
     };
-
-    let tests = root
-        .tests()
-        .enumerate()
-        .filter_map(|(index, test)| lower_test(file, index as u32, test))
-        .collect();
-    HirFile { tests }
+    HirFile {
+        tests: root
+            .tests()
+            .enumerate()
+            .filter_map(|(index, test)| lower_test(file, index as u32, test))
+            .collect(),
+    }
 }
 
 fn lower_test(file: FileId, id: u32, test: ast::TestDecl) -> Option<HirTest> {
@@ -95,55 +162,209 @@ fn lower_test(file: FileId, id: u32, test: ast::TestDecl) -> Option<HirTest> {
         id: TestId(id),
         name,
         body,
-        origin: SyntaxOrigin::new(file, test.syntax().text_range()),
+        origin: origin(file, test.syntax()),
     })
 }
 
 fn lower_browser_block(file: FileId, block: ast::BrowserBlock) -> HirBrowserBlock {
     let operations = block
         .operations()
-        .filter_map(|operation| match operation {
-            BrowserOperation::Open(statement) => {
-                let url = statement.url()?.value()?;
-                Some(HirBrowserOp::Open(HirOpen {
-                    url,
-                    origin: SyntaxOrigin::new(file, statement.syntax().text_range()),
-                }))
-            }
-            BrowserOperation::Click(statement) => {
-                let locator = lower_locator(file, statement.locator()?)?;
-                Some(HirBrowserOp::Click(HirClick {
-                    locator,
-                    origin: SyntaxOrigin::new(file, statement.syntax().text_range()),
-                }))
-            }
-            BrowserOperation::ExpectVisible(statement) => {
-                let locator = lower_locator(file, statement.locator()?)?;
-                Some(HirBrowserOp::ExpectVisible(HirExpectVisible {
-                    locator,
-                    origin: SyntaxOrigin::new(file, statement.syntax().text_range()),
-                }))
-            }
-        })
+        .filter_map(|operation| lower_operation(file, operation))
         .collect();
-
     HirBrowserBlock {
         operations,
-        origin: SyntaxOrigin::new(file, block.syntax().text_range()),
+        origin: origin(file, block.syntax()),
     }
 }
 
-fn lower_locator(file: FileId, locator: ast::Locator) -> Option<HirLocator> {
-    match locator {
-        ast::Locator::Id(locator) => Some(HirLocator {
-            kind: HirLocatorKind::Id(locator.value()?.value()?),
-            origin: SyntaxOrigin::new(file, locator.syntax().text_range()),
-        }),
-        ast::Locator::Text(locator) => Some(HirLocator {
-            kind: HirLocatorKind::Text(locator.value()?.value()?),
-            origin: SyntaxOrigin::new(file, locator.syntax().text_range()),
-        }),
+fn lower_operation(file: FileId, operation: BrowserOperation) -> Option<HirBrowserOp> {
+    match operation {
+        BrowserOperation::Open(statement) => Some(HirBrowserOp::Open(HirOpen {
+            url: lower_string(file, statement.url()?)?,
+            origin: origin(file, statement.syntax()),
+        })),
+        BrowserOperation::Click(statement) => Some(HirBrowserOp::Click(locator_action(
+            file,
+            statement.syntax(),
+            statement.locator()?,
+        )?)),
+        BrowserOperation::Fill(statement) => Some(HirBrowserOp::Fill(value_action(
+            file,
+            statement.syntax(),
+            statement.locator()?,
+            statement.value()?,
+        )?)),
+        BrowserOperation::Type(statement) => Some(HirBrowserOp::Type(value_action(
+            file,
+            statement.syntax(),
+            statement.locator()?,
+            statement.value()?,
+        )?)),
+        BrowserOperation::Press(statement) => Some(HirBrowserOp::Press(value_action(
+            file,
+            statement.syntax(),
+            statement.locator()?,
+            statement.key()?,
+        )?)),
+        BrowserOperation::Check(statement) => Some(HirBrowserOp::Check(locator_action(
+            file,
+            statement.syntax(),
+            statement.locator()?,
+        )?)),
+        BrowserOperation::Uncheck(statement) => Some(HirBrowserOp::Uncheck(locator_action(
+            file,
+            statement.syntax(),
+            statement.locator()?,
+        )?)),
+        BrowserOperation::Select(statement) => Some(HirBrowserOp::Select(value_action(
+            file,
+            statement.syntax(),
+            statement.locator()?,
+            statement.option()?,
+        )?)),
+        BrowserOperation::Hover(statement) => Some(HirBrowserOp::Hover(locator_action(
+            file,
+            statement.syntax(),
+            statement.locator()?,
+        )?)),
+        BrowserOperation::WaitLocator(statement) => {
+            Some(HirBrowserOp::WaitLocator(locator_expectation(
+                file,
+                statement.syntax(),
+                statement.locator()?,
+                statement.state()?,
+                statement.timeout().and_then(|it| it.value()),
+            )?))
+        }
+        BrowserOperation::ExpectLocator(statement) => {
+            Some(HirBrowserOp::ExpectLocator(locator_expectation(
+                file,
+                statement.syntax(),
+                statement.locator()?,
+                statement.state()?,
+                statement.timeout().and_then(|it| it.value()),
+            )?))
+        }
+        BrowserOperation::WaitUrl(statement) => Some(HirBrowserOp::WaitUrl(url_expectation(
+            file,
+            statement.syntax(),
+            statement.url()?,
+            statement.timeout().and_then(|it| it.value()),
+        )?)),
+        BrowserOperation::ExpectUrl(statement) => Some(HirBrowserOp::ExpectUrl(url_expectation(
+            file,
+            statement.syntax(),
+            statement.url()?,
+            statement.timeout().and_then(|it| it.value()),
+        )?)),
     }
+}
+
+fn locator_action(
+    file: FileId,
+    syntax: &webtest_syntax::SyntaxNode,
+    locator: ast::Locator,
+) -> Option<HirLocatorAction> {
+    Some(HirLocatorAction {
+        locator: lower_locator(file, locator)?,
+        origin: origin(file, syntax),
+    })
+}
+
+fn value_action(
+    file: FileId,
+    syntax: &webtest_syntax::SyntaxNode,
+    locator: ast::Locator,
+    value: ast::StringToken,
+) -> Option<HirValueAction> {
+    Some(HirValueAction {
+        locator: lower_locator(file, locator)?,
+        value: lower_string(file, value)?,
+        origin: origin(file, syntax),
+    })
+}
+
+fn locator_expectation(
+    file: FileId,
+    syntax: &webtest_syntax::SyntaxNode,
+    locator: ast::Locator,
+    state: ast::LocatorState,
+    timeout: Option<Duration>,
+) -> Option<HirLocatorExpectation> {
+    Some(HirLocatorExpectation {
+        locator: lower_locator(file, locator)?,
+        state: state.into(),
+        timeout,
+        origin: origin(file, syntax),
+    })
+}
+
+fn url_expectation(
+    file: FileId,
+    syntax: &webtest_syntax::SyntaxNode,
+    url: ast::StringToken,
+    timeout: Option<Duration>,
+) -> Option<HirUrlExpectation> {
+    Some(HirUrlExpectation {
+        url: lower_string(file, url)?,
+        timeout,
+        origin: origin(file, syntax),
+    })
+}
+
+fn lower_string(file: FileId, token: ast::StringToken) -> Option<HirString> {
+    Some(HirString {
+        value: token.value()?,
+        origin: SyntaxOrigin::new(file, token.syntax().text_range()),
+    })
+}
+
+fn lower_locator(file: FileId, locator: ast::Locator) -> Option<HirLocator> {
+    let (kind, range) = match locator {
+        ast::Locator::Id(locator) => (
+            HirLocatorKind::Id(locator.value()?.value()?),
+            locator.syntax().text_range(),
+        ),
+        ast::Locator::Role(locator) => (
+            HirLocatorKind::Role {
+                role: locator.role()?.value()?,
+                name: locator.name().and_then(|name| name.value()),
+            },
+            locator.syntax().text_range(),
+        ),
+        ast::Locator::Label(locator) => (
+            HirLocatorKind::Label(locator.value()?.value()?),
+            locator.syntax().text_range(),
+        ),
+        ast::Locator::Text(locator) => (
+            HirLocatorKind::Text(locator.value()?.value()?),
+            locator.syntax().text_range(),
+        ),
+        ast::Locator::Placeholder(locator) => (
+            HirLocatorKind::Placeholder(locator.value()?.value()?),
+            locator.syntax().text_range(),
+        ),
+        ast::Locator::TestId(locator) => (
+            HirLocatorKind::TestId(locator.value()?.value()?),
+            locator.syntax().text_range(),
+        ),
+        ast::Locator::Css(locator) => (
+            HirLocatorKind::Css(locator.value()?.value()?),
+            locator.syntax().text_range(),
+        ),
+        ast::Locator::XPath(locator) => (
+            HirLocatorKind::XPath(locator.value()?.value()?),
+            locator.syntax().text_range(),
+        ),
+    };
+    Some(HirLocator {
+        kind,
+        origin: SyntaxOrigin::new(file, range),
+    })
+}
+
+fn origin(file: FileId, syntax: &webtest_syntax::SyntaxNode) -> SyntaxOrigin {
+    SyntaxOrigin::new(file, syntax.text_range())
 }
 
 #[cfg(test)]
@@ -151,36 +372,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn locator_origin_is_precise() {
-        let source = "test \"x\" { browser { click id(\"foo\") } }";
-        let hir = lower(FileId::new(7), &webtest_syntax::parse(source));
+    fn lowers_all_milestone_b_operations_with_precise_origins() {
+        let source = r#"test "x" { browser {
+            fill role("textbox", name: "Email") with "alice"
+            press label("Search") key "Enter"
+            expect test_id("saved").visible within 5s
+            wait url("/done")
+        } }"#;
+        let parsed = webtest_syntax::parse(source);
+        assert!(parsed.errors().is_empty(), "{:?}", parsed.errors());
+        let hir = lower(FileId::new(7), &parsed);
         let HirStmt::Browser(block) = &hir.tests[0].body[0];
-        let HirBrowserOp::Click(click) = &block.operations[0] else {
-            panic!("expected click");
-        };
-        let range = click.locator.origin.range;
-        assert_eq!(
-            &source[u32::from(range.start()) as usize..u32::from(range.end()) as usize],
-            "id(\"foo\")"
-        );
-    }
-
-    #[test]
-    fn visible_text_expectation_is_lowered_with_precise_origin() {
-        let source = "test \"x\" { browser { expect text(\"submitted\").visible } }";
-        let hir = lower(FileId::new(8), &webtest_syntax::parse(source));
-        let HirStmt::Browser(block) = &hir.tests[0].body[0];
-        let HirBrowserOp::ExpectVisible(expectation) = &block.operations[0] else {
-            panic!("expected visible expectation");
+        assert_eq!(block.operations.len(), 4);
+        let HirBrowserOp::Fill(fill) = &block.operations[0] else {
+            panic!("fill")
         };
         assert_eq!(
-            expectation.locator.kind,
-            HirLocatorKind::Text("submitted".into())
+            fill.locator.kind,
+            HirLocatorKind::Role {
+                role: "textbox".into(),
+                name: Some("Email".into())
+            }
         );
-        let range = expectation.locator.origin.range;
+        let range = fill.locator.origin.range;
         assert_eq!(
-            &source[u32::from(range.start()) as usize..u32::from(range.end()) as usize],
-            "text(\"submitted\")"
+            &source[usize::from(range.start())..usize::from(range.end())],
+            "role(\"textbox\", name: \"Email\")"
         );
+        let HirBrowserOp::ExpectLocator(expectation) = &block.operations[2] else {
+            panic!("expect")
+        };
+        assert_eq!(expectation.state, LocatorState::Visible);
+        assert_eq!(expectation.timeout, Some(Duration::from_secs(5)));
     }
 }

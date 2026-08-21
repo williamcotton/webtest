@@ -13,5 +13,6 @@ webtest-observation.workspace = true
 webtest-plan.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 tokio.workspace = true
 webtest-text.workspace = true

@@ -40,6 +40,7 @@ pub struct ProjectConfig {
     pub browser: BrowserSection,
     pub timeouts: TimeoutSection,
     pub artifacts: ArtifactSection,
+    pub evidence: EvidenceSection,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -54,6 +55,15 @@ pub struct BrowserSection {
     pub headless: bool,
     pub channel: BrowserChannel,
     pub path: Option<PathBuf>,
+    pub base_url: Option<String>,
+    pub viewport: ViewportSection,
+    pub test_id_attribute: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViewportSection {
+    pub width: u32,
+    pub height: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -66,6 +76,8 @@ pub enum BrowserChannel {
 #[derive(Clone, Debug)]
 pub struct TimeoutSection {
     pub browser_command: Duration,
+    pub action: Duration,
+    pub assertion: Duration,
     pub navigation: Duration,
     pub test: Duration,
 }
@@ -73,6 +85,19 @@ pub struct TimeoutSection {
 #[derive(Clone, Debug)]
 pub struct ArtifactSection {
     pub directory: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvidenceMode {
+    Off,
+    OnFailure,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EvidenceSection {
+    pub screenshot: EvidenceMode,
+    pub dom_snapshot: EvidenceMode,
+    pub max_dom_bytes: usize,
 }
 
 impl Default for ProjectConfig {
@@ -83,14 +108,27 @@ impl Default for ProjectConfig {
                 headless: true,
                 channel: BrowserChannel::Managed,
                 path: None,
+                base_url: None,
+                viewport: ViewportSection {
+                    width: 1280,
+                    height: 720,
+                },
+                test_id_attribute: "data-testid".into(),
             },
             timeouts: TimeoutSection {
                 browser_command: Duration::from_secs(10),
+                action: Duration::from_secs(5),
+                assertion: Duration::from_secs(5),
                 navigation: Duration::from_secs(30),
                 test: Duration::from_secs(60),
             },
             artifacts: ArtifactSection {
                 directory: PathBuf::from(".webtest/artifacts"),
+            },
+            evidence: EvidenceSection {
+                screenshot: EvidenceMode::OnFailure,
+                dom_snapshot: EvidenceMode::OnFailure,
+                max_dom_bytes: 1_048_576,
             },
         }
     }
@@ -144,6 +182,8 @@ struct RawConfig {
     timeouts: RawTimeouts,
     #[serde(default)]
     artifacts: RawArtifacts,
+    #[serde(default)]
+    evidence: RawEvidence,
     #[serde(flatten)]
     extra: toml::Table,
 }
@@ -164,13 +204,24 @@ struct RawBrowser {
     headless: Option<bool>,
     channel: Option<String>,
     path: Option<PathBuf>,
+    base_url: Option<String>,
+    viewport: Option<RawViewport>,
+    test_id_attribute: Option<String>,
     #[serde(flatten)]
     extra: toml::Table,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawViewport {
+    width: u32,
+    height: u32,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct RawTimeouts {
     browser_command: Option<String>,
+    action: Option<String>,
+    assertion: Option<String>,
     navigation: Option<String>,
     test: Option<String>,
     #[serde(flatten)]
@@ -180,6 +231,15 @@ struct RawTimeouts {
 #[derive(Debug, Default, Deserialize)]
 struct RawArtifacts {
     directory: Option<PathBuf>,
+    #[serde(flatten)]
+    extra: toml::Table,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawEvidence {
+    screenshot: Option<String>,
+    dom_snapshot: Option<String>,
+    max_dom_bytes: Option<usize>,
     #[serde(flatten)]
     extra: toml::Table,
 }
@@ -299,6 +359,7 @@ fn parse_config(
     collect_unknown(&mut warnings, "browser", &raw.browser.extra);
     collect_unknown(&mut warnings, "timeouts", &raw.timeouts.extra);
     collect_unknown(&mut warnings, "artifacts", &raw.artifacts.extra);
+    collect_unknown(&mut warnings, "evidence", &raw.evidence.extra);
 
     let channel = match raw.browser.channel.as_deref().unwrap_or("managed") {
         "managed" => BrowserChannel::Managed,
@@ -317,6 +378,36 @@ fn parse_config(
         });
     }
     let defaults = ProjectConfig::default();
+    if let Some(base_url) = &raw.browser.base_url
+        && !is_absolute_url(base_url)
+    {
+        return Err(ProjectError::InvalidConfig {
+            path: path.to_path_buf(),
+            message: "browser.base_url must be an absolute URL".into(),
+        });
+    }
+    if raw
+        .browser
+        .test_id_attribute
+        .as_deref()
+        .is_some_and(str::is_empty)
+    {
+        return Err(ProjectError::InvalidConfig {
+            path: path.to_path_buf(),
+            message: "browser.test_id_attribute must not be empty".into(),
+        });
+    }
+    if let Some(viewport) = &raw.browser.viewport
+        && (viewport.width == 0
+            || viewport.height == 0
+            || viewport.width > 16_384
+            || viewport.height > 16_384)
+    {
+        return Err(ProjectError::InvalidConfig {
+            path: path.to_path_buf(),
+            message: "browser.viewport dimensions must be between 1 and 16384".into(),
+        });
+    }
     for test_root in &raw.project.test_roots {
         validate_project_relative(path, "project.test_roots", test_root)?;
     }
@@ -331,6 +422,52 @@ fn parse_config(
             })
         })
     };
+    let resolved_timeouts = TimeoutSection {
+        browser_command: timeout(
+            "browser_command",
+            raw.timeouts.browser_command,
+            defaults.timeouts.browser_command,
+        )?,
+        action: timeout("action", raw.timeouts.action, defaults.timeouts.action)?,
+        assertion: timeout(
+            "assertion",
+            raw.timeouts.assertion,
+            defaults.timeouts.assertion,
+        )?,
+        navigation: timeout(
+            "navigation",
+            raw.timeouts.navigation,
+            defaults.timeouts.navigation,
+        )?,
+        test: timeout("test", raw.timeouts.test, defaults.timeouts.test)?,
+    };
+    for (name, value) in [
+        ("action", resolved_timeouts.action),
+        ("assertion", resolved_timeouts.assertion),
+        ("navigation", resolved_timeouts.navigation),
+    ] {
+        if value > resolved_timeouts.test {
+            return Err(ProjectError::InvalidConfig {
+                path: path.to_path_buf(),
+                message: format!("timeouts.{name} must not exceed timeouts.test"),
+            });
+        }
+    }
+    let evidence_mode = |key: &str, value: Option<String>, default| match value.as_deref() {
+        None => Ok(default),
+        Some("off") => Ok(EvidenceMode::Off),
+        Some("on-failure") => Ok(EvidenceMode::OnFailure),
+        Some(value) => Err(ProjectError::InvalidConfig {
+            path: path.to_path_buf(),
+            message: format!("evidence.{key} must be `off` or `on-failure`, got `{value}`"),
+        }),
+    };
+    if raw.evidence.max_dom_bytes == Some(0) {
+        return Err(ProjectError::InvalidConfig {
+            path: path.to_path_buf(),
+            message: "evidence.max_dom_bytes must be positive".into(),
+        });
+    }
     Ok((
         ProjectConfig {
             project: ProjectSection {
@@ -342,29 +479,56 @@ fn parse_config(
                 headless: raw.browser.headless.unwrap_or(defaults.browser.headless),
                 channel,
                 path: raw.browser.path,
+                base_url: raw.browser.base_url,
+                viewport: raw
+                    .browser
+                    .viewport
+                    .map_or(defaults.browser.viewport, |viewport| ViewportSection {
+                        width: viewport.width,
+                        height: viewport.height,
+                    }),
+                test_id_attribute: raw
+                    .browser
+                    .test_id_attribute
+                    .unwrap_or(defaults.browser.test_id_attribute),
             },
-            timeouts: TimeoutSection {
-                browser_command: timeout(
-                    "browser_command",
-                    raw.timeouts.browser_command,
-                    defaults.timeouts.browser_command,
-                )?,
-                navigation: timeout(
-                    "navigation",
-                    raw.timeouts.navigation,
-                    defaults.timeouts.navigation,
-                )?,
-                test: timeout("test", raw.timeouts.test, defaults.timeouts.test)?,
-            },
+            timeouts: resolved_timeouts,
             artifacts: ArtifactSection {
                 directory: raw
                     .artifacts
                     .directory
                     .unwrap_or(defaults.artifacts.directory),
             },
+            evidence: EvidenceSection {
+                screenshot: evidence_mode(
+                    "screenshot",
+                    raw.evidence.screenshot,
+                    defaults.evidence.screenshot,
+                )?,
+                dom_snapshot: evidence_mode(
+                    "dom_snapshot",
+                    raw.evidence.dom_snapshot,
+                    defaults.evidence.dom_snapshot,
+                )?,
+                max_dom_bytes: raw
+                    .evidence
+                    .max_dom_bytes
+                    .unwrap_or(defaults.evidence.max_dom_bytes),
+            },
         },
         warnings,
     ))
+}
+
+fn is_absolute_url(value: &str) -> bool {
+    value.split_once(':').is_some_and(|(scheme, rest)| {
+        !scheme.is_empty()
+            && scheme.chars().next().is_some_and(char::is_alphabetic)
+            && scheme.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
+            })
+            && !rest.is_empty()
+    })
 }
 
 fn validate_project_relative(
@@ -641,6 +805,53 @@ mod tests {
             parse_config(path, "[timeouts]\ntest = \"0s\"\n"),
             Err(ProjectError::InvalidConfig { .. })
         ));
+    }
+
+    #[test]
+    fn parses_milestone_b_browser_timeouts_and_evidence() {
+        let path = Path::new("webtest.toml");
+        let (config, warnings) = parse_config(
+            path,
+            r#"
+[browser]
+base_url = "http://127.0.0.1:3000"
+viewport = { width = 1440, height = 900 }
+test_id_attribute = "data-test"
+
+[timeouts]
+action = "2s"
+assertion = "3s"
+navigation = "10s"
+test = "20s"
+
+[evidence]
+screenshot = "on-failure"
+dom_snapshot = "off"
+max_dom_bytes = 4096
+"#,
+        )
+        .expect("Milestone B config");
+        assert!(warnings.is_empty());
+        assert_eq!(
+            config.browser.base_url.as_deref(),
+            Some("http://127.0.0.1:3000")
+        );
+        assert_eq!(
+            config.browser.viewport,
+            ViewportSection {
+                width: 1440,
+                height: 900
+            }
+        );
+        assert_eq!(config.browser.test_id_attribute, "data-test");
+        assert_eq!(config.timeouts.action, Duration::from_secs(2));
+        assert_eq!(config.timeouts.assertion, Duration::from_secs(3));
+        assert_eq!(config.evidence.dom_snapshot, EvidenceMode::Off);
+        assert_eq!(config.evidence.max_dom_bytes, 4096);
+
+        assert!(parse_config(path, "[browser]\nbase_url = \"/relative\"\n").is_err());
+        assert!(parse_config(path, "[browser]\nviewport = { width = 0, height = 10 }\n").is_err());
+        assert!(parse_config(path, "[timeouts]\naction = \"61s\"\ntest = \"60s\"\n").is_err());
     }
 
     #[test]

@@ -12,18 +12,22 @@ use std::{
 };
 
 use async_trait::async_trait;
+use base64::Engine;
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::{
     process::{Child, Command as ProcessCommand},
-    sync::{mpsc, oneshot},
+    sync::{Mutex, mpsc, oneshot},
     time::{Instant, interval, sleep, timeout},
 };
 use tokio_tungstenite::tungstenite::Message;
 use tracing::instrument;
-use webtest_browser::{BrowserError, BrowserHost, BrowserSession, Locator, Page};
+use webtest_browser::{
+    Action, BrowserContext, BrowserContextOptions, BrowserError, BrowserHost, BrowserSession,
+    CandidateEvidence, EvidenceRequest, Locator, LocatorState, Page, PageEvidence,
+};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const LOAD_TIMEOUT: Duration = Duration::from_secs(15);
@@ -124,7 +128,18 @@ impl ChromeProcess {
         let contents = timeout(STARTUP_TIMEOUT, async {
             loop {
                 match tokio::fs::read_to_string(&port_file).await {
-                    Ok(contents) => break Ok(contents),
+                    Ok(contents) if contents.lines().take(2).count() == 2 => break Ok(contents),
+                    Ok(_) => {
+                        if let Some(status) = child
+                            .try_wait()
+                            .map_err(|error| BrowserError::Launch(error.to_string()))?
+                        {
+                            break Err(BrowserError::BrowserCrashed {
+                                status: format!("exited before CDP became available ({status})"),
+                            });
+                        }
+                        sleep(Duration::from_millis(25)).await;
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                         if let Some(status) = child
                             .try_wait()
@@ -242,6 +257,7 @@ struct CdpConnection {
     sender: mpsc::Sender<OutgoingCommand>,
     command_timeout: Duration,
     in_flight: Arc<AtomicUsize>,
+    console_errors: Arc<Mutex<Vec<String>>>,
 }
 
 struct OutgoingCommand {
@@ -276,6 +292,8 @@ struct IncomingMessage {
     session_id: Option<String>,
     result: Option<Value>,
     error: Option<CdpError>,
+    method: Option<String>,
+    params: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -295,6 +313,8 @@ impl CdpConnection {
         let (sender, mut receiver) = mpsc::channel::<OutgoingCommand>(32);
         let in_flight = Arc::new(AtomicUsize::new(0));
         let actor_in_flight = Arc::clone(&in_flight);
+        let console_errors = Arc::new(Mutex::new(Vec::new()));
+        let actor_console_errors = Arc::clone(&console_errors);
 
         tokio::spawn(async move {
             let mut next_id = 1u64;
@@ -367,7 +387,14 @@ impl CdpConnection {
                                 message: error.to_string(),
                             },
                         };
-                        let Some(id) = message.id else { continue };
+                        let Some(id) = message.id else {
+                            if let Some(entry) = console_error(&message) {
+                                let mut errors = actor_console_errors.lock().await;
+                                if errors.len() == 20 { errors.remove(0); }
+                                errors.push(entry);
+                            }
+                            continue
+                        };
                         let Some(pending_command) = pending.remove(&id) else {
                             tracing::warn!(id, "Chrome returned a response for an unknown CDP command");
                             continue;
@@ -425,6 +452,7 @@ impl CdpConnection {
             sender,
             command_timeout,
             in_flight,
+            console_errors,
         })
     }
 
@@ -460,6 +488,31 @@ impl CdpConnection {
     fn in_flight(&self) -> usize {
         self.in_flight.load(Ordering::Relaxed)
     }
+
+    async fn console_errors(&self) -> Vec<String> {
+        self.console_errors.lock().await.clone()
+    }
+}
+
+fn console_error(message: &IncomingMessage) -> Option<String> {
+    match message.method.as_deref()? {
+        "Runtime.exceptionThrown" => message
+            .params
+            .as_ref()?
+            .pointer("/exceptionDetails/text")
+            .and_then(Value::as_str)
+            .map(bounded_text),
+        "Runtime.consoleAPICalled"
+            if message.params.as_ref()?.get("type").and_then(Value::as_str) == Some("error") =>
+        {
+            Some("console.error".into())
+        }
+        _ => None,
+    }
+}
+
+fn bounded_text(value: &str) -> String {
+    value.chars().take(256).collect()
 }
 
 struct CdpBrowserSession {
@@ -471,34 +524,31 @@ struct CdpBrowserSession {
 #[async_trait]
 impl BrowserSession for CdpBrowserSession {
     async fn new_page(&mut self) -> Result<Box<dyn Page>, BrowserError> {
-        let target = self
+        let (page, _) = create_page(
+            &self.connection,
+            self.navigation_timeout,
+            None,
+            &BrowserContextOptions::default(),
+        )
+        .await?;
+        Ok(Box::new(page))
+    }
+
+    async fn new_context(
+        &mut self,
+        options: &BrowserContextOptions,
+    ) -> Result<Box<dyn BrowserContext>, BrowserError> {
+        let created = self
             .connection
-            .command(
-                "Target.createTarget",
-                Some(json!({ "url": "about:blank" })),
-                None,
-            )
+            .command("Target.createBrowserContext", Some(json!({})), None)
             .await?;
-        let target_id = string_field(&target, "targetId", "Target.createTarget")?;
-        let attached = self
-            .connection
-            .command(
-                "Target.attachToTarget",
-                Some(json!({ "targetId": target_id, "flatten": true })),
-                None,
-            )
-            .await?;
-        let session_id = string_field(&attached, "sessionId", "Target.attachToTarget")?;
-        self.connection
-            .command("Page.enable", None, Some(&session_id))
-            .await?;
-        self.connection
-            .command("Runtime.enable", None, Some(&session_id))
-            .await?;
-        Ok(Box::new(CdpPage {
+        let context_id = string_field(&created, "browserContextId", "Target.createBrowserContext")?;
+        Ok(Box::new(CdpBrowserContext {
             connection: self.connection.clone(),
-            session_id,
+            context_id: Some(context_id),
+            options: options.clone(),
             navigation_timeout: self.navigation_timeout,
+            target_ids: Vec::new(),
         }))
     }
 
@@ -516,10 +566,107 @@ impl BrowserSession for CdpBrowserSession {
     }
 }
 
+struct CdpBrowserContext {
+    connection: CdpConnection,
+    context_id: Option<String>,
+    options: BrowserContextOptions,
+    navigation_timeout: Duration,
+    target_ids: Vec<String>,
+}
+
+#[async_trait]
+impl BrowserContext for CdpBrowserContext {
+    async fn new_page(&mut self) -> Result<Box<dyn Page>, BrowserError> {
+        let context_id = self
+            .context_id
+            .as_deref()
+            .ok_or_else(|| BrowserError::Protocol {
+                method: "BrowserContext.new_page".into(),
+                message: "browser context is already closed".into(),
+            })?;
+        let (page, target_id) = create_page(
+            &self.connection,
+            self.navigation_timeout,
+            Some(context_id),
+            &self.options,
+        )
+        .await?;
+        self.target_ids.push(target_id);
+        Ok(Box::new(page))
+    }
+
+    async fn close(&mut self) -> Result<(), BrowserError> {
+        let Some(context_id) = self.context_id.take() else {
+            return Ok(());
+        };
+        self.target_ids.clear();
+        self.connection
+            .command(
+                "Target.disposeBrowserContext",
+                Some(json!({ "browserContextId": context_id })),
+                None,
+            )
+            .await
+            .map(|_| ())
+    }
+}
+
+async fn create_page(
+    connection: &CdpConnection,
+    navigation_timeout: Duration,
+    context_id: Option<&str>,
+    options: &BrowserContextOptions,
+) -> Result<(CdpPage, String), BrowserError> {
+    let mut params = json!({ "url": "about:blank" });
+    if let Some(context_id) = context_id {
+        params["browserContextId"] = Value::String(context_id.into());
+    }
+    let target = connection
+        .command("Target.createTarget", Some(params), None)
+        .await?;
+    let target_id = string_field(&target, "targetId", "Target.createTarget")?;
+    let attached = connection
+        .command(
+            "Target.attachToTarget",
+            Some(json!({ "targetId": target_id, "flatten": true })),
+            None,
+        )
+        .await?;
+    let session_id = string_field(&attached, "sessionId", "Target.attachToTarget")?;
+    connection
+        .command("Page.enable", None, Some(&session_id))
+        .await?;
+    connection
+        .command("Runtime.enable", None, Some(&session_id))
+        .await?;
+    connection
+        .command(
+            "Emulation.setDeviceMetricsOverride",
+            Some(json!({
+                "width": options.viewport.width,
+                "height": options.viewport.height,
+                "deviceScaleFactor": 1,
+                "mobile": false
+            })),
+            Some(&session_id),
+        )
+        .await?;
+    Ok((
+        CdpPage {
+            connection: connection.clone(),
+            session_id,
+            navigation_timeout,
+            test_id_attribute: options.test_id_attribute.clone(),
+        },
+        target_id,
+    ))
+}
+
 struct CdpPage {
     connection: CdpConnection,
     session_id: String,
     navigation_timeout: Duration,
+    test_id_attribute: String,
 }
 
 #[async_trait]
@@ -568,47 +715,248 @@ impl Page for CdpPage {
     }
 
     async fn click(&mut self, locator: &Locator) -> Result<(), BrowserError> {
-        let elements = locator_expression(locator)?;
-        let expression = format!(
-            "(() => {{ const elements = {elements}; if (elements.length !== 1) return {{ matches: elements.length }}; elements[0].click(); return {{ matches: 1 }}; }})()"
-        );
-        let result = self.evaluate(expression).await?;
-        match result_field(&result, "matches")?.as_u64() {
-            Some(1) => Ok(()),
-            Some(0) => Err(BrowserError::LocatorNotFound {
+        self.perform(
+            &Action::Click {
                 locator: locator.clone(),
-            }),
-            Some(matches) => Err(BrowserError::LocatorAmbiguous {
-                locator: locator.clone(),
-                matches: matches as usize,
-            }),
-            None => Err(invalid_evaluation("`matches` was not an integer")),
-        }
+            },
+            Duration::from_secs(5),
+        )
+        .await
     }
 
     async fn expect_visible(&mut self, locator: &Locator) -> Result<(), BrowserError> {
-        let elements = locator_expression(locator)?;
-        let expression = format!(
-            "(() => {{ const elements = {elements}; if (elements.length !== 1) return {{ matches: elements.length }}; const element = elements[0]; const style = getComputedStyle(element); const bounds = element.getBoundingClientRect(); const visible = style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity) !== 0 && bounds.width > 0 && bounds.height > 0; return {{ matches: 1, visible }}; }})()"
-        );
-        let result = self.evaluate(expression).await?;
-        match result_field(&result, "matches")?.as_u64() {
-            Some(0) => Err(BrowserError::LocatorNotFound {
-                locator: locator.clone(),
-            }),
-            Some(1) => match result_field(&result, "visible")?.as_bool() {
-                Some(true) => Ok(()),
-                Some(false) => Err(BrowserError::LocatorNotVisible {
-                    locator: locator.clone(),
-                }),
-                None => Err(invalid_evaluation("`visible` was not a boolean")),
-            },
-            Some(matches) => Err(BrowserError::LocatorAmbiguous {
-                locator: locator.clone(),
-                matches: matches as usize,
-            }),
-            None => Err(invalid_evaluation("`matches` was not an integer")),
+        self.wait_for_locator(locator, LocatorState::Visible, Duration::from_secs(5))
+            .await
+    }
+
+    async fn evaluate_expression(&mut self, expression: &str) -> Result<(), BrowserError> {
+        let evaluation = self
+            .connection
+            .command(
+                "Runtime.evaluate",
+                Some(json!({
+                    "expression": expression,
+                    "returnByValue": true
+                })),
+                Some(&self.session_id),
+            )
+            .await?;
+        if let Some(message) = evaluation.get("errorText").and_then(Value::as_str) {
+            return Err(BrowserError::EvaluationFailed {
+                expression: expression.to_owned(),
+                message: message.to_owned(),
+            });
         }
+        return Ok(());
+    }
+
+    async fn perform(&mut self, action: &Action, timeout: Duration) -> Result<(), BrowserError> {
+        let snapshot = self.wait_for_actionability(action, timeout).await?;
+        match action {
+            Action::Click { .. } => self.physical_click(&snapshot).await,
+            Action::Hover { .. } => self.mouse_move(&snapshot).await,
+            Action::Fill { value, .. } => {
+                self.physical_click(&snapshot).await?;
+                self.select_all().await?;
+                self.key_event("Backspace", "Backspace", 0, None).await?;
+                self.insert_text(value).await
+            }
+            Action::Type { value, .. } => {
+                self.physical_click(&snapshot).await?;
+                self.insert_text(value).await
+            }
+            Action::Press { key, .. } => {
+                self.physical_click(&snapshot).await?;
+                let key =
+                    parse_key(key).ok_or_else(|| BrowserError::InvalidKey { key: key.clone() })?;
+                self.key_event(&key.key, &key.code, key.modifiers, key.text.as_deref())
+                    .await
+            }
+            Action::Check { locator, checked } => {
+                if snapshot.checked == Some(*checked) {
+                    Ok(())
+                } else {
+                    self.physical_click(&snapshot).await?;
+                    let after = self.resolve(locator).await?;
+                    if after.checked == Some(*checked) {
+                        Ok(())
+                    } else {
+                        Err(BrowserError::AssertionFailed {
+                            locator: locator.clone(),
+                            expected: if *checked {
+                                LocatorState::Checked
+                            } else {
+                                LocatorState::Unchecked
+                            },
+                            actual: format!("checked={:?}", after.checked),
+                        })
+                    }
+                }
+            }
+            Action::Select { locator, option } => self.select_option(locator, option).await,
+        }
+    }
+
+    async fn wait_for_locator(
+        &mut self,
+        locator: &Locator,
+        state: LocatorState,
+        timeout: Duration,
+    ) -> Result<(), BrowserError> {
+        let deadline = Instant::now() + timeout;
+        let mut backoff = Duration::from_millis(20);
+        loop {
+            match self.resolve(locator).await {
+                Err(BrowserError::LocatorInvalid { locator, message }) => {
+                    return Err(BrowserError::LocatorInvalid { locator, message });
+                }
+                Err(error) => return Err(error),
+                Ok(snapshot) => {
+                    if state_satisfied(&snapshot, state) {
+                        return Ok(());
+                    }
+                    let final_actual = snapshot.state_summary();
+                    if snapshot.matches > 1 {
+                        if Instant::now() >= deadline {
+                            return Err(BrowserError::LocatorAmbiguous {
+                                locator: locator.clone(),
+                                matches: snapshot.matches,
+                            });
+                        }
+                    } else if Instant::now() >= deadline {
+                        if snapshot.matches == 0
+                            && !matches!(state, LocatorState::Hidden | LocatorState::Detached)
+                        {
+                            return Err(BrowserError::LocatorNotFound {
+                                locator: locator.clone(),
+                            });
+                        }
+                        if state == LocatorState::Visible
+                            && snapshot.matches == 1
+                            && !snapshot.visible
+                        {
+                            return Err(BrowserError::LocatorNotVisible {
+                                locator: locator.clone(),
+                            });
+                        }
+                        return Err(BrowserError::AssertionFailed {
+                            locator: locator.clone(),
+                            expected: state,
+                            actual: final_actual,
+                        });
+                    }
+                }
+            }
+            sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_millis(100));
+        }
+    }
+
+    async fn wait_for_url(
+        &mut self,
+        expected: &str,
+        timeout: Duration,
+    ) -> Result<(), BrowserError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let actual = self.current_url().await?;
+            if actual == expected {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(BrowserError::UrlMismatch {
+                    expected: expected.into(),
+                    actual,
+                });
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    async fn current_url(&mut self) -> Result<String, BrowserError> {
+        let result = self.evaluate("location.href".into()).await?;
+        evaluation_value(&result)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| invalid_evaluation("current URL was not a string"))
+    }
+
+    async fn capture_evidence(&mut self, request: &EvidenceRequest) -> PageEvidence {
+        let mut evidence = PageEvidence::default();
+        if request.include_screenshot {
+            match self
+                .connection
+                .command(
+                    "Page.captureScreenshot",
+                    Some(json!({ "format": "png", "fromSurface": true })),
+                    Some(&self.session_id),
+                )
+                .await
+            {
+                Ok(value) => {
+                    match value.get("data").and_then(Value::as_str).and_then(|data| {
+                        base64::engine::general_purpose::STANDARD.decode(data).ok()
+                    }) {
+                        Some(png) => evidence.screenshot_png = Some(png),
+                        None => evidence
+                            .capture_failures
+                            .push("screenshot response was invalid".into()),
+                    }
+                }
+                Err(error) => evidence
+                    .capture_failures
+                    .push(format!("screenshot: {error}")),
+            }
+        }
+        let page_state = self
+            .evaluate("({url: location.href, title: document.title})".into())
+            .await;
+        match page_state.and_then(|result| {
+            evaluation_value(&result)
+                .cloned()
+                .ok_or_else(|| invalid_evaluation("page state missing"))
+        }) {
+            Ok(value) => {
+                evidence.current_url = value.get("url").and_then(Value::as_str).map(str::to_owned);
+                evidence.title = value
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+            }
+            Err(error) => evidence
+                .capture_failures
+                .push(format!("page state: {error}")),
+        }
+        if let Some(locator) = &request.locator {
+            match self.resolve(locator).await {
+                Ok(snapshot) => {
+                    evidence.actionability = snapshot.actionability_facts();
+                    evidence.candidates = snapshot.candidates;
+                }
+                Err(error) => evidence
+                    .capture_failures
+                    .push(format!("locator evidence: {error}")),
+            }
+        }
+        if request.include_dom {
+            let expression = "(() => { const root = document.documentElement.cloneNode(true); root.querySelectorAll('input,textarea').forEach(e => { e.removeAttribute('value'); if (e.tagName === 'TEXTAREA') e.textContent = ''; }); return '<!doctype html>' + root.outerHTML; })()";
+            match self.evaluate(expression.into()).await {
+                Ok(result) => match evaluation_value(&result).and_then(Value::as_str) {
+                    Some(dom) => {
+                        evidence.dom_snapshot = Some(truncate_utf8(dom, request.max_dom_bytes))
+                    }
+                    None => evidence
+                        .capture_failures
+                        .push("DOM snapshot was not a string".into()),
+                },
+                Err(error) => evidence
+                    .capture_failures
+                    .push(format!("DOM snapshot: {error}")),
+            }
+        }
+        evidence.console_errors = self.connection.console_errors().await;
+        redact_evidence(&mut evidence, &request.redactions);
+        evidence
     }
 }
 
@@ -626,26 +974,605 @@ impl CdpPage {
             )
             .await
     }
+
+    async fn resolve(&self, locator: &Locator) -> Result<ResolveSnapshot, BrowserError> {
+        let expression = resolver_expression(locator, &self.test_id_attribute)?;
+        let result = self.evaluate(expression).await?;
+        let value = evaluation_value(&result)
+            .ok_or_else(|| invalid_evaluation("locator result was missing"))?;
+        let snapshot: ResolveSnapshot = serde_json::from_value(value.clone())
+            .map_err(|error| invalid_evaluation(&error.to_string()))?;
+        if let Some(message) = snapshot.invalid.clone() {
+            return Err(BrowserError::LocatorInvalid {
+                locator: locator.clone(),
+                message,
+            });
+        }
+        Ok(snapshot)
+    }
+
+    async fn wait_for_actionability(
+        &self,
+        action: &Action,
+        timeout: Duration,
+    ) -> Result<ResolveSnapshot, BrowserError> {
+        let locator = action.locator();
+        let deadline = Instant::now() + timeout;
+        let mut backoff = Duration::from_millis(20);
+        let mut observed_failure = None;
+        let mut failures_changed = false;
+        loop {
+            let first = self.resolve(locator).await?;
+            let last_error = match first.matches {
+                0 => BrowserError::LocatorNotFound {
+                    locator: locator.clone(),
+                },
+                count if count > 1 => BrowserError::LocatorAmbiguous {
+                    locator: locator.clone(),
+                    matches: count,
+                },
+                _ if !first.visible => BrowserError::LocatorNotVisible {
+                    locator: locator.clone(),
+                },
+                _ if first.disabled => BrowserError::ElementDisabled {
+                    locator: locator.clone(),
+                },
+                _ if matches!(action, Action::Fill { .. } | Action::Type { .. })
+                    && !first.editable =>
+                {
+                    BrowserError::ElementNotEditable {
+                        locator: locator.clone(),
+                    }
+                }
+                _ if matches!(action, Action::Select { .. })
+                    && first.tag.as_deref() != Some("select") =>
+                {
+                    BrowserError::ElementNotEditable {
+                        locator: locator.clone(),
+                    }
+                }
+                _ if matches!(action, Action::Check { .. }) && first.checked.is_none() => {
+                    BrowserError::ElementNotEditable {
+                        locator: locator.clone(),
+                    }
+                }
+                _ if matches!(
+                    action,
+                    Action::Click { .. } | Action::Hover { .. } | Action::Check { .. }
+                ) && first.obscured =>
+                {
+                    BrowserError::ElementObscured {
+                        locator: locator.clone(),
+                    }
+                }
+                _ => {
+                    sleep(Duration::from_millis(50)).await;
+                    let second = self.resolve(locator).await?;
+                    if second.matches == 0 {
+                        BrowserError::ElementDetached {
+                            locator: locator.clone(),
+                        }
+                    } else if !rect_stable(first.rect.as_ref(), second.rect.as_ref()) {
+                        BrowserError::ElementUnstable {
+                            locator: locator.clone(),
+                        }
+                    } else if second.obscured
+                        && matches!(
+                            action,
+                            Action::Click { .. } | Action::Hover { .. } | Action::Check { .. }
+                        )
+                    {
+                        BrowserError::ElementObscured {
+                            locator: locator.clone(),
+                        }
+                    } else {
+                        return Ok(second);
+                    }
+                }
+            };
+            if let Some(previous) = observed_failure {
+                failures_changed |= previous != last_error.code();
+            }
+            observed_failure = Some(last_error.code());
+            if Instant::now() >= deadline {
+                return if failures_changed {
+                    Err(BrowserError::ActionTimeout {
+                        locator: locator.clone(),
+                        timeout_ms: duration_millis(timeout),
+                    })
+                } else {
+                    Err(last_error)
+                };
+            }
+            sleep(backoff.min(deadline.saturating_duration_since(Instant::now()))).await;
+            backoff = (backoff * 2).min(Duration::from_millis(100));
+        }
+    }
+
+    async fn mouse_move(&self, snapshot: &ResolveSnapshot) -> Result<(), BrowserError> {
+        let (x, y) = snapshot
+            .center()
+            .ok_or_else(|| invalid_evaluation("element had no interaction point"))?;
+        self.connection
+            .command(
+                "Input.dispatchMouseEvent",
+                Some(json!({
+                    "type": "mouseMoved", "x": x, "y": y
+                })),
+                Some(&self.session_id),
+            )
+            .await
+            .map(|_| ())
+    }
+
+    async fn physical_click(&self, snapshot: &ResolveSnapshot) -> Result<(), BrowserError> {
+        let (x, y) = snapshot
+            .center()
+            .ok_or_else(|| invalid_evaluation("element had no interaction point"))?;
+        self.mouse_move(snapshot).await?;
+        self.connection
+            .command(
+                "Input.dispatchMouseEvent",
+                Some(json!({
+                    "type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1
+                })),
+                Some(&self.session_id),
+            )
+            .await?;
+        self.connection
+            .command(
+                "Input.dispatchMouseEvent",
+                Some(json!({
+                    "type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1
+                })),
+                Some(&self.session_id),
+            )
+            .await
+            .map(|_| ())
+    }
+
+    async fn insert_text(&self, value: &str) -> Result<(), BrowserError> {
+        self.connection
+            .command(
+                "Input.insertText",
+                Some(json!({ "text": value })),
+                Some(&self.session_id),
+            )
+            .await
+            .map(|_| ())
+    }
+
+    async fn select_all(&self) -> Result<(), BrowserError> {
+        let modifiers = if cfg!(target_os = "macos") { 4 } else { 2 };
+        self.connection
+            .command(
+                "Input.dispatchKeyEvent",
+                Some(json!({
+                    "type": "rawKeyDown", "key": "a", "code": "KeyA", "modifiers": modifiers,
+                    "commands": ["selectAll"]
+                })),
+                Some(&self.session_id),
+            )
+            .await?;
+        self.connection
+            .command(
+                "Input.dispatchKeyEvent",
+                Some(json!({
+                    "type": "keyUp", "key": "a", "code": "KeyA", "modifiers": modifiers
+                })),
+                Some(&self.session_id),
+            )
+            .await
+            .map(|_| ())
+    }
+
+    async fn key_event(
+        &self,
+        key: &str,
+        code: &str,
+        modifiers: i32,
+        text: Option<&str>,
+    ) -> Result<(), BrowserError> {
+        let mut down =
+            json!({ "type": "keyDown", "key": key, "code": code, "modifiers": modifiers });
+        if let Some(text) = text {
+            down["text"] = Value::String(text.into());
+        }
+        self.connection
+            .command("Input.dispatchKeyEvent", Some(down), Some(&self.session_id))
+            .await?;
+        self.connection
+            .command(
+                "Input.dispatchKeyEvent",
+                Some(json!({
+                    "type": "keyUp", "key": key, "code": code, "modifiers": modifiers
+                })),
+                Some(&self.session_id),
+            )
+            .await
+            .map(|_| ())
+    }
+
+    async fn select_option(&self, locator: &Locator, option: &str) -> Result<(), BrowserError> {
+        let elements = locator_array_expression(locator, &self.test_id_attribute)?;
+        let option_json = serde_json::to_string(option)
+            .map_err(|error| invalid_evaluation(&error.to_string()))?;
+        let expression = format!(
+            r#"(() => {{
+            const norm = value => String(value || '').replace(/\s+/g, ' ').trim();
+            const implicitRole = element => {{
+                const tag = element.tagName.toLowerCase();
+                if (tag === 'button') return 'button';
+                if (tag === 'textarea') return 'textbox';
+                if (tag === 'select') return 'combobox';
+                if (tag === 'input') {{
+                    if (element.type === 'checkbox') return 'checkbox';
+                    if (element.type === 'radio') return 'radio';
+                    return 'textbox';
+                }}
+                return element.getAttribute('role');
+            }};
+            const accessibleName = element => {{
+                const labelledby = element.getAttribute('aria-labelledby');
+                if (labelledby) return norm(labelledby.split(/\s+/).map(id => document.getElementById(id)?.innerText || '').join(' '));
+                if (element.hasAttribute('aria-label')) return norm(element.getAttribute('aria-label'));
+                if (element.labels?.length) return norm(Array.from(element.labels).map(label => {{
+                    const copy = label.cloneNode(true);
+                    copy.querySelectorAll('input,textarea,select,button').forEach(control => control.remove());
+                    return copy.innerText || copy.textContent;
+                }}).join(' '));
+                return norm(element.innerText || element.textContent || element.title);
+            }};
+            try {{ const elements = {elements}; if (elements.length !== 1) return {{matches: elements.length}};
+            const select = elements[0]; const wanted = {option_json};
+            const options = Array.from(select.options || []).filter(o => o.value === wanted || norm(o.text) === wanted);
+            if (options.length !== 1) return {{matches: 1, options: options.length}};
+            select.value = options[0].value; select.dispatchEvent(new Event('input', {{bubbles:true}}));
+            select.dispatchEvent(new Event('change', {{bubbles:true}})); return {{matches:1, options:1}};
+            }} catch (error) {{ return {{invalid:String(error)}}; }} }})()"#
+        );
+        let result = self.evaluate(expression).await?;
+        let value =
+            evaluation_value(&result).ok_or_else(|| invalid_evaluation("select result missing"))?;
+        if let Some(message) = value.get("invalid").and_then(Value::as_str) {
+            return Err(BrowserError::LocatorInvalid {
+                locator: locator.clone(),
+                message: bounded_text(message),
+            });
+        }
+        match value.get("matches").and_then(Value::as_u64) {
+            Some(0) => Err(BrowserError::LocatorNotFound {
+                locator: locator.clone(),
+            }),
+            Some(1) if value.get("options").and_then(Value::as_u64) == Some(1) => Ok(()),
+            Some(1) if value.get("options").and_then(Value::as_u64).unwrap_or(0) > 1 => {
+                Err(BrowserError::OptionAmbiguous {
+                    locator: locator.clone(),
+                    option: option.into(),
+                    matches: value.get("options").and_then(Value::as_u64).unwrap_or(0) as usize,
+                })
+            }
+            Some(1) => Err(BrowserError::OptionNotFound {
+                locator: locator.clone(),
+                option: option.into(),
+            }),
+            Some(count) => Err(BrowserError::LocatorAmbiguous {
+                locator: locator.clone(),
+                matches: count as usize,
+            }),
+            None => Err(invalid_evaluation(
+                "select result did not contain match count",
+            )),
+        }
+    }
 }
 
-fn locator_expression(locator: &Locator) -> Result<String, BrowserError> {
-    let (property, value) = match locator {
-        Locator::Id(value) => ("element.id", value),
-        Locator::Text(value) => ("element.textContent.trim()", value),
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+struct ResolveSnapshot {
+    matches: usize,
+    invalid: Option<String>,
+    visible: bool,
+    disabled: bool,
+    editable: bool,
+    checked: Option<bool>,
+    obscured: bool,
+    tag: Option<String>,
+    rect: Option<ElementRect>,
+    candidates: Vec<CandidateEvidence>,
+}
+
+impl ResolveSnapshot {
+    fn center(&self) -> Option<(f64, f64)> {
+        self.rect
+            .as_ref()
+            .map(|rect| (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0))
+    }
+    fn state_summary(&self) -> String {
+        if self.matches == 0 {
+            return "detached".into();
+        }
+        if self.matches > 1 {
+            return format!("{} matches", self.matches);
+        }
+        format!(
+            "visible={}, enabled={}, checked={:?}",
+            self.visible, !self.disabled, self.checked
+        )
+    }
+    fn actionability_facts(&self) -> Vec<String> {
+        vec![
+            format!("attached={}", self.matches == 1),
+            format!("visible={}", self.visible),
+            format!("enabled={}", !self.disabled),
+            format!("editable={}", self.editable),
+            format!("obscured={}", self.obscured),
+        ]
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ElementRect {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+fn rect_stable(first: Option<&ElementRect>, second: Option<&ElementRect>) -> bool {
+    let (Some(first), Some(second)) = (first, second) else {
+        return false;
     };
-    let value = serde_json::to_string(value).map_err(|error| BrowserError::Protocol {
-        method: "Runtime.evaluate".into(),
-        message: error.to_string(),
-    })?;
+    (first.x - second.x).abs() < 0.25
+        && (first.y - second.y).abs() < 0.25
+        && (first.width - second.width).abs() < 0.25
+        && (first.height - second.height).abs() < 0.25
+}
+
+fn state_satisfied(snapshot: &ResolveSnapshot, state: LocatorState) -> bool {
+    match state {
+        LocatorState::Hidden => {
+            snapshot.matches == 0 || (snapshot.matches == 1 && !snapshot.visible)
+        }
+        LocatorState::Detached => snapshot.matches == 0,
+        LocatorState::Attached => snapshot.matches == 1,
+        LocatorState::Visible => snapshot.matches == 1 && snapshot.visible,
+        LocatorState::Enabled => snapshot.matches == 1 && !snapshot.disabled,
+        LocatorState::Disabled => snapshot.matches == 1 && snapshot.disabled,
+        LocatorState::Checked => snapshot.matches == 1 && snapshot.checked == Some(true),
+        LocatorState::Unchecked => snapshot.matches == 1 && snapshot.checked == Some(false),
+    }
+}
+
+fn resolver_expression(locator: &Locator, test_id_attribute: &str) -> Result<String, BrowserError> {
+    let elements = locator_array_expression(locator, test_id_attribute)?;
     Ok(format!(
-        "Array.from(document.querySelectorAll('body *')).filter((element) => {property} === {value})"
+        r#"(() => {{
+        const norm = value => String(value || '').replace(/\s+/g, ' ').trim();
+        const implicitRole = element => {{
+            const tag = element.tagName.toLowerCase();
+            if (tag === 'button') return 'button';
+            if (tag === 'a' && element.hasAttribute('href')) return 'link';
+            if (tag === 'textarea') return 'textbox';
+            if (tag === 'select') return 'combobox';
+            if (tag === 'input') {{
+                const type = (element.type || 'text').toLowerCase();
+                if (['button','submit','reset'].includes(type)) return 'button';
+                if (type === 'checkbox') return 'checkbox';
+                if (type === 'radio') return 'radio';
+                if (['text','email','password','search','tel','url'].includes(type)) return 'textbox';
+            }}
+            return null;
+        }};
+        const accessibleName = element => {{
+            const labelledby = element.getAttribute('aria-labelledby');
+            if (labelledby) return norm(labelledby.split(/\s+/).map(id => document.getElementById(id)?.innerText || '').join(' '));
+            if (element.hasAttribute('aria-label')) return norm(element.getAttribute('aria-label'));
+            if (element.labels?.length) return norm(Array.from(element.labels).map(label => {{
+                const copy = label.cloneNode(true);
+                copy.querySelectorAll('input,textarea,select,button').forEach(control => control.remove());
+                return copy.innerText || copy.textContent;
+            }}).join(' '));
+            if (element.tagName === 'IMG') return norm(element.alt);
+            if (element.tagName === 'INPUT' && ['button','submit','reset'].includes(element.type)) return norm(element.value);
+            return norm(element.innerText || element.textContent || element.title);
+        }};
+        try {{
+            const elements = {elements};
+            const candidates = elements.slice(0, 5).map(element => {{
+                const password = element.tagName === 'INPUT' && element.type === 'password';
+                return {{
+                    tag: element.tagName.toLowerCase(), id: element.id || null,
+                    role: element.getAttribute('role') || implicitRole(element),
+                    name: accessibleName(element).slice(0, 120) || null,
+                    text: password ? null : norm(element.innerText || '').slice(0, 120) || null
+                }};
+            }});
+            if (elements.length !== 1) return {{matches: elements.length, candidates}};
+            const element = elements[0];
+            element.scrollIntoView({{block:'center', inline:'center', behavior:'instant'}});
+            const rect = element.getBoundingClientRect();
+            const style = getComputedStyle(element);
+            const visible = style.display !== 'none' && style.visibility !== 'hidden'
+                && Number(style.opacity) !== 0 && rect.width > 0 && rect.height > 0;
+            const disabled = element.matches(':disabled') || element.getAttribute('aria-disabled') === 'true';
+            const editable = !disabled && !element.readOnly && (
+                element.tagName === 'TEXTAREA' || element.isContentEditable
+                || (element.tagName === 'INPUT' && !['button','submit','reset','checkbox','radio','file','hidden'].includes(element.type))
+            );
+            const checked = ('checked' in element) ? Boolean(element.checked)
+                : (element.getAttribute('role') === 'checkbox' ? element.getAttribute('aria-checked') === 'true' : null);
+            const x = rect.left + rect.width / 2, y = rect.top + rect.height / 2;
+            const hit = visible ? document.elementFromPoint(x, y) : null;
+            const obscured = visible && !(hit === element || element.contains(hit));
+            return {{matches:1, candidates, visible, disabled, editable, checked, obscured,
+                tag: element.tagName.toLowerCase(), rect: {{x:rect.x,y:rect.y,width:rect.width,height:rect.height}}}};
+        }} catch (error) {{ return {{matches:0, invalid:String(error)}}; }}
+    }})()"#
     ))
 }
 
-fn result_field<'a>(result: &'a Value, field: &str) -> Result<&'a Value, BrowserError> {
-    result
-        .pointer(&format!("/result/value/{field}"))
-        .ok_or_else(|| invalid_evaluation(&format!("result did not contain `{field}`")))
+fn locator_array_expression(
+    locator: &Locator,
+    test_id_attribute: &str,
+) -> Result<String, BrowserError> {
+    let json = |value: &str| {
+        serde_json::to_string(value).map_err(|error| invalid_evaluation(&error.to_string()))
+    };
+    let expression = match locator {
+        Locator::Id(value) => format!(
+            "(() => {{ const e = document.getElementById({}); return e ? [e] : []; }})()",
+            json(value)?
+        ),
+        Locator::Role { role, name } => {
+            let role = json(role)?;
+            let name = name
+                .as_deref()
+                .map(json)
+                .transpose()?
+                .unwrap_or_else(|| "null".into());
+            format!(
+                "Array.from(document.querySelectorAll('body *')).filter(element => (element.getAttribute('role') || implicitRole(element)) === {role} && ({name} === null || accessibleName(element) === {name}))"
+            )
+        }
+        Locator::Label(value) => {
+            let value = json(value)?;
+            format!(
+                "Array.from(document.querySelectorAll('input,textarea,select,button,[contenteditable=true]')).filter(element => accessibleName(element) === {value})"
+            )
+        }
+        Locator::Text(value) => {
+            let value = json(value)?;
+            format!(
+                "(() => {{ const all = Array.from(document.querySelectorAll('body *')).filter(element => !['SCRIPT','STYLE','NOSCRIPT'].includes(element.tagName) && norm(element.innerText) === {value}); const actionable = all.filter(element => element.matches('button,a[href],input,textarea,select,[role],[contenteditable=true]')); const pool = actionable.length ? actionable : all; return pool.filter(element => !pool.some(other => other !== element && element.contains(other))); }})()"
+            )
+        }
+        Locator::Placeholder(value) => format!(
+            "Array.from(document.querySelectorAll('input[placeholder],textarea[placeholder]')).filter(element => element.getAttribute('placeholder') === {})",
+            json(value)?
+        ),
+        Locator::TestId(value) => format!(
+            "Array.from(document.querySelectorAll('[{}]')).filter(element => element.getAttribute({}) === {})",
+            css_attribute(test_id_attribute)?,
+            json(test_id_attribute)?,
+            json(value)?
+        ),
+        Locator::Css(value) => format!("Array.from(document.querySelectorAll({}))", json(value)?),
+        Locator::XPath(value) => format!(
+            "(() => {{ const result = document.evaluate({}, document, null, XPathResult.ORDERED_NODE_ITERATOR_TYPE, null); const values=[]; let item; while ((item=result.iterateNext())) {{ if (item.nodeType === Node.ELEMENT_NODE) values.push(item); }} return values; }})()",
+            json(value)?
+        ),
+    };
+    Ok(expression)
+}
+
+fn css_attribute(value: &str) -> Result<String, BrowserError> {
+    if !value.is_empty()
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | ':')
+        })
+    {
+        Ok(value.into())
+    } else {
+        Err(BrowserError::Protocol {
+            method: "Runtime.evaluate".into(),
+            message: "test-ID attribute is not a valid attribute name".into(),
+        })
+    }
+}
+
+fn evaluation_value(result: &Value) -> Option<&Value> {
+    result.pointer("/result/value")
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.into();
+    }
+    let mut end = max_bytes.min(value.len());
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].into()
+}
+
+fn redact_evidence(evidence: &mut PageEvidence, redactions: &[String]) {
+    let redact = |value: &mut String| {
+        for secret in redactions.iter().filter(|secret| !secret.is_empty()) {
+            *value = value.replace(secret, "<redacted>");
+        }
+    };
+    if let Some(value) = &mut evidence.current_url {
+        redact(value)
+    }
+    if let Some(value) = &mut evidence.title {
+        redact(value)
+    }
+    if let Some(value) = &mut evidence.dom_snapshot {
+        redact(value)
+    }
+    for value in &mut evidence.console_errors {
+        redact(value)
+    }
+    for candidate in &mut evidence.candidates {
+        if let Some(value) = &mut candidate.name {
+            redact(value)
+        }
+        if let Some(value) = &mut candidate.text {
+            redact(value)
+        }
+    }
+}
+
+struct KeySpec {
+    key: String,
+    code: String,
+    modifiers: i32,
+    text: Option<String>,
+}
+
+fn parse_key(value: &str) -> Option<KeySpec> {
+    let mut modifiers = 0;
+    let mut main = None;
+    for part in value.split('+') {
+        match part {
+            "Alt" => modifiers |= 1,
+            "Control" | "Ctrl" => modifiers |= 2,
+            "Meta" | "Command" => modifiers |= 4,
+            "Shift" => modifiers |= 8,
+            _ if main.is_none() && !part.is_empty() => main = Some(part),
+            _ => return None,
+        }
+    }
+    let main = main?;
+    let (key, code, text) = match main {
+        "Enter" => ("Enter".into(), "Enter".into(), None),
+        "Tab" => ("Tab".into(), "Tab".into(), None),
+        "Escape" | "Esc" => ("Escape".into(), "Escape".into(), None),
+        "Backspace" => ("Backspace".into(), "Backspace".into(), None),
+        "Delete" => ("Delete".into(), "Delete".into(), None),
+        "ArrowUp" | "ArrowDown" | "ArrowLeft" | "ArrowRight" | "Home" | "End" | "PageUp"
+        | "PageDown" => (main.into(), main.into(), None),
+        "Space" => (" ".into(), "Space".into(), Some(" ".into())),
+        value if value.chars().count() == 1 => {
+            let character = value.chars().next()?;
+            let code = if character.is_ascii_alphabetic() {
+                format!("Key{}", character.to_ascii_uppercase())
+            } else if character.is_ascii_digit() {
+                format!("Digit{character}")
+            } else {
+                "Unidentified".into()
+            };
+            (value.into(), code, Some(value.into()))
+        }
+        _ => return None,
+    };
+    Some(KeySpec {
+        key,
+        code,
+        modifiers,
+        text,
+    })
 }
 
 fn invalid_evaluation(message: &str) -> BrowserError {
@@ -732,6 +1659,23 @@ mod tests {
         assert!(ChromeHost::default().headless);
         assert!(!ChromeHost::default().with_headed(true).headless);
         assert!(ChromeHost::default().with_headed(false).headless);
+    }
+
+    #[test]
+    fn evidence_is_bounded_and_secret_values_are_redacted() {
+        let mut evidence = PageEvidence {
+            current_url: Some("http://example.test/?token=secret".into()),
+            dom_snapshot: Some("<body>secret</body>".into()),
+            candidates: vec![CandidateEvidence {
+                tag: "div".into(),
+                text: Some("secret".into()),
+                ..CandidateEvidence::default()
+            }],
+            ..PageEvidence::default()
+        };
+        redact_evidence(&mut evidence, &["secret".into()]);
+        assert!(!format!("{evidence:?}").contains("secret"));
+        assert_eq!(truncate_utf8("ééé", 3), "é");
     }
 
     #[tokio::test]
@@ -918,6 +1862,544 @@ mod tests {
         assert!(matches!(missing, Err(BrowserError::LocatorNotFound { .. })));
         drop(page);
         browser.close().await.expect("close and reap Chrome");
+    }
+
+    #[tokio::test]
+    async fn real_chrome_runs_semantic_form_flow_with_physical_input_when_available() {
+        let host = ChromeHost::default();
+        if host.locate().is_none() {
+            return;
+        }
+        let Ok(listener) = tokio::net::TcpListener::bind("127.0.0.1:0").await else {
+            return;
+        };
+        let address = listener.local_addr().expect("fixture address");
+        let fixture = r#"<!doctype html><html><body>
+            <form id="signin">
+              <label>Email <input type="email" value="old@example.com"></label>
+              <label>Password <input type="password"></label>
+              <label>Biography <textarea></textarea></label>
+              <label>Search <input type="search" placeholder="Search products"></label>
+              <label>Timezone <select><option value="America/Chicago">America/Chicago</option></select></label>
+              <label>Email notifications <input type="checkbox"></label>
+              <label>SMS notifications <input type="checkbox" checked></label>
+              <button type="button">Account</button>
+              <button type="submit">Sign in</button>
+            </form>
+            <script>
+              document.querySelector('button[type=submit]').addEventListener('click', event => {
+                event.preventDefault();
+                const values = Array.from(document.getElementById('signin').elements);
+                history.pushState({}, '', '/dashboard');
+                const result = document.createElement('div');
+                const email = document.querySelector('input[type=email]').value;
+                const password = document.querySelector('input[type=password]').value;
+                result.textContent = email === 'alice@example.com' && password === 'secret'
+                  ? 'Welcome, Alice' : `invalid:${email}:${password}`;
+                document.body.append(result);
+              });
+              document.querySelector('input[type=search]').addEventListener('keydown', event => {
+                if (event.key === 'Enter') {
+                  const result = document.createElement('div'); result.textContent = 'Key pressed'; document.body.append(result);
+                }
+              });
+            </script>
+        </body></html>"#;
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept form request");
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{fixture}",
+                fixture.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("serve form");
+        });
+
+        let mut browser = host.start().await.expect("start Chrome");
+        let mut context = browser
+            .new_context(&BrowserContextOptions::default())
+            .await
+            .expect("context");
+        let mut page = context.new_page().await.expect("page");
+        page.open(&format!("http://{address}/login"))
+            .await
+            .expect("open form");
+        page.perform(
+            &Action::Fill {
+                locator: Locator::Label("Email".into()),
+                value: "alice@example.com".into(),
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("fill email");
+        page.perform(
+            &Action::Fill {
+                locator: Locator::Label("Password".into()),
+                value: "secret".into(),
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("fill password");
+        page.perform(
+            &Action::Type {
+                locator: Locator::Label("Biography".into()),
+                value: "hello".into(),
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("type biography");
+        page.perform(
+            &Action::Press {
+                locator: Locator::Placeholder("Search products".into()),
+                key: "Enter".into(),
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("press Enter");
+        page.wait_for_locator(
+            &Locator::Text("Key pressed".into()),
+            LocatorState::Visible,
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("key event was dispatched");
+        page.perform(
+            &Action::Select {
+                locator: Locator::Label("Timezone".into()),
+                option: "America/Chicago".into(),
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("select timezone");
+        page.perform(
+            &Action::Check {
+                locator: Locator::Label("Email notifications".into()),
+                checked: true,
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("check notifications");
+        page.perform(
+            &Action::Check {
+                locator: Locator::Label("SMS notifications".into()),
+                checked: false,
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("uncheck notifications");
+        page.perform(
+            &Action::Hover {
+                locator: Locator::Text("Account".into()),
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("hover account");
+        page.perform(
+            &Action::Click {
+                locator: Locator::Role {
+                    role: "button".into(),
+                    name: Some("Sign in".into()),
+                },
+            },
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("physical sign-in click");
+        if let Err(error) = page
+            .wait_for_locator(
+                &Locator::Text("Welcome, Alice".into()),
+                LocatorState::Visible,
+                Duration::from_secs(2),
+            )
+            .await
+        {
+            let evidence = page
+                .capture_evidence(&EvidenceRequest {
+                    locator: None,
+                    include_screenshot: false,
+                    include_dom: true,
+                    max_dom_bytes: 4096,
+                    redactions: vec!["secret".into()],
+                })
+                .await;
+            panic!(
+                "welcome assertion: {error}; DOM: {:?}; console: {:?}",
+                evidence.dom_snapshot, evidence.console_errors
+            );
+        }
+        page.wait_for_url(
+            &format!("http://{address}/dashboard"),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("dashboard URL");
+        page.wait_for_locator(
+            &Locator::Label("Email notifications".into()),
+            LocatorState::Checked,
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("checked assertion");
+        page.wait_for_locator(
+            &Locator::Label("SMS notifications".into()),
+            LocatorState::Unchecked,
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("unchecked assertion");
+        let evidence = page
+            .capture_evidence(&EvidenceRequest {
+                locator: Some(Locator::Role {
+                    role: "button".into(),
+                    name: Some("Sign in".into()),
+                }),
+                include_screenshot: true,
+                include_dom: true,
+                max_dom_bytes: 512,
+                redactions: vec!["secret".into()],
+            })
+            .await;
+        assert!(
+            evidence
+                .screenshot_png
+                .as_deref()
+                .is_some_and(|png| png.starts_with(&[137, 80, 78, 71]))
+        );
+        assert!(
+            evidence
+                .dom_snapshot
+                .as_ref()
+                .is_some_and(|dom| dom.len() <= 512)
+        );
+        drop(page);
+        context.close().await.expect("close context");
+        browser.close().await.expect("close browser");
+    }
+
+    #[tokio::test]
+    async fn isolated_contexts_do_not_share_cookies_or_storage_when_available() {
+        let host = ChromeHost::default();
+        if host.locate().is_none() {
+            return;
+        }
+        let Ok(listener) = tokio::net::TcpListener::bind("127.0.0.1:0").await else {
+            return;
+        };
+        let address = listener.local_addr().expect("fixture address");
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.expect("accept isolation request");
+                let mut request = [0u8; 2048];
+                let read = stream.read(&mut request).await.expect("read request");
+                let request = String::from_utf8_lossy(&request[..read]);
+                let check = request.starts_with("GET /check ");
+                let body = if check {
+                    "<!doctype html><body><div id='result'></div><script>document.getElementById('result').textContent=(document.cookie.includes('shared=')||localStorage.getItem('shared'))?'leaked':'clean'</script></body>"
+                } else {
+                    "<!doctype html><body>set<script>document.cookie='shared=yes';localStorage.setItem('shared','yes')</script></body>"
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("serve isolation fixture");
+            }
+        });
+        let mut browser = host.start().await.expect("start Chrome once");
+        let mut first = browser
+            .new_context(&BrowserContextOptions::default())
+            .await
+            .expect("first context");
+        let mut first_page = first.new_page().await.expect("first page");
+        first_page
+            .open(&format!("http://{address}/set"))
+            .await
+            .expect("set storage");
+        drop(first_page);
+        first.close().await.expect("close first context");
+
+        let mut second = browser
+            .new_context(&BrowserContextOptions::default())
+            .await
+            .expect("second context");
+        let mut second_page = second.new_page().await.expect("second page");
+        second_page
+            .open(&format!("http://{address}/check"))
+            .await
+            .expect("check storage");
+        second_page
+            .wait_for_locator(
+                &Locator::Text("clean".into()),
+                LocatorState::Visible,
+                Duration::from_secs(2),
+            )
+            .await
+            .expect("storage is isolated");
+        drop(second_page);
+        second.close().await.expect("close second context");
+        browser.close().await.expect("close shared Chrome process");
+    }
+
+    #[tokio::test]
+    async fn actionability_failures_are_distinct_and_candidate_evidence_is_bounded() {
+        let host = ChromeHost::default();
+        if host.locate().is_none() {
+            return;
+        }
+    
+        let Ok(listener) = tokio::net::TcpListener::bind("127.0.0.1:0").await else {
+            return;
+        };
+    
+        let address = listener.local_addr().expect("fixture address");
+    
+        let body = r#"<!doctype html><style>
+            #covered { position:absolute;left:20px;top:20px;width:100px;height:30px }
+            #overlay { position:absolute;left:20px;top:20px;width:100px;height:30px;z-index:2 }
+            #unstable { position:absolute;top:80px;animation:move .08s infinite alternate linear }
+            @keyframes move { from { left:10px } to { left:200px } }
+        </style><body>
+            <button id="disabled" disabled>disabled</button>
+            <button id="covered">covered</button><div id="overlay">overlay</div>
+            <button id="unstable">unstable</button>
+    
+            <button class="duplicate">same</button><button class="duplicate">same</button>
+            <button class="duplicate">same</button><button class="duplicate">same</button>
+            <button class="duplicate">same</button><button class="duplicate">same</button>
+    
+            <button style="display:none" id="hidden">hidden</button>
+    
+            <input placeholder="Search products" data-testid="search-box">
+    
+            <div id="space"> Hello
+                 World </div>
+    
+            <div id="shadow-host"></div>
+            <iframe srcdoc="<button>Inside frame</button>"></iframe>
+    
+            <script>
+                document
+                    .getElementById('shadow-host')
+                    .attachShadow({mode:'open'})
+                    .innerHTML='<button>Inside shadow</button>';
+            </script>
+    
+            <div id="transient-host"></div>
+    
+            <script>
+                window.startTransient = () => {
+                    const host = document.getElementById('transient-host');
+    
+                    // Start with no matches.
+                    host.innerHTML = '';
+    
+                    // Then become ambiguous for long enough that the actionability
+                    // loop should reliably observe the second failure state.
+                    setTimeout(() => {
+                        host.innerHTML =
+                            '<button class="transient">one</button>' +
+                            '<button class="transient">two</button>';
+                    }, 80);
+    
+                    // Return to no matches. The action never becomes actionable,
+                    // but multiple distinct failure reasons are observed.
+                    setTimeout(() => {
+                        host.innerHTML = '';
+                    }, 180);
+                };
+            </script>
+        </body>"#;
+    
+        tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("accept actionability request");
+    
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).await;
+    
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: text/html\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\
+                 \r\n\
+                 {body}",
+                body.len()
+            );
+    
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("serve actionability fixture");
+        });
+    
+        let mut browser = host.start().await.expect("start Chrome");
+        let mut page = browser.new_page().await.expect("page");
+    
+        page.open(&format!("http://{address}"))
+            .await
+            .expect("open fixture");
+    
+        let click = |locator| Action::Click { locator };
+    
+        assert!(matches!(
+            page.perform(
+                &click(Locator::Id("missing".into())),
+                Duration::from_millis(100)
+            )
+            .await,
+            Err(BrowserError::LocatorNotFound { .. })
+        ));
+    
+        assert!(matches!(
+            page.perform(
+                &click(Locator::Css(".duplicate".into())),
+                Duration::from_millis(100)
+            )
+            .await,
+            Err(BrowserError::LocatorAmbiguous { .. })
+        ));
+    
+        assert!(matches!(
+            page.perform(
+                &click(Locator::Id("disabled".into())),
+                Duration::from_millis(100)
+            )
+            .await,
+            Err(BrowserError::ElementDisabled { .. })
+        ));
+    
+        assert!(matches!(
+            page.perform(
+                &click(Locator::Id("covered".into())),
+                Duration::from_millis(100)
+            )
+            .await,
+            Err(BrowserError::ElementObscured { .. })
+        ));
+    
+        assert!(matches!(
+            page.perform(
+                &click(Locator::Id("hidden".into())),
+                Duration::from_millis(100)
+            )
+            .await,
+            Err(BrowserError::LocatorNotVisible { .. })
+        ));
+    
+        assert!(matches!(
+            page.perform(
+                &click(Locator::Id("unstable".into())),
+                Duration::from_millis(140)
+            )
+            .await,
+            Err(BrowserError::ElementUnstable { .. })
+        ));
+    
+        assert!(matches!(
+            page.perform(
+                &click(Locator::Css("[".into())),
+                Duration::from_millis(100)
+            )
+            .await,
+            Err(BrowserError::LocatorInvalid { .. })
+        ));
+    
+        page.evaluate_expression("window.startTransient()")
+            .await
+            .expect("start transient fixture");
+    
+        assert!(matches!(
+            page.perform(
+                &click(Locator::Css(".transient".into())),
+                Duration::from_millis(300)
+            )
+            .await,
+            Err(BrowserError::ActionTimeout { .. })
+        ));
+    
+        page.wait_for_locator(
+            &Locator::Placeholder("Search products".into()),
+            LocatorState::Visible,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("placeholder locator");
+    
+        page.wait_for_locator(
+            &Locator::TestId("search-box".into()),
+            LocatorState::Visible,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("test-ID locator");
+    
+        page.wait_for_locator(
+            &Locator::Text("Hello World".into()),
+            LocatorState::Visible,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("rendered whitespace normalization");
+    
+        page.wait_for_locator(
+            &Locator::XPath("//*[@id='space']".into()),
+            LocatorState::Visible,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("XPath locator");
+    
+        assert!(matches!(
+            page.wait_for_locator(
+                &Locator::Text("Inside shadow".into()),
+                LocatorState::Visible,
+                Duration::from_millis(100)
+            )
+            .await,
+            Err(BrowserError::LocatorNotFound { .. })
+        ));
+    
+        assert!(matches!(
+            page.wait_for_locator(
+                &Locator::Text("Inside frame".into()),
+                LocatorState::Visible,
+                Duration::from_millis(100)
+            )
+            .await,
+            Err(BrowserError::LocatorNotFound { .. })
+        ));
+    
+        let evidence = page
+            .capture_evidence(&EvidenceRequest {
+                locator: Some(Locator::Css(".duplicate".into())),
+                include_screenshot: false,
+                include_dom: false,
+                max_dom_bytes: 0,
+                redactions: Vec::new(),
+            })
+            .await;
+    
+        assert_eq!(evidence.candidates.len(), 5);
+    
+        browser.close().await.expect("close browser");
     }
 
     #[tokio::test]

@@ -58,10 +58,10 @@ struct Backend {
 }
 
 impl Backend {
-    fn new(client: Client, browser: Arc<dyn BrowserHost>) -> Self {
+    fn new(client: Client, browser: Arc<dyn BrowserHost>, editor: Arc<EditorService>) -> Self {
         Self {
             client,
-            editor: Arc::new(EditorService::new()),
+            editor,
             documents: Arc::new(DocumentStore::default()),
             browser,
         }
@@ -255,9 +255,13 @@ impl LanguageServer for Backend {
 }
 
 pub async fn serve(browser: Arc<dyn BrowserHost>) {
+    serve_with_editor(browser, Arc::new(EditorService::new())).await;
+}
+
+pub async fn serve_with_editor(browser: Arc<dyn BrowserHost>, editor: Arc<EditorService>) {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
-    let (service, socket) = LspService::new(|client| Backend::new(client, browser));
+    let (service, socket) = LspService::new(|client| Backend::new(client, browser, editor));
     Server::new(stdin, stdout, socket).serve(service).await;
 }
 

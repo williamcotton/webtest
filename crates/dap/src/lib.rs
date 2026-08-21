@@ -23,7 +23,7 @@ use webtest_observation::ObservationStore;
 use webtest_plan::{
     AssertionOperation, BrowserOperation, PlannedStep, PlannedTest, TestOperation, TestPlan,
 };
-use webtest_runtime::{RunControl, Runner};
+use webtest_runtime::{RunControl, Runner, RunnerOptions};
 use webtest_text::TextRange;
 
 const THREAD_ID: i64 = 1;
@@ -210,6 +210,7 @@ enum ResumeCommand {
 struct DebugState {
     writer: ProtocolWriter,
     browser: Arc<dyn BrowserHost>,
+    runner_options: RunnerOptions,
     program: Mutex<Option<LoadedProgram>>,
     breakpoints: Mutex<HashMap<PathBuf, HashSet<u32>>>,
     paused: Mutex<Option<PausedFrame>>,
@@ -222,11 +223,16 @@ struct DebugState {
 }
 
 impl DebugState {
-    fn new(writer: ProtocolWriter, browser: Arc<dyn BrowserHost>) -> Arc<Self> {
+    fn new_with_options(
+        writer: ProtocolWriter,
+        browser: Arc<dyn BrowserHost>,
+        runner_options: RunnerOptions,
+    ) -> Arc<Self> {
         let (resume_sender, resume_receiver) = mpsc::unbounded_channel();
         Arc::new(Self {
             writer,
             browser,
+            runner_options,
             program: Mutex::new(None),
             breakpoints: Mutex::new(HashMap::new()),
             paused: Mutex::new(None),
@@ -525,7 +531,8 @@ impl DebugState {
             )
             .await;
 
-        let runner = Runner::new(Arc::new(ObservationStore::default()));
+        let runner = Runner::new(Arc::new(ObservationStore::default()))
+            .with_options(self.runner_options.clone());
         let result = runner
             .run_with_control(&program.plan, self.browser.as_ref(), Some(self.as_ref()))
             .await;
@@ -638,8 +645,15 @@ impl RunControl for DebugState {
 }
 
 pub async fn serve(browser: Arc<dyn BrowserHost>) -> Result<(), DapError> {
+    serve_with_options(browser, RunnerOptions::default()).await
+}
+
+pub async fn serve_with_options(
+    browser: Arc<dyn BrowserHost>,
+    options: RunnerOptions,
+) -> Result<(), DapError> {
     let writer = ProtocolWriter::new(tokio::io::stdout());
-    let state = DebugState::new(writer, browser);
+    let state = DebugState::new_with_options(writer, browser, options);
     let mut reader = BufReader::new(tokio::io::stdin());
     while let Some(request) = read_request(&mut reader).await? {
         if state.handle(request).await? {
@@ -711,12 +725,44 @@ fn dap_variable(name: &str, value: &str, kind: &str) -> Value {
 
 fn operation_name(operation: &TestOperation) -> String {
     match operation {
-        TestOperation::Browser(BrowserOperation::Open { url }) => format!("open {url:?}"),
+        TestOperation::Browser(BrowserOperation::Navigate { url }) => format!("open {url:?}"),
         TestOperation::Browser(BrowserOperation::Click { locator }) => {
             format!("click {}", locator_name(locator))
         }
-        TestOperation::Assertion(AssertionOperation::Visible { locator }) => {
-            format!("expect {}.visible", locator_name(locator))
+        TestOperation::Browser(BrowserOperation::Fill { locator, .. }) => {
+            format!("fill {} with <redacted>", locator_name(locator))
+        }
+        TestOperation::Browser(BrowserOperation::Type { locator, .. }) => {
+            format!("type {} with <text>", locator_name(locator))
+        }
+        TestOperation::Browser(BrowserOperation::Press { locator, key }) => {
+            format!("press {} key {key:?}", locator_name(locator))
+        }
+        TestOperation::Browser(BrowserOperation::Check {
+            locator,
+            checked: true,
+        }) => format!("check {}", locator_name(locator)),
+        TestOperation::Browser(BrowserOperation::Check {
+            locator,
+            checked: false,
+        }) => format!("uncheck {}", locator_name(locator)),
+        TestOperation::Browser(BrowserOperation::Select { locator, option }) => {
+            format!("select {} option {option:?}", locator_name(locator))
+        }
+        TestOperation::Browser(BrowserOperation::Hover { locator }) => {
+            format!("hover {}", locator_name(locator))
+        }
+        TestOperation::Browser(BrowserOperation::WaitForLocator { locator, state, .. }) => {
+            format!("wait {}.{state}", locator_name(locator))
+        }
+        TestOperation::Browser(BrowserOperation::WaitForUrl { url, .. }) => {
+            format!("wait url({url:?})")
+        }
+        TestOperation::Assertion(AssertionOperation::Locator { locator, state, .. }) => {
+            format!("expect {}.{state}", locator_name(locator))
+        }
+        TestOperation::Assertion(AssertionOperation::Url { url, .. }) => {
+            format!("expect url({url:?})")
         }
     }
 }
@@ -724,7 +770,17 @@ fn operation_name(operation: &TestOperation) -> String {
 fn locator_name(locator: &webtest_plan::Locator) -> String {
     match locator {
         webtest_plan::Locator::Id(value) => format!("id({value:?})"),
+        webtest_plan::Locator::Role {
+            role,
+            name: Some(name),
+        } => format!("role({role:?}, name: {name:?})"),
+        webtest_plan::Locator::Role { role, name: None } => format!("role({role:?})"),
+        webtest_plan::Locator::Label(value) => format!("label({value:?})"),
         webtest_plan::Locator::Text(value) => format!("text({value:?})"),
+        webtest_plan::Locator::Placeholder(value) => format!("placeholder({value:?})"),
+        webtest_plan::Locator::TestId(value) => format!("test_id({value:?})"),
+        webtest_plan::Locator::Css(value) => format!("css({value:?})"),
+        webtest_plan::Locator::XPath(value) => format!("xpath({value:?})"),
     }
 }
 
@@ -812,6 +868,50 @@ mod tests {
     }
 
     #[test]
+    fn every_milestone_b_operation_is_a_breakpoint_target_and_secrets_are_hidden() {
+        let source = r#"test "x" {
+    browser {
+        open "http://example.test"
+        fill label("Email") with "alice@example.com"
+        type label("Bio") with "hello"
+        press placeholder("Search") key "Enter"
+        check test_id("mail")
+        uncheck id("sms")
+        select label("Timezone") option "UTC"
+        hover text("Account")
+        click role("button", name: "Save")
+        wait id("ready").visible within 1s
+        wait url("http://example.test/done")
+        expect id("ready").enabled
+        expect url("http://example.test/done")
+    }
+}
+"#;
+        let directory = tempfile::tempdir().expect("temp directory");
+        let program =
+            LoadedProgram::load(directory.path().join("all.webtest"), Some(source.into()))
+                .expect("program");
+        assert_eq!(program.locations().len(), 13);
+        let names = program.plan.tests[0]
+            .steps
+            .iter()
+            .map(|step| operation_name(&step.operation))
+            .collect::<Vec<_>>();
+        assert!(
+            names
+                .iter()
+                .any(|name| name == "fill label(\"Email\") with <redacted>")
+        );
+        assert!(
+            names
+                .iter()
+                .any(|name| name.starts_with("wait id(\"ready\")"))
+        );
+        assert!(names.iter().any(|name| name.starts_with("expect url(")));
+        assert!(names.iter().all(|name| !name.contains("alice@example.com")));
+    }
+
+    #[test]
     fn locations_use_one_based_utf16_columns() {
         let source = "😀 click id(\"x\")";
         let start = source.find("id").expect("locator");
@@ -830,9 +930,10 @@ mod tests {
         let program = LoadedProgram::load(path, Some(source.into())).expect("program");
         let test = program.plan.tests[0].clone();
         let step = test.steps[1].clone();
-        let state = DebugState::new(
+        let state = DebugState::new_with_options(
             ProtocolWriter::new(tokio::io::sink()),
             Arc::new(UnusedBrowserHost),
+            RunnerOptions::default(),
         );
         lock(&state.breakpoints).insert(program.path.clone(), HashSet::from([4]));
         *lock(&state.program) = Some(program);

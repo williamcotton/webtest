@@ -15,12 +15,13 @@ use report::{
     SourceSpanReport, TestReport, WarningReport,
 };
 use webtest_analysis::{AnalysisDatabase, Diagnostic, DiagnosticSeverity};
-use webtest_browser::{BrowserError, Locator};
+use webtest_browser::{BrowserContextOptions, BrowserError, Locator, Viewport};
 use webtest_browser_cdp::{ChromeHost, find_system_chrome};
 use webtest_browser_manager::{BrowserManager, BrowserManagerError};
 use webtest_observation::{ExecutionEvent, ObservationStore, RuntimeFailure};
+use webtest_plan::{AssertionOperation, BrowserOperation, TestOperation, TestPlan};
 use webtest_project::{DiscoveredFile, Project};
-use webtest_runtime::Runner;
+use webtest_runtime::{EvidenceOptions, Runner, RunnerOptions};
 use webtest_text::{SourceRevision, TextRange};
 
 #[derive(Parser)]
@@ -229,7 +230,10 @@ async fn run(cli: Cli) -> Result<ExitClass, AppError> {
                 project.config.timeouts.browser_command,
                 project.config.timeouts.navigation,
             );
-            webtest_lsp::serve(Arc::new(browser)).await;
+            let editor = Arc::new(webtest_editor::EditorService::with_runner_options(
+                runner_options(&project),
+            ));
+            webtest_lsp::serve_with_editor(Arc::new(browser), editor).await;
             Ok(ExitClass::Success)
         }
         Command::Dap {
@@ -246,7 +250,7 @@ async fn run(cli: Cli) -> Result<ExitClass, AppError> {
                     project.config.timeouts.browser_command,
                     project.config.timeouts.navigation,
                 );
-            webtest_dap::serve(Arc::new(browser))
+            webtest_dap::serve_with_options(Arc::new(browser), runner_options(&project))
                 .await
                 .map_err(AppError::infrastructure)?;
             Ok(ExitClass::Success)
@@ -265,10 +269,12 @@ fn check_project(project: &Project) -> Result<CommandReport, AppError> {
         let source = read_source(&file.path)?;
         let (mut database, file_id) = database_for(&file.path, &source);
         let diagnostics = database.diagnostics(file_id).map_err(AppError::internal)?;
-        let diagnostics = diagnostics
+        let mut diagnostics = diagnostics
             .iter()
             .map(|diagnostic| diagnostic_report(&source, diagnostic))
             .collect::<Vec<_>>();
+        let plan = database.test_plan(file_id).map_err(AppError::internal)?;
+        diagnostics.extend(config_diagnostics(project, &source, &plan));
         if diagnostics
             .iter()
             .any(|diagnostic| diagnostic.severity == "error")
@@ -345,13 +351,15 @@ async fn test_project(
         let revision = SourceRevision::of(&source);
         let (mut database, file_id) = database_for(&file.path, &source);
         let diagnostics = database.diagnostics(file_id).map_err(AppError::internal)?;
-        let diagnostic_reports = diagnostics
+        let mut diagnostic_reports = diagnostics
             .iter()
             .map(|diagnostic| diagnostic_report(&source, diagnostic))
             .collect::<Vec<_>>();
-        if diagnostics
+        let plan = database.test_plan(file_id).map_err(AppError::internal)?;
+        diagnostic_reports.extend(config_diagnostics(project, &source, &plan));
+        if diagnostic_reports
             .iter()
-            .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
+            .any(|diagnostic| diagnostic.severity == "error")
         {
             report.exit_class = report.exit_class.combine(ExitClass::TestFailure);
             report.files.push(FileReport {
@@ -367,9 +375,8 @@ async fn test_project(
             continue;
         }
 
-        let plan = database.test_plan(file_id).map_err(AppError::internal)?;
         let observations = Arc::new(ObservationStore::default());
-        let runner = Runner::new(observations);
+        let runner = Runner::new(observations).with_options(runner_options(project));
         let mut file_report = FileReport {
             path: display_path(file),
             exit_class: ExitClass::Success,
@@ -397,6 +404,7 @@ async fn test_project(
                         code: "runtime.browser_launch".into(),
                         message: error.message,
                         span: None,
+                        artifacts: Vec::new(),
                     });
                     file_report.duration_nanos = nanos(started.elapsed());
                     report.exit_class = report.exit_class.combine(ExitClass::Infrastructure);
@@ -422,6 +430,7 @@ async fn test_project(
                         project.config.timeouts.test.as_millis()
                     ),
                     span: None,
+                    artifacts: Vec::new(),
                 });
                 report.exit_class = report.exit_class.combine(ExitClass::Infrastructure);
                 file_report.exit_class = ExitClass::Infrastructure;
@@ -431,6 +440,7 @@ async fn test_project(
                     code: runtime_code(&error).into(),
                     message: infrastructure_message(&error),
                     span: None,
+                    artifacts: Vec::new(),
                 });
                 report.exit_class = report.exit_class.combine(ExitClass::Infrastructure);
                 file_report.exit_class = ExitClass::Infrastructure;
@@ -446,6 +456,11 @@ async fn test_project(
                             code: runtime_code(&failure.error).into(),
                             message: runtime_message(&failure.error),
                             span: Some(source_span(&source, failure.step.origin.range)),
+                            artifacts: failure
+                                .artifacts
+                                .into_iter()
+                                .map(|artifact| normalized_path(&artifact.path))
+                                .collect(),
                         });
                         TestReport {
                             name: test.name,
@@ -487,6 +502,30 @@ fn base_report(command: &str, project: &Project) -> CommandReport {
         })
         .collect();
     report
+}
+
+fn runner_options(project: &Project) -> RunnerOptions {
+    RunnerOptions {
+        base_url: project.config.browser.base_url.clone(),
+        action_timeout: project.config.timeouts.action,
+        assertion_timeout: project.config.timeouts.assertion,
+        test_timeout: project.config.timeouts.test,
+        browser_context: BrowserContextOptions {
+            viewport: Viewport {
+                width: project.config.browser.viewport.width,
+                height: project.config.browser.viewport.height,
+            },
+            test_id_attribute: project.config.browser.test_id_attribute.clone(),
+        },
+        evidence: EvidenceOptions {
+            screenshot_on_failure: project.config.evidence.screenshot
+                == webtest_project::EvidenceMode::OnFailure,
+            dom_snapshot_on_failure: project.config.evidence.dom_snapshot
+                == webtest_project::EvidenceMode::OnFailure,
+            max_dom_bytes: project.config.evidence.max_dom_bytes,
+            artifact_directory: project.root.join(&project.config.artifacts.directory),
+        },
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -656,6 +695,59 @@ fn diagnostic_report(source: &str, diagnostic: &Diagnostic) -> DiagnosticReport 
     }
 }
 
+fn config_diagnostics(project: &Project, source: &str, plan: &TestPlan) -> Vec<DiagnosticReport> {
+    let mut diagnostics = Vec::new();
+    for test in &plan.tests {
+        for step in &test.steps {
+            let (url, timeout) = match &step.operation {
+                TestOperation::Browser(BrowserOperation::Navigate { url }) => {
+                    (Some(url.as_str()), None)
+                }
+                TestOperation::Browser(BrowserOperation::WaitForUrl { url, timeout })
+                | TestOperation::Assertion(AssertionOperation::Url { url, timeout }) => {
+                    (Some(url.as_str()), *timeout)
+                }
+                TestOperation::Browser(BrowserOperation::WaitForLocator { timeout, .. })
+                | TestOperation::Assertion(AssertionOperation::Locator { timeout, .. }) => {
+                    (None, *timeout)
+                }
+                _ => (None, None),
+            };
+            if let Some(url) = url
+                && !is_absolute_config_url(url)
+                && project.config.browser.base_url.is_none()
+            {
+                diagnostics.push(DiagnosticReport {
+                    severity: "error".into(),
+                    code: "config.missing_base_url".into(),
+                    message: format!("relative URL {url:?} requires browser.base_url"),
+                    span: source_span(source, step.origin.range),
+                });
+            }
+            if timeout.is_some_and(|timeout| timeout > project.config.timeouts.test) {
+                diagnostics.push(DiagnosticReport {
+                    severity: "error".into(),
+                    code: "config.timeout_exceeds_test".into(),
+                    message: "step timeout must not exceed timeouts.test".into(),
+                    span: source_span(source, step.origin.range),
+                });
+            }
+        }
+    }
+    diagnostics
+}
+
+fn is_absolute_config_url(value: &str) -> bool {
+    value.split_once(':').is_some_and(|(scheme, rest)| {
+        !scheme.is_empty()
+            && !rest.is_empty()
+            && scheme.chars().next().is_some_and(char::is_alphabetic)
+            && scheme.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
+            })
+    })
+}
+
 fn source_span(source: &str, range: TextRange) -> SourceSpanReport {
     let (line, column, line_text, width) = line_details(source, range);
     SourceSpanReport {
@@ -697,7 +789,19 @@ fn runtime_code(error: &BrowserError) -> &'static str {
     match error {
         BrowserError::LocatorNotFound { .. } => "runtime.locator_not_found",
         BrowserError::LocatorAmbiguous { .. } => "runtime.locator_ambiguous",
+        BrowserError::LocatorInvalid { .. } => "runtime.locator_invalid",
+        BrowserError::ElementDetached { .. } => "runtime.element_detached",
         BrowserError::LocatorNotVisible { .. } => "runtime.locator_not_visible",
+        BrowserError::ElementUnstable { .. } => "runtime.element_unstable",
+        BrowserError::ElementDisabled { .. } => "runtime.element_disabled",
+        BrowserError::ElementObscured { .. } => "runtime.element_obscured",
+        BrowserError::ElementNotEditable { .. } => "runtime.element_not_editable",
+        BrowserError::OptionNotFound { .. } => "runtime.option_not_found",
+        BrowserError::OptionAmbiguous { .. } => "runtime.option_ambiguous",
+        BrowserError::InvalidKey { .. } => "runtime.invalid_key",
+        BrowserError::ActionTimeout { .. } => "runtime.action_timeout",
+        BrowserError::AssertionFailed { .. } => "runtime.assertion_failed",
+        BrowserError::UrlMismatch { .. } => "runtime.url_mismatch",
         BrowserError::NavigationFailed { .. } => "runtime.navigation_failed",
         BrowserError::NavigationTimeout { .. } => "runtime.navigation_timeout",
         BrowserError::CommandTimeout { .. } => "runtime.browser_command_timeout",
@@ -706,6 +810,7 @@ fn runtime_code(error: &BrowserError) -> &'static str {
         BrowserError::MalformedProtocol { .. } => "runtime.browser_malformed_protocol",
         BrowserError::Protocol { .. } => "runtime.browser_protocol",
         BrowserError::Launch(_) => "runtime.browser_launch",
+        BrowserError::EvaluationFailed { .. } => "runtime.evaluation_failed"
     }
 }
 
@@ -735,10 +840,7 @@ fn infrastructure_message(error: &BrowserError) -> String {
 }
 
 fn locator_description(locator: &Locator) -> String {
-    match locator {
-        Locator::Id(value) => format!("id {value:?}"),
-        Locator::Text(value) => format!("text {value:?}"),
-    }
+    locator.to_string()
 }
 
 fn event_reports(path: &str, events: &[ExecutionEvent]) -> Vec<EventReport> {

@@ -1,0 +1,16 @@
+test "user signs in" {
+    browser {
+        open "/"
+        fill label("Email") with "alice@example.com"
+        fill label("Password") with "secret"
+        type label("Biography") with "hello"
+        press placeholder("Search products") key "Escape"
+        check label("Email notifications")
+        uncheck label("SMS notifications")
+        select label("Timezone") option "America/Chicago"
+        hover text("Sign in")
+        click role("button", name: "Sign in")
+        expect text("Welcome, Alice").visible within 5s
+        expect url("/dashboard")
+    }
+}

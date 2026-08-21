@@ -13,7 +13,6 @@ impl Parse {
     pub fn syntax(&self) -> SyntaxNode {
         SyntaxNode::new_root(self.green.clone())
     }
-
     pub fn errors(&self) -> &[SyntaxError] {
         &self.errors
     }
@@ -90,7 +89,6 @@ impl<'a> Parser<'a> {
             self.finish();
             return;
         }
-
         loop {
             self.eat_trivia();
             match self.current() {
@@ -123,13 +121,28 @@ impl<'a> Parser<'a> {
             self.finish();
             return;
         }
-
         loop {
             self.eat_trivia();
             match self.current() {
                 SyntaxKind::OpenKw => self.open_statement(),
-                SyntaxKind::ClickKw => self.click_statement(),
-                SyntaxKind::ExpectKw => self.expect_visible_statement(),
+                SyntaxKind::ClickKw => self.locator_action(SyntaxKind::ClickStmt),
+                SyntaxKind::FillKw => {
+                    self.value_action(SyntaxKind::FillStmt, SyntaxKind::WithKw, "with")
+                }
+                SyntaxKind::TypeKw => {
+                    self.value_action(SyntaxKind::TypeStmt, SyntaxKind::WithKw, "with")
+                }
+                SyntaxKind::PressKw => {
+                    self.value_action(SyntaxKind::PressStmt, SyntaxKind::KeyKw, "key")
+                }
+                SyntaxKind::CheckKw => self.locator_action(SyntaxKind::CheckStmt),
+                SyntaxKind::UncheckKw => self.locator_action(SyntaxKind::UncheckStmt),
+                SyntaxKind::SelectKw => {
+                    self.value_action(SyntaxKind::SelectStmt, SyntaxKind::OptionKw, "option")
+                }
+                SyntaxKind::HoverKw => self.locator_action(SyntaxKind::HoverStmt),
+                SyntaxKind::WaitKw => self.wait_statement(),
+                SyntaxKind::ExpectKw => self.expect_statement(),
                 SyntaxKind::RBrace => {
                     self.bump();
                     break;
@@ -143,7 +156,7 @@ impl<'a> Parser<'a> {
                 }
                 _ => self.unexpected(
                     "syntax.expected_browser_statement",
-                    "expected `open`, `click`, or `expect` in browser block",
+                    "expected a browser action, wait, or assertion in browser block",
                 ),
             }
         }
@@ -161,43 +174,142 @@ impl<'a> Parser<'a> {
         self.finish();
     }
 
-    fn click_statement(&mut self) {
-        self.start(SyntaxKind::ClickStmt);
+    fn locator_action(&mut self, kind: SyntaxKind) {
+        self.start(kind);
         self.bump();
-        self.eat_trivia();
-        if !self.locator() {
-            self.error_here("syntax.expected_locator", "expected locator after `click`");
-            if !matches!(self.current(), SyntaxKind::RBrace | SyntaxKind::Eof) {
-                self.unexpected("syntax.invalid_locator", "invalid locator");
-            }
-        }
+        self.require_locator("after action");
         self.finish();
     }
 
-    fn expect_visible_statement(&mut self) {
-        self.start(SyntaxKind::ExpectVisibleStmt);
+    fn value_action(&mut self, kind: SyntaxKind, separator: SyntaxKind, spelling: &'static str) {
+        self.start(kind);
         self.bump();
-        self.eat_trivia();
-        if !self.locator() {
-            self.error_here("syntax.expected_locator", "expected locator after `expect`");
+        self.require_locator("after action");
+        self.expect(
+            separator,
+            "syntax.expected_action_argument",
+            match spelling {
+                "with" => "expected `with` and a value string after locator",
+                "key" => "expected `key` and a key string after locator",
+                _ => "expected `option` and an option string after locator",
+            },
+        );
+        self.expect(
+            SyntaxKind::String,
+            "syntax.expected_action_value",
+            "expected action value string",
+        );
+        self.finish();
+    }
+
+    fn wait_statement(&mut self) {
+        let kind = if self.nth_non_trivia(1) == SyntaxKind::UrlKw {
+            SyntaxKind::WaitUrlStmt
+        } else {
+            SyntaxKind::WaitLocatorStmt
+        };
+        self.start(kind);
+        self.bump();
+        if kind == SyntaxKind::WaitUrlStmt {
+            self.url_expression();
+        } else {
+            self.require_locator("after `wait`");
+            self.locator_state();
         }
+        self.optional_within();
+        self.finish();
+    }
+
+    fn expect_statement(&mut self) {
+        let kind = if self.nth_non_trivia(1) == SyntaxKind::UrlKw {
+            SyntaxKind::ExpectUrlStmt
+        } else {
+            SyntaxKind::ExpectLocatorStmt
+        };
+        self.start(kind);
+        self.bump();
+        if kind == SyntaxKind::ExpectUrlStmt {
+            self.url_expression();
+        } else {
+            self.require_locator("after `expect`");
+            self.locator_state();
+        }
+        self.optional_within();
+        self.finish();
+    }
+
+    fn url_expression(&mut self) {
+        self.expect(
+            SyntaxKind::UrlKw,
+            "syntax.expected_url",
+            "expected `url` expression",
+        );
+        self.expect(
+            SyntaxKind::LParen,
+            "syntax.expected_lparen",
+            "expected `(` after `url`",
+        );
+        self.expect(
+            SyntaxKind::String,
+            "syntax.expected_url",
+            "expected URL string",
+        );
+        self.expect(
+            SyntaxKind::RParen,
+            "syntax.expected_rparen",
+            "expected `)` after URL",
+        );
+    }
+
+    fn locator_state(&mut self) {
         self.expect(
             SyntaxKind::Dot,
             "syntax.expected_dot",
             "expected `.` after locator",
         );
-        self.expect(
-            SyntaxKind::VisibleKw,
-            "syntax.expected_visible",
-            "expected `visible` after locator",
-        );
-        self.finish();
+        self.eat_trivia();
+        if self.current().is_locator_state() {
+            self.bump();
+        } else {
+            self.error_here(
+                "syntax.expected_locator_state",
+                "expected locator state after `.`",
+            );
+        }
+    }
+
+    fn optional_within(&mut self) {
+        self.eat_trivia();
+        if self.current() == SyntaxKind::WithinKw {
+            self.bump();
+            self.expect(
+                SyntaxKind::Duration,
+                "syntax.expected_duration",
+                "expected duration after `within`",
+            );
+        }
+    }
+
+    fn require_locator(&mut self, context: &'static str) {
+        self.eat_trivia();
+        if !self.locator() {
+            self.error_here(
+                "syntax.expected_locator",
+                format!("expected locator {context}"),
+            );
+        }
     }
 
     fn locator(&mut self) -> bool {
         let node_kind = match self.current() {
             SyntaxKind::IdKw => SyntaxKind::IdLocator,
+            SyntaxKind::RoleKw => SyntaxKind::RoleLocator,
+            SyntaxKind::LabelKw => SyntaxKind::LabelLocator,
             SyntaxKind::TextKw => SyntaxKind::TextLocator,
+            SyntaxKind::PlaceholderKw => SyntaxKind::PlaceholderLocator,
+            SyntaxKind::TestIdKw => SyntaxKind::TestIdLocator,
+            SyntaxKind::CssKw => SyntaxKind::CssLocator,
+            SyntaxKind::XPathKw => SyntaxKind::XPathLocator,
             _ => return false,
         };
         self.start(node_kind);
@@ -212,6 +324,25 @@ impl<'a> Parser<'a> {
             "syntax.expected_locator_string",
             "expected string in locator",
         );
+        self.eat_trivia();
+        if node_kind == SyntaxKind::RoleLocator && self.current() == SyntaxKind::Comma {
+            self.bump();
+            self.expect(
+                SyntaxKind::NameKw,
+                "syntax.expected_role_name",
+                "expected `name` after `,`",
+            );
+            self.expect(
+                SyntaxKind::Colon,
+                "syntax.expected_colon",
+                "expected `:` after `name`",
+            );
+            self.expect(
+                SyntaxKind::String,
+                "syntax.expected_role_name_value",
+                "expected role name string",
+            );
+        }
         self.expect(
             SyntaxKind::RParen,
             "syntax.expected_rparen",
@@ -241,10 +372,10 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn error_here(&mut self, code: &'static str, message: &'static str) {
+    fn error_here(&mut self, code: &'static str, message: impl Into<String>) {
         self.eat_trivia();
         self.errors
-            .push(SyntaxError::new(self.current_range(), code, message));
+            .push(SyntaxError::new(self.current_range(), code, message.into()));
     }
 
     fn eat_trivia(&mut self) {
@@ -252,13 +383,19 @@ impl<'a> Parser<'a> {
             self.bump();
         }
     }
-
     fn current(&self) -> SyntaxKind {
         self.tokens
             .get(self.position)
             .map_or(SyntaxKind::Eof, |token| token.kind)
     }
-
+    fn nth_non_trivia(&self, nth: usize) -> SyntaxKind {
+        self.tokens
+            .iter()
+            .skip(self.position)
+            .filter(|token| !token.kind.is_trivia())
+            .nth(nth)
+            .map_or(SyntaxKind::Eof, |token| token.kind)
+    }
     fn current_range(&self) -> TextRange {
         self.tokens.get(self.position).map_or_else(
             || {
@@ -268,7 +405,6 @@ impl<'a> Parser<'a> {
             |token| token.range,
         )
     }
-
     fn bump(&mut self) {
         if let Some(token) = self.tokens.get(self.position) {
             let start = u32::from(token.range.start()) as usize;
@@ -280,11 +416,9 @@ impl<'a> Parser<'a> {
             self.position += 1;
         }
     }
-
     fn start(&mut self, kind: SyntaxKind) {
         self.builder.start_node(rowan::SyntaxKind(kind as u16));
     }
-
     fn finish(&mut self) {
         self.builder.finish_node();
     }

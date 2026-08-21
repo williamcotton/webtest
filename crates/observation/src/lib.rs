@@ -8,7 +8,7 @@ use std::{
     },
 };
 
-use webtest_browser::Locator;
+use webtest_browser::{CandidateEvidence, Locator};
 use webtest_hir::{StepId, TestId};
 use webtest_text::{FileId, SourceRevision, TextRange};
 
@@ -77,6 +77,16 @@ pub struct RuntimeObservation {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeObservationKind {
+    BrowserFailure {
+        code: String,
+        message: String,
+        locator: Option<Locator>,
+        page_url: Option<String>,
+        candidates: Vec<CandidateEvidence>,
+        actionability: Vec<String>,
+        artifacts: Vec<String>,
+        elapsed_ms: u64,
+    },
     LocatorNotFound {
         locator: Locator,
         page_url: Option<String>,

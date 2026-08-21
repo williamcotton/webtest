@@ -1,0 +1,20 @@
+test "missing button" {
+    browser {
+        open "http://127.0.0.1:3000"
+        click id("does-not-exist")
+    }
+}
+
+test "ambiguous semantic locator" {
+    browser {
+        open "/"
+        click role("button")
+    }
+}
+
+test "bounded missing-element wait" {
+    browser {
+        open "/"
+        wait test_id("never-appears").visible within 250ms
+    }
+}

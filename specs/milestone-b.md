@@ -1,6 +1,10 @@
 # Milestone B — Useful Browser Testing
 
+**Status: implemented.** 
+
 ## 0. Status and dependencies
+
+The canonical syntax-to-runtime path supports the complete language surface below; Chrome execution uses isolated per-test contexts, physical CDP input, bounded actionability polling, and failure evidence. The acceptance coverage lives in the syntax, HIR, plan, runtime, browser-CDP, editor, DAP, project, and reporter test suites.
 
 This specification expands Milestone B in [`future-functionality.md`](./future-functionality.md). It depends on the project, browser-management, reporting, CDP-lifecycle, and packaged-editor guarantees in [`milestone-a.md`](./milestone-a.md).
 

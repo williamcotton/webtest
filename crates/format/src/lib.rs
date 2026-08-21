@@ -68,6 +68,13 @@ pub fn format_file(parse: &Parse) -> String {
                 output.push('.');
                 line_start = false;
             }
+            SyntaxKind::Comma | SyntaxKind::Colon => {
+                while output.ends_with(' ') {
+                    output.pop();
+                }
+                output.push(if kind == SyntaxKind::Comma { ',' } else { ':' });
+                line_start = false;
+            }
             _ => {
                 let starts_statement = matches!(
                     kind,
@@ -75,6 +82,14 @@ pub fn format_file(parse: &Parse) -> String {
                         | SyntaxKind::BrowserKw
                         | SyntaxKind::OpenKw
                         | SyntaxKind::ClickKw
+                        | SyntaxKind::FillKw
+                        | SyntaxKind::TypeKw
+                        | SyntaxKind::PressKw
+                        | SyntaxKind::CheckKw
+                        | SyntaxKind::UncheckKw
+                        | SyntaxKind::SelectKw
+                        | SyntaxKind::HoverKw
+                        | SyntaxKind::WaitKw
                         | SyntaxKind::ExpectKw
                 );
                 if starts_statement && !line_start {
@@ -113,7 +128,11 @@ fn push_indent(output: &mut String, indent: usize) {
 fn needs_space(previous: Option<SyntaxKind>, current: SyntaxKind) -> bool {
     !matches!(
         current,
-        SyntaxKind::LParen | SyntaxKind::RParen | SyntaxKind::Dot
+        SyntaxKind::LParen
+            | SyntaxKind::RParen
+            | SyntaxKind::Dot
+            | SyntaxKind::Comma
+            | SyntaxKind::Colon
     ) && !matches!(previous, None | Some(SyntaxKind::LParen | SyntaxKind::Dot))
 }
 
@@ -125,6 +144,15 @@ mod tests {
     fn formats_and_preserves_comments() {
         let source = "test   \"x\"{// hello\nbrowser{open \"u\" click id ( \"x\" ) expect text ( \"done\" ) . visible}}";
         let expected = "test \"x\" {\n    // hello\n    browser {\n        open \"u\"\n        click id(\"x\")\n        expect text(\"done\").visible\n    }\n}\n";
+        let formatted = format_file(&webtest_syntax::parse(source));
+        assert_eq!(formatted, expected);
+        assert_eq!(format_file(&webtest_syntax::parse(&formatted)), expected);
+    }
+
+    #[test]
+    fn formats_milestone_b_calls_actions_and_deadlines_canonically() {
+        let source = "test \"x\"{browser{fill role ( \"textbox\" ,name :\"Email\")with \"a\" wait id (\"ready\"). visible within 5s}}";
+        let expected = "test \"x\" {\n    browser {\n        fill role(\"textbox\", name: \"Email\") with \"a\"\n        wait id(\"ready\").visible within 5s\n    }\n}\n";
         let formatted = format_file(&webtest_syntax::parse(source));
         assert_eq!(formatted, expected);
         assert_eq!(format_file(&webtest_syntax::parse(&formatted)), expected);

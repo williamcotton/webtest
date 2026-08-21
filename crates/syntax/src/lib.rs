@@ -20,8 +20,11 @@ mod tests {
     // retained
     browser {
         open "http://example.test"
-        click id("foo")
-        expect text("submitted").visible
+        fill label("Email") with "alice@example.com"
+        press placeholder("Search") key "Enter"
+        click role("button", name: "Submit")
+        expect text("submitted").visible within 5s
+        wait url("/done")
     }
 }
 "#;
@@ -43,31 +46,37 @@ mod tests {
         );
         let block = test.browser_blocks().next().expect("browser block");
         let operations: Vec<_> = block.operations().collect();
-        assert_eq!(operations.len(), 3);
-        match &operations[1] {
-            ast::BrowserOperation::Click(click) => match click.locator().expect("locator") {
-                ast::Locator::Id(locator) => {
-                    assert_eq!(
-                        locator.value().and_then(|token| token.value()).as_deref(),
-                        Some("foo")
-                    );
-                }
-                ast::Locator::Text(_) => panic!("expected id locator"),
-            },
-            _ => panic!("expected click"),
-        }
-        match &operations[2] {
-            ast::BrowserOperation::ExpectVisible(expectation) => {
-                match expectation.locator().expect("locator") {
-                    ast::Locator::Text(locator) => assert_eq!(
-                        locator.value().and_then(|token| token.value()).as_deref(),
-                        Some("submitted")
-                    ),
-                    ast::Locator::Id(_) => panic!("expected text locator"),
-                }
-            }
-            _ => panic!("expected visible expectation"),
-        }
+        assert_eq!(operations.len(), 6);
+        let ast::BrowserOperation::Fill(fill) = &operations[1] else {
+            panic!("fill")
+        };
+        assert!(matches!(fill.locator(), Some(ast::Locator::Label(_))));
+        assert_eq!(
+            fill.value().and_then(|token| token.value()).as_deref(),
+            Some("alice@example.com")
+        );
+        let ast::BrowserOperation::Click(click) = &operations[3] else {
+            panic!("click")
+        };
+        let Some(ast::Locator::Role(role)) = click.locator() else {
+            panic!("role")
+        };
+        assert_eq!(
+            role.role().and_then(|token| token.value()).as_deref(),
+            Some("button")
+        );
+        assert_eq!(
+            role.name().and_then(|token| token.value()).as_deref(),
+            Some("Submit")
+        );
+        let ast::BrowserOperation::ExpectLocator(expectation) = &operations[4] else {
+            panic!("expect")
+        };
+        assert_eq!(expectation.state(), Some(ast::LocatorState::Visible));
+        assert_eq!(
+            expectation.timeout().and_then(|token| token.value()),
+            Some(std::time::Duration::from_secs(5))
+        );
     }
 
     #[test]
@@ -89,5 +98,45 @@ mod tests {
                 .any(|error| error.code == "syntax.unterminated_string")
         );
         assert_eq!(parsed.syntax().text().to_string(), source);
+    }
+
+    #[test]
+    fn all_locator_action_and_state_forms_are_lossless() {
+        let source = r##"test "all" { browser {
+            click id("one")
+            fill label("Email") with "a"
+            type placeholder("Search") with "b"
+            press role("textbox", name: "Query") key "Control+a"
+            check test_id("mail")
+            uncheck css("#sms")
+            select xpath("//select") option "UTC"
+            hover text("Account")
+            wait id("ready").attached within 250ms
+            expect id("gone").detached
+            expect id("busy").hidden
+            expect id("go").enabled
+            expect id("stop").disabled
+            expect id("yes").checked
+            expect id("no").unchecked
+        } }"##;
+        let parsed = parse(source);
+        assert!(parsed.errors().is_empty(), "{:?}", parsed.errors());
+        assert_eq!(parsed.syntax().text().to_string(), source);
+    }
+
+    #[test]
+    fn half_typed_locator_does_not_consume_enclosing_block() {
+        let source = "test \"x\" { browser { fill role(\"textbox\", name: } }";
+        let parsed = parse(source);
+        assert!(!parsed.errors().is_empty());
+        assert_eq!(parsed.syntax().text().to_string(), source);
+        assert_eq!(
+            parsed
+                .syntax()
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::BrowserBlock)
+                .count(),
+            1
+        );
     }
 }

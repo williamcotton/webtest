@@ -73,6 +73,21 @@ pub(crate) fn lex(source: &str) -> Vec<Token> {
                 offset += 1;
                 SyntaxKind::Dot
             }
+            b',' => {
+                offset += 1;
+                SyntaxKind::Comma
+            }
+            b':' => {
+                offset += 1;
+                SyntaxKind::Colon
+            }
+            byte if byte.is_ascii_digit() => {
+                offset += 1;
+                while offset < bytes.len() && bytes[offset].is_ascii_alphanumeric() {
+                    offset += 1;
+                }
+                SyntaxKind::Duration
+            }
             byte if is_ident_start(byte) => {
                 offset += 1;
                 while offset < bytes.len() && is_ident_continue(bytes[offset]) {
@@ -83,10 +98,37 @@ pub(crate) fn lex(source: &str) -> Vec<Token> {
                     "browser" => SyntaxKind::BrowserKw,
                     "open" => SyntaxKind::OpenKw,
                     "click" => SyntaxKind::ClickKw,
-                    "id" => SyntaxKind::IdKw,
+                    "fill" => SyntaxKind::FillKw,
+                    "type" => SyntaxKind::TypeKw,
+                    "press" => SyntaxKind::PressKw,
+                    "key" => SyntaxKind::KeyKw,
+                    "with" => SyntaxKind::WithKw,
+                    "check" => SyntaxKind::CheckKw,
+                    "uncheck" => SyntaxKind::UncheckKw,
+                    "select" => SyntaxKind::SelectKw,
+                    "option" => SyntaxKind::OptionKw,
+                    "hover" => SyntaxKind::HoverKw,
+                    "wait" => SyntaxKind::WaitKw,
                     "expect" => SyntaxKind::ExpectKw,
+                    "within" => SyntaxKind::WithinKw,
+                    "url" => SyntaxKind::UrlKw,
+                    "id" => SyntaxKind::IdKw,
+                    "role" => SyntaxKind::RoleKw,
+                    "name" => SyntaxKind::NameKw,
+                    "label" => SyntaxKind::LabelKw,
                     "text" => SyntaxKind::TextKw,
+                    "placeholder" => SyntaxKind::PlaceholderKw,
+                    "test_id" => SyntaxKind::TestIdKw,
+                    "css" => SyntaxKind::CssKw,
+                    "xpath" => SyntaxKind::XPathKw,
                     "visible" => SyntaxKind::VisibleKw,
+                    "hidden" => SyntaxKind::HiddenKw,
+                    "attached" => SyntaxKind::AttachedKw,
+                    "detached" => SyntaxKind::DetachedKw,
+                    "enabled" => SyntaxKind::EnabledKw,
+                    "disabled" => SyntaxKind::DisabledKw,
+                    "checked" => SyntaxKind::CheckedKw,
+                    "unchecked" => SyntaxKind::UncheckedKw,
                     _ => SyntaxKind::Ident,
                 }
             }

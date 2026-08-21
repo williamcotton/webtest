@@ -1,7 +1,0 @@
-test "missing button" {
-    browser {
-        open "http://127.0.0.1:3000"
-        click id("does-not-exist")
-    }
-}
-

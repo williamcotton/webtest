@@ -86,6 +86,8 @@ pub struct FailureReport {
     pub code: String,
     pub message: String,
     pub span: Option<SourceSpanReport>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -230,6 +232,9 @@ impl CommandReport {
                         )?;
                     } else {
                         writeln!(output, "error[{}]: {}", failure.code, failure.message)?;
+                    }
+                    for artifact in &failure.artifacts {
+                        writeln!(output, "  evidence: {artifact}")?;
                     }
                 }
             }
@@ -517,6 +522,7 @@ mod tests {
                         underline_start: 6,
                         underline_width: 13,
                     }),
+                    artifacts: Vec::new(),
                 }),
             }],
             infrastructure_error: None,
@@ -537,6 +543,34 @@ mod tests {
         assert!(output.contains("tests/a.webtest:2:7"));
         assert!(output.contains("2 | click id(\"missing\")"));
         assert!(output.contains("      ^^^^^^^^^^^^^"));
+    }
+
+    #[test]
+    fn failure_artifact_links_are_in_human_and_json_reports() {
+        let mut report = sample();
+        report.files[0].tests[0]
+            .failure
+            .as_mut()
+            .expect("failure")
+            .artifacts = vec!["/project/.webtest/artifacts/test-0-step-1-execution-2.png".into()];
+        let mut human = Vec::new();
+        report
+            .write(Reporter::Human, &mut human)
+            .expect("human report");
+        assert!(
+            String::from_utf8(human)
+                .expect("UTF-8")
+                .contains("evidence: /project/.webtest/artifacts")
+        );
+        let mut json = Vec::new();
+        report
+            .write(Reporter::Json, &mut json)
+            .expect("JSON report");
+        let value: serde_json::Value = serde_json::from_slice(&json).expect("JSON");
+        assert_eq!(
+            value["files"][0]["tests"][0]["failure"]["artifacts"][0],
+            "/project/.webtest/artifacts/test-0-step-1-execution-2.png"
+        );
     }
 
     #[test]

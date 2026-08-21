@@ -8,7 +8,7 @@ use webtest_analysis::{
 };
 use webtest_browser::{BrowserError, BrowserHost, Locator};
 use webtest_observation::{ObservationStore, RuntimeObservationKind};
-use webtest_runtime::{RunResult, Runner};
+use webtest_runtime::{RunResult, Runner, RunnerOptions};
 use webtest_syntax::SyntaxKind;
 use webtest_text::{FileId, TextRange};
 
@@ -40,11 +40,20 @@ pub enum EditorError {
 pub struct EditorService {
     database: RwLock<AnalysisDatabase>,
     observations: Arc<ObservationStore>,
+    runner_options: RunnerOptions,
 }
 
 impl EditorService {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_runner_options(runner_options: RunnerOptions) -> Self {
+        Self {
+            database: RwLock::new(AnalysisDatabase::default()),
+            observations: Arc::new(ObservationStore::default()),
+            runner_options,
+        }
     }
 
     pub fn observations(&self) -> Arc<ObservationStore> {
@@ -85,6 +94,18 @@ impl EditorService {
                 .observations_for(file, revision)
                 .into_iter()
                 .map(|observation| match observation.kind {
+                    RuntimeObservationKind::BrowserFailure {
+                        code,
+                        message,
+                        locator,
+                        ..
+                    } => Diagnostic {
+                        range: observation.range,
+                        severity: DiagnosticSeverity::Error,
+                        code: runtime_diagnostic_code(&code),
+                        message: friendly_runtime_message(&code, locator.as_ref(), &message),
+                        source: DiagnosticSource::Runtime,
+                    },
                     RuntimeObservationKind::LocatorNotFound { locator, .. } => Diagnostic {
                         range: observation.range,
                         severity: DiagnosticSeverity::Error,
@@ -138,9 +159,36 @@ impl EditorService {
                     | SyntaxKind::BrowserKw
                     | SyntaxKind::OpenKw
                     | SyntaxKind::ClickKw
+                    | SyntaxKind::FillKw
+                    | SyntaxKind::TypeKw
+                    | SyntaxKind::PressKw
+                    | SyntaxKind::KeyKw
+                    | SyntaxKind::WithKw
+                    | SyntaxKind::CheckKw
+                    | SyntaxKind::UncheckKw
+                    | SyntaxKind::SelectKw
+                    | SyntaxKind::OptionKw
+                    | SyntaxKind::HoverKw
+                    | SyntaxKind::WaitKw
                     | SyntaxKind::ExpectKw
-                    | SyntaxKind::VisibleKw => SemanticTokenKind::Keyword,
-                    SyntaxKind::IdKw | SyntaxKind::TextKw => SemanticTokenKind::Function,
+                    | SyntaxKind::WithinKw
+                    | SyntaxKind::VisibleKw
+                    | SyntaxKind::HiddenKw
+                    | SyntaxKind::AttachedKw
+                    | SyntaxKind::DetachedKw
+                    | SyntaxKind::EnabledKw
+                    | SyntaxKind::DisabledKw
+                    | SyntaxKind::CheckedKw
+                    | SyntaxKind::UncheckedKw => SemanticTokenKind::Keyword,
+                    SyntaxKind::IdKw
+                    | SyntaxKind::RoleKw
+                    | SyntaxKind::LabelKw
+                    | SyntaxKind::TextKw
+                    | SyntaxKind::PlaceholderKw
+                    | SyntaxKind::TestIdKw
+                    | SyntaxKind::CssKw
+                    | SyntaxKind::XPathKw
+                    | SyntaxKind::UrlKw => SemanticTokenKind::Function,
                     SyntaxKind::String => SemanticTokenKind::String,
                     SyntaxKind::LineComment => SemanticTokenKind::Comment,
                     _ => return None,
@@ -169,7 +217,8 @@ impl EditorService {
             }
             database.test_plan(file)?
         };
-        let runner = Runner::new(Arc::clone(&self.observations));
+        let runner =
+            Runner::new(Arc::clone(&self.observations)).with_options(self.runner_options.clone());
         Ok(runner.run(&plan, browser).await?)
     }
 
@@ -190,6 +239,41 @@ fn locator_description(locator: &Locator) -> String {
     match locator {
         Locator::Id(value) => format!("id {value:?}"),
         Locator::Text(value) => format!("text {value:?}"),
+        _ => locator.to_string(),
+    }
+}
+
+fn friendly_runtime_message(code: &str, locator: Option<&Locator>, fallback: &str) -> String {
+    match (code, locator) {
+        ("locator_not_found", Some(locator)) => format!(
+            "No element with {} was found during the last test run.",
+            locator_description(locator)
+        ),
+        ("element_not_visible", Some(locator)) => format!(
+            "The element with {} was not visible during the last test run.",
+            locator_description(locator)
+        ),
+        _ => fallback.into(),
+    }
+}
+
+fn runtime_diagnostic_code(code: &str) -> &'static str {
+    match code {
+        "locator_not_found" => "runtime.locator_not_found",
+        "locator_ambiguous" => "runtime.locator_ambiguous",
+        "locator_invalid" => "runtime.locator_invalid",
+        "element_detached" => "runtime.element_detached",
+        "element_not_visible" => "runtime.locator_not_visible",
+        "element_unstable" => "runtime.element_unstable",
+        "element_disabled" => "runtime.element_disabled",
+        "element_obscured" => "runtime.element_obscured",
+        "element_not_editable" => "runtime.element_not_editable",
+        "option_not_found" => "runtime.option_not_found",
+        "option_ambiguous" => "runtime.option_ambiguous",
+        "invalid_key" => "runtime.invalid_key",
+        "action_timeout" => "runtime.action_timeout",
+        "url_mismatch" => "runtime.url_mismatch",
+        _ => "runtime.assertion_failed",
     }
 }
 
@@ -249,6 +333,17 @@ mod tests {
             } else {
                 Err(BrowserError::LocatorNotFound {
                     locator: locator.clone(),
+                })
+            }
+        }
+
+        async fn evaluate_expression(&mut self, expression: &str) -> Result<(), BrowserError> {
+            if self.0 {
+                Ok(())
+            } else {
+                Err(BrowserError::EvaluationFailed {
+                    expression: expression.into(),
+                    message: "".into()
                 })
             }
         }

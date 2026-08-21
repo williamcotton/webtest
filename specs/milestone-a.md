@@ -1,5 +1,7 @@
 # Milestone A — Productize the Proven Slice
 
+**Status: implemented.** 
+
 ## 0. Status and relationship to the roadmap
 
 This specification expands Milestone A in [`future-functionality.md`](./future-functionality.md). It begins from the delivered lossless parser, source-mapped plan/runtime, direct CDP backend, runtime diagnostics, headed mode, Tower LSP, DAP, and Cursor/VS Code extension.

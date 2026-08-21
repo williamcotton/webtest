@@ -1006,6 +1006,8 @@ The lossless language pipeline, source-mapped browser plan, direct CDP execution
 
 ### [Milestone A — Productize the proven slice](./milestone-a.md)
 
+Implemented.
+
 - project configuration and path discovery;
 - managed Chrome for Testing;
 - improved CLI diagnostics/reporters and stable exit codes;
@@ -1015,6 +1017,8 @@ The lossless language pipeline, source-mapped browser plan, direct CDP execution
 Acceptance: a new user can install WebTest and its browser, run the examples, and see current runtime diagnostics without manually locating Chrome.
 
 ### [Milestone B — Useful browser testing](./milestone-b.md)
+
+Implemented.
 
 - semantic locators;
 - fill, press, select, check, hover, and waits;

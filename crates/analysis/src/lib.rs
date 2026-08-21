@@ -162,7 +162,7 @@ impl AnalysisDatabase {
         }
 
         let parsed = webtest_syntax::parse(&source.text);
-        let diagnostics = parsed
+        let mut diagnostics = parsed
             .errors()
             .iter()
             .map(|error| Diagnostic {
@@ -172,8 +172,51 @@ impl AnalysisDatabase {
                 message: error.message.clone(),
                 source: DiagnosticSource::Syntax,
             })
-            .collect();
+            .collect::<Vec<_>>();
+        diagnostics.extend(
+            parsed
+                .syntax()
+                .descendants_with_tokens()
+                .filter_map(|element| {
+                    let token = element.into_token()?;
+                    if token.kind() != webtest_syntax::SyntaxKind::Duration {
+                        return None;
+                    }
+                    let valid = token
+                        .text()
+                        .strip_suffix("ms")
+                        .or_else(|| token.text().strip_suffix('s'))
+                        .or_else(|| token.text().strip_suffix('m'))
+                        .and_then(|number| number.parse::<u64>().ok())
+                        .is_some_and(|number| number > 0);
+                    (!valid).then(|| Diagnostic {
+                        range: token.text_range(),
+                        severity: DiagnosticSeverity::Error,
+                        code: "semantic.invalid_duration",
+                        message: format!("invalid positive duration `{}`", token.text()),
+                        source: DiagnosticSource::Semantic,
+                    })
+                }),
+        );
         let hir = Arc::new(webtest_hir::lower(file, &parsed));
+        for test in &hir.tests {
+            for statement in &test.body {
+                let webtest_hir::HirStmt::Browser(block) = statement;
+                for operation in &block.operations {
+                    if let webtest_hir::HirBrowserOp::Press(action) = operation
+                        && !valid_key_chord(&action.value.value)
+                    {
+                        diagnostics.push(Diagnostic {
+                            range: action.value.origin.range,
+                            severity: DiagnosticSeverity::Error,
+                            code: "semantic.invalid_key",
+                            message: format!("invalid key chord `{}`", action.value.value),
+                            source: DiagnosticSource::Semantic,
+                        });
+                    }
+                }
+            }
+        }
         let plan = Arc::new(webtest_plan::lower(file, source.revision, &hir));
         self.cache.insert(
             file,
@@ -187,6 +230,21 @@ impl AnalysisDatabase {
         );
         Ok(())
     }
+}
+
+fn valid_key_chord(value: &str) -> bool {
+    let mut main = 0;
+    for part in value.split('+') {
+        match part {
+            "Alt" | "Control" | "Ctrl" | "Meta" | "Command" | "Shift" => {}
+            "Enter" | "Tab" | "Escape" | "Esc" | "Backspace" | "Delete" | "ArrowUp"
+            | "ArrowDown" | "ArrowLeft" | "ArrowRight" | "Home" | "End" | "PageUp" | "PageDown"
+            | "Space" => main += 1,
+            value if value.chars().count() == 1 => main += 1,
+            _ => return false,
+        }
+    }
+    main == 1
 }
 
 #[cfg(test)]

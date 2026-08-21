@@ -1723,6 +1723,7 @@ name = "webtest-browser-cdp"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "futures",
  "serde",
  "serde_json",
@@ -1850,6 +1851,7 @@ name = "webtest-runtime"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "tempfile",
  "tokio",
  "tracing",
  "webtest-browser",
