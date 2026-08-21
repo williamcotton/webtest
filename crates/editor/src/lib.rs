@@ -204,11 +204,19 @@ mod tests {
     struct FakeHost(bool);
     struct FakeSession(bool);
     struct FakePage(bool);
+    struct DisconnectHost;
 
     #[async_trait]
     impl BrowserHost for FakeHost {
         async fn start(&self) -> Result<Box<dyn BrowserSession>, BrowserError> {
             Ok(Box::new(FakeSession(self.0)))
+        }
+    }
+
+    #[async_trait]
+    impl BrowserHost for DisconnectHost {
+        async fn start(&self) -> Result<Box<dyn BrowserSession>, BrowserError> {
+            Err(BrowserError::BrowserDisconnected)
         }
     }
 
@@ -283,6 +291,52 @@ mod tests {
             editor
                 .diagnostics(file)
                 .expect("passing diagnostics")
+                .iter()
+                .all(|diagnostic| diagnostic.source != DiagnosticSource::Runtime)
+        );
+    }
+
+    #[tokio::test]
+    async fn infrastructure_rerun_clears_previous_runtime_diagnostic() {
+        let editor = EditorService::new();
+        let source = "test \"x\" { browser { click id(\"missing\") } }";
+        let file = editor.open_document("file:///disconnect.webtest", source);
+        editor
+            .run_file(file, &FakeHost(false))
+            .await
+            .expect("failed assertion run");
+        assert!(
+            editor
+                .diagnostics(file)
+                .expect("failure diagnostics")
+                .iter()
+                .any(|diagnostic| diagnostic.source == DiagnosticSource::Runtime)
+        );
+
+        let error = editor
+            .run_file(file, &DisconnectHost)
+            .await
+            .expect_err("forced disconnect");
+        assert!(matches!(
+            error,
+            EditorError::Browser(BrowserError::BrowserDisconnected)
+        ));
+        assert!(
+            editor
+                .diagnostics(file)
+                .expect("disconnect diagnostics")
+                .iter()
+                .all(|diagnostic| diagnostic.source != DiagnosticSource::Runtime)
+        );
+
+        editor
+            .run_file(file, &FakeHost(true))
+            .await
+            .expect("successful rerun");
+        assert!(
+            editor
+                .diagnostics(file)
+                .expect("successful diagnostics")
                 .iter()
                 .all(|diagnostic| diagnostic.source != DiagnosticSource::Runtime)
         );

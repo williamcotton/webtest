@@ -1,0 +1,16 @@
+[project]
+name = "webtest"
+test_roots = ["examples/minimal"]
+exclude = ["examples/minimal/failing.webtest", "target/**", "node_modules/**"]
+
+[browser]
+headless = true
+channel = "managed"
+
+[timeouts]
+browser_command = "10s"
+navigation = "30s"
+test = "60s"
+
+[artifacts]
+directory = ".webtest/artifacts"

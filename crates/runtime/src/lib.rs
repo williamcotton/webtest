@@ -1,6 +1,6 @@
 //! Sequential execution of protocol-neutral test plans.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use tracing::instrument;
@@ -24,6 +24,7 @@ pub struct TestResult {
     pub name: String,
     pub passed: bool,
     pub failure: Option<StepFailure>,
+    pub duration: Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -31,6 +32,7 @@ pub struct RunResult {
     pub execution_id: ExecutionId,
     pub tests: Vec<TestResult>,
     pub events: Vec<ExecutionEvent>,
+    pub duration: Duration,
 }
 
 impl RunResult {
@@ -74,12 +76,41 @@ impl Runner {
         control: Option<&dyn RunControl>,
     ) -> Result<RunResult, BrowserError> {
         self.observations.clear_for_file(plan.file);
+        let run_started = std::time::Instant::now();
         let execution_id = ExecutionId::next();
         let mut events = vec![ExecutionEvent::RunStarted { execution_id }];
         let mut session = browser.start().await?;
+        let result = self
+            .run_session(
+                plan,
+                control,
+                run_started,
+                execution_id,
+                &mut events,
+                session.as_mut(),
+            )
+            .await;
+        let shutdown = session.close().await;
+        match (result, shutdown) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(result), Ok(())) => Ok(result),
+        }
+    }
+
+    async fn run_session(
+        &self,
+        plan: &TestPlan,
+        control: Option<&dyn RunControl>,
+        run_started: std::time::Instant,
+        execution_id: ExecutionId,
+        events: &mut Vec<ExecutionEvent>,
+        session: &mut dyn webtest_browser::BrowserSession,
+    ) -> Result<RunResult, BrowserError> {
         let mut tests = Vec::with_capacity(plan.tests.len());
 
         for test in &plan.tests {
+            let test_started = std::time::Instant::now();
             events.push(ExecutionEvent::TestStarted {
                 execution_id,
                 test_id: test.id,
@@ -138,13 +169,15 @@ impl Runner {
                 name: test.name.clone(),
                 passed,
                 failure,
+                duration: test_started.elapsed(),
             });
         }
         events.push(ExecutionEvent::RunFinished { execution_id });
         Ok(RunResult {
             execution_id,
             tests,
-            events,
+            events: events.clone(),
+            duration: run_started.elapsed(),
         })
     }
 }
@@ -192,7 +225,11 @@ fn runtime_observation(error: &BrowserError) -> Option<RuntimeObservationKind> {
             })
         }
         BrowserError::NavigationFailed { .. }
+        | BrowserError::NavigationTimeout { .. }
+        | BrowserError::CommandTimeout { .. }
         | BrowserError::BrowserDisconnected
+        | BrowserError::BrowserCrashed { .. }
+        | BrowserError::MalformedProtocol { .. }
         | BrowserError::Protocol { .. }
         | BrowserError::Launch(_) => None,
     }
@@ -200,7 +237,10 @@ fn runtime_observation(error: &BrowserError) -> Option<RuntimeObservationKind> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
 
     use async_trait::async_trait;
     use webtest_browser::{BrowserSession, Page};
@@ -222,12 +262,34 @@ mod tests {
         click: Mutex<Result<(), BrowserError>>,
     }
 
+    struct ClosingHost(Arc<AtomicBool>);
+    struct ClosingSession(Arc<AtomicBool>);
+
     #[async_trait]
     impl BrowserHost for FakeHost {
         async fn start(&self) -> Result<Box<dyn BrowserSession>, BrowserError> {
             Ok(Box::new(FakeSession {
                 click: self.click.clone(),
             }))
+        }
+    }
+
+    #[async_trait]
+    impl BrowserHost for ClosingHost {
+        async fn start(&self) -> Result<Box<dyn BrowserSession>, BrowserError> {
+            Ok(Box::new(ClosingSession(Arc::clone(&self.0))))
+        }
+    }
+
+    #[async_trait]
+    impl BrowserSession for ClosingSession {
+        async fn new_page(&mut self) -> Result<Box<dyn Page>, BrowserError> {
+            Err(BrowserError::BrowserDisconnected)
+        }
+
+        async fn close(&mut self) -> Result<(), BrowserError> {
+            self.0.store(true, Ordering::Release);
+            Ok(())
         }
     }
 
@@ -320,5 +382,20 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn session_is_closed_even_when_execution_returns_infrastructure_error() {
+        let closed = Arc::new(AtomicBool::new(false));
+        let runner = Runner::new(Arc::new(ObservationStore::default()));
+        let error = runner
+            .run(
+                &plan(SourceRevision::of("close")),
+                &ClosingHost(Arc::clone(&closed)),
+            )
+            .await
+            .expect_err("new page disconnect");
+        assert_eq!(error, BrowserError::BrowserDisconnected);
+        assert!(closed.load(Ordering::Acquire));
     }
 }

@@ -12,21 +12,75 @@ test "submit button" {
 }
 ```
 
-## Build and use
+## Install and use
 
-Rust stable and Chrome/Chromium are required. WebTest searches standard Chrome locations; use `WEBTEST_CHROME_PATH` or `--chrome-path` to override it.
+Build the native executable with Rust stable, then install the tested Chrome for Testing release into WebTest's versioned cache. Ordinary test runs never download a browser.
 
 ```sh
 cargo build
-target/debug/webtest check examples/minimal/passing.webtest
-target/debug/webtest fmt examples/minimal/passing.webtest
-target/debug/webtest test examples/minimal/passing.webtest
+target/debug/webtest browser install
+target/debug/webtest browser path
+target/debug/webtest check
+target/debug/webtest test
+```
+
+All file-oriented commands accept zero or more files/directories. With no paths, WebTest finds the nearest `webtest.toml` and deterministically discovers `.webtest` files under `project.test_roots`. Useful variants are:
+
+```sh
+target/debug/webtest check examples/minimal --reporter json
+target/debug/webtest fmt examples/minimal --check
 target/debug/webtest test examples/minimal/passing.webtest --headed
+target/debug/webtest test examples/minimal --reporter junit
+target/debug/webtest browser list
+target/debug/webtest browser clean
 target/debug/webtest lsp
 target/debug/webtest dap
 ```
 
-Tests run headlessly by default. Pass `--headed` to watch Chrome execute the test. The examples expect a site on port 3000. Automated browser tests instead start a fixture server on a random loopback port and skip gracefully when Chrome is unavailable.
+Browser resolution is `--chrome-path`, `WEBTEST_CHROME_PATH`, `browser.path`, managed Chrome, then supported system locations. Set `WEBTEST_CACHE_DIR` to relocate the managed cache. Tests are headless by default; `--headed` shows Chrome.
+
+Exit codes are stable: `0` success, `1` static/test/format failure, `2` CLI/config/input error, `3` browser/CDP/filesystem/reporter infrastructure failure, and `4` internal invariant failure. JSON and JSONL event output use `schema_version: 1`; machine durations are integer nanoseconds. JUnit distinguishes test failures from infrastructure errors.
+
+## Project configuration
+
+The initial `webtest.toml` schema is intentionally small:
+
+```toml
+[project]
+name = "storefront"
+test_roots = ["tests"]
+exclude = ["tests/generated/**", "node_modules/**"]
+
+[browser]
+headless = true
+channel = "managed" # or "system"
+# path = "/absolute/path/to/chrome"
+
+[timeouts]
+browser_command = "10s"
+navigation = "30s"
+test = "60s"
+
+[artifacts]
+directory = ".webtest/artifacts"
+```
+
+Durations accept positive `ms`, `s`, or `m` values. Test roots and artifact paths must remain project-relative. Excludes use slash-normalized glob syntax: `*` matches within one path component and `**` crosses directories. Hidden and symlinked directories are not traversed. Unknown keys warn; malformed values and contradictory `browser.channel = "system"` plus `browser.path` are errors.
+
+## Manual example
+
+Serve the fixture in one terminal:
+
+```sh
+cd examples
+python -m http.server 3000
+```
+
+Then run from the repository root:
+
+```sh
+target/debug/webtest test examples/minimal/passing.webtest --headed
+```
 
 ## Cursor / VS Code extension development
 
@@ -34,8 +88,9 @@ Tests run headlessly by default. Pass `--headed` to watch Chrome execute the tes
 cd editors/vscode
 npm install
 npm run compile
-npm run package
-cursor --install-extension webtest-vscode-0.2.0.vsix --force
+npm run smoke
+npm run smoke:cursor
+npm run smoke:activation
 ```
 
 Reload Cursor after installing the VSIX, then open the repository and a `.webtest` file. The extension discovers `target/debug/webtest` in the workspace automatically. The command **WebTest: Run Current File** asks the language server to run the currently synchronized buffer, including unsaved changes. Set `webtest.serverPath` explicitly when the executable lives elsewhere.
@@ -58,7 +113,10 @@ The architectural invariants are deliberate:
 Run the complete quality suite with:
 
 ```sh
-cargo fmt --check
+cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+cargo check -p webtest-wasm --target wasm32-unknown-unknown
+cd editors/vscode && npm run smoke
+cd editors/vscode && npm run smoke:activation
 ```

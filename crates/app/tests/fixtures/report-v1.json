@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "command": "test",
+  "project_root": "/project",
+  "warnings": [],
+  "files": [
+    {
+      "path": "tests/a.webtest",
+      "exit_class": "test_failure",
+      "source_revision": "abc",
+      "duration_nanos": 12,
+      "diagnostics": [],
+      "tests": [
+        {
+          "name": "a < b",
+          "exit_class": "test_failure",
+          "passed": false,
+          "duration_nanos": 10,
+          "failure": {
+            "code": "runtime.locator_not_found",
+            "message": "missing & gone",
+            "span": {
+              "line": 2,
+              "column": 7,
+              "source_line": "click id(\"missing\")",
+              "underline_start": 6,
+              "underline_width": 13
+            }
+          }
+        }
+      ],
+      "infrastructure_error": null
+    }
+  ],
+  "summary": {
+    "files": 1,
+    "diagnostics": 0,
+    "tests": 1,
+    "passed": 0,
+    "failed": 1,
+    "infrastructure_errors": 0,
+    "duration_nanos": 12
+  },
+  "exit_class": "test_failure"
+}

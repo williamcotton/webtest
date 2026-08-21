@@ -18,9 +18,9 @@ There is one Rust lexer, parser, CST, syntax-to-HIR lowering path, formatter, pl
 
 The current DSL supports `test` declarations containing `browser` blocks, `open`, `click`, `id(...)` and `text(...)` locators, and `expect <locator>.visible`. Plans distinguish browser operations from assertions. Chrome can run headlessly or with `--headed`; text visibility failures, missing locators, and ambiguous locators remain structured and source-mapped.
 
-The executable currently provides `check`, `fmt`, `test`, `lsp`, and `dap`. The Tower LSP supplies full-document synchronization, diagnostics, formatting, semantic tokens, and synchronized-buffer execution. Syntax highlighting comes from CST-backed semantic tokens; the extension only maps token categories to theme scopes. The Cursor/VS Code extension supplies language registration, run/debug commands, breakpoint contribution, and zero-config DAP launch. `webtest dap` uses the same `TestPlan` and `Runner` as normal execution, pausing through `RunControl` before a source-mapped step. The WASM facade currently exposes diagnostics and formatting; it is not yet a complete Monaco service.
+The executable currently provides path-oriented `check`, `fmt`, and `test`, managed-browser commands, `lsp`, and `dap`. Project discovery and typed `webtest.toml` configuration live in `project`; managed Chrome distribution is separate from CDP in `browser-manager`. CLI reporters provide human, concise, versioned JSON/events, and JUnit output with stable exit classes. The Tower LSP supplies full-document synchronization, diagnostics, formatting, semantic tokens, and synchronized-buffer execution. Syntax highlighting comes from CST-backed semantic tokens; the extension only maps token categories to theme scopes. The Cursor/VS Code extension supplies language registration, run/debug commands, breakpoint contribution, and zero-config DAP launch. `webtest dap` uses the same `TestPlan` and `Runner` as normal execution, pausing through `RunControl` before a source-mapped step. The WASM facade currently exposes diagnostics and formatting; it is not yet a complete Monaco service.
 
-Do not claim unimplemented roadmap features—such as bindings, types/effects, modules, managed Chrome, actionability, retries, parallelism, server/HTTP operations, traces, or CLI-to-LSP IPC—already exist. Add them incrementally without weakening the shared architecture.
+Do not claim unimplemented roadmap features—such as bindings, types/effects, modules, actionability, retries, parallelism, server/HTTP operations, traces, or CLI-to-LSP IPC—already exist. Add them incrementally without weakening the shared architecture.
 
 ## Crate Ownership and Dependency Direction
 
@@ -31,14 +31,16 @@ Do not claim unimplemented roadmap features—such as bindings, types/effects, m
 - `crates/format`: the one canonical formatter. It consumes CST tokens so trivia survives; CLI and editor formatting must call it.
 - `crates/plan`: runtime-facing, syntax-independent `TestPlan`, deterministic `StepId`s, browser/assertion operations, locators, source revision, and precise origins.
 - `crates/browser`: protocol-neutral `BrowserHost`, `BrowserSession`, `Page`, `Locator`, and structured `BrowserError` semantics.
-- `crates/browser-cdp`: Chrome discovery/launch, temporary profiles, WebSocket command correlation, target sessions, navigation, locator resolution, clicking, and visibility evaluation. CDP JSON types never escape this crate.
+- `crates/project`: nearest-root selection, typed `webtest.toml`, configuration warnings/errors, and deterministic path discovery. Analysis never reads ambient project configuration.
+- `crates/browser-manager`: pinned Chrome for Testing metadata, verified atomic installation, owned cache cleanup, and managed executable resolution. It contains no CDP semantics.
+- `crates/browser-cdp`: system Chrome discovery/launch, temporary profiles, bounded/deadlined WebSocket command correlation, target sessions, navigation, locator resolution, clicking, visibility evaluation, and child reaping. CDP JSON types never escape this crate.
 - `crates/observation`: execution IDs/events and revision-bound runtime observations stored by `(FileId, SourceRevision)`.
 - `crates/runtime`: sequential plan execution, plan-to-browser conversion, structured results/events, observation recording, and the pre-step `RunControl` hook used by DAP. It does not parse source or print terminal output.
 - `crates/editor`: protocol-neutral document state, diagnostic composition, formatting, semantic tokens, and run orchestration. It returns internal DTOs, never LSP or VS Code types.
 - `crates/lsp`: thin Tower adapter, document synchronization, UTF-8 byte-range to UTF-16 LSP conversion, command routing, and diagnostic/token publication.
 - `crates/dap`: stdio DAP framing, launch/breakpoint state, source-to-step mapping, stack/scopes/variables, and pause/continue/step control. The app injects a `BrowserHost`; DAP does not own CDP semantics.
 - `crates/wasm`: stable portable DTO facade over shared analysis/formatting. Native filesystem, process, socket, and Chrome capabilities do not belong here.
-- `crates/app`: Clap CLI, filesystem/terminal presentation, tracing setup, and composition of LSP/DAP/runtime with `ChromeHost` into the single executable.
+- `crates/app`: Clap CLI, configuration precedence, reporters/exit classes, filesystem/terminal presentation, tracing setup, and composition of LSP/DAP/runtime with managed Chrome and `ChromeHost` into the single executable.
 - `editors/vscode`: Cursor/VS Code manifest and TypeScript adapter. It locates/spawns `webtest lsp` and `webtest dap`; it contains no language intelligence.
 - `examples`: manual HTTP fixture and passing/failing `.webtest` programs. Automated tests should not depend on port 3000.
 

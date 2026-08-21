@@ -29,8 +29,16 @@ pub enum BrowserError {
     LocatorNotVisible { locator: Locator },
     #[error("navigation to {url} failed: {reason}")]
     NavigationFailed { url: String, reason: String },
+    #[error("navigation to {url} timed out after {timeout_ms}ms")]
+    NavigationTimeout { url: String, timeout_ms: u64 },
+    #[error("CDP method {method} timed out after {timeout_ms}ms")]
+    CommandTimeout { method: String, timeout_ms: u64 },
     #[error("the browser disconnected")]
     BrowserDisconnected,
+    #[error("the browser crashed: {status}")]
+    BrowserCrashed { status: String },
+    #[error("Chrome sent a malformed CDP message: {message}")]
+    MalformedProtocol { message: String },
     #[error("CDP method {method} failed: {message}")]
     Protocol { method: String, message: String },
     #[error("could not launch the browser: {0}")]
@@ -45,6 +53,12 @@ pub trait BrowserHost: Send + Sync {
 #[async_trait]
 pub trait BrowserSession: Send {
     async fn new_page(&mut self) -> Result<Box<dyn Page>, BrowserError>;
+
+    /// Gracefully close and reap browser resources. Implementations that do not
+    /// own a process can use the default no-op.
+    async fn close(&mut self) -> Result<(), BrowserError> {
+        Ok(())
+    }
 }
 
 #[async_trait]

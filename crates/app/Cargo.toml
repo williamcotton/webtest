@@ -11,18 +11,25 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 webtest-analysis.workspace = true
 webtest-browser.workspace = true
 webtest-browser-cdp.workspace = true
+webtest-browser-manager.workspace = true
 webtest-dap.workspace = true
 webtest-editor.workspace = true
 webtest-format.workspace = true
 webtest-lsp.workspace = true
 webtest-observation.workspace = true
 webtest-plan.workspace = true
+webtest-project.workspace = true
 webtest-runtime.workspace = true
 webtest-syntax.workspace = true
 webtest-text.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

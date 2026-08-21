@@ -3,5 +3,6 @@ src/**
 tsconfig.json
 package-lock.json
 out/**/*.map
+scripts/**
+test/**
 *.vsix
-

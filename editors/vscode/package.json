@@ -176,7 +176,10 @@
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "package": "npm run compile && vsce package --out webtest-vscode-0.2.0.vsix"
+    "package": "npm run compile && vsce package",
+    "smoke": "npm run package && node ./scripts/package-smoke.mjs",
+    "smoke:cursor": "npm run smoke && node ./scripts/cursor-smoke.mjs",
+    "smoke:activation": "npm run compile && node ./test/run.mjs"
   },
   "dependencies": {
     "vscode-languageclient": "^10.0.0"
@@ -184,7 +187,9 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@types/vscode": "^1.96.0",
+    "@vscode/test-electron": "^3.1.0",
     "@vscode/vsce": "^3.9.2",
-    "typescript": "^5.7.0"
+    "typescript": "^5.7.0",
+    "yauzl": "^3.2.1"
   }
 }
