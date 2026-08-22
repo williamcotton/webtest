@@ -72,17 +72,17 @@ Durations accept positive `ms`, `s`, or `m` values. Test roots and artifact path
 Serve the fixture in one terminal:
 
 ```sh
-cd examples
+cd examples/plain-html
 python -m http.server 3000
 ```
 
 Then run from the repository root:
 
 ```sh
-target/debug/webtest test examples/minimal/passing.webtest --headed
+target/debug/webtest test examples/plain-html/sign-in.webtest --headed
 ```
 
-## Cursor / VS Code extension development
+## VS Code / Cursor extension development
 
 ```sh
 cd editors/vscode
@@ -93,9 +93,9 @@ npm run smoke:cursor
 npm run smoke:activation
 ```
 
-Reload Cursor after installing the VSIX, then open the repository and a `.webtest` file. The extension discovers `target/debug/webtest` in the workspace automatically. The command **WebTest: Run Current File** asks the language server to run the currently synchronized buffer, including unsaved changes. Set `webtest.serverPath` explicitly when the executable lives elsewhere.
+Reload VS Code/Cursor after installing the VSIX, then open the repository and a `.webtest` file. The extension discovers `target/debug/webtest` in the workspace automatically. The command **WebTest: Run Current File** asks the language server to run the currently synchronized buffer, including unsaved changes. Set `webtest.serverPath` explicitly when the executable lives elsewhere.
 
-For interactive debugging, set a breakpoint on any `open`, `click`, or `expect` line and choose **WebTest: Debug Current File** (or press F5 and select **Debug WebTest**). Debug sessions show Chrome by default and pause immediately before the selected step, leaving the page available for inspection and Chrome DevTools. Continue or step from Cursor's debug toolbar. No `launch.json` is required.
+For interactive debugging, set a breakpoint on any `open`, `click`, or `expect` line and choose **WebTest: Debug Current File** (or press F5 and select **Debug WebTest**). Debug sessions show Chrome by default and pause immediately before the selected step, leaving the page available for inspection and Chrome DevTools. Continue or step from VS Code/Cursor's debug toolbar. No `launch.json` is required.
 
 ## Architecture
 
