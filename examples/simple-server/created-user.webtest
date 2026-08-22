@@ -1,0 +1,15 @@
+test "created user can sign in" {
+    server {
+        let response = http.post("/api/test/users", json: { email: "alice@example.com" })
+        expect response.status == 201
+        let user: { id: Int, email: String } = response.json
+        expect user.id > 0
+    }
+    browser {
+        open "/login"
+        fill label("Email") with user.email
+        click role("button", name: "Sign in")
+        expect text("Welcome, alice@example.com").visible within 5s
+        expect url("/dashboard")
+    }
+}

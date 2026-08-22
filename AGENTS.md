@@ -42,7 +42,7 @@ Do not claim unimplemented roadmap features—such as modules, user-defined func
 - `crates/wasm`: stable portable DTO facade over shared analysis/formatting. Native filesystem, process, socket, and Chrome capabilities do not belong here.
 - `crates/app`: Clap CLI, configuration precedence, reporters/exit classes, filesystem/terminal presentation, tracing setup, and composition of LSP/DAP/runtime with managed Chrome and `ChromeHost` into the single executable.
 - `editors/vscode`: Cursor/VS Code manifest and TypeScript adapter. It locates/spawns `webtest lsp` and `webtest dap`; it contains no language intelligence.
-- `examples`: manual HTTP fixture and passing/failing `.webtest` programs. Automated tests should not depend on port 3000.
+- `examples`: self-contained manual fixture projects and passing/failing `.webtest` programs. Automated tests should not depend on their fixed ports.
 
 Dependencies point from adapters toward reusable cores. In particular, forbid `syntax -> analysis/runtime/lsp`, `hir -> lsp/browser-cdp`, `analysis -> lsp/CDP/VS Code`, `editor -> LSP types`, `browser -> browser-cdp`, and `runtime -> CLI formatting`. `app` is the composition root and may depend on all native components.
 
@@ -89,17 +89,17 @@ Both `webtest lsp` and `webtest dap` own stdout for framed protocol messages. Al
 - `cargo test --workspace`: run unit, Chrome integration, and doc tests.
 - `cargo fmt --all -- --check`: verify Rust formatting.
 - `cargo clippy --workspace --all-targets -- -D warnings`: require a warning-free workspace.
-- `target/debug/webtest check examples/minimal/passing.webtest`: run static checks.
-- `target/debug/webtest fmt examples/minimal/passing.webtest`: rewrite with the shared formatter.
-- `target/debug/webtest test examples/minimal/passing.webtest`: execute in headless Chrome.
-- `target/debug/webtest test --headed examples/minimal/passing.webtest`: execute with visible Chrome.
+- `target/debug/webtest check examples/plain-html/sign-in.webtest`: run static checks.
+- `target/debug/webtest fmt examples/plain-html/sign-in.webtest`: rewrite with the shared formatter.
+- `target/debug/webtest test examples/plain-html/sign-in.webtest`: execute in headless Chrome.
+- `target/debug/webtest test --headed examples/plain-html/sign-in.webtest`: execute with visible Chrome.
 - `target/debug/webtest lsp`: run Tower LSP over stdio; do not type into this process manually.
 - `target/debug/webtest dap`: run headed DAP over stdio; normally launched by the extension.
 - `cd editors/vscode && npm install && npm run compile`: install and type-check extension glue.
 - `cd editors/vscode && npm run package`: produce the versioned VSIX; install with `cursor --install-extension <file>.vsix --force`.
 - `cargo check -p webtest-wasm --target wasm32-unknown-unknown`: verify the portable target when that Rust target is installed.
 
-Set `WEBTEST_CHROME_PATH` or pass `--chrome-path` when discovery fails. For manual examples, serve `examples/index.html` on port 3000. Chrome tests must instead bind `127.0.0.1:0`, use the assigned port, and gracefully skip only when Chrome or loopback sockets are genuinely unavailable.
+Set `WEBTEST_CHROME_PATH` or pass `--chrome-path` when discovery fails. Manual example projects document their fixture commands and fixed ports in `examples/README.md`; Chrome tests must instead bind `127.0.0.1:0`, use the assigned port, and gracefully skip only when Chrome or loopback sockets are genuinely unavailable.
 
 ## Coding and Test Conventions
 

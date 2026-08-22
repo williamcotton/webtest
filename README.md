@@ -29,9 +29,9 @@ Build the native executable with Rust stable, then install the tested Chrome for
 cargo build
 target/debug/webtest browser install
 target/debug/webtest browser path
-target/debug/webtest check
-target/debug/webtest test
-target/debug/webtest build --emit plan.json
+target/debug/webtest check examples/plain-html
+target/debug/webtest test examples/plain-html
+target/debug/webtest build examples/plain-html --emit plan.json
 ```
 
 All file-oriented commands accept zero or more files/directories. With no paths, WebTest finds the nearest `webtest.toml` and deterministically discovers `.webtest` files under `project.test_roots`. Useful variants are:
@@ -98,19 +98,31 @@ Durations accept positive `ms`, `s`, or `m` values. Test roots, provider roots, 
 
 `webtest build --emit` writes a versioned plan only after successful static analysis. Emission refuses literal values in configured secret fields or schema-secret provider arguments; it never writes a redacted placeholder that would alter execution semantics.
 
-## Manual example
+## Examples
 
-Serve the fixture in one terminal:
+Each directory under `examples` is an independent WebTest project with its own configuration. For the plain HTML browser example, serve the fixture in one terminal:
 
 ```sh
 cd examples/plain-html
-python -m http.server 3000
+python3 -m http.server 3000 --bind 127.0.0.1
 ```
 
 Then run from the repository root:
 
 ```sh
 target/debug/webtest test examples/plain-html/sign-in.webtest --headed
+```
+
+The server-backed example uses only the Python standard library. Start its application in one terminal:
+
+```sh
+python3 examples/simple-server/server.py
+```
+
+Then run its typed server-to-browser workflow:
+
+```sh
+target/debug/webtest test examples/simple-server/created-user.webtest --headed
 ```
 
 ## VS Code / Cursor extension development

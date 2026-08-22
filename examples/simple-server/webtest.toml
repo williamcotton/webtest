@@ -1,14 +1,20 @@
 [project]
-name = "webtest"
-test_roots = ["examples/plain-html"]
-exclude = ["examples/plain-html/failure-cases.webtest", "target/**", "node_modules/**"]
+name = "simple-server"
+test_roots = ["."]
 
 [browser]
 headless = true
 channel = "managed"
-base_url = "http://127.0.0.1:3000"
+base_url = "http://127.0.0.1:3001"
 viewport = { width = 1440, height = 900 }
 test_id_attribute = "data-testid"
+
+[server]
+base_url = "http://127.0.0.1:3001"
+
+[server.http]
+follow_redirects = true
+max_response_bytes = 1048576
 
 [timeouts]
 browser_command = "10s"

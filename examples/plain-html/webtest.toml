@@ -1,0 +1,26 @@
+[project]
+name = "plain-html"
+test_roots = ["."]
+exclude = ["failure-cases.webtest"]
+
+[browser]
+headless = true
+channel = "managed"
+base_url = "http://127.0.0.1:3000"
+viewport = { width = 1440, height = 900 }
+test_id_attribute = "data-testid"
+
+[timeouts]
+browser_command = "10s"
+action = "5s"
+assertion = "5s"
+navigation = "30s"
+test = "60s"
+
+[artifacts]
+directory = ".webtest/artifacts"
+
+[evidence]
+screenshot = "on-failure"
+dom_snapshot = "on-failure"
+max_dom_bytes = 1048576
