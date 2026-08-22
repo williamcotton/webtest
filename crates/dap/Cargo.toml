@@ -14,6 +14,7 @@ webtest-analysis.workspace = true
 webtest-browser.workspace = true
 webtest-observation.workspace = true
 webtest-plan.workspace = true
+webtest-provider.workspace = true
 webtest-runtime.workspace = true
 webtest-text.workspace = true
 

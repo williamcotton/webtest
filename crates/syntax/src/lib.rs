@@ -175,4 +175,55 @@ mod tests {
             1
         );
     }
+
+    #[test]
+    fn typed_workflow_language_is_lossless_and_precedence_is_structural() {
+        let source = r#"test "typed" {
+            server {
+                let response = http.post("/users", json: { email: "a@example.test" })
+                expect response.status >= 200 && response.status < 300
+                let user: { id: Int, email: String, admin?: Bool } = response.json
+            }
+            browser {
+                fill label("Email") with user.email
+                expect user.email contains "@"
+            }
+        }"#;
+        let parsed = parse(source);
+        assert!(parsed.errors().is_empty(), "{:?}", parsed.errors());
+        assert_eq!(parsed.syntax().text().to_string(), source);
+        assert!(
+            parsed
+                .syntax()
+                .descendants()
+                .any(|node| node.kind() == SyntaxKind::ServerBlock)
+        );
+        assert_eq!(
+            parsed
+                .syntax()
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::BinaryExpr)
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn half_typed_expression_preserves_the_enclosing_server_block() {
+        let source = "test \"x\" { server { let value = 1 + } browser { open \"/\" } }";
+        let parsed = parse(source);
+        assert!(!parsed.errors().is_empty());
+        assert_eq!(parsed.syntax().text().to_string(), source);
+        assert_eq!(
+            parsed
+                .syntax()
+                .descendants()
+                .filter(|node| matches!(
+                    node.kind(),
+                    SyntaxKind::ServerBlock | SyntaxKind::BrowserBlock
+                ))
+                .count(),
+            2
+        );
+    }
 }

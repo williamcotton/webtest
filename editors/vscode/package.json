@@ -145,6 +145,15 @@
           ],
           "function": [
             "support.function.locator.webtest"
+          ],
+          "variable": [
+            "variable.other.readwrite.webtest"
+          ],
+          "property": [
+            "variable.other.property.webtest"
+          ],
+          "type": [
+            "entity.name.type.webtest"
           ]
         }
       }

@@ -50,6 +50,48 @@ pub struct SyntaxOrigin {
     pub range: TextRange,
 }
 
+impl Serialize for SyntaxOrigin {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        #[derive(Serialize)]
+        struct SerializableOrigin {
+            file: FileId,
+            start: u32,
+            end: u32,
+        }
+        SerializableOrigin {
+            file: self.file,
+            start: self.range.start().into(),
+            end: self.range.end().into(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SyntaxOrigin {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct SerializableOrigin {
+            file: FileId,
+            start: u32,
+            end: u32,
+        }
+        let value = SerializableOrigin::deserialize(deserializer)?;
+        if value.start > value.end {
+            return Err(serde::de::Error::custom("source range start exceeds end"));
+        }
+        Ok(Self {
+            file: value.file,
+            range: TextRange::new(TextSize::from(value.start), TextSize::from(value.end)),
+        })
+    }
+}
+
 impl SyntaxOrigin {
     pub const fn new(file: FileId, range: TextRange) -> Self {
         Self { file, range }

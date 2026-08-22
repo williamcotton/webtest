@@ -1,12 +1,23 @@
-//! Incremental workspace and semantic query facade.
+//! Incremental workspace, static semantics, and deterministic plan construction.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    sync::Arc,
+};
 
 use thiserror::Error;
-use webtest_hir::HirFile;
-use webtest_plan::TestPlan;
+use webtest_hir::{
+    BinaryOperator, BindingId, HirBrowserOp, HirExpr, HirExprKind, HirFile, HirLiteral, HirNameRef,
+    HirStmt, HirType, HirTypeKind, StepId, UnaryOperator,
+};
+use webtest_plan::{
+    AssertionOperation, BrowserOperation, EvaluatePureOperation, PlanExpr, PlannedStep,
+    PlannedTest, ServerProviderCall, TestOperation, TestPlan, ValueMatcher, locator_from_hir,
+    locator_state_from_hir,
+};
+use webtest_provider::{Capability, OperationSchema, ProviderRegistry, RecordField, Type, Value};
 use webtest_syntax::Parse;
-use webtest_text::{FileId, SourceRevision, TextRange};
+use webtest_text::{FileId, SourceRevision, SyntaxOrigin, TextRange, TextSize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DiagnosticSeverity {
@@ -32,6 +43,13 @@ pub struct Diagnostic {
     pub source: DiagnosticSource,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TypeFact {
+    pub range: TextRange,
+    pub ty: Type,
+    pub capability: Capability,
+}
+
 #[derive(Debug, Error)]
 pub enum AnalysisError {
     #[error("unknown source file {0:?}")]
@@ -51,18 +69,38 @@ struct CachedQueries {
     parse: Parse,
     hir: Arc<HirFile>,
     diagnostics: Arc<Vec<Diagnostic>>,
+    type_facts: Arc<Vec<TypeFact>>,
     plan: Arc<TestPlan>,
 }
 
-#[derive(Default)]
 pub struct AnalysisDatabase {
     files: HashMap<FileId, SourceFile>,
     paths: HashMap<String, FileId>,
     cache: HashMap<FileId, CachedQueries>,
     next_file: u32,
+    providers: ProviderRegistry,
+}
+
+impl Default for AnalysisDatabase {
+    fn default() -> Self {
+        Self {
+            files: HashMap::new(),
+            paths: HashMap::new(),
+            cache: HashMap::new(),
+            next_file: 0,
+            providers: ProviderRegistry::built_in_schemas(),
+        }
+    }
 }
 
 impl AnalysisDatabase {
+    pub fn with_provider_registry(providers: ProviderRegistry) -> Self {
+        Self {
+            providers,
+            ..Self::default()
+        }
+    }
+
     pub fn open_file(&mut self, path: impl Into<String>, text: impl Into<String>) -> FileId {
         let path = path.into();
         if let Some(file) = self.paths.get(&path).copied() {
@@ -143,9 +181,34 @@ impl AnalysisDatabase {
         Ok(Arc::clone(&self.cache[&file].diagnostics))
     }
 
+    pub fn type_facts(&mut self, file: FileId) -> Result<Arc<Vec<TypeFact>>, AnalysisError> {
+        self.ensure_queries(file)?;
+        Ok(Arc::clone(&self.cache[&file].type_facts))
+    }
+
+    pub fn type_at(
+        &mut self,
+        file: FileId,
+        offset: TextSize,
+    ) -> Result<Option<TypeFact>, AnalysisError> {
+        Ok(self
+            .type_facts(file)?
+            .iter()
+            .filter(|fact| fact.range.contains(offset) || fact.range.end() == offset)
+            .min_by_key(|fact| fact.range.len())
+            .cloned())
+    }
+
     pub fn test_plan(&mut self, file: FileId) -> Result<Arc<TestPlan>, AnalysisError> {
         self.ensure_queries(file)?;
         Ok(Arc::clone(&self.cache[&file].plan))
+    }
+
+    pub fn provider_schema_hashes(&self) -> BTreeMap<String, String> {
+        self.providers
+            .schemas()
+            .map(|schema| (schema.name.0.clone(), schema.hash()))
+            .collect()
     }
 
     fn ensure_queries(&mut self, file: FileId) -> Result<(), AnalysisError> {
@@ -173,62 +236,1289 @@ impl AnalysisDatabase {
                 source: DiagnosticSource::Syntax,
             })
             .collect::<Vec<_>>();
-        diagnostics.extend(
-            parsed
-                .syntax()
-                .descendants_with_tokens()
-                .filter_map(|element| {
-                    let token = element.into_token()?;
-                    if token.kind() != webtest_syntax::SyntaxKind::Duration {
-                        return None;
-                    }
-                    let valid = token
-                        .text()
-                        .strip_suffix("ms")
-                        .or_else(|| token.text().strip_suffix('s'))
-                        .or_else(|| token.text().strip_suffix('m'))
-                        .and_then(|number| number.parse::<u64>().ok())
-                        .is_some_and(|number| number > 0);
-                    (!valid).then(|| Diagnostic {
-                        range: token.text_range(),
-                        severity: DiagnosticSeverity::Error,
-                        code: "semantic.invalid_duration",
-                        message: format!("invalid positive duration `{}`", token.text()),
-                        source: DiagnosticSource::Semantic,
-                    })
-                }),
-        );
+        diagnostics.extend(invalid_duration_diagnostics(&parsed));
         let hir = Arc::new(webtest_hir::lower(file, &parsed));
-        for test in &hir.tests {
-            for statement in &test.body {
-                let webtest_hir::HirStmt::Browser(block) = statement;
-                for operation in &block.operations {
-                    if let webtest_hir::HirBrowserOp::Press(action) = operation
-                        && !valid_key_chord(&action.value.value)
-                    {
-                        diagnostics.push(Diagnostic {
-                            range: action.value.origin.range,
-                            severity: DiagnosticSeverity::Error,
-                            code: "semantic.invalid_key",
-                            message: format!("invalid key chord `{}`", action.value.value),
-                            source: DiagnosticSource::Semantic,
-                        });
-                    }
-                }
-            }
-        }
-        let plan = Arc::new(webtest_plan::lower(file, source.revision, &hir));
+        let compiled =
+            Compiler::new(file, source.revision, &self.providers, diagnostics).compile(&hir);
         self.cache.insert(
             file,
             CachedQueries {
                 revision: source.revision,
                 parse: parsed,
                 hir,
-                diagnostics: Arc::new(diagnostics),
-                plan,
+                diagnostics: Arc::new(compiled.diagnostics),
+                type_facts: Arc::new(compiled.type_facts),
+                plan: Arc::new(compiled.plan),
             },
         );
         Ok(())
+    }
+}
+
+fn invalid_duration_diagnostics(parsed: &Parse) -> Vec<Diagnostic> {
+    parsed
+        .syntax()
+        .descendants_with_tokens()
+        .filter_map(|element| {
+            let token = element.into_token()?;
+            if token.kind() != webtest_syntax::SyntaxKind::Duration {
+                return None;
+            }
+            let valid = token
+                .text()
+                .strip_suffix("ms")
+                .or_else(|| token.text().strip_suffix('s'))
+                .or_else(|| token.text().strip_suffix('m'))
+                .and_then(|number| number.parse::<u64>().ok())
+                .is_some_and(|number| number > 0);
+            (!valid).then(|| Diagnostic {
+                range: token.text_range(),
+                severity: DiagnosticSeverity::Error,
+                code: "semantic.invalid_duration",
+                message: format!("invalid positive duration `{}`", token.text()),
+                source: DiagnosticSource::Semantic,
+            })
+        })
+        .collect()
+}
+
+struct CompileResult {
+    diagnostics: Vec<Diagnostic>,
+    type_facts: Vec<TypeFact>,
+    plan: TestPlan,
+}
+
+#[derive(Clone)]
+struct BindingState {
+    name: String,
+    ty: Type,
+    domain: Capability,
+    provider_operation: Option<String>,
+}
+
+struct TypedExpr {
+    expression: PlanExpr,
+    ty: Type,
+    capability: Capability,
+}
+
+struct CompiledProviderCall {
+    provider: String,
+    operation: String,
+    arguments: BTreeMap<String, PlanExpr>,
+    result_type: Type,
+    schema_hash: String,
+    redacted_arguments: Vec<String>,
+}
+
+struct Compiler<'a> {
+    file: FileId,
+    revision: SourceRevision,
+    providers: &'a ProviderRegistry,
+    diagnostics: Vec<Diagnostic>,
+    type_facts: Vec<TypeFact>,
+    bindings: HashMap<BindingId, BindingState>,
+    names: HashMap<String, SyntaxOrigin>,
+    declared_names: HashSet<String>,
+    required: BTreeSet<Capability>,
+    next_step: u32,
+}
+
+impl<'a> Compiler<'a> {
+    fn new(
+        file: FileId,
+        revision: SourceRevision,
+        providers: &'a ProviderRegistry,
+        diagnostics: Vec<Diagnostic>,
+    ) -> Self {
+        Self {
+            file,
+            revision,
+            providers,
+            diagnostics,
+            type_facts: Vec::new(),
+            bindings: HashMap::new(),
+            names: HashMap::new(),
+            declared_names: HashSet::new(),
+            required: BTreeSet::new(),
+            next_step: 0,
+        }
+    }
+
+    fn compile(mut self, hir: &HirFile) -> CompileResult {
+        let tests = hir
+            .tests
+            .iter()
+            .map(|test| {
+                self.bindings.clear();
+                self.names.clear();
+                self.declared_names.clear();
+                for statement in &test.body {
+                    collect_binding_names(statement, &mut self.declared_names);
+                }
+                let mut steps = Vec::new();
+                for statement in &test.body {
+                    self.compile_statement(statement, Capability::Pure, &mut steps);
+                }
+                PlannedTest {
+                    id: test.id,
+                    name: test.name.clone(),
+                    steps,
+                    origin: test.origin,
+                }
+            })
+            .collect();
+        CompileResult {
+            diagnostics: self.diagnostics,
+            type_facts: self.type_facts,
+            plan: TestPlan {
+                file: self.file,
+                source_revision: self.revision,
+                required_host_capabilities: self.required.into_iter().collect(),
+                tests,
+            },
+        }
+    }
+
+    fn compile_statement(
+        &mut self,
+        statement: &HirStmt,
+        domain: Capability,
+        steps: &mut Vec<PlannedStep>,
+    ) {
+        match statement {
+            HirStmt::Server(block) => {
+                for statement in &block.statements {
+                    self.compile_statement(statement, Capability::Server, steps);
+                }
+            }
+            HirStmt::Browser(block) => {
+                for statement in &block.statements {
+                    self.compile_statement(statement, Capability::Browser, steps);
+                }
+            }
+            HirStmt::Let(binding) => self.compile_let(binding, domain, steps),
+            HirStmt::Expression(statement) => {
+                if let Some(call) = self.provider_call(&statement.expression, domain) {
+                    self.push_step(
+                        steps,
+                        statement.expression.origin,
+                        TestOperation::ServerProviderCall(ServerProviderCall {
+                            provider: call.provider,
+                            operation: call.operation,
+                            arguments: call.arguments,
+                            result_binding: None,
+                            result_name: None,
+                            result_type: call.result_type,
+                            schema_hash: call.schema_hash,
+                            timeout: None,
+                            redacted_arguments: call.redacted_arguments,
+                        }),
+                    );
+                } else {
+                    let value = self.infer_expr(&statement.expression, domain, None);
+                    self.push_step(
+                        steps,
+                        statement.expression.origin,
+                        TestOperation::EvaluatePure(EvaluatePureOperation {
+                            expression: value.expression,
+                            result_binding: None,
+                            result_name: None,
+                            result_type: value.ty,
+                        }),
+                    );
+                }
+            }
+            HirStmt::Expect(expectation) => {
+                self.compile_expectation(&expectation.expression, domain, steps)
+            }
+            HirStmt::BrowserOperation(operation) => {
+                self.compile_browser_operation(operation, domain, steps)
+            }
+        }
+    }
+
+    fn compile_let(
+        &mut self,
+        binding: &webtest_hir::HirLet,
+        domain: Capability,
+        steps: &mut Vec<PlannedStep>,
+    ) {
+        if let Some(previous) = self.names.get(&binding.name) {
+            self.error(
+                binding.name_origin.range,
+                "semantic.duplicate_binding",
+                format!(
+                    "binding `{}` is already declared at byte {}",
+                    binding.name,
+                    u32::from(previous.range.start())
+                ),
+            );
+        } else {
+            self.names.insert(binding.name.clone(), binding.name_origin);
+        }
+
+        if let Some(call) = self.provider_call(&binding.value, domain) {
+            let mut result_type = call.result_type.clone();
+            if let Some(annotation) = &binding.annotation {
+                let expected = self.lower_type(annotation);
+                if !expected.accepts(&result_type) {
+                    self.type_mismatch(binding.value.origin.range, &expected, &result_type);
+                }
+                result_type = expected;
+            }
+            self.bindings.insert(
+                binding.id,
+                BindingState {
+                    name: binding.name.clone(),
+                    ty: result_type.clone(),
+                    domain,
+                    provider_operation: Some(format!("{}.{}", call.provider, call.operation)),
+                },
+            );
+            self.type_fact(binding.name_origin.range, result_type.clone(), domain);
+            self.push_step(
+                steps,
+                binding.value.origin,
+                TestOperation::ServerProviderCall(ServerProviderCall {
+                    provider: call.provider,
+                    operation: call.operation,
+                    arguments: call.arguments,
+                    result_binding: Some(binding.id),
+                    result_name: Some(binding.name.clone()),
+                    result_type,
+                    schema_hash: call.schema_hash,
+                    timeout: None,
+                    redacted_arguments: call.redacted_arguments,
+                }),
+            );
+            return;
+        }
+
+        let annotation = binding
+            .annotation
+            .as_ref()
+            .map(|annotation| self.lower_type(annotation));
+        let mut value = self.infer_expr(&binding.value, domain, annotation.as_ref());
+        if let Some(expected) = annotation {
+            if value.ty == Type::Json && decodable_type(&expected) {
+                let response_operation = self.response_operation(&binding.value);
+                value.expression = PlanExpr::Decode {
+                    value: Box::new(value.expression),
+                    target: expected.clone(),
+                    response_operation,
+                };
+                value.ty = expected;
+            } else if !expected.accepts(&value.ty) {
+                self.type_mismatch(binding.value.origin.range, &expected, &value.ty);
+                value.ty = expected;
+            } else {
+                value.ty = expected;
+            }
+        }
+        self.bindings.insert(
+            binding.id,
+            BindingState {
+                name: binding.name.clone(),
+                ty: value.ty.clone(),
+                domain,
+                provider_operation: None,
+            },
+        );
+        self.type_fact(
+            binding.name_origin.range,
+            value.ty.clone(),
+            value.capability,
+        );
+        self.push_step(
+            steps,
+            binding.value.origin,
+            TestOperation::EvaluatePure(EvaluatePureOperation {
+                expression: value.expression,
+                result_binding: Some(binding.id),
+                result_name: Some(binding.name.clone()),
+                result_type: value.ty,
+            }),
+        );
+    }
+
+    fn compile_expectation(
+        &mut self,
+        expression: &HirExpr,
+        domain: Capability,
+        steps: &mut Vec<PlannedStep>,
+    ) {
+        let (matcher, actual, expected, value_type) = if let HirExprKind::Binary {
+            operator,
+            left,
+            right,
+        } = &expression.kind
+        {
+            if *operator == BinaryOperator::Matches {
+                let actual = self.infer_expr(left, domain, None);
+                let pattern = self.pattern_type(right);
+                if actual.ty != Type::Json && !matches!(actual.ty, Type::Record(_)) {
+                    self.error(
+                        left.origin.range,
+                        "semantic.invalid_matcher",
+                        format!("`matches` requires Json or a record, got {}", actual.ty),
+                    );
+                }
+                (
+                    ValueMatcher::Matches,
+                    actual.expression,
+                    Some(PlanExpr::Type(pattern.clone())),
+                    pattern,
+                )
+            } else {
+                let left = self.infer_expr(left, domain, None);
+                let right = self.infer_expr(right, domain, Some(&left.ty));
+                self.validate_binary(*operator, &left.ty, &right.ty, expression.origin.range);
+                (
+                    matcher_for(*operator).unwrap_or(ValueMatcher::Truthy),
+                    left.expression,
+                    Some(right.expression),
+                    left.ty,
+                )
+            }
+        } else {
+            let value = self.infer_expr(expression, domain, Some(&Type::Bool));
+            if value.ty != Type::Bool && value.ty != Type::Unknown {
+                self.type_mismatch(expression.origin.range, &Type::Bool, &value.ty);
+            }
+            (ValueMatcher::Truthy, value.expression, None, Type::Bool)
+        };
+        self.required.insert(Capability::Test);
+        self.push_step(
+            steps,
+            expression.origin,
+            TestOperation::Assertion(AssertionOperation::Value {
+                matcher,
+                actual,
+                expected,
+                value_type,
+            }),
+        );
+    }
+
+    fn response_operation(&self, expression: &HirExpr) -> Option<String> {
+        let HirExprKind::Member {
+            receiver, member, ..
+        } = &expression.kind
+        else {
+            return None;
+        };
+        if member != "json" {
+            return None;
+        }
+        let HirExprKind::Name(HirNameRef::Binding { id, .. }) = receiver.kind else {
+            return None;
+        };
+        self.bindings
+            .get(&id)
+            .and_then(|binding| binding.provider_operation.clone())
+    }
+
+    fn compile_browser_operation(
+        &mut self,
+        operation: &HirBrowserOp,
+        domain: Capability,
+        steps: &mut Vec<PlannedStep>,
+    ) {
+        if domain != Capability::Browser {
+            self.error(
+                browser_origin(operation).range,
+                "semantic.capability_mismatch",
+                format!("Browser operation is not allowed in {domain} context"),
+            );
+        }
+        self.required.insert(Capability::Browser);
+        let (operation, origin, assertion) = match operation {
+            HirBrowserOp::Open(open) => {
+                let url = self.infer_expr(&open.url, domain, Some(&Type::String));
+                self.expect_type(open.url.origin.range, &Type::String, &url.ty);
+                (
+                    BrowserOperation::Navigate {
+                        url: url.expression,
+                    },
+                    open.url.origin,
+                    None,
+                )
+            }
+            HirBrowserOp::Evaluate(evaluate) => (
+                BrowserOperation::Evaluate {
+                    expression: evaluate.expression.value.clone(),
+                },
+                evaluate.expression.origin,
+                None,
+            ),
+            HirBrowserOp::Click(action) => (
+                BrowserOperation::Click {
+                    locator: locator_from_hir(&action.locator.kind),
+                },
+                action.locator.origin,
+                None,
+            ),
+            HirBrowserOp::Fill(action) => {
+                let value = self.browser_string_value(action, domain);
+                (
+                    BrowserOperation::Fill {
+                        locator: locator_from_hir(&action.locator.kind),
+                        value,
+                    },
+                    action.locator.origin,
+                    None,
+                )
+            }
+            HirBrowserOp::Type(action) => {
+                let value = self.browser_string_value(action, domain);
+                (
+                    BrowserOperation::Type {
+                        locator: locator_from_hir(&action.locator.kind),
+                        value,
+                    },
+                    action.locator.origin,
+                    None,
+                )
+            }
+            HirBrowserOp::Press(action) => {
+                let value = self.browser_string_value(action, domain);
+                if let HirExprKind::Literal(HirLiteral::String(key)) = &action.value.kind
+                    && !valid_key_chord(key)
+                {
+                    self.error(
+                        action.value.origin.range,
+                        "semantic.invalid_key",
+                        format!("invalid key chord `{key}`"),
+                    );
+                }
+                (
+                    BrowserOperation::Press {
+                        locator: locator_from_hir(&action.locator.kind),
+                        key: value,
+                    },
+                    action.locator.origin,
+                    None,
+                )
+            }
+            HirBrowserOp::Check(action) | HirBrowserOp::Uncheck(action) => (
+                BrowserOperation::Check {
+                    locator: locator_from_hir(&action.locator.kind),
+                    checked: matches!(operation, HirBrowserOp::Check(_)),
+                },
+                action.locator.origin,
+                None,
+            ),
+            HirBrowserOp::Select(action) => {
+                let value = self.browser_string_value(action, domain);
+                (
+                    BrowserOperation::Select {
+                        locator: locator_from_hir(&action.locator.kind),
+                        option: value,
+                    },
+                    action.locator.origin,
+                    None,
+                )
+            }
+            HirBrowserOp::Hover(action) => (
+                BrowserOperation::Hover {
+                    locator: locator_from_hir(&action.locator.kind),
+                },
+                action.locator.origin,
+                None,
+            ),
+            HirBrowserOp::WaitLocator(wait) => (
+                BrowserOperation::WaitForLocator {
+                    locator: locator_from_hir(&wait.locator.kind),
+                    state: locator_state_from_hir(wait.state),
+                    timeout: wait.timeout,
+                },
+                wait.locator.origin,
+                None,
+            ),
+            HirBrowserOp::WaitUrl(wait) => (
+                BrowserOperation::WaitForUrl {
+                    url: PlanExpr::Literal(Value::String(wait.url.value.clone())),
+                    timeout: wait.timeout,
+                },
+                wait.url.origin,
+                None,
+            ),
+            HirBrowserOp::ExpectLocator(expectation) => {
+                let assertion = AssertionOperation::Locator {
+                    locator: locator_from_hir(&expectation.locator.kind),
+                    state: locator_state_from_hir(expectation.state),
+                    timeout: expectation.timeout,
+                };
+                (
+                    BrowserOperation::Hover {
+                        locator: locator_from_hir(&expectation.locator.kind),
+                    },
+                    expectation.locator.origin,
+                    Some(assertion),
+                )
+            }
+            HirBrowserOp::ExpectUrl(expectation) => {
+                let assertion = AssertionOperation::Url {
+                    url: PlanExpr::Literal(Value::String(expectation.url.value.clone())),
+                    timeout: expectation.timeout,
+                };
+                (
+                    BrowserOperation::WaitForUrl {
+                        url: PlanExpr::Literal(Value::String(expectation.url.value.clone())),
+                        timeout: expectation.timeout,
+                    },
+                    expectation.url.origin,
+                    Some(assertion),
+                )
+            }
+        };
+        self.push_step(
+            steps,
+            origin,
+            assertion.map_or(TestOperation::Browser(operation), TestOperation::Assertion),
+        );
+    }
+
+    fn browser_string_value(
+        &mut self,
+        action: &webtest_hir::HirValueAction,
+        domain: Capability,
+    ) -> PlanExpr {
+        let value = self.infer_expr(&action.value, domain, Some(&Type::String));
+        self.expect_type(action.value.origin.range, &Type::String, &value.ty);
+        value.expression
+    }
+
+    fn provider_call(
+        &mut self,
+        expression: &HirExpr,
+        domain: Capability,
+    ) -> Option<CompiledProviderCall> {
+        let HirExprKind::Call { callee, arguments } = &expression.kind else {
+            return None;
+        };
+        let HirExprKind::Member {
+            receiver,
+            member: operation,
+            ..
+        } = &callee.kind
+        else {
+            return None;
+        };
+        let HirExprKind::Name(HirNameRef::Unresolved(provider)) = &receiver.kind else {
+            return None;
+        };
+        let Some(schema) = self.providers.schema(provider) else {
+            if provider == "app" {
+                self.error(
+                    receiver.origin.range,
+                    "semantic.reserved_provider",
+                    "`app` is reserved for the application bridge".into(),
+                );
+            } else {
+                self.error(
+                    receiver.origin.range,
+                    "semantic.unknown_provider",
+                    format!("unknown provider `{provider}`"),
+                );
+            }
+            return Some(CompiledProviderCall {
+                provider: provider.clone(),
+                operation: operation.clone(),
+                arguments: BTreeMap::new(),
+                result_type: Type::Unknown,
+                schema_hash: String::new(),
+                redacted_arguments: Vec::new(),
+            });
+        };
+        let Some(operation_schema) = schema.operation(operation) else {
+            self.error(
+                callee.origin.range,
+                "semantic.unknown_provider_operation",
+                format!("provider `{provider}` has no operation `{operation}`"),
+            );
+            return Some(CompiledProviderCall {
+                provider: provider.clone(),
+                operation: operation.clone(),
+                arguments: BTreeMap::new(),
+                result_type: Type::Unknown,
+                schema_hash: schema.hash(),
+                redacted_arguments: Vec::new(),
+            });
+        };
+        if domain != operation_schema.capability {
+            self.error(
+                expression.origin.range,
+                "semantic.capability_mismatch",
+                format!(
+                    "{}.{} requires {} capability but is used in {domain} context",
+                    provider, operation, operation_schema.capability
+                ),
+            );
+        }
+        self.required.insert(operation_schema.capability);
+        let values =
+            self.provider_arguments(operation_schema, arguments, domain, expression.origin.range);
+        Some(CompiledProviderCall {
+            provider: provider.clone(),
+            operation: operation.clone(),
+            arguments: values,
+            result_type: operation_schema.result.clone(),
+            schema_hash: schema.hash(),
+            redacted_arguments: operation_schema
+                .parameters
+                .iter()
+                .filter(|parameter| parameter.secret)
+                .map(|parameter| parameter.name.clone())
+                .collect(),
+        })
+    }
+
+    fn provider_arguments(
+        &mut self,
+        schema: &OperationSchema,
+        arguments: &[webtest_hir::HirCallArgument],
+        domain: Capability,
+        call_range: TextRange,
+    ) -> BTreeMap<String, PlanExpr> {
+        let mut values = BTreeMap::new();
+        let positional: Vec<_> = schema
+            .parameters
+            .iter()
+            .filter(|parameter| parameter.positional)
+            .collect();
+        let mut next_positional = 0;
+        let mut body_argument = None;
+        for argument in arguments {
+            let parameter = if let Some(name) = &argument.name {
+                schema
+                    .parameters
+                    .iter()
+                    .find(|parameter| &parameter.name == name)
+            } else {
+                let parameter = positional.get(next_positional).copied();
+                next_positional += 1;
+                parameter
+            };
+            let Some(parameter) = parameter else {
+                self.error(
+                    argument.origin.range,
+                    "semantic.unknown_argument",
+                    argument.name.as_ref().map_or_else(
+                        || "too many positional arguments".into(),
+                        |name| format!("unknown argument `{name}`"),
+                    ),
+                );
+                continue;
+            };
+            if values.contains_key(&parameter.name) {
+                self.error(
+                    argument.origin.range,
+                    "semantic.duplicate_argument",
+                    format!("argument `{}` is provided more than once", parameter.name),
+                );
+                continue;
+            }
+            if matches!(parameter.name.as_str(), "json" | "text" | "bytes" | "form") {
+                if let Some(previous) = &body_argument {
+                    self.error(
+                        argument.origin.range,
+                        "semantic.conflicting_arguments",
+                        format!(
+                            "HTTP body arguments `{previous}` and `{}` cannot be combined",
+                            parameter.name
+                        ),
+                    );
+                } else {
+                    body_argument = Some(parameter.name.clone());
+                }
+            }
+            let value = self.infer_expr(&argument.value, domain, Some(&parameter.ty));
+            self.expect_type(argument.value.origin.range, &parameter.ty, &value.ty);
+            values.insert(parameter.name.clone(), value.expression);
+        }
+        for parameter in schema
+            .parameters
+            .iter()
+            .filter(|parameter| parameter.required)
+        {
+            if !values.contains_key(&parameter.name) {
+                self.error(
+                    call_range,
+                    "semantic.missing_argument",
+                    format!("missing required argument `{}`", parameter.name),
+                );
+            }
+        }
+        values
+    }
+
+    fn infer_expr(
+        &mut self,
+        expression: &HirExpr,
+        domain: Capability,
+        expected: Option<&Type>,
+    ) -> TypedExpr {
+        let result = match &expression.kind {
+            HirExprKind::Literal(literal) => match literal {
+                HirLiteral::String(value) => typed(Value::String(value.clone()), Type::String),
+                HirLiteral::Int(value) => typed(Value::Int(*value), Type::Int),
+                HirLiteral::Float(value) => typed(Value::Float(*value), Type::Float),
+                HirLiteral::Bool(value) => typed(Value::Bool(*value), Type::Bool),
+                HirLiteral::Null => typed(Value::Null, Type::Null),
+                HirLiteral::Duration(value) => typed(
+                    Value::DurationMillis(value.as_millis().min(u128::from(u64::MAX)) as u64),
+                    Type::Duration,
+                ),
+            },
+            HirExprKind::Name(HirNameRef::Binding { id, name }) => {
+                if let Some(binding) = self.bindings.get(id).cloned() {
+                    if domain == Capability::Browser
+                        && binding.domain == Capability::Server
+                        && !binding.ty.is_transferable()
+                    {
+                        self.error(
+                            expression.origin.range,
+                            "semantic.non_transferable_value",
+                            format!(
+                                "binding `{}` has non-transferable type {} and cannot cross from Server to Browser",
+                                binding.name, binding.ty
+                            ),
+                        );
+                    }
+                    TypedExpr {
+                        expression: PlanExpr::Binding(*id),
+                        ty: binding.ty,
+                        capability: Capability::Pure,
+                    }
+                } else {
+                    self.error(
+                        expression.origin.range,
+                        "semantic.use_before_definition",
+                        format!("binding `{name}` is used before its value is available"),
+                    );
+                    unknown_expr()
+                }
+            }
+            HirExprKind::Name(HirNameRef::Unresolved(name)) => {
+                if self.declared_names.contains(name) {
+                    self.error(
+                        expression.origin.range,
+                        "semantic.use_before_definition",
+                        format!("binding `{name}` is used before its declaration"),
+                    );
+                } else {
+                    self.error(
+                        expression.origin.range,
+                        "semantic.unknown_name",
+                        format!("unknown name `{name}`"),
+                    );
+                }
+                unknown_expr()
+            }
+            HirExprKind::List(items) => {
+                let item_expected = match expected {
+                    Some(Type::List(inner)) => Some(inner.as_ref()),
+                    _ => None,
+                };
+                if items.is_empty() && item_expected.is_none() {
+                    self.error(
+                        expression.origin.range,
+                        "semantic.empty_list_needs_type",
+                        "empty list requires a contextual type".into(),
+                    );
+                }
+                let compiled: Vec<_> = items
+                    .iter()
+                    .map(|item| self.infer_expr(item, domain, item_expected))
+                    .collect();
+                let item_type = item_expected
+                    .cloned()
+                    .or_else(|| compiled.first().map(|it| it.ty.clone()))
+                    .unwrap_or(Type::Unknown);
+                for item in &compiled {
+                    self.expect_type(expression.origin.range, &item_type, &item.ty);
+                }
+                TypedExpr {
+                    expression: PlanExpr::List(
+                        compiled.into_iter().map(|item| item.expression).collect(),
+                    ),
+                    ty: Type::List(Box::new(item_type)),
+                    capability: Capability::Pure,
+                }
+            }
+            HirExprKind::Record(fields) => {
+                let mut values = BTreeMap::new();
+                let mut types = BTreeMap::new();
+                for field in fields {
+                    let expected_field = match expected {
+                        Some(Type::Record(fields)) => fields.get(&field.name).map(|it| &it.ty),
+                        _ => None,
+                    };
+                    if values.contains_key(&field.name) {
+                        self.error(
+                            field.origin.range,
+                            "semantic.duplicate_record_field",
+                            format!("record field `{}` is provided more than once", field.name),
+                        );
+                    }
+                    let value = self.infer_expr(&field.value, domain, expected_field);
+                    values.insert(field.name.clone(), value.expression);
+                    types.insert(
+                        field.name.clone(),
+                        RecordField {
+                            ty: value.ty,
+                            optional: false,
+                        },
+                    );
+                }
+                TypedExpr {
+                    expression: PlanExpr::Record(values),
+                    ty: Type::Record(types),
+                    capability: Capability::Pure,
+                }
+            }
+            HirExprKind::Member {
+                receiver,
+                member,
+                member_origin,
+            } => {
+                let receiver = self.infer_expr(receiver, domain, None);
+                if let Some(ty) = receiver.ty.member(member) {
+                    TypedExpr {
+                        expression: PlanExpr::Member {
+                            receiver: Box::new(receiver.expression),
+                            member: member.clone(),
+                        },
+                        ty,
+                        capability: receiver.capability,
+                    }
+                } else {
+                    if receiver.ty != Type::Unknown {
+                        self.error(
+                            member_origin.range,
+                            "semantic.unknown_member",
+                            format!("type {} has no member `{member}`", receiver.ty),
+                        );
+                    }
+                    unknown_expr()
+                }
+            }
+            HirExprKind::Call { .. } => {
+                if let Some(call) = self.provider_call(expression, domain) {
+                    self.error(
+                        expression.origin.range,
+                        "semantic.effectful_expression",
+                        format!(
+                            "provider call `{}.{}` must be the direct value of a binding or a statement",
+                            call.provider, call.operation
+                        ),
+                    );
+                    TypedExpr {
+                        expression: PlanExpr::Literal(Value::Null),
+                        ty: call.result_type,
+                        capability: Capability::Server,
+                    }
+                } else {
+                    self.error(
+                        expression.origin.range,
+                        "semantic.unknown_function",
+                        "bare function calls do not resolve to providers".into(),
+                    );
+                    unknown_expr()
+                }
+            }
+            HirExprKind::Unary { operator, operand } => {
+                let operand = self.infer_expr(operand, domain, None);
+                let ty = match operator {
+                    UnaryOperator::Not if operand.ty == Type::Bool => Type::Bool,
+                    UnaryOperator::Negate if numeric(&operand.ty) => operand.ty.clone(),
+                    UnaryOperator::Not => {
+                        self.type_mismatch(expression.origin.range, &Type::Bool, &operand.ty);
+                        Type::Unknown
+                    }
+                    UnaryOperator::Negate => {
+                        self.error(
+                            expression.origin.range,
+                            "semantic.invalid_unary_operand",
+                            format!("numeric negation does not accept {}", operand.ty),
+                        );
+                        Type::Unknown
+                    }
+                };
+                TypedExpr {
+                    expression: PlanExpr::Unary {
+                        operator: *operator,
+                        operand: Box::new(operand.expression),
+                    },
+                    ty,
+                    capability: operand.capability,
+                }
+            }
+            HirExprKind::Binary {
+                operator,
+                left,
+                right,
+            } => {
+                let left = self.infer_expr(left, domain, None);
+                let right = self.infer_expr(right, domain, Some(&left.ty));
+                let ty =
+                    self.validate_binary(*operator, &left.ty, &right.ty, expression.origin.range);
+                TypedExpr {
+                    expression: PlanExpr::Binary {
+                        operator: *operator,
+                        left: Box::new(left.expression),
+                        right: Box::new(right.expression),
+                    },
+                    ty,
+                    capability: Capability::Pure,
+                }
+            }
+            HirExprKind::Missing => unknown_expr(),
+        };
+        self.type_fact(
+            expression.origin.range,
+            result.ty.clone(),
+            result.capability,
+        );
+        result
+    }
+
+    fn validate_binary(
+        &mut self,
+        operator: BinaryOperator,
+        left: &Type,
+        right: &Type,
+        range: TextRange,
+    ) -> Type {
+        if matches!(left, Type::Unknown) || matches!(right, Type::Unknown) {
+            return Type::Unknown;
+        }
+        match operator {
+            BinaryOperator::Equal | BinaryOperator::NotEqual => {
+                if !left.accepts(right) && !right.accepts(left) {
+                    self.error(
+                        range,
+                        "semantic.incompatible_equality",
+                        format!("cannot compare {left} with {right}"),
+                    );
+                }
+                Type::Bool
+            }
+            BinaryOperator::Less
+            | BinaryOperator::LessEqual
+            | BinaryOperator::Greater
+            | BinaryOperator::GreaterEqual => {
+                if !(numeric(left) && numeric(right)
+                    || left == &Type::String && right == &Type::String)
+                {
+                    self.error(
+                        range,
+                        "semantic.invalid_comparison",
+                        format!("ordered comparison does not accept {left} and {right}"),
+                    );
+                }
+                Type::Bool
+            }
+            BinaryOperator::Add => {
+                if left == &Type::String && right == &Type::String {
+                    Type::String
+                } else if numeric(left) && numeric(right) {
+                    numeric_result(left, right)
+                } else {
+                    self.error(
+                        range,
+                        "semantic.invalid_binary_operands",
+                        format!("addition does not accept {left} and {right}"),
+                    );
+                    Type::Unknown
+                }
+            }
+            BinaryOperator::Subtract | BinaryOperator::Multiply | BinaryOperator::Divide => {
+                if numeric(left) && numeric(right) {
+                    numeric_result(left, right)
+                } else {
+                    self.error(
+                        range,
+                        "semantic.invalid_binary_operands",
+                        format!("numeric operator does not accept {left} and {right}"),
+                    );
+                    Type::Unknown
+                }
+            }
+            BinaryOperator::And | BinaryOperator::Or => {
+                if left != &Type::Bool || right != &Type::Bool {
+                    self.error(
+                        range,
+                        "semantic.invalid_boolean_operands",
+                        format!("boolean operator requires Bool operands, got {left} and {right}"),
+                    );
+                }
+                Type::Bool
+            }
+            BinaryOperator::Contains => {
+                let valid = (left == &Type::String && right == &Type::String)
+                    || matches!(left, Type::List(inner) if inner.accepts(right));
+                if !valid {
+                    self.error(
+                        range,
+                        "semantic.invalid_matcher",
+                        format!("`contains` does not accept {left} and {right}"),
+                    );
+                }
+                Type::Bool
+            }
+            BinaryOperator::Matches => Type::Bool,
+        }
+    }
+
+    fn pattern_type(&mut self, expression: &HirExpr) -> Type {
+        match &expression.kind {
+            HirExprKind::Name(HirNameRef::Unresolved(name)) => {
+                named_type(name).unwrap_or_else(|| {
+                    self.error(
+                        expression.origin.range,
+                        "semantic.unknown_type",
+                        format!("unknown type `{name}` in match pattern"),
+                    );
+                    Type::Unknown
+                })
+            }
+            HirExprKind::Record(fields) => Type::Record(
+                fields
+                    .iter()
+                    .map(|field| {
+                        (
+                            field.name.clone(),
+                            RecordField {
+                                ty: self.pattern_type(&field.value),
+                                optional: false,
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
+            HirExprKind::List(items) if items.len() == 1 => {
+                Type::List(Box::new(self.pattern_type(&items[0])))
+            }
+            _ => {
+                self.error(
+                    expression.origin.range,
+                    "semantic.invalid_type_pattern",
+                    "expected a type name, record shape, or one-element list shape".into(),
+                );
+                Type::Unknown
+            }
+        }
+    }
+
+    fn lower_type(&mut self, ty: &HirType) -> Type {
+        match &ty.kind {
+            HirTypeKind::Named(name) => named_type(name).unwrap_or_else(|| {
+                self.error(
+                    ty.origin.range,
+                    "semantic.unknown_type",
+                    format!("unknown type `{name}`"),
+                );
+                Type::Unknown
+            }),
+            HirTypeKind::Generic { name, argument } => {
+                let argument = self.lower_type(argument);
+                match name.as_str() {
+                    "List" => Type::List(Box::new(argument)),
+                    "Option" => Type::Option(Box::new(argument)),
+                    "Response" => Type::Response(Box::new(argument)),
+                    _ => {
+                        self.error(
+                            ty.origin.range,
+                            "semantic.unknown_type",
+                            format!("unknown generic type `{name}`"),
+                        );
+                        Type::Unknown
+                    }
+                }
+            }
+            HirTypeKind::Record(fields) => Type::Record(
+                fields
+                    .iter()
+                    .map(|field| {
+                        (
+                            field.name.clone(),
+                            RecordField {
+                                ty: self.lower_type(&field.ty),
+                                optional: field.optional,
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
+            HirTypeKind::Missing => Type::Unknown,
+        }
+    }
+
+    fn push_step(
+        &mut self,
+        steps: &mut Vec<PlannedStep>,
+        origin: SyntaxOrigin,
+        operation: TestOperation,
+    ) {
+        steps.push(PlannedStep {
+            id: StepId(self.next_step),
+            operation,
+            origin,
+        });
+        self.next_step += 1;
+    }
+
+    fn expect_type(&mut self, range: TextRange, expected: &Type, actual: &Type) {
+        if !expected.accepts(actual) {
+            self.type_mismatch(range, expected, actual);
+        }
+    }
+
+    fn type_mismatch(&mut self, range: TextRange, expected: &Type, actual: &Type) {
+        if expected != &Type::Unknown && actual != &Type::Unknown {
+            self.error(
+                range,
+                "semantic.type_mismatch",
+                format!("expected {expected}, got {actual}"),
+            );
+        }
+    }
+
+    fn type_fact(&mut self, range: TextRange, ty: Type, capability: Capability) {
+        self.type_facts.push(TypeFact {
+            range,
+            ty,
+            capability,
+        });
+    }
+
+    fn error(&mut self, range: TextRange, code: &'static str, message: String) {
+        self.diagnostics.push(Diagnostic {
+            range,
+            severity: DiagnosticSeverity::Error,
+            code,
+            message,
+            source: DiagnosticSource::Semantic,
+        });
+    }
+}
+
+fn collect_binding_names(statement: &HirStmt, names: &mut HashSet<String>) {
+    match statement {
+        HirStmt::Server(block) => {
+            for statement in &block.statements {
+                collect_binding_names(statement, names);
+            }
+        }
+        HirStmt::Browser(block) => {
+            for statement in &block.statements {
+                collect_binding_names(statement, names);
+            }
+        }
+        HirStmt::Let(binding) => {
+            names.insert(binding.name.clone());
+        }
+        HirStmt::Expression(_) | HirStmt::Expect(_) | HirStmt::BrowserOperation(_) => {}
+    }
+}
+
+fn typed(value: Value, ty: Type) -> TypedExpr {
+    TypedExpr {
+        expression: PlanExpr::Literal(value),
+        ty,
+        capability: Capability::Pure,
+    }
+}
+
+fn unknown_expr() -> TypedExpr {
+    typed(Value::Null, Type::Unknown)
+}
+
+fn named_type(name: &str) -> Option<Type> {
+    Some(match name {
+        "Null" => Type::Null,
+        "Bool" => Type::Bool,
+        "Int" => Type::Int,
+        "Float" => Type::Float,
+        "String" => Type::String,
+        "Duration" => Type::Duration,
+        "Url" => Type::Url,
+        "Json" => Type::Json,
+        "StatusCode" => Type::StatusCode,
+        "Headers" => Type::Headers,
+        "Bytes" => Type::Bytes,
+        "ProcessResult" => Type::ProcessResult,
+        "FilePath" => Type::FilePath,
+        "TempDirectory" => Type::TempDirectory,
+        "Locator" => Type::Locator,
+        "BrowserPage" => Type::BrowserPage,
+        _ => return None,
+    })
+}
+
+fn decodable_type(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Null
+            | Type::Bool
+            | Type::Int
+            | Type::Float
+            | Type::String
+            | Type::Json
+            | Type::List(_)
+            | Type::Option(_)
+            | Type::Record(_)
+    )
+}
+
+fn numeric(ty: &Type) -> bool {
+    matches!(ty, Type::Int | Type::Float | Type::StatusCode)
+}
+
+fn numeric_result(left: &Type, right: &Type) -> Type {
+    if left == &Type::Float || right == &Type::Float {
+        Type::Float
+    } else {
+        Type::Int
+    }
+}
+
+fn matcher_for(operator: BinaryOperator) -> Option<ValueMatcher> {
+    Some(match operator {
+        BinaryOperator::Equal => ValueMatcher::Equal,
+        BinaryOperator::NotEqual => ValueMatcher::NotEqual,
+        BinaryOperator::Less => ValueMatcher::Less,
+        BinaryOperator::LessEqual => ValueMatcher::LessEqual,
+        BinaryOperator::Greater => ValueMatcher::Greater,
+        BinaryOperator::GreaterEqual => ValueMatcher::GreaterEqual,
+        BinaryOperator::Contains => ValueMatcher::Contains,
+        BinaryOperator::Matches => ValueMatcher::Matches,
+        BinaryOperator::Add
+        | BinaryOperator::Subtract
+        | BinaryOperator::Multiply
+        | BinaryOperator::Divide
+        | BinaryOperator::And
+        | BinaryOperator::Or => return None,
+    })
+}
+
+fn browser_origin(operation: &HirBrowserOp) -> SyntaxOrigin {
+    match operation {
+        HirBrowserOp::Open(value) => value.origin,
+        HirBrowserOp::Evaluate(value) => value.origin,
+        HirBrowserOp::Click(value)
+        | HirBrowserOp::Check(value)
+        | HirBrowserOp::Uncheck(value)
+        | HirBrowserOp::Hover(value) => value.origin,
+        HirBrowserOp::Fill(value)
+        | HirBrowserOp::Type(value)
+        | HirBrowserOp::Press(value)
+        | HirBrowserOp::Select(value) => value.origin,
+        HirBrowserOp::WaitLocator(value) | HirBrowserOp::ExpectLocator(value) => value.origin,
+        HirBrowserOp::WaitUrl(value) | HirBrowserOp::ExpectUrl(value) => value.origin,
     }
 }
 
@@ -251,6 +1541,127 @@ fn valid_key_chord(value: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn analyze(source: &str) -> (Vec<Diagnostic>, TestPlan) {
+        let mut database = AnalysisDatabase::default();
+        let file = database.open_file("file:///test.webtest", source);
+        (
+            database
+                .diagnostics(file)
+                .expect("diagnostics")
+                .as_ref()
+                .clone(),
+            database.test_plan(file).expect("plan").as_ref().clone(),
+        )
+    }
+
+    #[test]
+    fn compiles_typed_server_to_browser_flow() {
+        let source = r#"test "created user can sign in" {
+            server {
+                let response = http.post("/api/test/users", json: { email: "alice@example.com" })
+                expect response.status == 201
+                let user: { id: Int, email: String } = response.json
+            }
+            browser {
+                open "/login"
+                fill label("Email") with user.email
+                click role("button", name: "Sign in")
+                expect text("Welcome").visible
+            }
+        }"#;
+        let (diagnostics, plan) = analyze(source);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        assert!(matches!(
+            plan.tests[0].steps[0].operation,
+            TestOperation::ServerProviderCall(_)
+        ));
+        assert!(matches!(
+            plan.tests[0].steps[2].operation,
+            TestOperation::EvaluatePure(EvaluatePureOperation {
+                expression: PlanExpr::Decode { .. },
+                ..
+            })
+        ));
+        assert_eq!(
+            plan.required_host_capabilities,
+            vec![Capability::Server, Capability::Browser, Capability::Test]
+        );
+    }
+
+    #[test]
+    fn reports_provider_type_capability_and_transfer_errors() {
+        let source = r#"test "bad" {
+            server { let result = process.run("seed", args: [1]) }
+            browser {
+                let nope = http.get("/inside-browser")
+                fill label("Output") with result.stdout
+            }
+        }"#;
+        let (diagnostics, _) = analyze(source);
+        let codes: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect();
+        assert!(
+            codes.contains(&"semantic.type_mismatch"),
+            "{diagnostics:#?}"
+        );
+        assert!(
+            codes.contains(&"semantic.capability_mismatch"),
+            "{diagnostics:#?}"
+        );
+        assert!(
+            codes.contains(&"semantic.non_transferable_value"),
+            "{diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn distinguishes_use_before_definition_from_unknown_names() {
+        let source = r#"test "names" {
+            let first = later
+            let later = 1
+            expect missing == 1
+        }"#;
+        let (diagnostics, _) = analyze(source);
+        let later = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "semantic.use_before_definition")
+            .expect("use-before diagnostic");
+        assert_eq!(
+            &source[u32::from(later.range.start()) as usize..u32::from(later.range.end()) as usize],
+            "later"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "semantic.unknown_name")
+        );
+    }
+
+    #[test]
+    fn expression_precedence_is_preserved_in_the_typed_plan() {
+        let (diagnostics, plan) = analyze(r#"test "math" { let value = 1 + 2 * 3 }"#);
+        assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        let TestOperation::EvaluatePure(operation) = &plan.tests[0].steps[0].operation else {
+            panic!("pure evaluation")
+        };
+        assert!(matches!(
+            operation.expression,
+            PlanExpr::Binary {
+                operator: BinaryOperator::Add,
+                ref right,
+                ..
+            } if matches!(
+                right.as_ref(),
+                PlanExpr::Binary {
+                    operator: BinaryOperator::Multiply,
+                    ..
+                }
+            )
+        ));
+    }
+
     #[test]
     fn static_diagnostics_and_queries_follow_source_updates() {
         let mut database = AnalysisDatabase::default();
@@ -264,7 +1675,7 @@ mod tests {
                 .diagnostics(file)
                 .expect("invalid diagnostics")
                 .iter()
-                .any(|diagnostic| diagnostic.code == "syntax.expected_url")
+                .any(|diagnostic| diagnostic.code == "syntax.expected_expression")
         );
 
         database.set_file_text(

@@ -5,7 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+serde.workspace = true
 webtest-browser.workspace = true
 webtest-hir.workspace = true
+webtest-provider.workspace = true
 webtest-text.workspace = true
-

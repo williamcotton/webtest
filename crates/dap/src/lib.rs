@@ -1,7 +1,7 @@
 //! Debug Adapter Protocol transport over the source-mapped WebTest runtime.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -199,6 +199,7 @@ struct PausedFrame {
     source_line: String,
     path: PathBuf,
     location: StepLocation,
+    bindings: BTreeMap<String, webtest_provider::Value>,
 }
 
 #[derive(Clone, Copy)]
@@ -455,18 +456,24 @@ impl DebugState {
             .get("variablesReference")
             .and_then(Value::as_i64);
         let frame = lock(&self.paused).clone();
-        let variables = if reference == Some(VARIABLES_REFERENCE) {
-            frame.map_or_else(Vec::new, |frame| {
-                vec![
-                    dap_variable("test", &format!("{:?}", frame.test_name), "string"),
-                    dap_variable("operation", &format!("{:?}", frame.operation), "string"),
-                    dap_variable("source", &format!("{:?}", frame.source_line), "string"),
-                    dap_variable("line", &frame.location.line.to_string(), "number"),
-                ]
-            })
-        } else {
-            Vec::new()
-        };
+        let variables =
+            if reference == Some(VARIABLES_REFERENCE) {
+                frame.map_or_else(Vec::new, |frame| {
+                    vec![
+                        dap_variable("test", &format!("{:?}", frame.test_name), "string"),
+                        dap_variable("operation", &format!("{:?}", frame.operation), "string"),
+                        dap_variable("source", &format!("{:?}", frame.source_line), "string"),
+                        dap_variable("line", &frame.location.line.to_string(), "number"),
+                    ]
+                    .into_iter()
+                    .chain(frame.bindings.iter().map(|(name, value)| {
+                        dap_variable(name, &dap_value(value), value.type_name())
+                    }))
+                    .collect()
+                })
+            } else {
+                Vec::new()
+            };
         self.writer
             .response(request, json!({ "variables": variables }))
             .await
@@ -594,9 +601,13 @@ impl DebugState {
     }
 }
 
-#[async_trait]
-impl RunControl for DebugState {
-    async fn before_step(&self, test: &PlannedTest, step: &PlannedStep) {
+impl DebugState {
+    async fn pause_before_step(
+        &self,
+        test: &PlannedTest,
+        step: &PlannedStep,
+        bindings: BTreeMap<String, webtest_provider::Value>,
+    ) {
         if self.shutting_down.load(Ordering::Acquire) {
             return;
         }
@@ -620,12 +631,22 @@ impl RunControl for DebugState {
             .unwrap_or_default()
             .trim()
             .to_owned();
+        let bindings = bindings
+            .into_iter()
+            .map(|(name, value)| {
+                (
+                    name,
+                    value.redacted(&self.runner_options.redacted_json_fields),
+                )
+            })
+            .collect();
         *lock(&self.paused) = Some(PausedFrame {
             test_name: test.name.clone(),
             operation: operation_name(&step.operation),
             source_line,
             path: program.path,
             location,
+            bindings,
         });
         let _ = self
             .writer
@@ -641,6 +662,22 @@ impl RunControl for DebugState {
             .await;
         let _ = self.resume_receiver.lock().await.recv().await;
         *lock(&self.paused) = None;
+    }
+}
+
+#[async_trait]
+impl RunControl for DebugState {
+    async fn before_step(&self, test: &PlannedTest, step: &PlannedStep) {
+        self.pause_before_step(test, step, BTreeMap::new()).await;
+    }
+
+    async fn before_step_with_bindings(
+        &self,
+        test: &PlannedTest,
+        step: &PlannedStep,
+        bindings: &BTreeMap<String, webtest_provider::Value>,
+    ) {
+        self.pause_before_step(test, step, bindings.clone()).await;
     }
 }
 
@@ -723,9 +760,33 @@ fn dap_variable(name: &str, value: &str, kind: &str) -> Value {
     })
 }
 
+fn dap_value(value: &webtest_provider::Value) -> String {
+    let mut rendered = webtest_provider::value_to_json(value)
+        .and_then(|value| serde_json::to_string(&value).ok())
+        .unwrap_or_else(|| format!("<{}>", value.type_name()));
+    if rendered.len() > 1024 {
+        let mut end = 1024;
+        while !rendered.is_char_boundary(end) {
+            end -= 1;
+        }
+        rendered.truncate(end);
+        rendered.push_str("...");
+    }
+    rendered
+}
+
 fn operation_name(operation: &TestOperation) -> String {
     match operation {
-        TestOperation::Browser(BrowserOperation::Navigate { url }) => format!("open {url:?}"),
+        TestOperation::EvaluatePure(operation) => operation.result_binding.map_or_else(
+            || "evaluate expression".into(),
+            |binding| format!("let binding_{}", binding.0),
+        ),
+        TestOperation::ServerProviderCall(call) => {
+            format!("{}.{}", call.provider, call.operation)
+        }
+        TestOperation::Browser(BrowserOperation::Navigate { url }) => {
+            format!("open {}", expression_name(url))
+        }
         TestOperation::Browser(BrowserOperation::Evaluate { .. }) => "evaluate <script>".into(),
         TestOperation::Browser(BrowserOperation::Click { locator }) => {
             format!("click {}", locator_name(locator))
@@ -737,7 +798,11 @@ fn operation_name(operation: &TestOperation) -> String {
             format!("type {} with <text>", locator_name(locator))
         }
         TestOperation::Browser(BrowserOperation::Press { locator, key }) => {
-            format!("press {} key {key:?}", locator_name(locator))
+            format!(
+                "press {} key {}",
+                locator_name(locator),
+                expression_name(key)
+            )
         }
         TestOperation::Browser(BrowserOperation::Check {
             locator,
@@ -748,7 +813,11 @@ fn operation_name(operation: &TestOperation) -> String {
             checked: false,
         }) => format!("uncheck {}", locator_name(locator)),
         TestOperation::Browser(BrowserOperation::Select { locator, option }) => {
-            format!("select {} option {option:?}", locator_name(locator))
+            format!(
+                "select {} option {}",
+                locator_name(locator),
+                expression_name(option)
+            )
         }
         TestOperation::Browser(BrowserOperation::Hover { locator }) => {
             format!("hover {}", locator_name(locator))
@@ -763,8 +832,21 @@ fn operation_name(operation: &TestOperation) -> String {
             format!("expect {}.{state}", locator_name(locator))
         }
         TestOperation::Assertion(AssertionOperation::Url { url, .. }) => {
-            format!("expect url({url:?})")
+            format!("expect url({})", expression_name(url))
         }
+        TestOperation::Assertion(AssertionOperation::Value { matcher, .. }) => {
+            format!("expect {matcher:?}")
+        }
+    }
+}
+
+fn expression_name(expression: &webtest_plan::PlanExpr) -> String {
+    match expression {
+        webtest_plan::PlanExpr::Literal(webtest_provider::Value::String(value)) => {
+            format!("{value:?}")
+        }
+        webtest_plan::PlanExpr::Binding(binding) => format!("binding_{}", binding.0),
+        _ => "<expression>".into(),
     }
 }
 
@@ -869,7 +951,7 @@ mod tests {
     }
 
     #[test]
-    fn every_milestone_b_operation_is_a_breakpoint_target_and_secrets_are_hidden() {
+    fn every_browser_operation_is_a_breakpoint_target_and_secrets_are_hidden() {
         let source = r#"test "x" {
     browser {
         open "http://example.test"
@@ -939,9 +1021,28 @@ mod tests {
         lock(&state.breakpoints).insert(program.path.clone(), HashSet::from([4]));
         *lock(&state.program) = Some(program);
 
+        let bindings = BTreeMap::from([(
+            "user".into(),
+            webtest_provider::Value::Record(
+                [
+                    (
+                        "email".into(),
+                        webtest_provider::Value::String("alice@example.test".into()),
+                    ),
+                    (
+                        "token".into(),
+                        webtest_provider::Value::String("private".into()),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        )]);
         let paused_state = Arc::clone(&state);
         let task = tokio::spawn(async move {
-            paused_state.before_step(&test, &step).await;
+            paused_state
+                .before_step_with_bindings(&test, &step, &bindings)
+                .await;
         });
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             while lock(&state.paused).is_none() {
@@ -954,6 +1055,10 @@ mod tests {
         let frame = lock(&state.paused).clone().expect("paused frame");
         assert_eq!(frame.location.line, 4);
         assert_eq!(frame.operation, "click id(\"submit\")");
+        assert_eq!(
+            frame.bindings["user"].member("token"),
+            Some(webtest_provider::Value::String("[redacted]".into()))
+        );
         state
             .resume_sender
             .send(ResumeCommand::Continue)

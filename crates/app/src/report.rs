@@ -1,6 +1,7 @@
 use std::io::{self, Write};
 
 use serde::Serialize;
+use webtest_observation::ValueDiff;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -86,6 +87,8 @@ pub struct FailureReport {
     pub code: String,
     pub message: String,
     pub span: Option<SourceSpanReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff: Option<ValueDiff>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<String>,
 }
@@ -132,6 +135,8 @@ pub struct EventReport {
     pub code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff: Option<ValueDiff>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -522,6 +527,7 @@ mod tests {
                         underline_start: 6,
                         underline_width: 13,
                     }),
+                    diff: None,
                     artifacts: Vec::new(),
                 }),
             }],

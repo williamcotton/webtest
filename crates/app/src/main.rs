@@ -19,9 +19,15 @@ use webtest_browser::{BrowserContextOptions, BrowserError, Locator, Viewport};
 use webtest_browser_cdp::{ChromeHost, find_system_chrome};
 use webtest_browser_manager::{BrowserManager, BrowserManagerError};
 use webtest_observation::{ExecutionEvent, ObservationStore, RuntimeFailure};
-use webtest_plan::{AssertionOperation, BrowserOperation, TestOperation, TestPlan};
+use webtest_plan::{
+    AssertionOperation, BrowserOperation, PLAN_FORMAT_VERSION, PlanEnvelope, PlanExpr,
+    PlanSourceFile, TestOperation, TestPlan,
+};
 use webtest_project::{DiscoveredFile, Project};
-use webtest_runtime::{EvidenceOptions, Runner, RunnerOptions};
+use webtest_provider::{
+    Capability, FsProviderConfig, HttpProviderConfig, NativeProviderConfig, ProcessProviderConfig,
+};
+use webtest_runtime::{EvidenceOptions, RunError, Runner, RunnerOptions, StepError};
 use webtest_text::{SourceRevision, TextRange};
 
 #[derive(Parser)]
@@ -49,6 +55,13 @@ enum Command {
         /// Report files that differ without rewriting them.
         #[arg(long)]
         check: bool,
+    },
+    /// Analyze WebTest files and emit a versioned execution plan.
+    Build {
+        paths: Vec<PathBuf>,
+        /// Destination for the serialized plan envelope.
+        #[arg(long)]
+        emit: PathBuf,
     },
     /// Execute WebTest files in Chrome.
     Test {
@@ -209,6 +222,7 @@ async fn run(cli: Cli) -> Result<ExitClass, AppError> {
             Ok(report.exit_class)
         }
         Command::Fmt { paths, check } => format_project(&project(&paths)?, check),
+        Command::Build { paths, emit } => build_project(&project(&paths)?, &emit),
         Command::Test {
             paths,
             chrome_path,
@@ -336,6 +350,227 @@ fn format_project(project: &Project, check: bool) -> Result<ExitClass, AppError>
     Ok(class)
 }
 
+fn build_project(project: &Project, emit: &Path) -> Result<ExitClass, AppError> {
+    let report = check_project(project)?;
+    if report.exit_class != ExitClass::Success {
+        write_report(&report, Reporter::Human)?;
+        return Ok(report.exit_class);
+    }
+
+    let mut database = AnalysisDatabase::default();
+    let mut opened = Vec::new();
+    for file in &project.files {
+        let source = read_source(&file.path)?;
+        let file_id = database.open_file(file.path.display().to_string(), source);
+        opened.push((file, file_id));
+    }
+    let mut source_files = Vec::new();
+    let mut tests = Vec::new();
+    let mut capabilities = std::collections::BTreeSet::new();
+    let mut next_test = 0u32;
+    let mut next_step = 0u32;
+    for (file, file_id) in opened {
+        let plan = database.test_plan(file_id).map_err(AppError::internal)?;
+        source_files.push(PlanSourceFile {
+            file: file_id,
+            path: display_path(file),
+            revision: plan.source_revision,
+        });
+        capabilities.extend(plan.required_host_capabilities.iter().copied());
+        for mut test in plan.tests.clone() {
+            test.id = webtest_hir::TestId(next_test);
+            next_test += 1;
+            for step in &mut test.steps {
+                step.id = webtest_hir::StepId(next_step);
+                next_step += 1;
+            }
+            tests.push(test);
+        }
+    }
+    let project_name = project
+        .config
+        .project
+        .name
+        .clone()
+        .unwrap_or_else(|| normalized_path(&project.root));
+    let config_source = project
+        .config_path
+        .as_deref()
+        .map(read_source)
+        .transpose()?
+        .unwrap_or_default();
+    let envelope = PlanEnvelope {
+        format_version: PLAN_FORMAT_VERSION,
+        compiler_version: env!("CARGO_PKG_VERSION").into(),
+        project_identity: format!(
+            "{project_name}@{}",
+            revision_hex(SourceRevision::of(&config_source))
+        ),
+        source_files,
+        required_host_capabilities: capabilities.into_iter().collect(),
+        provider_schema_hashes: database.provider_schema_hashes(),
+        tests,
+    };
+    reject_literal_secrets(&envelope, project)?;
+    let encoded = serde_json::to_vec_pretty(&envelope).map_err(AppError::internal)?;
+    if let Some(parent) = emit.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(AppError::infrastructure)?;
+    }
+    std::fs::write(emit, encoded).map_err(AppError::infrastructure)?;
+    println!("emitted {}", emit.display());
+    Ok(ExitClass::Success)
+}
+
+fn reject_literal_secrets(envelope: &PlanEnvelope, project: &Project) -> Result<(), AppError> {
+    for test in &envelope.tests {
+        let mut bindings = std::collections::HashMap::new();
+        for step in &test.steps {
+            if let TestOperation::EvaluatePure(operation) = &step.operation
+                && let Some(binding) = operation.result_binding
+            {
+                bindings.insert(binding, &operation.expression);
+            }
+            let TestOperation::ServerProviderCall(call) = &step.operation else {
+                continue;
+            };
+            for argument in &call.redacted_arguments {
+                if call
+                    .arguments
+                    .get(argument)
+                    .is_some_and(|value| has_literal_value(value, &bindings))
+                {
+                    return Err(secret_plan_error(&call.provider, &call.operation, argument));
+                }
+            }
+            if call.provider == "http" {
+                if call.arguments.get("json").is_some_and(|value| {
+                    has_sensitive_record_literal(
+                        value,
+                        &project.config.redaction.json_fields,
+                        &bindings,
+                    )
+                }) {
+                    return Err(secret_plan_error(&call.provider, &call.operation, "json"));
+                }
+                if call.arguments.get("headers").is_some_and(|value| {
+                    has_sensitive_record_literal(
+                        value,
+                        &project.config.redaction.headers,
+                        &bindings,
+                    )
+                }) {
+                    return Err(secret_plan_error(
+                        &call.provider,
+                        &call.operation,
+                        "headers",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn secret_plan_error(provider: &str, operation: &str, argument: &str) -> AppError {
+    AppError::usage(format!(
+        "cannot emit a plan containing a literal secret in `{provider}.{operation}` argument `{argument}`; use a late-bound secret source"
+    ))
+}
+
+fn has_literal_value(
+    expression: &PlanExpr,
+    bindings: &std::collections::HashMap<webtest_hir::BindingId, &PlanExpr>,
+) -> bool {
+    has_literal_value_inner(expression, bindings, &mut std::collections::HashSet::new())
+}
+
+fn has_literal_value_inner(
+    expression: &PlanExpr,
+    bindings: &std::collections::HashMap<webtest_hir::BindingId, &PlanExpr>,
+    visiting: &mut std::collections::HashSet<webtest_hir::BindingId>,
+) -> bool {
+    match expression {
+        PlanExpr::Literal(_) => true,
+        PlanExpr::Binding(binding) => {
+            visiting.insert(*binding)
+                && bindings
+                    .get(binding)
+                    .is_some_and(|value| has_literal_value_inner(value, bindings, visiting))
+        }
+        PlanExpr::List(values) => values
+            .iter()
+            .any(|value| has_literal_value_inner(value, bindings, visiting)),
+        PlanExpr::Record(values) => values
+            .values()
+            .any(|value| has_literal_value_inner(value, bindings, visiting)),
+        PlanExpr::Member { receiver, .. }
+        | PlanExpr::Unary {
+            operand: receiver, ..
+        }
+        | PlanExpr::Decode {
+            value: receiver, ..
+        } => has_literal_value_inner(receiver, bindings, visiting),
+        PlanExpr::Binary { left, right, .. } => {
+            has_literal_value_inner(left, bindings, visiting)
+                || has_literal_value_inner(right, bindings, visiting)
+        }
+        PlanExpr::Type(_) => false,
+    }
+}
+
+fn has_sensitive_record_literal(
+    expression: &PlanExpr,
+    sensitive_fields: &[String],
+    bindings: &std::collections::HashMap<webtest_hir::BindingId, &PlanExpr>,
+) -> bool {
+    has_sensitive_record_literal_inner(
+        expression,
+        sensitive_fields,
+        bindings,
+        &mut std::collections::HashSet::new(),
+    )
+}
+
+fn has_sensitive_record_literal_inner(
+    expression: &PlanExpr,
+    sensitive_fields: &[String],
+    bindings: &std::collections::HashMap<webtest_hir::BindingId, &PlanExpr>,
+    visiting: &mut std::collections::HashSet<webtest_hir::BindingId>,
+) -> bool {
+    match expression {
+        PlanExpr::Binding(binding) => {
+            visiting.insert(*binding)
+                && bindings.get(binding).is_some_and(|value| {
+                    has_sensitive_record_literal_inner(value, sensitive_fields, bindings, visiting)
+                })
+        }
+        PlanExpr::Record(values) => values.iter().any(|(name, value)| {
+            (sensitive_fields
+                .iter()
+                .any(|field| field.eq_ignore_ascii_case(name))
+                && has_literal_value(value, bindings))
+                || has_sensitive_record_literal_inner(value, sensitive_fields, bindings, visiting)
+        }),
+        PlanExpr::List(values) => values.iter().any(|value| {
+            has_sensitive_record_literal_inner(value, sensitive_fields, bindings, visiting)
+        }),
+        PlanExpr::Member { receiver, .. }
+        | PlanExpr::Unary {
+            operand: receiver, ..
+        }
+        | PlanExpr::Decode {
+            value: receiver, ..
+        } => has_sensitive_record_literal_inner(receiver, sensitive_fields, bindings, visiting),
+        PlanExpr::Binary { left, right, .. } => {
+            has_sensitive_record_literal_inner(left, sensitive_fields, bindings, visiting)
+                || has_sensitive_record_literal_inner(right, sensitive_fields, bindings, visiting)
+        }
+        PlanExpr::Literal(_) | PlanExpr::Type(_) => false,
+    }
+}
+
 async fn test_project(
     project: &Project,
     chrome_path: Option<PathBuf>,
@@ -387,7 +622,10 @@ async fn test_project(
             infrastructure_error: None,
             events: Vec::new(),
         };
-        if browser.is_none() {
+        let needs_browser = plan
+            .required_host_capabilities
+            .contains(&Capability::Browser);
+        if needs_browser && browser.is_none() {
             match resolve_chrome(project, chrome_path.clone()) {
                 Ok(resolved) => {
                     browser = Some(
@@ -404,6 +642,7 @@ async fn test_project(
                         code: "runtime.browser_launch".into(),
                         message: error.message,
                         span: None,
+                        diff: None,
                         artifacts: Vec::new(),
                     });
                     file_report.duration_nanos = nanos(started.elapsed());
@@ -414,11 +653,8 @@ async fn test_project(
                 }
             }
         }
-        let Some(browser) = browser.as_ref() else {
-            return Err(AppError::internal(
-                "browser resolution completed without a browser host",
-            ));
-        };
+        let inactive_browser = ChromeHost::new(None);
+        let browser = browser.as_ref().unwrap_or(&inactive_browser);
         let run =
             tokio::time::timeout(project.config.timeouts.test, runner.run(&plan, browser)).await;
         match run {
@@ -430,6 +666,7 @@ async fn test_project(
                         project.config.timeouts.test.as_millis()
                     ),
                     span: None,
+                    diff: None,
                     artifacts: Vec::new(),
                 });
                 report.exit_class = report.exit_class.combine(ExitClass::Infrastructure);
@@ -437,9 +674,10 @@ async fn test_project(
             }
             Ok(Err(error)) => {
                 file_report.infrastructure_error = Some(FailureReport {
-                    code: runtime_code(&error).into(),
-                    message: infrastructure_message(&error),
+                    code: run_error_code(&error),
+                    message: run_error_message(&error),
                     span: None,
+                    diff: None,
                     artifacts: Vec::new(),
                 });
                 report.exit_class = report.exit_class.combine(ExitClass::Infrastructure);
@@ -453,9 +691,13 @@ async fn test_project(
                     .into_iter()
                     .map(|test| {
                         let failure = test.failure.map(|failure| FailureReport {
-                            code: runtime_code(&failure.error).into(),
-                            message: runtime_message(&failure.error),
+                            code: step_error_code(&failure.error),
+                            message: failure.error.to_string(),
                             span: Some(source_span(&source, failure.step.origin.range)),
+                            diff: match &failure.error {
+                                StepError::Assertion(error) => Some(error.diff.clone()),
+                                _ => None,
+                            },
                             artifacts: failure
                                 .artifacts
                                 .into_iter()
@@ -524,6 +766,30 @@ fn runner_options(project: &Project) -> RunnerOptions {
                 == webtest_project::EvidenceMode::OnFailure,
             max_dom_bytes: project.config.evidence.max_dom_bytes,
             artifact_directory: project.root.join(&project.config.artifacts.directory),
+        },
+        project_root: project.root.clone(),
+        redacted_json_fields: project
+            .config
+            .redaction
+            .json_fields
+            .iter()
+            .chain(&project.config.redaction.headers)
+            .cloned()
+            .collect(),
+        provider_config: NativeProviderConfig {
+            http: HttpProviderConfig {
+                base_url: project.config.server.base_url.clone(),
+                follow_redirects: project.config.server.http.follow_redirects,
+                max_response_bytes: project.config.server.http.max_response_bytes,
+            },
+            process: ProcessProviderConfig {
+                allowed_working_roots: project.config.server.process.allowed_working_roots.clone(),
+                max_output_bytes: project.config.server.process.max_output_bytes,
+            },
+            fs: FsProviderConfig {
+                read_roots: project.config.server.fs.read_roots.clone(),
+                write_root: project.config.server.fs.write_root.clone(),
+            },
         },
     }
 }
@@ -701,11 +967,11 @@ fn config_diagnostics(project: &Project, source: &str, plan: &TestPlan) -> Vec<D
         for step in &test.steps {
             let (url, timeout) = match &step.operation {
                 TestOperation::Browser(BrowserOperation::Navigate { url }) => {
-                    (Some(url.as_str()), None)
+                    (literal_string(url), None)
                 }
                 TestOperation::Browser(BrowserOperation::WaitForUrl { url, timeout })
                 | TestOperation::Assertion(AssertionOperation::Url { url, timeout }) => {
-                    (Some(url.as_str()), *timeout)
+                    (literal_string(url), *timeout)
                 }
                 TestOperation::Browser(BrowserOperation::WaitForLocator { timeout, .. })
                 | TestOperation::Assertion(AssertionOperation::Locator { timeout, .. }) => {
@@ -746,6 +1012,13 @@ fn is_absolute_config_url(value: &str) -> bool {
                 character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
             })
     })
+}
+
+fn literal_string(expression: &webtest_plan::PlanExpr) -> Option<&str> {
+    match expression {
+        webtest_plan::PlanExpr::Literal(webtest_provider::Value::String(value)) => Some(value),
+        _ => None,
+    }
 }
 
 fn source_span(source: &str, range: TextRange) -> SourceSpanReport {
@@ -839,6 +1112,28 @@ fn infrastructure_message(error: &BrowserError) -> String {
     }
 }
 
+fn run_error_code(error: &RunError) -> String {
+    match error {
+        RunError::Browser(error) => runtime_code(error).into(),
+        RunError::Provider(error) => format!("runtime.{}", error.code()),
+        RunError::Internal(_) => "runtime.internal_error".into(),
+    }
+}
+
+fn run_error_message(error: &RunError) -> String {
+    match error {
+        RunError::Browser(error) => infrastructure_message(error),
+        _ => error.to_string(),
+    }
+}
+
+fn step_error_code(error: &StepError) -> String {
+    match error {
+        StepError::Browser(error) => runtime_code(error).into(),
+        _ => format!("runtime.{}", error.code()),
+    }
+}
+
 fn locator_description(locator: &Locator) -> String {
     locator.to_string()
 }
@@ -887,13 +1182,70 @@ fn event_reports(path: &str, events: &[ExecutionEvent]) -> Vec<EventReport> {
                 Some(test_id.0),
                 Some(step_id.0),
             ),
+            ExecutionEvent::ProviderCallStarted {
+                execution_id,
+                test_id,
+                step_id,
+                provider,
+                operation,
+            } => {
+                let mut event = event_report(
+                    path,
+                    "provider_call_started",
+                    Some(execution_id.0),
+                    Some(test_id.0),
+                    Some(step_id.0),
+                );
+                event.name = Some(format!("{provider}.{operation}"));
+                event
+            }
+            ExecutionEvent::ProviderCallFinished {
+                execution_id,
+                test_id,
+                step_id,
+                provider,
+                operation,
+                elapsed_ms,
+            } => {
+                let mut event = event_report(
+                    path,
+                    "provider_call_finished",
+                    Some(execution_id.0),
+                    Some(test_id.0),
+                    Some(step_id.0),
+                );
+                event.name = Some(format!("{provider}.{operation}"));
+                event.message = Some(format!("completed in {elapsed_ms}ms"));
+                event
+            }
+            ExecutionEvent::ProviderCallFailed {
+                execution_id,
+                test_id,
+                step_id,
+                provider,
+                operation,
+                code,
+                message,
+                elapsed_ms,
+            } => {
+                let mut event = event_report(
+                    path,
+                    "provider_call_failed",
+                    Some(execution_id.0),
+                    Some(test_id.0),
+                    Some(step_id.0),
+                );
+                event.name = Some(format!("{provider}.{operation}"));
+                event.code = Some(format!("runtime.{code}"));
+                event.message = Some(format!("{message} (failed after {elapsed_ms}ms)"));
+                event
+            }
             ExecutionEvent::StepFailed {
                 execution_id,
                 test_id,
                 step_id,
                 failure,
             } => {
-                let RuntimeFailure::Browser(error) = failure;
                 let mut event = event_report(
                     path,
                     "step_failed",
@@ -901,8 +1253,12 @@ fn event_reports(path: &str, events: &[ExecutionEvent]) -> Vec<EventReport> {
                     Some(test_id.0),
                     Some(step_id.0),
                 );
-                event.code = Some(runtime_code(error).into());
-                event.message = Some(runtime_message(error));
+                let (code, message) = runtime_failure_report(failure);
+                event.code = Some(code);
+                event.message = Some(message);
+                if let RuntimeFailure::Assertion { diff, .. } = failure {
+                    event.diff = Some(diff.clone());
+                }
                 event
             }
             ExecutionEvent::TestFinished {
@@ -932,6 +1288,23 @@ fn event_reports(path: &str, events: &[ExecutionEvent]) -> Vec<EventReport> {
         .collect()
 }
 
+fn runtime_failure_report(failure: &RuntimeFailure) -> (String, String) {
+    match failure {
+        RuntimeFailure::Browser(error) => (runtime_code(error).into(), runtime_message(error)),
+        RuntimeFailure::Provider(error) => (format!("runtime.{}", error.code()), error.to_string()),
+        RuntimeFailure::Assertion { message, .. } => {
+            ("runtime.assertion_failed".into(), message.clone())
+        }
+        RuntimeFailure::Decode { message } => {
+            ("runtime.json_decode_failed".into(), message.clone())
+        }
+        RuntimeFailure::Evaluation { code, message } => {
+            (format!("runtime.{code}"), message.clone())
+        }
+        RuntimeFailure::Internal { message } => ("runtime.internal_error".into(), message.clone()),
+    }
+}
+
 fn event_report(
     path: &str,
     kind: &str,
@@ -951,6 +1324,7 @@ fn event_report(
         exit_class: None,
         code: None,
         message: None,
+        diff: None,
     }
 }
 

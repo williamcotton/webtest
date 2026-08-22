@@ -8,6 +8,6 @@ license.workspace = true
 thiserror.workspace = true
 webtest-hir.workspace = true
 webtest-plan.workspace = true
+webtest-provider.workspace = true
 webtest-syntax.workspace = true
 webtest-text.workspace = true
-

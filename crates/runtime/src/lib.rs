@@ -1,20 +1,31 @@
 //! Sequential execution of protocol-neutral test plans.
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
+use thiserror::Error;
 use tracing::instrument;
 use webtest_browser::{
     Action, BrowserContextOptions, BrowserError, BrowserHost, EvidenceRequest,
     Locator as BrowserLocator, LocatorState as BrowserLocatorState, Page, PageEvidence,
 };
+use webtest_hir::{BinaryOperator, BindingId, UnaryOperator};
 use webtest_observation::{
     ExecutionEvent, ExecutionId, ObservationStore, RuntimeFailure, RuntimeObservation,
-    RuntimeObservationKind,
+    RuntimeObservationKind, ValueDiff,
 };
 use webtest_plan::{
-    AssertionOperation, BrowserOperation, Locator, LocatorState, PlannedStep, TestOperation,
-    TestPlan,
+    AssertionOperation, BrowserOperation, Locator, LocatorState, PlanExpr, PlannedStep,
+    ServerProviderCall, TestOperation, TestPlan, ValueMatcher,
+};
+use webtest_provider::{
+    CallContext, Capability, NativeProviderConfig, OperationName, ProviderCall, ProviderError,
+    ProviderName, ProviderRegistry, Type, Value,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -33,9 +44,120 @@ pub struct Artifact {
 #[derive(Clone, Debug)]
 pub struct StepFailure {
     pub step: PlannedStep,
-    pub error: BrowserError,
+    pub error: StepError,
     pub evidence: PageEvidence,
     pub artifacts: Vec<Artifact>,
+}
+
+#[derive(Clone, Debug)]
+pub enum StepError {
+    Browser(BrowserError),
+    Provider(ProviderError),
+    Assertion(Box<AssertionFailure>),
+    Decode(DecodeFailure),
+    Evaluation(EvaluationFailure),
+    Internal(String),
+}
+
+impl StepError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Browser(error) => error.code(),
+            Self::Provider(error) => error.code(),
+            Self::Assertion(_) => "assertion_failed",
+            Self::Decode(_) => "json_decode_failed",
+            Self::Evaluation(error) => error.code,
+            Self::Internal(_) => "internal_error",
+        }
+    }
+
+    pub fn is_infrastructure(&self) -> bool {
+        match self {
+            Self::Browser(error) => error.is_infrastructure(),
+            Self::Provider(error) => error.is_infrastructure(),
+            Self::Assertion(_) | Self::Decode(_) | Self::Evaluation(_) | Self::Internal(_) => false,
+        }
+    }
+}
+
+impl std::fmt::Display for StepError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Browser(error) => error.fmt(formatter),
+            Self::Provider(error) => error.fmt(formatter),
+            Self::Assertion(error) => error.fmt(formatter),
+            Self::Decode(error) => error.fmt(formatter),
+            Self::Evaluation(error) => error.fmt(formatter),
+            Self::Internal(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for StepError {}
+
+#[derive(Clone, Debug)]
+pub struct AssertionFailure {
+    pub matcher: ValueMatcher,
+    pub expected: Option<Value>,
+    pub actual: Value,
+    pub message: String,
+    pub diff: ValueDiff,
+}
+
+impl std::fmt::Display for AssertionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct DecodeFailure {
+    pub path: String,
+    pub expected: Type,
+    pub actual: String,
+    pub response_operation: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct EvaluationFailure {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl std::fmt::Display for EvaluationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::fmt::Display for DecodeFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "JSON decode failed at {}: expected {}, got {}",
+            self.path, self.expected, self.actual
+        )
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum RunError {
+    #[error(transparent)]
+    Browser(#[from] BrowserError),
+    #[error(transparent)]
+    Provider(#[from] ProviderError),
+    #[error("internal runtime error: {0}")]
+    Internal(String),
+}
+
+impl RunError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Browser(error) => error.code(),
+            Self::Provider(error) => error.code(),
+            Self::Internal(_) => "internal_error",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -44,6 +166,7 @@ pub struct TestResult {
     pub passed: bool,
     pub failure: Option<StepFailure>,
     pub duration: Duration,
+    pub bindings: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -58,6 +181,7 @@ impl RunResult {
     pub fn passed(&self) -> usize {
         self.tests.iter().filter(|result| result.passed).count()
     }
+
     pub fn failed(&self) -> usize {
         self.tests.len() - self.passed()
     }
@@ -90,6 +214,9 @@ pub struct RunnerOptions {
     pub test_timeout: Duration,
     pub browser_context: BrowserContextOptions,
     pub evidence: EvidenceOptions,
+    pub project_root: PathBuf,
+    pub redacted_json_fields: Vec<String>,
+    pub provider_config: NativeProviderConfig,
 }
 
 impl Default for RunnerOptions {
@@ -101,6 +228,16 @@ impl Default for RunnerOptions {
             test_timeout: Duration::from_secs(60),
             browser_context: BrowserContextOptions::default(),
             evidence: EvidenceOptions::default(),
+            project_root: PathBuf::from("."),
+            redacted_json_fields: vec![
+                "password".into(),
+                "token".into(),
+                "secret".into(),
+                "authorization".into(),
+                "cookie".into(),
+                "set-cookie".into(),
+            ],
+            provider_config: NativeProviderConfig::default(),
         }
     }
 }
@@ -108,11 +245,21 @@ impl Default for RunnerOptions {
 pub struct Runner {
     observations: Arc<ObservationStore>,
     options: RunnerOptions,
+    providers: ProviderRegistry,
 }
 
 #[async_trait]
 pub trait RunControl: Send + Sync {
     async fn before_step(&self, test: &webtest_plan::PlannedTest, step: &PlannedStep);
+
+    async fn before_step_with_bindings(
+        &self,
+        test: &webtest_plan::PlannedTest,
+        step: &PlannedStep,
+        _bindings: &BTreeMap<String, Value>,
+    ) {
+        self.before_step(test, step).await;
+    }
 }
 
 impl Runner {
@@ -120,11 +267,18 @@ impl Runner {
         Self {
             observations,
             options: RunnerOptions::default(),
+            providers: ProviderRegistry::built_in(NativeProviderConfig::default()),
         }
     }
 
     pub fn with_options(mut self, options: RunnerOptions) -> Self {
+        self.providers = ProviderRegistry::built_in(options.provider_config.clone());
         self.options = options;
+        self
+    }
+
+    pub fn with_provider_registry(mut self, providers: ProviderRegistry) -> Self {
+        self.providers = providers;
         self
     }
 
@@ -133,7 +287,7 @@ impl Runner {
         &self,
         plan: &TestPlan,
         browser: &dyn BrowserHost,
-    ) -> Result<RunResult, BrowserError> {
+    ) -> Result<RunResult, RunError> {
         self.run_with_control(plan, browser, None).await
     }
 
@@ -143,34 +297,38 @@ impl Runner {
         plan: &TestPlan,
         browser: &dyn BrowserHost,
         control: Option<&dyn RunControl>,
-    ) -> Result<RunResult, BrowserError> {
+    ) -> Result<RunResult, RunError> {
         self.observations.clear_for_file(plan.file);
         let run_started = std::time::Instant::now();
         let execution_id = ExecutionId::next();
         let mut events = vec![ExecutionEvent::RunStarted { execution_id }];
-        let mut session = browser.start().await?;
+        let needs_browser = plan
+            .required_host_capabilities
+            .contains(&Capability::Browser);
+        let mut session = if needs_browser {
+            Some(browser.start().await?)
+        } else {
+            None
+        };
         let mut tests = Vec::with_capacity(plan.tests.len());
 
         for (index, test) in plan.tests.iter().enumerate() {
             let (result, tainted) = self
-                .run_test(
-                    plan,
-                    test,
-                    execution_id,
-                    &mut events,
-                    session.as_mut(),
-                    control,
-                )
+                .run_test(plan, test, execution_id, &mut events, &mut session, control)
                 .await?;
             tests.push(result);
             if tainted && index + 1 < plan.tests.len() {
-                let _ = session.close().await;
-                session = browser.start().await?;
+                if let Some(mut current) = session.take() {
+                    let _ = current.close().await;
+                }
+                session = Some(browser.start().await?);
             }
         }
 
         events.push(ExecutionEvent::RunFinished { execution_id });
-        session.close().await?;
+        if let Some(mut session) = session {
+            session.close().await?;
+        }
         Ok(RunResult {
             execution_id,
             tests,
@@ -185,57 +343,111 @@ impl Runner {
         test: &webtest_plan::PlannedTest,
         execution_id: ExecutionId,
         events: &mut Vec<ExecutionEvent>,
-        session: &mut dyn webtest_browser::BrowserSession,
+        session: &mut Option<Box<dyn webtest_browser::BrowserSession>>,
         control: Option<&dyn RunControl>,
-    ) -> Result<(TestResult, bool), BrowserError> {
+    ) -> Result<(TestResult, bool), RunError> {
         let test_started = std::time::Instant::now();
         events.push(ExecutionEvent::TestStarted {
             execution_id,
             test_id: test.id,
             name: test.name.clone(),
         });
-        let mut context = session.new_context(&self.options.browser_context).await?;
-        let mut page = context.new_page().await?;
+        let mut context = if let Some(session) = session.as_deref_mut() {
+            Some(session.new_context(&self.options.browser_context).await?)
+        } else {
+            None
+        };
+        let mut page = if let Some(context) = context.as_mut() {
+            Some(context.new_page().await?)
+        } else {
+            None
+        };
         let mut failure = None;
+        let mut environment = HashMap::new();
+        let mut binding_names = HashMap::new();
         let mut secrets = Vec::new();
 
         for step in &test.steps {
+            if let TestOperation::ServerProviderCall(call) = &step.operation {
+                collect_provider_secrets(
+                    call,
+                    &environment,
+                    &self.options.redacted_json_fields,
+                    &mut secrets,
+                );
+            }
             if let Some(control) = control {
-                control.before_step(test, step).await
+                let bindings = visible_bindings(
+                    &environment,
+                    &binding_names,
+                    &self.options.redacted_json_fields,
+                    &secrets,
+                );
+                control
+                    .before_step_with_bindings(test, step, &bindings)
+                    .await;
             }
             events.push(ExecutionEvent::StepStarted {
                 execution_id,
                 test_id: test.id,
                 step_id: step.id,
             });
-            let step_started = std::time::Instant::now();
-            if let TestOperation::Browser(BrowserOperation::Fill { value, .. }) = &step.operation {
-                secrets.push(value.clone());
-            }
-            match execute_step(page.as_mut(), step, &self.options).await {
-                Ok(()) => events.push(ExecutionEvent::StepPassed {
+            if let TestOperation::ServerProviderCall(call) = &step.operation {
+                events.push(ExecutionEvent::ProviderCallStarted {
                     execution_id,
                     test_id: test.id,
                     step_id: step.id,
-                }),
+                    provider: call.provider.clone(),
+                    operation: call.operation.clone(),
+                });
+            }
+            let step_started = std::time::Instant::now();
+            let result = self
+                .execute_step(&mut page, step, &mut environment, &mut binding_names)
+                .await;
+            match result {
+                Ok(()) => {
+                    if let TestOperation::ServerProviderCall(call) = &step.operation {
+                        events.push(ExecutionEvent::ProviderCallFinished {
+                            execution_id,
+                            test_id: test.id,
+                            step_id: step.id,
+                            provider: call.provider.clone(),
+                            operation: call.operation.clone(),
+                            elapsed_ms: duration_millis(step_started.elapsed()),
+                        });
+                    }
+                    events.push(ExecutionEvent::StepPassed {
+                        execution_id,
+                        test_id: test.id,
+                        step_id: step.id,
+                    });
+                }
                 Err(error) => {
-                    let mut evidence = if !error.is_infrastructure()
+                    let error =
+                        redact_step_error(error, &self.options.redacted_json_fields, &secrets);
+                    let mut evidence = if matches!(error, StepError::Browser(_))
+                        && !error.is_infrastructure()
                         && (self.options.evidence.screenshot_on_failure
                             || self.options.evidence.dom_snapshot_on_failure)
                     {
-                        page.capture_evidence(&EvidenceRequest {
-                            locator: step_browser_locator(step),
-                            include_screenshot: self.options.evidence.screenshot_on_failure,
-                            include_dom: self.options.evidence.dom_snapshot_on_failure,
-                            max_dom_bytes: self.options.evidence.max_dom_bytes,
-                            redactions: secrets.clone(),
-                        })
-                        .await
+                        if let Some(page) = page.as_deref_mut() {
+                            page.capture_evidence(&EvidenceRequest {
+                                locator: step_browser_locator(step),
+                                include_screenshot: self.options.evidence.screenshot_on_failure,
+                                include_dom: self.options.evidence.dom_snapshot_on_failure,
+                                max_dom_bytes: self.options.evidence.max_dom_bytes,
+                                redactions: secrets.clone(),
+                            })
+                            .await
+                        } else {
+                            PageEvidence::default()
+                        }
                     } else {
                         PageEvidence::default()
                     };
                     if !self.options.evidence.screenshot_on_failure {
-                        evidence.screenshot_png = None
+                        evidence.screenshot_png = None;
                     }
                     let artifacts = write_artifacts(
                         &self.options.evidence.artifact_directory,
@@ -245,35 +457,47 @@ impl Runner {
                         &mut evidence,
                     );
                     let elapsed_ms = duration_millis(step_started.elapsed());
-                    if !error.is_infrastructure() {
-                        self.observations.record(RuntimeObservation {
+                    if let TestOperation::ServerProviderCall(call) = &step.operation {
+                        events.push(ExecutionEvent::ProviderCallFailed {
                             execution_id,
-                            file: plan.file,
-                            source_revision: plan.source_revision,
                             test_id: test.id,
                             step_id: step.id,
-                            range: step.origin.range,
-                            kind: RuntimeObservationKind::BrowserFailure {
-                                code: error.code().into(),
-                                message: error.to_string(),
-                                locator: step_browser_locator(step),
-                                page_url: evidence.current_url.clone(),
-                                candidates: evidence.candidates.clone(),
-                                actionability: evidence.actionability.clone(),
-                                artifacts: artifacts
-                                    .iter()
-                                    .map(|artifact| artifact.path.display().to_string())
-                                    .collect(),
-                                elapsed_ms,
-                            },
+                            provider: call.provider.clone(),
+                            operation: call.operation.clone(),
+                            code: error.code().into(),
+                            message: error.to_string(),
+                            elapsed_ms,
                         });
+                    }
+                    if !error.is_infrastructure() {
+                        self.record_observation(
+                            plan,
+                            test.id,
+                            step,
+                            execution_id,
+                            &error,
+                            &evidence,
+                            &artifacts,
+                            elapsed_ms,
+                        );
                     }
                     events.push(ExecutionEvent::StepFailed {
                         execution_id,
                         test_id: test.id,
                         step_id: step.id,
-                        failure: RuntimeFailure::Browser(error.clone()),
+                        failure: runtime_failure(&error),
                     });
+                    if error.is_infrastructure() {
+                        drop(page);
+                        if let Some(context) = context.as_mut() {
+                            let _ = context.close().await;
+                        }
+                        return Err(match error {
+                            StepError::Browser(error) => RunError::Browser(error),
+                            StepError::Provider(error) => RunError::Provider(error),
+                            other => RunError::Internal(other.to_string()),
+                        });
+                    }
                     failure = Some(StepFailure {
                         step: step.clone(),
                         error,
@@ -286,83 +510,309 @@ impl Runner {
         }
 
         drop(page);
-        let cleanup_failed = context.close().await.is_err();
-        let tainted = cleanup_failed
-            || failure
-                .as_ref()
-                .is_some_and(|failure| failure.error.is_infrastructure());
+        let cleanup_failed = if let Some(context) = context.as_mut() {
+            context.close().await.is_err()
+        } else {
+            false
+        };
         let passed = failure.is_none();
         events.push(ExecutionEvent::TestFinished {
             execution_id,
             test_id: test.id,
             passed,
         });
+        let bindings = binding_names
+            .into_iter()
+            .filter_map(|(id, name)| {
+                environment
+                    .get(&id)
+                    .filter(|value| runtime_transferable(value))
+                    .map(|value| {
+                        value.redacted_with_secrets(&self.options.redacted_json_fields, &secrets)
+                    })
+                    .map(|value| (name, value))
+            })
+            .collect();
+        for directory in environment.values().flat_map(temporary_directories) {
+            tokio::fs::remove_dir_all(&directory)
+                .await
+                .map_err(|error| {
+                    RunError::Provider(ProviderError::Filesystem {
+                        path: directory.display().to_string(),
+                        message: format!("temporary resource cleanup failed: {error}"),
+                    })
+                })?;
+        }
         Ok((
             TestResult {
                 name: test.name.clone(),
                 passed,
                 failure,
                 duration: test_started.elapsed(),
+                bindings,
             },
-            tainted,
+            cleanup_failed,
         ))
+    }
+
+    async fn execute_step(
+        &self,
+        page: &mut Option<Box<dyn Page>>,
+        step: &PlannedStep,
+        environment: &mut HashMap<BindingId, Value>,
+        binding_names: &mut HashMap<BindingId, String>,
+    ) -> Result<(), StepError> {
+        match &step.operation {
+            TestOperation::EvaluatePure(operation) => {
+                let value = evaluate(&operation.expression, environment)?;
+                if let Some(binding) = operation.result_binding {
+                    environment.insert(binding, value);
+                    binding_names.insert(
+                        binding,
+                        operation
+                            .result_name
+                            .clone()
+                            .unwrap_or_else(|| format!("binding_{}", binding.0)),
+                    );
+                }
+                Ok(())
+            }
+            TestOperation::ServerProviderCall(call) => {
+                let value = self.execute_provider(call, environment).await?;
+                if let Some(binding) = call.result_binding {
+                    environment.insert(binding, value);
+                    binding_names.insert(
+                        binding,
+                        call.result_name
+                            .clone()
+                            .unwrap_or_else(|| format!("binding_{}", binding.0)),
+                    );
+                }
+                Ok(())
+            }
+            TestOperation::Browser(operation) => {
+                let page = page.as_deref_mut().ok_or_else(|| {
+                    StepError::Internal("browser operation has no browser page".into())
+                })?;
+                execute_browser(page, operation, environment, &self.options).await
+            }
+            TestOperation::Assertion(assertion) => {
+                execute_assertion(page.as_deref_mut(), assertion, environment, &self.options).await
+            }
+        }
+    }
+
+    async fn execute_provider(
+        &self,
+        call: &ServerProviderCall,
+        environment: &HashMap<BindingId, Value>,
+    ) -> Result<Value, StepError> {
+        let mut arguments = BTreeMap::new();
+        for (name, expression) in &call.arguments {
+            arguments.insert(name.clone(), evaluate(expression, environment)?);
+        }
+        let result = self
+            .providers
+            .call(
+                ProviderCall {
+                    provider: ProviderName(call.provider.clone()),
+                    operation: OperationName(call.operation.clone()),
+                    arguments,
+                },
+                CallContext {
+                    project_root: self.options.project_root.clone(),
+                    timeout: call.timeout.unwrap_or(self.options.test_timeout),
+                    redacted_json_fields: self.options.redacted_json_fields.clone(),
+                },
+            )
+            .await
+            .map_err(StepError::Provider)?;
+        Ok(result.value)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_observation(
+        &self,
+        plan: &TestPlan,
+        test_id: webtest_hir::TestId,
+        step: &PlannedStep,
+        execution_id: ExecutionId,
+        error: &StepError,
+        evidence: &PageEvidence,
+        artifacts: &[Artifact],
+        elapsed_ms: u64,
+    ) {
+        let kind = match error {
+            StepError::Browser(error) => RuntimeObservationKind::BrowserFailure {
+                code: error.code().into(),
+                message: error.to_string(),
+                locator: step_browser_locator(step),
+                page_url: evidence.current_url.clone(),
+                candidates: evidence.candidates.clone(),
+                actionability: evidence.actionability.clone(),
+                artifacts: artifacts
+                    .iter()
+                    .map(|artifact| artifact.path.display().to_string())
+                    .collect(),
+                elapsed_ms,
+            },
+            StepError::Decode(error) => RuntimeObservationKind::ValueFailure {
+                code: "json_decode_failed".into(),
+                message: error.to_string(),
+                path: Some(error.path.clone()),
+                expected: Some(error.expected.to_string()),
+                actual: Some(error.actual.clone()),
+                diff: None,
+            },
+            StepError::Assertion(error) => RuntimeObservationKind::ValueFailure {
+                code: "assertion_failed".into(),
+                message: error.message.clone(),
+                path: None,
+                expected: error.expected.as_ref().map(display_value),
+                actual: Some(display_value(&error.actual)),
+                diff: Some(error.diff.clone()),
+            },
+            StepError::Provider(error) => RuntimeObservationKind::ValueFailure {
+                code: error.code().into(),
+                message: error.to_string(),
+                path: None,
+                expected: None,
+                actual: None,
+                diff: None,
+            },
+            StepError::Evaluation(error) => RuntimeObservationKind::ValueFailure {
+                code: error.code.into(),
+                message: error.message.clone(),
+                path: None,
+                expected: None,
+                actual: None,
+                diff: None,
+            },
+            StepError::Internal(message) => RuntimeObservationKind::ValueFailure {
+                code: "internal_error".into(),
+                message: message.clone(),
+                path: None,
+                expected: None,
+                actual: None,
+                diff: None,
+            },
+        };
+        self.observations.record(RuntimeObservation {
+            execution_id,
+            file: plan.file,
+            source_revision: plan.source_revision,
+            test_id,
+            step_id: step.id,
+            range: step.origin.range,
+            kind,
+        });
     }
 }
 
-async fn execute_step(
+fn runtime_failure(error: &StepError) -> RuntimeFailure {
+    match error {
+        StepError::Browser(error) => RuntimeFailure::Browser(error.clone()),
+        StepError::Provider(error) => RuntimeFailure::Provider(error.clone()),
+        StepError::Assertion(error) => RuntimeFailure::Assertion {
+            message: error.to_string(),
+            diff: error.diff.clone(),
+        },
+        StepError::Decode(error) => RuntimeFailure::Decode {
+            message: error.to_string(),
+        },
+        StepError::Evaluation(error) => RuntimeFailure::Evaluation {
+            code: error.code.into(),
+            message: error.message.clone(),
+        },
+        StepError::Internal(message) => RuntimeFailure::Internal {
+            message: message.clone(),
+        },
+    }
+}
+
+fn redact_step_error(error: StepError, fields: &[String], secrets: &[String]) -> StepError {
+    match error {
+        StepError::Assertion(error) => {
+            let expected = error
+                .expected
+                .map(|value| value.redacted_with_secrets(fields, secrets));
+            let actual = error.actual.redacted_with_secrets(fields, secrets);
+            StepError::Assertion(Box::new(AssertionFailure {
+                matcher: error.matcher,
+                message: assertion_message(error.matcher, &actual, expected.as_ref()),
+                diff: value_diff(error.matcher, &actual, expected.as_ref()),
+                expected,
+                actual,
+            }))
+        }
+        StepError::Provider(error) => StepError::Provider(error.redacted(secrets)),
+        error => error,
+    }
+}
+
+async fn execute_browser(
     page: &mut dyn Page,
-    step: &PlannedStep,
+    operation: &BrowserOperation,
+    environment: &HashMap<BindingId, Value>,
     options: &RunnerOptions,
-) -> Result<(), BrowserError> {
-    match &step.operation {
-        TestOperation::Browser(BrowserOperation::Navigate { url }) => {
-            page.open(&resolve_url(options.base_url.as_deref(), url)?)
+) -> Result<(), StepError> {
+    match operation {
+        BrowserOperation::Navigate { url } => {
+            let url = string_value(evaluate(url, environment)?)?;
+            page.open(&resolve_url(options.base_url.as_deref(), &url)?)
                 .await
+                .map_err(StepError::Browser)
         }
-        TestOperation::Browser(BrowserOperation::Evaluate { expression }) => {
-            page.evaluate(expression).await
+        BrowserOperation::Evaluate { expression } => {
+            page.evaluate(expression).await.map_err(StepError::Browser)
         }
-        TestOperation::Browser(BrowserOperation::Click { locator }) => {
-            page.perform(
+        BrowserOperation::Click { locator } => page
+            .perform(
                 &Action::Click {
                     locator: browser_locator(locator),
                 },
                 options.action_timeout,
             )
             .await
-        }
-        TestOperation::Browser(BrowserOperation::Fill { locator, value }) => {
+            .map_err(StepError::Browser),
+        BrowserOperation::Fill { locator, value } => {
+            let value = string_value(evaluate(value, environment)?)?;
             page.perform(
                 &Action::Fill {
                     locator: browser_locator(locator),
-                    value: value.clone(),
+                    value,
                 },
                 options.action_timeout,
             )
             .await
+            .map_err(StepError::Browser)
         }
-        TestOperation::Browser(BrowserOperation::Type { locator, value }) => {
+        BrowserOperation::Type { locator, value } => {
+            let value = string_value(evaluate(value, environment)?)?;
             page.perform(
                 &Action::Type {
                     locator: browser_locator(locator),
-                    value: value.clone(),
+                    value,
                 },
                 options.action_timeout,
             )
             .await
+            .map_err(StepError::Browser)
         }
-        TestOperation::Browser(BrowserOperation::Press { locator, key }) => {
+        BrowserOperation::Press { locator, key } => {
+            let key = string_value(evaluate(key, environment)?)?;
             page.perform(
                 &Action::Press {
                     locator: browser_locator(locator),
-                    key: key.clone(),
+                    key,
                 },
                 options.action_timeout,
             )
             .await
+            .map_err(StepError::Browser)
         }
-        TestOperation::Browser(BrowserOperation::Check { locator, checked }) => {
-            page.perform(
+        BrowserOperation::Check { locator, checked } => page
+            .perform(
                 &Action::Check {
                     locator: browser_locator(locator),
                     checked: *checked,
@@ -370,52 +820,671 @@ async fn execute_step(
                 options.action_timeout,
             )
             .await
-        }
-        TestOperation::Browser(BrowserOperation::Select { locator, option }) => {
+            .map_err(StepError::Browser),
+        BrowserOperation::Select { locator, option } => {
+            let option = string_value(evaluate(option, environment)?)?;
             page.perform(
                 &Action::Select {
                     locator: browser_locator(locator),
-                    option: option.clone(),
+                    option,
                 },
                 options.action_timeout,
             )
             .await
+            .map_err(StepError::Browser)
         }
-        TestOperation::Browser(BrowserOperation::Hover { locator }) => {
-            page.perform(
+        BrowserOperation::Hover { locator } => page
+            .perform(
                 &Action::Hover {
                     locator: browser_locator(locator),
                 },
                 options.action_timeout,
             )
             .await
+            .map_err(StepError::Browser),
+        BrowserOperation::WaitForLocator {
+            locator,
+            state,
+            timeout,
+        } => page
+            .wait_for_locator(
+                &browser_locator(locator),
+                browser_state(*state),
+                bounded_timeout(
+                    timeout.unwrap_or(options.assertion_timeout),
+                    options.test_timeout,
+                ),
+            )
+            .await
+            .map_err(StepError::Browser),
+        BrowserOperation::WaitForUrl { url, timeout } => {
+            let url = string_value(evaluate(url, environment)?)?;
+            let expected = resolve_url(options.base_url.as_deref(), &url)?;
+            page.wait_for_url(
+                &expected,
+                bounded_timeout(
+                    timeout.unwrap_or(options.assertion_timeout),
+                    options.test_timeout,
+                ),
+            )
+            .await
+            .map_err(StepError::Browser)
         }
-        TestOperation::Browser(BrowserOperation::WaitForLocator {
+    }
+}
+
+async fn execute_assertion(
+    page: Option<&mut (dyn Page + '_)>,
+    assertion: &AssertionOperation,
+    environment: &HashMap<BindingId, Value>,
+    options: &RunnerOptions,
+) -> Result<(), StepError> {
+    match assertion {
+        AssertionOperation::Locator {
             locator,
             state,
             timeout,
-        })
-        | TestOperation::Assertion(AssertionOperation::Locator {
-            locator,
-            state,
-            timeout,
-        }) => {
-            let timeout = bounded_timeout(
-                timeout.unwrap_or(options.assertion_timeout),
-                options.test_timeout,
-            );
-            page.wait_for_locator(&browser_locator(locator), browser_state(*state), timeout)
+        } => page
+            .ok_or_else(|| StepError::Internal("locator assertion has no browser page".into()))?
+            .wait_for_locator(
+                &browser_locator(locator),
+                browser_state(*state),
+                bounded_timeout(
+                    timeout.unwrap_or(options.assertion_timeout),
+                    options.test_timeout,
+                ),
+            )
+            .await
+            .map_err(StepError::Browser),
+        AssertionOperation::Url { url, timeout } => {
+            let url = string_value(evaluate(url, environment)?)?;
+            let expected = resolve_url(options.base_url.as_deref(), &url)?;
+            page.ok_or_else(|| StepError::Internal("URL assertion has no browser page".into()))?
+                .wait_for_url(
+                    &expected,
+                    bounded_timeout(
+                        timeout.unwrap_or(options.assertion_timeout),
+                        options.test_timeout,
+                    ),
+                )
                 .await
+                .map_err(StepError::Browser)
         }
-        TestOperation::Browser(BrowserOperation::WaitForUrl { url, timeout })
-        | TestOperation::Assertion(AssertionOperation::Url { url, timeout }) => {
-            let expected = resolve_url(options.base_url.as_deref(), url)?;
-            let timeout = bounded_timeout(
-                timeout.unwrap_or(options.assertion_timeout),
-                options.test_timeout,
-            );
-            page.wait_for_url(&expected, timeout).await
+        AssertionOperation::Value {
+            matcher,
+            actual,
+            expected,
+            ..
+        } => {
+            let actual = evaluate(actual, environment)?;
+            if *matcher == ValueMatcher::Matches {
+                let expected_type = expected
+                    .as_ref()
+                    .and_then(|expression| match expression {
+                        PlanExpr::Type(ty) => Some(ty),
+                        _ => None,
+                    })
+                    .ok_or_else(|| StepError::Internal("matches assertion has no type".into()))?;
+                decode_value(&actual, expected_type, "$", None)
+                    .map(|_| ())
+                    .map_err(StepError::Decode)
+            } else {
+                let expected = expected
+                    .as_ref()
+                    .map(|expected| evaluate(expected, environment))
+                    .transpose()?;
+                if assertion_matches(*matcher, &actual, expected.as_ref()) {
+                    Ok(())
+                } else {
+                    Err(StepError::Assertion(Box::new(AssertionFailure {
+                        matcher: *matcher,
+                        message: assertion_message(*matcher, &actual, expected.as_ref()),
+                        diff: value_diff(*matcher, &actual, expected.as_ref()),
+                        expected,
+                        actual,
+                    })))
+                }
+            }
         }
+    }
+}
+
+fn evaluate(
+    expression: &PlanExpr,
+    environment: &HashMap<BindingId, Value>,
+) -> Result<Value, StepError> {
+    match expression {
+        PlanExpr::Literal(value) => Ok(value.clone()),
+        PlanExpr::Binding(binding) => environment.get(binding).cloned().ok_or_else(|| {
+            StepError::Internal(format!("binding {} has no runtime value", binding.0))
+        }),
+        PlanExpr::List(items) => items
+            .iter()
+            .map(|item| evaluate(item, environment))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::List),
+        PlanExpr::Record(fields) => fields
+            .iter()
+            .map(|(name, value)| Ok((name.clone(), evaluate(value, environment)?)))
+            .collect::<Result<BTreeMap<_, _>, StepError>>()
+            .map(Value::Record),
+        PlanExpr::Type(_) => Err(StepError::Internal(
+            "type pattern cannot be evaluated as a value".into(),
+        )),
+        PlanExpr::Member { receiver, member } => {
+            let receiver = evaluate(receiver, environment)?;
+            receiver.member(member).ok_or_else(|| {
+                if matches!(receiver, Value::Response(_))
+                    && matches!(member.as_str(), "json" | "text")
+                {
+                    StepError::Evaluation(EvaluationFailure {
+                        code: "response_decode_failed",
+                        message: format!(
+                            "response body is not available as `{member}` for this operation"
+                        ),
+                    })
+                } else {
+                    StepError::Internal(format!("runtime value has no member `{member}`"))
+                }
+            })
+        }
+        PlanExpr::Unary { operator, operand } => {
+            let operand = evaluate(operand, environment)?;
+            match (operator, operand) {
+                (UnaryOperator::Not, Value::Bool(value)) => Ok(Value::Bool(!value)),
+                (UnaryOperator::Negate, Value::Int(value)) => Ok(Value::Int(-value)),
+                (UnaryOperator::Negate, Value::Float(value)) => Ok(Value::Float(-value)),
+                _ => Err(StepError::Internal("invalid typed unary operation".into())),
+            }
+        }
+        PlanExpr::Binary {
+            operator,
+            left,
+            right,
+        } => {
+            let left = evaluate(left, environment)?;
+            match (operator, &left) {
+                (BinaryOperator::And, Value::Bool(false)) => Ok(Value::Bool(false)),
+                (BinaryOperator::Or, Value::Bool(true)) => Ok(Value::Bool(true)),
+                _ => evaluate_binary(*operator, left, evaluate(right, environment)?),
+            }
+        }
+        PlanExpr::Decode {
+            value,
+            target,
+            response_operation,
+        } => {
+            let value = evaluate(value, environment)?;
+            decode_value(&value, target, "$", response_operation.clone()).map_err(StepError::Decode)
+        }
+    }
+}
+
+fn evaluate_binary(
+    operator: BinaryOperator,
+    left: Value,
+    right: Value,
+) -> Result<Value, StepError> {
+    let value = match operator {
+        BinaryOperator::Equal => Value::Bool(values_equal(&left, &right)),
+        BinaryOperator::NotEqual => Value::Bool(!values_equal(&left, &right)),
+        BinaryOperator::Less => Value::Bool(compare_values(&left, &right).is_some_and(|it| it < 0)),
+        BinaryOperator::LessEqual => {
+            Value::Bool(compare_values(&left, &right).is_some_and(|it| it <= 0))
+        }
+        BinaryOperator::Greater => {
+            Value::Bool(compare_values(&left, &right).is_some_and(|it| it > 0))
+        }
+        BinaryOperator::GreaterEqual => {
+            Value::Bool(compare_values(&left, &right).is_some_and(|it| it >= 0))
+        }
+        BinaryOperator::Add => match (left, right) {
+            (Value::Int(left), Value::Int(right)) => Value::Int(left + right),
+            (Value::Float(left), Value::Float(right)) => Value::Float(left + right),
+            (Value::Int(left), Value::Float(right)) => Value::Float(left as f64 + right),
+            (Value::Float(left), Value::Int(right)) => Value::Float(left + right as f64),
+            (Value::String(left), Value::String(right)) => Value::String(left + &right),
+            _ => return Err(StepError::Internal("invalid typed addition".into())),
+        },
+        BinaryOperator::Subtract | BinaryOperator::Multiply | BinaryOperator::Divide => {
+            numeric_binary(operator, left, right)?
+        }
+        BinaryOperator::And => match (left, right) {
+            (Value::Bool(left), Value::Bool(right)) => Value::Bool(left && right),
+            _ => {
+                return Err(StepError::Internal(
+                    "invalid typed boolean operation".into(),
+                ));
+            }
+        },
+        BinaryOperator::Or => match (left, right) {
+            (Value::Bool(left), Value::Bool(right)) => Value::Bool(left || right),
+            _ => {
+                return Err(StepError::Internal(
+                    "invalid typed boolean operation".into(),
+                ));
+            }
+        },
+        BinaryOperator::Contains => Value::Bool(value_contains(&left, &right)),
+        BinaryOperator::Matches => {
+            return Err(StepError::Internal(
+                "matches is evaluated by assertion execution".into(),
+            ));
+        }
+    };
+    Ok(value)
+}
+
+fn numeric_binary(operator: BinaryOperator, left: Value, right: Value) -> Result<Value, StepError> {
+    if let (Value::Int(left), Value::Int(right)) = (&left, &right)
+        && operator != BinaryOperator::Divide
+    {
+        return Ok(Value::Int(match operator {
+            BinaryOperator::Subtract => left - right,
+            BinaryOperator::Multiply => left * right,
+            _ => unreachable!(),
+        }));
+    }
+    let left = number(&left).ok_or_else(|| StepError::Internal("expected number".into()))?;
+    let right = number(&right).ok_or_else(|| StepError::Internal("expected number".into()))?;
+    if operator == BinaryOperator::Divide && right == 0.0 {
+        return Err(StepError::Evaluation(EvaluationFailure {
+            code: "division_by_zero",
+            message: "division by zero".into(),
+        }));
+    }
+    Ok(Value::Float(match operator {
+        BinaryOperator::Subtract => left - right,
+        BinaryOperator::Multiply => left * right,
+        BinaryOperator::Divide => left / right,
+        _ => unreachable!(),
+    }))
+}
+
+fn decode_value(
+    value: &Value,
+    expected: &Type,
+    path: &str,
+    response_operation: Option<String>,
+) -> Result<Value, DecodeFailure> {
+    let failure = || DecodeFailure {
+        path: path.into(),
+        expected: expected.clone(),
+        actual: value.type_name().into(),
+        response_operation: response_operation.clone(),
+    };
+    match expected {
+        Type::Json | Type::Unknown => Ok(value.clone()),
+        Type::Null if matches!(value, Value::Null) => Ok(Value::Null),
+        Type::Bool if matches!(value, Value::Bool(_)) => Ok(value.clone()),
+        Type::Int if matches!(value, Value::Int(_)) => Ok(value.clone()),
+        Type::Float => match value {
+            Value::Float(_) => Ok(value.clone()),
+            Value::Int(value) => Ok(Value::Float(*value as f64)),
+            _ => Err(failure()),
+        },
+        Type::String | Type::Url if matches!(value, Value::String(_)) => Ok(value.clone()),
+        Type::Duration if matches!(value, Value::DurationMillis(_)) => Ok(value.clone()),
+        Type::Bytes if matches!(value, Value::Bytes(_)) => Ok(value.clone()),
+        Type::StatusCode if matches!(value, Value::Int(_)) => Ok(value.clone()),
+        Type::Option(_) if matches!(value, Value::Null) => Ok(Value::Null),
+        Type::Option(inner) => decode_value(value, inner, path, response_operation),
+        Type::List(inner) => {
+            let Value::List(values) = value else {
+                return Err(failure());
+            };
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    decode_value(
+                        value,
+                        inner,
+                        &format!("{path}[{index}]"),
+                        response_operation.clone(),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(Value::List)
+        }
+        Type::Record(expected_fields) => {
+            let Value::Record(values) = value else {
+                return Err(failure());
+            };
+            let mut decoded = BTreeMap::new();
+            for (name, field) in expected_fields {
+                match values.get(name) {
+                    Some(value) => {
+                        decoded.insert(
+                            name.clone(),
+                            decode_value(
+                                value,
+                                &field.ty,
+                                &format!("{path}.{name}"),
+                                response_operation.clone(),
+                            )?,
+                        );
+                    }
+                    None if field.optional => {
+                        decoded.insert(name.clone(), Value::Null);
+                    }
+                    None => {
+                        return Err(DecodeFailure {
+                            path: format!("{path}.{name}"),
+                            expected: field.ty.clone(),
+                            actual: "missing field".into(),
+                            response_operation,
+                        });
+                    }
+                }
+            }
+            Ok(Value::Record(decoded))
+        }
+        Type::FilePath if matches!(value, Value::FilePath(_)) => Ok(value.clone()),
+        Type::TempDirectory if matches!(value, Value::TempDirectory(_)) => Ok(value.clone()),
+        Type::ProcessResult if matches!(value, Value::ProcessResult(_)) => Ok(value.clone()),
+        Type::Response(_) if matches!(value, Value::Response(_)) => Ok(value.clone()),
+        Type::Headers if matches!(value, Value::Headers(_)) => Ok(value.clone()),
+        _ => Err(failure()),
+    }
+}
+
+fn assertion_matches(matcher: ValueMatcher, actual: &Value, expected: Option<&Value>) -> bool {
+    match matcher {
+        ValueMatcher::Truthy => matches!(actual, Value::Bool(true)),
+        ValueMatcher::Equal => expected.is_some_and(|expected| values_equal(actual, expected)),
+        ValueMatcher::NotEqual => expected.is_some_and(|expected| !values_equal(actual, expected)),
+        ValueMatcher::Less => expected
+            .and_then(|expected| compare_values(actual, expected))
+            .is_some_and(|ordering| ordering < 0),
+        ValueMatcher::LessEqual => expected
+            .and_then(|expected| compare_values(actual, expected))
+            .is_some_and(|ordering| ordering <= 0),
+        ValueMatcher::Greater => expected
+            .and_then(|expected| compare_values(actual, expected))
+            .is_some_and(|ordering| ordering > 0),
+        ValueMatcher::GreaterEqual => expected
+            .and_then(|expected| compare_values(actual, expected))
+            .is_some_and(|ordering| ordering >= 0),
+        ValueMatcher::Contains => expected.is_some_and(|expected| value_contains(actual, expected)),
+        ValueMatcher::Matches => false,
+    }
+}
+
+fn assertion_message(matcher: ValueMatcher, actual: &Value, expected: Option<&Value>) -> String {
+    match expected {
+        Some(expected) => format!(
+            "assertion {matcher:?} failed: expected {}, got {}",
+            bounded_display_value(expected),
+            bounded_display_value(actual)
+        ),
+        None => format!(
+            "assertion {matcher:?} failed for {}",
+            bounded_display_value(actual)
+        ),
+    }
+}
+
+fn value_diff(matcher: ValueMatcher, actual: &Value, expected: Option<&Value>) -> ValueDiff {
+    if matcher == ValueMatcher::Contains {
+        return ValueDiff::Contains {
+            expected_item: expected.map(bounded_display_value).unwrap_or_default(),
+            actual: bounded_display_value(actual),
+        };
+    }
+    if matcher == ValueMatcher::Equal {
+        match (actual, expected) {
+            (Value::String(actual), Some(Value::String(expected))) => {
+                let actual_chars: Vec<_> = actual.chars().collect();
+                let expected_chars: Vec<_> = expected.chars().collect();
+                let common_prefix_chars = actual_chars
+                    .iter()
+                    .zip(&expected_chars)
+                    .take_while(|(actual, expected)| actual == expected)
+                    .count();
+                return ValueDiff::String {
+                    common_prefix_chars,
+                    expected_segment: bounded_char_segment(&expected_chars, common_prefix_chars),
+                    actual_segment: bounded_char_segment(&actual_chars, common_prefix_chars),
+                };
+            }
+            (Value::List(actual), Some(Value::List(expected))) => {
+                let common = actual.len().min(expected.len());
+                let mut differing_indices: Vec<_> = (0..common)
+                    .filter(|index| !values_equal(&actual[*index], &expected[*index]))
+                    .take(20)
+                    .collect();
+                differing_indices.extend(
+                    (common..actual.len().max(expected.len()))
+                        .take(20usize.saturating_sub(differing_indices.len())),
+                );
+                return ValueDiff::List {
+                    expected_len: expected.len(),
+                    actual_len: actual.len(),
+                    differing_indices,
+                };
+            }
+            (Value::Record(actual), Some(Value::Record(expected))) => {
+                let missing_fields = expected
+                    .keys()
+                    .filter(|name| !actual.contains_key(*name))
+                    .take(20)
+                    .cloned()
+                    .collect();
+                let unexpected_fields = actual
+                    .keys()
+                    .filter(|name| !expected.contains_key(*name))
+                    .take(20)
+                    .cloned()
+                    .collect();
+                let mismatched_fields = expected
+                    .iter()
+                    .filter(|(name, expected)| {
+                        actual
+                            .get(*name)
+                            .is_some_and(|actual| !values_equal(actual, expected))
+                    })
+                    .map(|(name, _)| name.clone())
+                    .take(20)
+                    .collect();
+                return ValueDiff::Record {
+                    missing_fields,
+                    unexpected_fields,
+                    mismatched_fields,
+                };
+            }
+            _ => {}
+        }
+    }
+    ValueDiff::Scalar {
+        expected: expected.map(bounded_display_value),
+        actual: bounded_display_value(actual),
+    }
+}
+
+fn bounded_char_segment(characters: &[char], difference: usize) -> String {
+    const CONTEXT: usize = 24;
+    const LIMIT: usize = 80;
+    let start = difference.saturating_sub(CONTEXT);
+    let mut segment: String = characters.iter().skip(start).take(LIMIT).collect();
+    if start > 0 {
+        segment.insert_str(0, "...");
+    }
+    if start + LIMIT < characters.len() {
+        segment.push_str("...");
+    }
+    segment
+}
+
+fn bounded_display_value(value: &Value) -> String {
+    const LIMIT: usize = 240;
+    let value = display_value(value);
+    let mut characters = value.chars();
+    let mut bounded: String = characters.by_ref().take(LIMIT).collect();
+    if characters.next().is_some() {
+        bounded.push_str("...");
+    }
+    bounded
+}
+
+fn values_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Int(left), Value::Float(right)) => *left as f64 == *right,
+        (Value::Float(left), Value::Int(right)) => *left == *right as f64,
+        _ => left == right,
+    }
+}
+
+fn compare_values(left: &Value, right: &Value) -> Option<i8> {
+    match (left, right) {
+        (Value::String(left), Value::String(right)) => Some(match left.cmp(right) {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+        }),
+        _ => {
+            let left = number(left)?;
+            let right = number(right)?;
+            Some(if left < right {
+                -1
+            } else if left > right {
+                1
+            } else {
+                0
+            })
+        }
+    }
+}
+
+fn number(value: &Value) -> Option<f64> {
+    match value {
+        Value::Int(value) => Some(*value as f64),
+        Value::Float(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn value_contains(container: &Value, value: &Value) -> bool {
+    match (container, value) {
+        (Value::String(container), Value::String(value)) => container.contains(value),
+        (Value::List(values), value) => values.iter().any(|item| values_equal(item, value)),
+        _ => false,
+    }
+}
+
+fn display_value(value: &Value) -> String {
+    webtest_provider::value_to_json(value)
+        .and_then(|value| serde_json::to_string(&value).ok())
+        .unwrap_or_else(|| format!("<{:?}>", value.type_name()))
+}
+
+fn runtime_transferable(value: &Value) -> bool {
+    match value {
+        Value::Null
+        | Value::Bool(_)
+        | Value::Int(_)
+        | Value::Float(_)
+        | Value::String(_)
+        | Value::DurationMillis(_) => true,
+        Value::List(values) => values.iter().all(runtime_transferable),
+        Value::Record(values) => values.values().all(runtime_transferable),
+        Value::Headers(_)
+        | Value::Bytes(_)
+        | Value::Response(_)
+        | Value::ProcessResult(_)
+        | Value::FilePath(_)
+        | Value::TempDirectory(_) => false,
+    }
+}
+
+fn visible_bindings(
+    environment: &HashMap<BindingId, Value>,
+    names: &HashMap<BindingId, String>,
+    redacted_fields: &[String],
+    secrets: &[String],
+) -> BTreeMap<String, Value> {
+    names
+        .iter()
+        .filter_map(|(id, name)| {
+            environment
+                .get(id)
+                .filter(|value| runtime_transferable(value))
+                .map(|value| {
+                    (
+                        name.clone(),
+                        value.redacted_with_secrets(redacted_fields, secrets),
+                    )
+                })
+        })
+        .collect()
+}
+
+fn collect_provider_secrets(
+    call: &ServerProviderCall,
+    environment: &HashMap<BindingId, Value>,
+    redacted_fields: &[String],
+    secrets: &mut Vec<String>,
+) {
+    for (name, expression) in &call.arguments {
+        let Ok(value) = evaluate(expression, environment) else {
+            continue;
+        };
+        collect_sensitive_values(
+            &value,
+            redacted_fields,
+            call.redacted_arguments
+                .iter()
+                .any(|argument| argument == name),
+            secrets,
+        );
+    }
+    secrets.sort();
+    secrets.dedup();
+}
+
+fn collect_sensitive_values(
+    value: &Value,
+    redacted_fields: &[String],
+    sensitive: bool,
+    secrets: &mut Vec<String>,
+) {
+    match value {
+        Value::String(value) if sensitive && !value.is_empty() => secrets.push(value.clone()),
+        Value::Record(values) => {
+            for (name, value) in values {
+                let sensitive = sensitive
+                    || redacted_fields
+                        .iter()
+                        .any(|field| field.eq_ignore_ascii_case(name));
+                collect_sensitive_values(value, redacted_fields, sensitive, secrets);
+            }
+        }
+        Value::List(values) => {
+            for value in values {
+                collect_sensitive_values(value, redacted_fields, sensitive, secrets);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn temporary_directories(value: &Value) -> Vec<PathBuf> {
+    match value {
+        Value::TempDirectory(path) => vec![path.clone()],
+        Value::List(values) => values.iter().flat_map(temporary_directories).collect(),
+        Value::Record(values) => values.values().flat_map(temporary_directories).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn string_value(value: Value) -> Result<String, StepError> {
+    if let Value::String(value) = value {
+        Ok(value)
+    } else {
+        Err(StepError::Internal(format!(
+            "typed expression produced {}, expected string",
+            value.type_name()
+        )))
     }
 }
 
@@ -465,20 +1534,19 @@ fn step_browser_locator(step: &PlannedStep) -> Option<BrowserLocator> {
         | TestOperation::Assertion(AssertionOperation::Locator { locator, .. }) => {
             Some(browser_locator(locator))
         }
-        TestOperation::Browser(BrowserOperation::Navigate { .. })
-        | TestOperation::Browser(BrowserOperation::Evaluate { .. })
-        | TestOperation::Browser(BrowserOperation::WaitForUrl { .. })
-        | TestOperation::Assertion(AssertionOperation::Url { .. }) => None,
+        _ => None,
     }
 }
 
-fn resolve_url(base_url: Option<&str>, value: &str) -> Result<String, BrowserError> {
+fn resolve_url(base_url: Option<&str>, value: &str) -> Result<String, StepError> {
     if is_absolute_url(value) {
         return Ok(normalize_url(value));
     }
-    let base = base_url.ok_or_else(|| BrowserError::NavigationFailed {
-        url: value.into(),
-        reason: "relative URL requires browser.base_url".into(),
+    let base = base_url.ok_or_else(|| {
+        StepError::Browser(BrowserError::NavigationFailed {
+            url: value.into(),
+            reason: "relative URL requires browser.base_url".into(),
+        })
     })?;
     let resolved = if value.starts_with('/') {
         let scheme_end = base.find("://").map(|index| index + 3).unwrap_or(0);
@@ -604,9 +1672,9 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
-    use webtest_browser::{BrowserContext, BrowserSession, Page};
+    use webtest_browser::{BrowserSession, Page};
     use webtest_hir::{StepId, TestId};
-    use webtest_plan::PlannedTest;
+    use webtest_plan::{PlannedTest, TestPlan};
     use webtest_text::{FileId, SourceRevision, SyntaxOrigin, TextRange, TextSize};
 
     use super::*;
@@ -621,24 +1689,6 @@ mod tests {
     struct FakePage {
         result: Mutex<Result<(), BrowserError>>,
     }
-    struct RecordingPage {
-        evaluations: Arc<Mutex<Vec<String>>>,
-    }
-    struct ContextHost {
-        starts: Arc<AtomicUsize>,
-        contexts: Arc<AtomicUsize>,
-        closes: Arc<AtomicUsize>,
-        fail_first_cleanup: bool,
-    }
-    struct ContextSession {
-        contexts: Arc<AtomicUsize>,
-        closes: Arc<AtomicUsize>,
-        fail_first_cleanup: bool,
-    }
-    struct CountingContext {
-        closes: Arc<AtomicUsize>,
-        fail_cleanup: bool,
-    }
 
     #[async_trait]
     impl BrowserHost for FakeHost {
@@ -649,6 +1699,7 @@ mod tests {
             }))
         }
     }
+
     #[async_trait]
     impl BrowserSession for FakeSession {
         async fn new_page(&mut self) -> Result<Box<dyn Page>, BrowserError> {
@@ -657,52 +1708,7 @@ mod tests {
             }))
         }
     }
-    #[async_trait]
-    impl BrowserHost for ContextHost {
-        async fn start(&self) -> Result<Box<dyn BrowserSession>, BrowserError> {
-            self.starts.fetch_add(1, Ordering::Relaxed);
-            Ok(Box::new(ContextSession {
-                contexts: Arc::clone(&self.contexts),
-                closes: Arc::clone(&self.closes),
-                fail_first_cleanup: self.fail_first_cleanup,
-            }))
-        }
-    }
-    #[async_trait]
-    impl BrowserSession for ContextSession {
-        async fn new_page(&mut self) -> Result<Box<dyn Page>, BrowserError> {
-            unreachable!("runtime uses contexts")
-        }
-        async fn new_context(
-            &mut self,
-            _options: &BrowserContextOptions,
-        ) -> Result<Box<dyn BrowserContext>, BrowserError> {
-            let index = self.contexts.fetch_add(1, Ordering::Relaxed);
-            Ok(Box::new(CountingContext {
-                closes: Arc::clone(&self.closes),
-                fail_cleanup: self.fail_first_cleanup && index == 0,
-            }))
-        }
-    }
-    #[async_trait]
-    impl BrowserContext for CountingContext {
-        async fn new_page(&mut self) -> Result<Box<dyn Page>, BrowserError> {
-            Ok(Box::new(FakePage {
-                result: Mutex::new(Ok(())),
-            }))
-        }
-        async fn close(&mut self) -> Result<(), BrowserError> {
-            self.closes.fetch_add(1, Ordering::Relaxed);
-            if self.fail_cleanup {
-                Err(BrowserError::Protocol {
-                    method: "context.close".into(),
-                    message: "failed".into(),
-                })
-            } else {
-                Ok(())
-            }
-        }
-    }
+
     #[async_trait]
     impl Page for FakePage {
         async fn open(&mut self, _url: &str) -> Result<(), BrowserError> {
@@ -727,31 +1733,13 @@ mod tests {
                 .clone()
         }
     }
-    #[async_trait]
-    impl Page for RecordingPage {
-        async fn open(&mut self, _url: &str) -> Result<(), BrowserError> {
-            Ok(())
-        }
-        async fn click(&mut self, _locator: &BrowserLocator) -> Result<(), BrowserError> {
-            Ok(())
-        }
-        async fn expect_visible(&mut self, _locator: &BrowserLocator) -> Result<(), BrowserError> {
-            Ok(())
-        }
-        async fn evaluate(&mut self, expression: &str) -> Result<(), BrowserError> {
-            self.evaluations
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(expression.into());
-            Ok(())
-        }
-    }
 
     fn plan(revision: SourceRevision) -> TestPlan {
         let file = FileId::new(0);
         TestPlan {
             file,
             source_revision: revision,
+            required_host_capabilities: vec![Capability::Browser],
             tests: vec![PlannedTest {
                 id: TestId(0),
                 name: "x".into(),
@@ -768,16 +1756,6 @@ mod tests {
                 }],
             }],
         }
-    }
-
-    fn two_test_plan() -> TestPlan {
-        let mut plan = plan(SourceRevision::of("two"));
-        let mut second = plan.tests[0].clone();
-        second.id = TestId(1);
-        second.name = "y".into();
-        second.steps[0].id = StepId(1);
-        plan.tests.push(second);
-        plan
     }
 
     #[tokio::test]
@@ -810,6 +1788,91 @@ mod tests {
     }
 
     #[test]
+    fn typed_decode_reports_the_exact_json_path() {
+        let value = Value::Record(
+            [
+                ("id".into(), Value::String("wrong".into())),
+                ("email".into(), Value::String("a@example.test".into())),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let expected = Type::Record(
+            [(
+                "id".into(),
+                webtest_provider::RecordField {
+                    ty: Type::Int,
+                    optional: false,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let error = decode_value(&value, &expected, "$", Some("http.post".into()))
+            .expect_err("decode should fail");
+        assert_eq!(error.path, "$.id");
+        assert_eq!(error.expected, Type::Int);
+        assert_eq!(error.actual, "string");
+    }
+
+    #[test]
+    fn assertion_diffs_are_bounded_structural_and_unicode_safe() {
+        let string = value_diff(
+            ValueMatcher::Equal,
+            &Value::String("prefix-β-actual".into()),
+            Some(&Value::String("prefix-β-expected".into())),
+        );
+        assert!(matches!(
+            string,
+            ValueDiff::String {
+                common_prefix_chars: 9,
+                ..
+            }
+        ));
+
+        let record = value_diff(
+            ValueMatcher::Equal,
+            &Value::Record(
+                [
+                    ("id".into(), Value::String("wrong".into())),
+                    ("extra".into(), Value::Bool(true)),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            Some(&Value::Record(
+                [
+                    ("id".into(), Value::Int(7)),
+                    ("email".into(), Value::String("a@example.test".into())),
+                ]
+                .into_iter()
+                .collect(),
+            )),
+        );
+        assert_eq!(
+            record,
+            ValueDiff::Record {
+                missing_fields: vec!["email".into()],
+                unexpected_fields: vec!["extra".into()],
+                mismatched_fields: vec!["id".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn dynamic_expression_errors_are_test_failures_not_internal_invariants() {
+        let expression = PlanExpr::Binary {
+            operator: BinaryOperator::Divide,
+            left: Box::new(PlanExpr::Literal(Value::Int(1))),
+            right: Box::new(PlanExpr::Literal(Value::Int(0))),
+        };
+        let error = evaluate(&expression, &HashMap::new()).expect_err("division should fail");
+        assert_eq!(error.code(), "division_by_zero");
+        assert!(!error.is_infrastructure());
+        assert!(matches!(error, StepError::Evaluation(_)));
+    }
+
+    #[test]
     fn resolves_relative_and_normalizes_absolute_urls() {
         assert_eq!(
             resolve_url(Some("http://example.test/base"), "/login").unwrap(),
@@ -820,80 +1883,5 @@ mod tests {
             "http://example.test/"
         );
         assert!(resolve_url(None, "/login").is_err());
-    }
-
-    #[tokio::test]
-    async fn evaluate_step_calls_page_evaluate() {
-        let evaluations = Arc::new(Mutex::new(Vec::new()));
-        let mut page = RecordingPage {
-            evaluations: Arc::clone(&evaluations),
-        };
-        let file = FileId::new(0);
-        let step = PlannedStep {
-            id: StepId(0),
-            origin: SyntaxOrigin::new(file, TextRange::new(TextSize::new(10), TextSize::new(31))),
-            operation: TestOperation::Browser(BrowserOperation::Evaluate {
-                expression: "window.saveDraft()".into(),
-            }),
-        };
-
-        execute_step(&mut page, &step, &RunnerOptions::default())
-            .await
-            .expect("evaluate step");
-
-        assert_eq!(
-            evaluations
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .as_slice(),
-            ["window.saveDraft()"]
-        );
-    }
-
-    #[test]
-    fn artifact_names_are_stable_and_do_not_use_test_names() {
-        let directory = tempfile::tempdir().expect("directory");
-        let mut evidence = PageEvidence {
-            screenshot_png: Some(vec![137, 80, 78, 71]),
-            current_url: Some("about:blank".into()),
-            ..PageEvidence::default()
-        };
-        let artifacts = write_artifacts(
-            directory.path(),
-            ExecutionId(9),
-            TestId(2),
-            StepId(3),
-            &mut evidence,
-        );
-        assert!(
-            artifacts
-                .iter()
-                .any(|artifact| artifact.path.ends_with("test-2-step-3-execution-9.png"))
-        );
-    }
-
-    #[tokio::test]
-    async fn tests_use_fresh_contexts_and_cleanup_failure_restarts_the_process() {
-        let starts = Arc::new(AtomicUsize::new(0));
-        let contexts = Arc::new(AtomicUsize::new(0));
-        let closes = Arc::new(AtomicUsize::new(0));
-        let host = ContextHost {
-            starts: Arc::clone(&starts),
-            contexts: Arc::clone(&contexts),
-            closes: Arc::clone(&closes),
-            fail_first_cleanup: true,
-        };
-        let result = Runner::new(Arc::new(ObservationStore::default()))
-            .run(&two_test_plan(), &host)
-            .await
-            .expect("run");
-        assert_eq!(result.passed(), 2);
-        assert_eq!(contexts.load(Ordering::Relaxed), 2);
-        assert_eq!(closes.load(Ordering::Relaxed), 2);
-        assert_eq!(
-            starts.load(Ordering::Relaxed),
-            2,
-            "tainted browser process was replaced"
-        );
     }
 }

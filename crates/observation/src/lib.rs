@@ -12,6 +12,34 @@ use webtest_browser::{CandidateEvidence, Locator};
 use webtest_hir::{StepId, TestId};
 use webtest_text::{FileId, SourceRevision, TextRange};
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ValueDiff {
+    Scalar {
+        expected: Option<String>,
+        actual: String,
+    },
+    String {
+        common_prefix_chars: usize,
+        expected_segment: String,
+        actual_segment: String,
+    },
+    List {
+        expected_len: usize,
+        actual_len: usize,
+        differing_indices: Vec<usize>,
+    },
+    Record {
+        missing_fields: Vec<String>,
+        unexpected_fields: Vec<String>,
+        mismatched_fields: Vec<String>,
+    },
+    Contains {
+        expected_item: String,
+        actual: String,
+    },
+}
+
 static NEXT_EXECUTION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -26,6 +54,11 @@ impl ExecutionId {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeFailure {
     Browser(webtest_browser::BrowserError),
+    Provider(webtest_provider::ProviderError),
+    Assertion { message: String, diff: ValueDiff },
+    Decode { message: String },
+    Evaluation { code: String, message: String },
+    Internal { message: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,6 +80,31 @@ pub enum ExecutionEvent {
         execution_id: ExecutionId,
         test_id: TestId,
         step_id: StepId,
+    },
+    ProviderCallStarted {
+        execution_id: ExecutionId,
+        test_id: TestId,
+        step_id: StepId,
+        provider: String,
+        operation: String,
+    },
+    ProviderCallFinished {
+        execution_id: ExecutionId,
+        test_id: TestId,
+        step_id: StepId,
+        provider: String,
+        operation: String,
+        elapsed_ms: u64,
+    },
+    ProviderCallFailed {
+        execution_id: ExecutionId,
+        test_id: TestId,
+        step_id: StepId,
+        provider: String,
+        operation: String,
+        code: String,
+        message: String,
+        elapsed_ms: u64,
     },
     StepFailed {
         execution_id: ExecutionId,
@@ -86,6 +144,14 @@ pub enum RuntimeObservationKind {
         actionability: Vec<String>,
         artifacts: Vec<String>,
         elapsed_ms: u64,
+    },
+    ValueFailure {
+        code: String,
+        message: String,
+        path: Option<String>,
+        expected: Option<String>,
+        actual: Option<String>,
+        diff: Option<ValueDiff>,
     },
     LocatorNotFound {
         locator: Locator,

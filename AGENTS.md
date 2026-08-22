@@ -2,7 +2,7 @@
 
 ## Product and Architectural Intent
 
-WebTest is a statically analyzable language platform for web-system tests, not merely a browser automation wrapper or an editor extension. The native product is one Rust executable, `webtest`, while portable language services are exposed through `webtest-wasm`. The initial architecture is specified in `specs/intitial-vertical-slice.md`; `specs/future-functionality.md` is the roadmap. Treat milestone-era feature lists as historical limits, not current facts. Confirm current behavior in code before relying on either spec.
+WebTest is a statically analyzable language platform for web-system tests, not merely a browser automation wrapper or an editor extension. The native product is one Rust executable, `webtest`, while portable language services are exposed through `webtest-wasm`. The initial architecture is specified in `specs/intitial-vertical-slice.md`; `specs/future-functionality.md` is the roadmap. Treat staged feature lists as historical limits, not current facts. Confirm current behavior in code before relying on either spec.
 
 The durable architecture is:
 
@@ -16,11 +16,11 @@ There is one Rust lexer, parser, CST, syntax-to-HIR lowering path, formatter, pl
 
 ## Current Implemented Slice
 
-The current DSL supports `test` declarations containing `browser` blocks, `open`, `click`, `id(...)` and `text(...)` locators, and `expect <locator>.visible`. Plans distinguish browser operations from assertions. Chrome can run headlessly or with `--headed`; text visibility failures, missing locators, and ambiguous locators remain structured and source-mapped.
+The current DSL supports sequential test flows with `server` and `browser` capability blocks, local typed `let` bindings, primitive/list/record expressions, provider calls, JSON-to-record decoding, typed value assertions, browser actions, and the full locator/state surface. Static analysis resolves bindings to IDs, checks provider schemas and capabilities, and rejects non-transferable server-to-browser values. Plans distinguish pure evaluation, provider calls, browser operations, and assertions. Chrome can run headlessly or with `--headed`; value/decode failures and browser failures remain structured and source-mapped.
 
-The executable currently provides path-oriented `check`, `fmt`, and `test`, managed-browser commands, `lsp`, and `dap`. Project discovery and typed `webtest.toml` configuration live in `project`; managed Chrome distribution is separate from CDP in `browser-manager`. CLI reporters provide human, concise, versioned JSON/events, and JUnit output with stable exit classes. The Tower LSP supplies full-document synchronization, diagnostics, formatting, semantic tokens, and synchronized-buffer execution. Syntax highlighting comes from CST-backed semantic tokens; the extension only maps token categories to theme scopes. The Cursor/VS Code extension supplies language registration, run/debug commands, breakpoint contribution, and zero-config DAP launch. `webtest dap` uses the same `TestPlan` and `Runner` as normal execution, pausing through `RunControl` before a source-mapped step. The WASM facade currently exposes diagnostics and formatting; it is not yet a complete Monaco service.
+The executable currently provides path-oriented `check`, `fmt`, `test`, and deterministic `build --emit`, managed-browser commands, `lsp`, and `dap`. Built-in HTTP, direct-process, and sandboxed filesystem providers share one typed registry contract. Project discovery and typed `webtest.toml` configuration live in `project`; managed Chrome distribution is separate from CDP in `browser-manager`. CLI reporters provide human, concise, versioned JSON/events, and JUnit output with stable exit classes. The Tower LSP supplies full-document synchronization, static and revision-safe runtime diagnostics, formatting, semantic tokens, type/capability hover, and synchronized-buffer execution. Syntax highlighting comes from CST-backed semantic tokens; the extension only maps token categories to theme scopes. The Cursor/VS Code extension supplies language registration, run/debug commands, breakpoint contribution, and zero-config DAP launch. `webtest dap` uses the same `TestPlan` and `Runner` as normal execution, pausing through `RunControl` before source-mapped provider, assertion, and browser steps and showing evaluated redacted transferable bindings. The WASM facade exposes diagnostics, formatting, and portable plan compilation with required host-capability metadata; it does not execute native providers and is not yet a complete Monaco service.
 
-Do not claim unimplemented roadmap features—such as bindings, types/effects, modules, actionability, retries, parallelism, server/HTTP operations, traces, or CLI-to-LSP IPC—already exist. Add them incrementally without weakening the shared architecture.
+Do not claim unimplemented roadmap features—such as modules, user-defined functions, application bridges, actionability, retries, parallelism, traces, or CLI-to-LSP IPC—already exist. Add them incrementally without weakening the shared architecture.
 
 ## Crate Ownership and Dependency Direction
 
@@ -73,7 +73,7 @@ Make changes vertically through the existing path rather than special-casing the
 6. Extend protocol-neutral browser/runtime traits and structured errors where execution semantics require it; implement CDP mechanics only in `browser-cdp`.
 7. Convert source-relevant failures into revision-bound observations, then compose them in `editor`.
 8. Expose the capability through LSP, DAP, WASM, CLI, or the extension only as thin conversion/routing work.
-9. Update examples and the relevant spec/status section when the product contract or roadmap changes; do not silently rewrite the initial milestone's historical scope.
+9. Update examples and the relevant spec/status section when the product contract or roadmap changes; do not silently rewrite an archived specification's historical scope.
 
 For syntax work, test valid, invalid, and half-typed input and assert `parse.syntax().text().to_string() == source`. For new operations, test exact AST/HIR/plan ranges and deterministic step ordering. Prefer fake `BrowserHost`/`Page` implementations for runtime and editor tests; reserve real Chrome for backend semantics and end-to-end proof.
 

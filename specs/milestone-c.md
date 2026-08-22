@@ -6,6 +6,10 @@ This specification expands Milestone C in [`future-functionality.md`](./future-f
 
 Milestone C introduces the expression, type, capability, provider, and value-transfer foundations required by the language-neutral application bridge in [`milestone-d.md`](./milestone-d.md). It proves those foundations first with built-in HTTP, process, and filesystem providers.
 
+**Implementation status (2026-08-22): complete.** The shared Rust pipeline now implements the syntax, typed HIR, static analysis, provider schemas, serializable plan, native providers, typed runtime, revision-bound observations, editor/LSP/DAP services, and WASM compilation DTOs described here. Compiler, runtime, editor, and protocol tests cover the typed server-to-browser workflow.
+
+Plan emission has a deliberately strict secret policy: `webtest build --emit` rejects literal values in schema-secret arguments and configured sensitive HTTP header/JSON fields. A future late-bound secret source may make those plans emit-safe; the current compiler never substitutes a redacted placeholder that would change runtime behavior.
+
 ## 1. Outcome
 
 A test can prepare state through a typed black-box server operation, make assertions about the result, transfer serializable values into a browser flow, and receive static diagnostics for invalid calls or domain crossings:
@@ -396,7 +400,7 @@ Required coverage includes:
 
 Milestone C is complete only when:
 
-1. The reference created-user flow prepares state with `http.*`, decodes a typed record, and uses it in the browser.
+1. End-to-end coverage proves that a flow can prepare state with `http.*`, decode a typed record, and use it in the browser.
 2. Invalid fields, call arguments, matcher types, provider domains, and non-transferable crossings fail statically at precise ranges.
 3. HTTP, process, and filesystem calls lower to the same explicit provider-call IR and run behind one registry contract.
 4. Provider/assertion failures produce structured, redacted events, observations, CLI output, and DAP values.

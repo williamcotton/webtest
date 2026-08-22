@@ -8,7 +8,7 @@ use webtest_analysis::{
 };
 use webtest_browser::{BrowserError, BrowserHost, Locator};
 use webtest_observation::{ObservationStore, RuntimeObservationKind};
-use webtest_runtime::{RunResult, Runner, RunnerOptions};
+use webtest_runtime::{RunError, RunResult, Runner, RunnerOptions};
 use webtest_syntax::SyntaxKind;
 use webtest_text::{FileId, TextRange};
 
@@ -18,6 +18,9 @@ pub enum SemanticTokenKind {
     String,
     Comment,
     Function,
+    Variable,
+    Property,
+    Type,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,12 +29,20 @@ pub struct SemanticToken {
     pub kind: SemanticTokenKind,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hover {
+    pub range: TextRange,
+    pub contents: String,
+}
+
 #[derive(Debug, Error)]
 pub enum EditorError {
     #[error(transparent)]
     Analysis(#[from] AnalysisError),
     #[error(transparent)]
     Browser(#[from] BrowserError),
+    #[error(transparent)]
+    Runtime(#[from] RunError),
     #[error("the file has static errors and cannot be executed")]
     StaticErrors,
 }
@@ -106,6 +117,29 @@ impl EditorService {
                         message: friendly_runtime_message(&code, locator.as_ref(), &message),
                         source: DiagnosticSource::Runtime,
                     },
+                    RuntimeObservationKind::ValueFailure {
+                        code,
+                        message,
+                        path,
+                        expected,
+                        actual,
+                        diff: _,
+                    } => {
+                        let mut details = message;
+                        if let Some(path) = path {
+                            details.push_str(&format!(" Path: {path}."));
+                        }
+                        if let (Some(expected), Some(actual)) = (expected, actual) {
+                            details.push_str(&format!(" Expected {expected}; got {actual}."));
+                        }
+                        Diagnostic {
+                            range: observation.range,
+                            severity: DiagnosticSeverity::Error,
+                            code: value_runtime_diagnostic_code(&code),
+                            message: details,
+                            source: DiagnosticSource::Runtime,
+                        }
+                    }
                     RuntimeObservationKind::LocatorNotFound { locator, .. } => Diagnostic {
                         range: observation.range,
                         severity: DiagnosticSeverity::Error,
@@ -147,6 +181,20 @@ impl EditorService {
         Ok(webtest_format::format_file(&parse))
     }
 
+    pub fn hover(
+        &self,
+        file: FileId,
+        offset: webtest_text::TextSize,
+    ) -> Result<Option<Hover>, EditorError> {
+        Ok(self
+            .write_database()
+            .type_at(file, offset)?
+            .map(|fact| Hover {
+                range: fact.range,
+                contents: format!("{} ({})", fact.ty, fact.capability),
+            }))
+    }
+
     pub fn semantic_tokens(&self, file: FileId) -> Result<Vec<SemanticToken>, EditorError> {
         let parse = self.write_database().parse(file)?;
         Ok(parse
@@ -154,9 +202,17 @@ impl EditorService {
             .descendants_with_tokens()
             .filter_map(|element| element.into_token())
             .filter_map(|token| {
+                let parent = token.parent().map(|node| node.kind());
                 let kind = match token.kind() {
                     SyntaxKind::TestKw
                     | SyntaxKind::BrowserKw
+                    | SyntaxKind::ServerKw
+                    | SyntaxKind::LetKw
+                    | SyntaxKind::TrueKw
+                    | SyntaxKind::FalseKw
+                    | SyntaxKind::NullKw
+                    | SyntaxKind::ContainsKw
+                    | SyntaxKind::MatchesKw
                     | SyntaxKind::OpenKw
                     | SyntaxKind::ClickKw
                     | SyntaxKind::FillKw
@@ -191,6 +247,22 @@ impl EditorService {
                     | SyntaxKind::UrlKw => SemanticTokenKind::Function,
                     SyntaxKind::String => SemanticTokenKind::String,
                     SyntaxKind::LineComment => SemanticTokenKind::Comment,
+                    SyntaxKind::Ident
+                        if matches!(parent, Some(SyntaxKind::LetStmt | SyntaxKind::NameExpr)) =>
+                    {
+                        SemanticTokenKind::Variable
+                    }
+                    SyntaxKind::Ident if parent == Some(SyntaxKind::MemberExpr) => {
+                        SemanticTokenKind::Property
+                    }
+                    SyntaxKind::Ident
+                        if matches!(
+                            parent,
+                            Some(SyntaxKind::NamedType | SyntaxKind::GenericType)
+                        ) =>
+                    {
+                        SemanticTokenKind::Type
+                    }
                     _ => return None,
                 };
                 Some(SemanticToken {
@@ -274,6 +346,19 @@ fn runtime_diagnostic_code(code: &str) -> &'static str {
         "action_timeout" => "runtime.action_timeout",
         "url_mismatch" => "runtime.url_mismatch",
         _ => "runtime.assertion_failed",
+    }
+}
+
+fn value_runtime_diagnostic_code(code: &str) -> &'static str {
+    match code {
+        "json_decode_failed" => "runtime.json_decode_failed",
+        "assertion_failed" => "runtime.assertion_failed",
+        "provider_invalid_argument" => "runtime.provider_invalid_argument",
+        "path_escape" => "runtime.path_escape",
+        "division_by_zero" => "runtime.division_by_zero",
+        "response_decode_failed" => "runtime.response_decode_failed",
+        "internal_error" => "runtime.internal_error",
+        _ => "runtime.provider_failure",
     }
 }
 
@@ -414,7 +499,7 @@ mod tests {
             .expect_err("forced disconnect");
         assert!(matches!(
             error,
-            EditorError::Browser(BrowserError::BrowserDisconnected)
+            EditorError::Runtime(RunError::Browser(BrowserError::BrowserDisconnected))
         ));
         assert!(
             editor
@@ -484,6 +569,75 @@ mod tests {
         assert!(rendered.contains(&("text", SemanticTokenKind::Function)));
         assert!(rendered.contains(&("visible", SemanticTokenKind::Keyword)));
         assert!(rendered.contains(&("\"submit\"", SemanticTokenKind::String)));
+    }
+
+    #[test]
+    fn hover_uses_shared_static_type_facts() {
+        let editor = EditorService::new();
+        let source = "test \"x\" { server { let response = http.get(\"/user\") expect response.status == 200 } }";
+        let file = editor.open_document("file:///hover.webtest", source);
+        let offset = source.find("status").expect("status") + 1;
+        let hover = editor
+            .hover(file, webtest_text::TextSize::from(offset as u32))
+            .expect("hover")
+            .expect("type fact");
+        assert!(hover.contents.contains("StatusCode"), "{}", hover.contents);
+    }
+
+    #[tokio::test]
+    async fn typed_json_decode_failure_is_published_on_the_constrained_expression() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fixture listener");
+        let address = listener.local_addr().expect("fixture address");
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let (mut stream, _) = listener.accept().await.expect("fixture request");
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).await;
+            let body = r#"{"id":"wrong","email":"alice@example.test"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("fixture response");
+        });
+
+        let source = format!(
+            r#"test "decode" {{
+    server {{
+        let response = http.get("http://{address}/user")
+        let user: {{ id: Int, email: String }} = response.json
+    }}
+}}
+"#,
+        );
+        let editor = EditorService::new();
+        let file = editor.open_document("file:///decode.webtest", &source);
+        let run = editor
+            .run_file(file, &FakeHost(true))
+            .await
+            .expect("decode failure is a completed test run");
+        assert_eq!(run.failed(), 1);
+        let diagnostic = editor
+            .diagnostics(file)
+            .expect("diagnostics")
+            .into_iter()
+            .find(|diagnostic| diagnostic.code == "runtime.json_decode_failed")
+            .expect("runtime decode diagnostic");
+        let start = u32::from(diagnostic.range.start()) as usize;
+        let end = u32::from(diagnostic.range.end()) as usize;
+        assert_eq!(&source[start..end], "response.json");
+        assert!(
+            diagnostic.message.contains("$.id"),
+            "{}",
+            diagnostic.message
+        );
+        assert!(diagnostic.message.contains("Int"), "{}", diagnostic.message);
     }
 
     #[tokio::test]

@@ -13,6 +13,7 @@ impl Parse {
     pub fn syntax(&self) -> SyntaxNode {
         SyntaxNode::new_root(self.green.clone())
     }
+
     pub fn errors(&self) -> &[SyntaxError] {
         &self.errors
     }
@@ -20,6 +21,13 @@ impl Parse {
 
 pub fn parse(source: &str) -> Parse {
     Parser::new(source).parse()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockDomain {
+    Test,
+    Server,
+    Browser,
 }
 
 struct Parser<'a> {
@@ -75,16 +83,16 @@ impl<'a> Parser<'a> {
             "syntax.expected_test_name",
             "expected test name string after `test`",
         );
-        self.block();
+        self.braced_block(SyntaxKind::Block, BlockDomain::Test);
         self.finish();
     }
 
-    fn block(&mut self) {
-        self.start(SyntaxKind::Block);
+    fn braced_block(&mut self, kind: SyntaxKind, domain: BlockDomain) {
+        self.start(kind);
         if !self.expect(
             SyntaxKind::LBrace,
             "syntax.expected_lbrace",
-            "expected `{` to start test body",
+            "expected `{` to start block",
         ) {
             self.finish();
             return;
@@ -92,31 +100,86 @@ impl<'a> Parser<'a> {
         loop {
             self.eat_trivia();
             match self.current() {
-                SyntaxKind::BrowserKw => self.browser_block(),
                 SyntaxKind::RBrace => {
                     self.bump();
                     break;
                 }
                 SyntaxKind::Eof => {
-                    self.error_here("syntax.expected_rbrace", "expected `}` to close test body");
+                    self.error_here("syntax.expected_rbrace", "expected `}` to close block");
                     break;
                 }
-                _ => self.unexpected(
-                    "syntax.expected_browser",
-                    "expected `browser` block in test body",
-                ),
+                _ => self.statement(domain),
             }
         }
         self.finish();
     }
 
-    fn browser_block(&mut self) {
-        self.start(SyntaxKind::BrowserBlock);
+    fn statement(&mut self, domain: BlockDomain) {
+        match (domain, self.current()) {
+            (BlockDomain::Test, SyntaxKind::ServerKw) => {
+                self.capability_block(SyntaxKind::ServerBlock, BlockDomain::Server)
+            }
+            (BlockDomain::Test, SyntaxKind::BrowserKw) => {
+                self.capability_block(SyntaxKind::BrowserBlock, BlockDomain::Browser)
+            }
+            (_, SyntaxKind::LetKw) => self.let_statement(),
+            (BlockDomain::Browser, SyntaxKind::OpenKw) => self.open_statement(),
+            (BlockDomain::Browser, SyntaxKind::EvaluateKw) => self.evaluate_statement(),
+            (BlockDomain::Browser, SyntaxKind::ClickKw) => {
+                self.locator_action(SyntaxKind::ClickStmt)
+            }
+            (BlockDomain::Browser, SyntaxKind::FillKw) => {
+                self.value_action(SyntaxKind::FillStmt, SyntaxKind::WithKw, "with")
+            }
+            (BlockDomain::Browser, SyntaxKind::TypeKw) => {
+                self.value_action(SyntaxKind::TypeStmt, SyntaxKind::WithKw, "with")
+            }
+            (BlockDomain::Browser, SyntaxKind::PressKw) => {
+                self.value_action(SyntaxKind::PressStmt, SyntaxKind::KeyKw, "key")
+            }
+            (BlockDomain::Browser, SyntaxKind::CheckKw) => {
+                self.locator_action(SyntaxKind::CheckStmt)
+            }
+            (BlockDomain::Browser, SyntaxKind::UncheckKw) => {
+                self.locator_action(SyntaxKind::UncheckStmt)
+            }
+            (BlockDomain::Browser, SyntaxKind::SelectKw) => {
+                self.value_action(SyntaxKind::SelectStmt, SyntaxKind::OptionKw, "option")
+            }
+            (BlockDomain::Browser, SyntaxKind::HoverKw) => {
+                self.locator_action(SyntaxKind::HoverStmt)
+            }
+            (BlockDomain::Browser, SyntaxKind::WaitKw) => self.wait_statement(),
+            (BlockDomain::Browser, SyntaxKind::ExpectKw)
+                if self.nth_non_trivia(1) == SyntaxKind::UrlKw
+                    || self.nth_non_trivia(1).is_locator_start() =>
+            {
+                self.browser_expect_statement()
+            }
+            (_, SyntaxKind::ExpectKw) => self.expression_expect_statement(),
+            (_, kind) if self.expression_start(kind) => self.expression_statement(),
+            (BlockDomain::Test, _) => self.unexpected(
+                "syntax.expected_flow_statement",
+                "expected `server`, `browser`, `let`, or assertion in test body",
+            ),
+            (BlockDomain::Server, _) => self.unexpected(
+                "syntax.expected_server_statement",
+                "expected binding, provider call, or assertion in server block",
+            ),
+            (BlockDomain::Browser, _) => self.unexpected(
+                "syntax.expected_browser_statement",
+                "expected browser action, binding, wait, or assertion in browser block",
+            ),
+        }
+    }
+
+    fn capability_block(&mut self, kind: SyntaxKind, domain: BlockDomain) {
+        self.start(kind);
         self.bump();
         if !self.expect(
             SyntaxKind::LBrace,
             "syntax.expected_lbrace",
-            "expected `{` to start browser block",
+            "expected `{` to start capability block",
         ) {
             self.finish();
             return;
@@ -124,54 +187,59 @@ impl<'a> Parser<'a> {
         loop {
             self.eat_trivia();
             match self.current() {
-                SyntaxKind::OpenKw => self.open_statement(),
-                SyntaxKind::EvaluateKw => self.evaluate_statement(),
-                SyntaxKind::ClickKw => self.locator_action(SyntaxKind::ClickStmt),
-                SyntaxKind::FillKw => {
-                    self.value_action(SyntaxKind::FillStmt, SyntaxKind::WithKw, "with")
-                }
-                SyntaxKind::TypeKw => {
-                    self.value_action(SyntaxKind::TypeStmt, SyntaxKind::WithKw, "with")
-                }
-                SyntaxKind::PressKw => {
-                    self.value_action(SyntaxKind::PressStmt, SyntaxKind::KeyKw, "key")
-                }
-                SyntaxKind::CheckKw => self.locator_action(SyntaxKind::CheckStmt),
-                SyntaxKind::UncheckKw => self.locator_action(SyntaxKind::UncheckStmt),
-                SyntaxKind::SelectKw => {
-                    self.value_action(SyntaxKind::SelectStmt, SyntaxKind::OptionKw, "option")
-                }
-                SyntaxKind::HoverKw => self.locator_action(SyntaxKind::HoverStmt),
-                SyntaxKind::WaitKw => self.wait_statement(),
-                SyntaxKind::ExpectKw => self.expect_statement(),
                 SyntaxKind::RBrace => {
                     self.bump();
                     break;
                 }
                 SyntaxKind::Eof => {
-                    self.error_here(
-                        "syntax.expected_rbrace",
-                        "expected `}` to close browser block",
-                    );
+                    self.error_here("syntax.expected_rbrace", "expected `}` to close block");
                     break;
                 }
-                _ => self.unexpected(
-                    "syntax.expected_browser_statement",
-                    "expected a browser action, wait, or assertion in browser block",
-                ),
+                _ => self.statement(domain),
             }
         }
+        self.finish();
+    }
+
+    fn let_statement(&mut self) {
+        self.start(SyntaxKind::LetStmt);
+        self.bump();
+        self.expect(
+            SyntaxKind::Ident,
+            "syntax.expected_binding_name",
+            "expected binding name after `let`",
+        );
+        self.eat_trivia();
+        if self.current() == SyntaxKind::Colon {
+            self.bump();
+            self.type_expression();
+        }
+        self.expect(
+            SyntaxKind::Equal,
+            "syntax.expected_equal",
+            "expected `=` in binding",
+        );
+        self.require_expression("expected expression after `=`");
+        self.finish();
+    }
+
+    fn expression_statement(&mut self) {
+        self.start(SyntaxKind::ExprStmt);
+        self.require_expression("expected expression");
+        self.finish();
+    }
+
+    fn expression_expect_statement(&mut self) {
+        self.start(SyntaxKind::ExpectExprStmt);
+        self.bump();
+        self.require_expression("expected assertion expression after `expect`");
         self.finish();
     }
 
     fn open_statement(&mut self) {
         self.start(SyntaxKind::OpenStmt);
         self.bump();
-        self.expect(
-            SyntaxKind::String,
-            "syntax.expected_url",
-            "expected URL string after `open`",
-        );
+        self.require_expression("expected URL expression after `open`");
         self.finish();
     }
 
@@ -201,16 +269,12 @@ impl<'a> Parser<'a> {
             separator,
             "syntax.expected_action_argument",
             match spelling {
-                "with" => "expected `with` and a value string after locator",
-                "key" => "expected `key` and a key string after locator",
-                _ => "expected `option` and an option string after locator",
+                "with" => "expected `with` and a value after locator",
+                "key" => "expected `key` and a key after locator",
+                _ => "expected `option` and an option after locator",
             },
         );
-        self.expect(
-            SyntaxKind::String,
-            "syntax.expected_action_value",
-            "expected action value string",
-        );
+        self.require_expression("expected action value expression");
         self.finish();
     }
 
@@ -232,7 +296,7 @@ impl<'a> Parser<'a> {
         self.finish();
     }
 
-    fn expect_statement(&mut self) {
+    fn browser_expect_statement(&mut self) {
         let kind = if self.nth_non_trivia(1) == SyntaxKind::UrlKw {
             SyntaxKind::ExpectUrlStmt
         } else {
@@ -261,11 +325,7 @@ impl<'a> Parser<'a> {
             "syntax.expected_lparen",
             "expected `(` after `url`",
         );
-        self.expect(
-            SyntaxKind::String,
-            "syntax.expected_url",
-            "expected URL string",
-        );
+        self.require_expression("expected URL expression");
         self.expect(
             SyntaxKind::RParen,
             "syntax.expected_rparen",
@@ -364,6 +424,329 @@ impl<'a> Parser<'a> {
         true
     }
 
+    fn require_expression(&mut self, message: &'static str) {
+        self.eat_trivia();
+        if !self.expression_start(self.current()) {
+            self.error_here("syntax.expected_expression", message);
+            return;
+        }
+        self.expression_bp(0);
+    }
+
+    fn expression_bp(&mut self, min_binding_power: u8) {
+        self.eat_trivia();
+        let checkpoint = self.builder.checkpoint();
+        match self.current() {
+            SyntaxKind::Bang | SyntaxKind::Minus => {
+                self.start(SyntaxKind::UnaryExpr);
+                self.bump();
+                self.expression_bp(13);
+                self.finish();
+            }
+            SyntaxKind::String
+            | SyntaxKind::Int
+            | SyntaxKind::Float
+            | SyntaxKind::Duration
+            | SyntaxKind::TrueKw
+            | SyntaxKind::FalseKw
+            | SyntaxKind::NullKw => {
+                self.start(SyntaxKind::LiteralExpr);
+                self.bump();
+                self.finish();
+            }
+            kind if self.name_token(kind) => {
+                self.start(SyntaxKind::NameExpr);
+                self.bump();
+                self.finish();
+            }
+            SyntaxKind::LBracket => self.list_expression(),
+            SyntaxKind::LBrace => self.record_expression(),
+            SyntaxKind::LParen => {
+                self.start(SyntaxKind::ParenExpr);
+                self.bump();
+                self.require_expression("expected expression after `(`");
+                self.expect(SyntaxKind::RParen, "syntax.expected_rparen", "expected `)`");
+                self.finish();
+            }
+            _ => {
+                self.error_here("syntax.expected_expression", "expected expression");
+                return;
+            }
+        }
+
+        loop {
+            self.eat_trivia();
+            if self.current() == SyntaxKind::Dot {
+                self.builder
+                    .start_node_at(checkpoint, rowan::SyntaxKind(SyntaxKind::MemberExpr as u16));
+                self.bump();
+                self.eat_trivia();
+                if self.name_token(self.current()) {
+                    self.bump();
+                } else {
+                    self.error_here("syntax.expected_member", "expected member name after `.`");
+                }
+                self.finish();
+                continue;
+            }
+            if self.current() == SyntaxKind::LParen {
+                self.builder
+                    .start_node_at(checkpoint, rowan::SyntaxKind(SyntaxKind::CallExpr as u16));
+                self.call_arguments();
+                self.finish();
+                continue;
+            }
+            let Some((left, right)) = self.binary_binding_power(self.current()) else {
+                break;
+            };
+            if left < min_binding_power {
+                break;
+            }
+            self.builder
+                .start_node_at(checkpoint, rowan::SyntaxKind(SyntaxKind::BinaryExpr as u16));
+            self.bump();
+            self.eat_trivia();
+            if self.expression_start(self.current()) {
+                self.expression_bp(right);
+            } else {
+                self.error_here(
+                    "syntax.expected_operand",
+                    "expected expression after operator",
+                );
+            }
+            self.finish();
+        }
+    }
+
+    fn list_expression(&mut self) {
+        self.start(SyntaxKind::ListExpr);
+        self.bump();
+        loop {
+            self.eat_trivia();
+            if self.current() == SyntaxKind::RBracket {
+                self.bump();
+                break;
+            }
+            if self.current() == SyntaxKind::Eof || self.current() == SyntaxKind::RBrace {
+                self.error_here("syntax.expected_rbracket", "expected `]` to close list");
+                break;
+            }
+            self.require_expression("expected list item");
+            self.eat_trivia();
+            if self.current() == SyntaxKind::Comma {
+                self.bump();
+            } else if self.current() != SyntaxKind::RBracket {
+                self.error_here("syntax.expected_comma", "expected `,` between list items");
+                break;
+            }
+        }
+        self.finish();
+    }
+
+    fn record_expression(&mut self) {
+        self.start(SyntaxKind::RecordExpr);
+        self.bump();
+        loop {
+            self.eat_trivia();
+            if self.current() == SyntaxKind::RBrace {
+                self.bump();
+                break;
+            }
+            if self.current() == SyntaxKind::Eof {
+                self.error_here("syntax.expected_rbrace", "expected `}` to close record");
+                break;
+            }
+            self.start(SyntaxKind::RecordField);
+            if self.current() == SyntaxKind::String || self.name_token(self.current()) {
+                self.bump();
+            } else {
+                self.error_here("syntax.expected_field_name", "expected record field name");
+            }
+            self.expect(
+                SyntaxKind::Colon,
+                "syntax.expected_colon",
+                "expected `:` after field name",
+            );
+            self.require_expression("expected record field value");
+            self.finish();
+            self.eat_trivia();
+            if self.current() == SyntaxKind::Comma {
+                self.bump();
+            } else if self.current() != SyntaxKind::RBrace {
+                self.error_here(
+                    "syntax.expected_comma",
+                    "expected `,` between record fields",
+                );
+                break;
+            }
+        }
+        self.finish();
+    }
+
+    fn call_arguments(&mut self) {
+        self.bump();
+        loop {
+            self.eat_trivia();
+            if self.current() == SyntaxKind::RParen {
+                self.bump();
+                break;
+            }
+            if self.current() == SyntaxKind::Eof || self.current() == SyntaxKind::RBrace {
+                self.error_here("syntax.expected_rparen", "expected `)` to close call");
+                break;
+            }
+            self.start(SyntaxKind::CallArg);
+            if self.name_token(self.current()) && self.nth_non_trivia(1) == SyntaxKind::Colon {
+                self.bump();
+                self.expect(
+                    SyntaxKind::Colon,
+                    "syntax.expected_colon",
+                    "expected `:` after argument name",
+                );
+            }
+            self.require_expression("expected call argument");
+            self.finish();
+            self.eat_trivia();
+            if self.current() == SyntaxKind::Comma {
+                self.bump();
+            } else if self.current() != SyntaxKind::RParen {
+                self.error_here(
+                    "syntax.expected_comma",
+                    "expected `,` between call arguments",
+                );
+                break;
+            }
+        }
+    }
+
+    fn type_expression(&mut self) {
+        self.eat_trivia();
+        if self.current() == SyntaxKind::LBrace {
+            self.record_type();
+            return;
+        }
+        if !self.name_token(self.current()) {
+            self.error_here("syntax.expected_type", "expected type");
+            return;
+        }
+        let kind = if self.nth_non_trivia(1) == SyntaxKind::Lt {
+            SyntaxKind::GenericType
+        } else {
+            SyntaxKind::NamedType
+        };
+        self.start(kind);
+        self.bump();
+        if kind == SyntaxKind::GenericType {
+            self.expect(
+                SyntaxKind::Lt,
+                "syntax.expected_lt",
+                "expected `<` after type name",
+            );
+            self.type_expression();
+            self.expect(
+                SyntaxKind::Gt,
+                "syntax.expected_gt",
+                "expected `>` after type argument",
+            );
+        }
+        self.finish();
+    }
+
+    fn record_type(&mut self) {
+        self.start(SyntaxKind::RecordType);
+        self.bump();
+        loop {
+            self.eat_trivia();
+            if self.current() == SyntaxKind::RBrace {
+                self.bump();
+                break;
+            }
+            if self.current() == SyntaxKind::Eof {
+                self.error_here(
+                    "syntax.expected_rbrace",
+                    "expected `}` to close record type",
+                );
+                break;
+            }
+            self.start(SyntaxKind::TypeField);
+            if self.name_token(self.current()) || self.current() == SyntaxKind::String {
+                self.bump();
+            } else {
+                self.error_here("syntax.expected_field_name", "expected type field name");
+            }
+            self.eat_trivia();
+            if self.current() == SyntaxKind::Question {
+                self.bump();
+            }
+            self.expect(
+                SyntaxKind::Colon,
+                "syntax.expected_colon",
+                "expected `:` after type field",
+            );
+            self.type_expression();
+            self.finish();
+            self.eat_trivia();
+            if self.current() == SyntaxKind::Comma {
+                self.bump();
+            } else if self.current() != SyntaxKind::RBrace {
+                self.error_here("syntax.expected_comma", "expected `,` between type fields");
+                break;
+            }
+        }
+        self.finish();
+    }
+
+    fn binary_binding_power(&self, kind: SyntaxKind) -> Option<(u8, u8)> {
+        Some(match kind {
+            SyntaxKind::OrOr => (1, 2),
+            SyntaxKind::AndAnd => (3, 4),
+            SyntaxKind::EqEq
+            | SyntaxKind::BangEq
+            | SyntaxKind::ContainsKw
+            | SyntaxKind::MatchesKw => (5, 6),
+            SyntaxKind::Lt | SyntaxKind::LtEq | SyntaxKind::Gt | SyntaxKind::GtEq => (7, 8),
+            SyntaxKind::Plus | SyntaxKind::Minus => (9, 10),
+            SyntaxKind::Star | SyntaxKind::Slash => (11, 12),
+            _ => return None,
+        })
+    }
+
+    fn expression_start(&self, kind: SyntaxKind) -> bool {
+        matches!(
+            kind,
+            SyntaxKind::String
+                | SyntaxKind::Int
+                | SyntaxKind::Float
+                | SyntaxKind::Duration
+                | SyntaxKind::TrueKw
+                | SyntaxKind::FalseKw
+                | SyntaxKind::NullKw
+                | SyntaxKind::Bang
+                | SyntaxKind::Minus
+                | SyntaxKind::LBracket
+                | SyntaxKind::LBrace
+                | SyntaxKind::LParen
+        ) || self.name_token(kind)
+    }
+
+    fn name_token(&self, kind: SyntaxKind) -> bool {
+        matches!(
+            kind,
+            SyntaxKind::Ident
+                | SyntaxKind::NameKw
+                | SyntaxKind::IdKw
+                | SyntaxKind::RoleKw
+                | SyntaxKind::LabelKw
+                | SyntaxKind::TextKw
+                | SyntaxKind::PlaceholderKw
+                | SyntaxKind::TestIdKw
+                | SyntaxKind::CssKw
+                | SyntaxKind::XPathKw
+                | SyntaxKind::UrlKw
+                | SyntaxKind::OptionKw
+        )
+    }
+
     fn expect(&mut self, kind: SyntaxKind, code: &'static str, message: &'static str) -> bool {
         self.eat_trivia();
         if self.current() == kind {
@@ -395,11 +778,13 @@ impl<'a> Parser<'a> {
             self.bump();
         }
     }
+
     fn current(&self) -> SyntaxKind {
         self.tokens
             .get(self.position)
             .map_or(SyntaxKind::Eof, |token| token.kind)
     }
+
     fn nth_non_trivia(&self, nth: usize) -> SyntaxKind {
         self.tokens
             .iter()
@@ -408,6 +793,7 @@ impl<'a> Parser<'a> {
             .nth(nth)
             .map_or(SyntaxKind::Eof, |token| token.kind)
     }
+
     fn current_range(&self) -> TextRange {
         self.tokens.get(self.position).map_or_else(
             || {
@@ -417,6 +803,7 @@ impl<'a> Parser<'a> {
             |token| token.range,
         )
     }
+
     fn bump(&mut self) {
         if let Some(token) = self.tokens.get(self.position) {
             let start = u32::from(token.range.start()) as usize;
@@ -428,9 +815,11 @@ impl<'a> Parser<'a> {
             self.position += 1;
         }
     }
+
     fn start(&mut self, kind: SyntaxKind) {
         self.builder.start_node(rowan::SyntaxKind(kind as u16));
     }
+
     fn finish(&mut self) {
         self.builder.finish_node();
     }

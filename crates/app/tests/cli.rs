@@ -80,7 +80,7 @@ fn static_usage_and_browser_failures_have_distinct_exit_codes() {
 
     write(
         &directory.path().join("valid.webtest"),
-        "test \"valid\" {}\n",
+        "test \"valid\" { browser { open \"about:blank\" } }\n",
     );
     let infrastructure = webtest(directory.path())
         .args([
@@ -138,6 +138,144 @@ fn fmt_check_is_non_mutating_and_rewrite_converges() {
             .expect("second check")
             .success()
     );
+}
+
+#[test]
+fn build_emits_a_versioned_typed_plan_deterministically() {
+    let directory = tempfile::tempdir().expect("temp directory");
+    write(
+        &directory.path().join("typed.webtest"),
+        r#"test "typed" {
+    server {
+        let response = http.get("http://example.test/user")
+        expect response.status == 200
+    }
+}
+"#,
+    );
+    let first = directory.path().join("first.json");
+    let second = directory.path().join("second.json");
+    for output in [&first, &second] {
+        let result = webtest(directory.path())
+            .args(["build", "typed.webtest", "--emit"])
+            .arg(output)
+            .output()
+            .expect("build plan");
+        assert_eq!(
+            result.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    let first_bytes = fs::read(&first).expect("first plan");
+    assert_eq!(first_bytes, fs::read(&second).expect("second plan"));
+    let plan: serde_json::Value = serde_json::from_slice(&first_bytes).expect("plan JSON");
+    assert_eq!(plan["format_version"], 1);
+    assert_eq!(plan["required_host_capabilities"][0], "server");
+    assert_eq!(
+        plan["tests"][0]["steps"][0]["operation"]["kind"],
+        "server_provider_call"
+    );
+
+    write(
+        &directory.path().join("webtest.toml"),
+        "[server]\nbase_url = \"http://127.0.0.1:4000\"\n",
+    );
+    let configured = directory.path().join("configured.json");
+    assert!(
+        webtest(directory.path())
+            .args(["build", "typed.webtest", "--emit"])
+            .arg(&configured)
+            .status()
+            .expect("configured build")
+            .success()
+    );
+    let configured: serde_json::Value =
+        serde_json::from_slice(&fs::read(configured).expect("configured plan"))
+            .expect("configured plan JSON");
+    assert_ne!(plan["project_identity"], configured["project_identity"]);
+}
+
+#[test]
+fn build_refuses_to_serialize_literal_secrets() {
+    let directory = tempfile::tempdir().expect("temp directory");
+    write(
+        &directory.path().join("secret.webtest"),
+        r#"test "secret" {
+    server {
+        let credential = "do-not-emit"
+        http.post("http://example.test/login", json: { password: credential })
+    }
+}
+"#,
+    );
+    let output_path = directory.path().join("plan.json");
+    let result = webtest(directory.path())
+        .args(["build", "secret.webtest", "--emit"])
+        .arg(&output_path)
+        .output()
+        .expect("secret build");
+    assert_eq!(result.status.code(), Some(2));
+    assert!(!output_path.exists());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("literal secret"), "{stderr}");
+    assert!(!stderr.contains("do-not-emit"), "{stderr}");
+}
+
+#[test]
+fn server_only_http_decode_and_assertion_runs_without_chrome() {
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("fixture listener");
+    let address = listener.local_addr().expect("fixture address");
+    let fixture = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("fixture request");
+        let mut request = [0u8; 4096];
+        let _ = stream.read(&mut request);
+        let body = r#"{"id":7,"email":"alice@example.test"}"#;
+        write!(
+            stream,
+            "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .expect("fixture response");
+    });
+
+    let directory = tempfile::tempdir().expect("temp directory");
+    write(
+        &directory.path().join("server.webtest"),
+        &format!(
+            r#"test "server" {{
+    server {{
+        let response = http.post("http://{address}/users", json: {{ email: "alice@example.test" }})
+        expect response.status == 201
+        let user: {{ id: Int, email: String }} = response.json
+        expect user.id == 7
+    }}
+}}
+"#,
+        ),
+    );
+    let result = webtest(directory.path())
+        .args(["test", "server.webtest", "--reporter", "json"])
+        .env(
+            "WEBTEST_CHROME_PATH",
+            directory.path().join("missing-chrome"),
+        )
+        .output()
+        .expect("server-only run");
+    fixture.join().expect("fixture thread");
+    assert_eq!(
+        result.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&result.stdout).expect("run report");
+    assert_eq!(report["summary"]["passed"], 1);
 }
 
 #[test]
@@ -213,7 +351,7 @@ fn mixed_outcomes_use_the_highest_severity_exit_class() {
     );
     write(
         &directory.path().join("valid.webtest"),
-        "test \"valid\" {}\n",
+        "test \"valid\" { browser { open \"about:blank\" } }\n",
     );
     let fake_chrome = directory.path().join("fake-chrome");
     write(&fake_chrome, "#!/bin/sh\nexit 9\n");

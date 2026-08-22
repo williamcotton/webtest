@@ -14,6 +14,12 @@ pub fn format_file(parse: &Parse) -> String {
         .filter_map(|it| it.into_token())
     {
         let kind = token.kind();
+        let structural_brace = token.parent().is_some_and(|parent| {
+            matches!(
+                parent.kind(),
+                SyntaxKind::RecordExpr | SyntaxKind::RecordType
+            )
+        });
         match kind {
             SyntaxKind::Whitespace => {}
             SyntaxKind::LineComment => {
@@ -27,25 +33,50 @@ pub fn format_file(parse: &Parse) -> String {
                 line_start = true;
             }
             SyntaxKind::LBrace => {
-                if line_start {
-                    push_indent(&mut output, indent);
-                } else if !output.ends_with(' ') {
+                if structural_brace {
+                    if line_start {
+                        push_indent(&mut output, indent);
+                    } else if needs_space(previous, kind) && !output.ends_with(' ') {
+                        output.push(' ');
+                    }
+                    output.push('{');
                     output.push(' ');
+                    line_start = false;
+                } else {
+                    if line_start {
+                        push_indent(&mut output, indent);
+                    } else if !output.ends_with(' ') {
+                        output.push(' ');
+                    }
+                    output.push('{');
+                    output.push('\n');
+                    indent += 1;
+                    line_start = true;
                 }
-                output.push('{');
-                output.push('\n');
-                indent += 1;
-                line_start = true;
             }
             SyntaxKind::RBrace => {
-                if !line_start {
+                if structural_brace {
+                    while output.ends_with(' ') {
+                        output.pop();
+                    }
+                    if output.ends_with(',') {
+                        output.pop();
+                    }
+                    if previous != Some(SyntaxKind::LBrace) {
+                        output.push(' ');
+                    }
+                    output.push('}');
+                    line_start = false;
+                } else {
+                    if !line_start {
+                        output.push('\n');
+                    }
+                    indent = indent.saturating_sub(1);
+                    push_indent(&mut output, indent);
+                    output.push('}');
                     output.push('\n');
+                    line_start = true;
                 }
-                indent = indent.saturating_sub(1);
-                push_indent(&mut output, indent);
-                output.push('}');
-                output.push('\n');
-                line_start = true;
             }
             SyntaxKind::LParen => {
                 if line_start {
@@ -59,6 +90,29 @@ pub fn format_file(parse: &Parse) -> String {
                     output.pop();
                 }
                 output.push(')');
+                line_start = false;
+            }
+            SyntaxKind::LBracket => {
+                if line_start {
+                    push_indent(&mut output, indent);
+                } else if needs_space(previous, kind) && !output.ends_with(' ') {
+                    output.push(' ');
+                }
+                output.push('[');
+                line_start = false;
+            }
+            SyntaxKind::RBracket => {
+                while output.ends_with(' ') {
+                    output.pop();
+                }
+                output.push(']');
+                line_start = false;
+            }
+            SyntaxKind::Question => {
+                while output.ends_with(' ') {
+                    output.pop();
+                }
+                output.push('?');
                 line_start = false;
             }
             SyntaxKind::Dot => {
@@ -80,6 +134,8 @@ pub fn format_file(parse: &Parse) -> String {
                     kind,
                     SyntaxKind::TestKw
                         | SyntaxKind::BrowserKw
+                        | SyntaxKind::ServerKw
+                        | SyntaxKind::LetKw
                         | SyntaxKind::OpenKw
                         | SyntaxKind::EvaluateKw
                         | SyntaxKind::ClickKw
@@ -131,9 +187,11 @@ fn needs_space(previous: Option<SyntaxKind>, current: SyntaxKind) -> bool {
         current,
         SyntaxKind::LParen
             | SyntaxKind::RParen
+            | SyntaxKind::RBracket
             | SyntaxKind::Dot
             | SyntaxKind::Comma
             | SyntaxKind::Colon
+            | SyntaxKind::Question
     ) && !matches!(previous, None | Some(SyntaxKind::LParen | SyntaxKind::Dot))
 }
 
@@ -151,9 +209,18 @@ mod tests {
     }
 
     #[test]
-    fn formats_milestone_b_calls_actions_and_deadlines_canonically() {
+    fn formats_browser_calls_actions_and_deadlines_canonically() {
         let source = "test \"x\"{browser{fill role ( \"textbox\" ,name :\"Email\")with \"a\" wait id (\"ready\"). visible within 5s}}";
         let expected = "test \"x\" {\n    browser {\n        fill role(\"textbox\", name: \"Email\") with \"a\"\n        wait id(\"ready\").visible within 5s\n    }\n}\n";
+        let formatted = format_file(&webtest_syntax::parse(source));
+        assert_eq!(formatted, expected);
+        assert_eq!(format_file(&webtest_syntax::parse(&formatted)), expected);
+    }
+
+    #[test]
+    fn formats_typed_server_workflows_canonically() {
+        let source = "test \"x\"{server{let response=http.post(\"/users\",json:{email:\"a\"})expect response.status==201 let user:{id:Int,email:String}=response.json}browser{fill label(\"Email\")with user.email}}";
+        let expected = "test \"x\" {\n    server {\n        let response = http.post(\"/users\", json: { email: \"a\" })\n        expect response.status == 201\n        let user: { id: Int, email: String } = response.json\n    }\n    browser {\n        fill label(\"Email\") with user.email\n    }\n}\n";
         let formatted = format_file(&webtest_syntax::parse(source));
         assert_eq!(formatted, expected);
         assert_eq!(format_file(&webtest_syntax::parse(&formatted)), expected);

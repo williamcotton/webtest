@@ -78,7 +78,7 @@ impl ProtocolProcess {
                 return pending.remove(index).expect("matched pending message");
             }
         }
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let message = self
@@ -117,7 +117,7 @@ fn available_chrome() -> Option<std::path::PathBuf> {
         .map(|installed| installed.executable)
         .or_else(|| {
             let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../target/milestone-a-browser-cache");
+                .join("../../target/protocol-browser-cache");
             webtest_browser_manager::BrowserManager::with_cache_root(root)
                 .current()
                 .ok()

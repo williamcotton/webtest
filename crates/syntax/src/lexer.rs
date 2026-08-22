@@ -31,6 +31,10 @@ pub(crate) fn lex(source: &str) -> Vec<Token> {
                 }
                 SyntaxKind::LineComment
             }
+            b'/' => {
+                offset += 1;
+                SyntaxKind::Slash
+            }
             b'"' => {
                 offset += 1;
                 let mut escaped = false;
@@ -69,6 +73,14 @@ pub(crate) fn lex(source: &str) -> Vec<Token> {
                 offset += 1;
                 SyntaxKind::RParen
             }
+            b'[' => {
+                offset += 1;
+                SyntaxKind::LBracket
+            }
+            b']' => {
+                offset += 1;
+                SyntaxKind::RBracket
+            }
             b'.' => {
                 offset += 1;
                 SyntaxKind::Dot
@@ -81,12 +93,86 @@ pub(crate) fn lex(source: &str) -> Vec<Token> {
                 offset += 1;
                 SyntaxKind::Colon
             }
+            b'?' => {
+                offset += 1;
+                SyntaxKind::Question
+            }
+            b'=' if bytes.get(offset + 1) == Some(&b'=') => {
+                offset += 2;
+                SyntaxKind::EqEq
+            }
+            b'=' => {
+                offset += 1;
+                SyntaxKind::Equal
+            }
+            b'!' if bytes.get(offset + 1) == Some(&b'=') => {
+                offset += 2;
+                SyntaxKind::BangEq
+            }
+            b'!' => {
+                offset += 1;
+                SyntaxKind::Bang
+            }
+            b'<' if bytes.get(offset + 1) == Some(&b'=') => {
+                offset += 2;
+                SyntaxKind::LtEq
+            }
+            b'<' => {
+                offset += 1;
+                SyntaxKind::Lt
+            }
+            b'>' if bytes.get(offset + 1) == Some(&b'=') => {
+                offset += 2;
+                SyntaxKind::GtEq
+            }
+            b'>' => {
+                offset += 1;
+                SyntaxKind::Gt
+            }
+            b'+' => {
+                offset += 1;
+                SyntaxKind::Plus
+            }
+            b'-' => {
+                offset += 1;
+                SyntaxKind::Minus
+            }
+            b'*' => {
+                offset += 1;
+                SyntaxKind::Star
+            }
+            b'&' if bytes.get(offset + 1) == Some(&b'&') => {
+                offset += 2;
+                SyntaxKind::AndAnd
+            }
+            b'|' if bytes.get(offset + 1) == Some(&b'|') => {
+                offset += 2;
+                SyntaxKind::OrOr
+            }
             byte if byte.is_ascii_digit() => {
                 offset += 1;
-                while offset < bytes.len() && bytes[offset].is_ascii_alphanumeric() {
+                while offset < bytes.len() && bytes[offset].is_ascii_digit() {
                     offset += 1;
                 }
-                SyntaxKind::Duration
+                let mut kind = SyntaxKind::Int;
+                if bytes.get(offset) == Some(&b'.')
+                    && bytes.get(offset + 1).is_some_and(u8::is_ascii_digit)
+                {
+                    offset += 1;
+                    while offset < bytes.len() && bytes[offset].is_ascii_digit() {
+                        offset += 1;
+                    }
+                    kind = SyntaxKind::Float;
+                }
+                if bytes.get(offset) == Some(&b'm') && bytes.get(offset + 1) == Some(&b's') {
+                    offset += 2;
+                    SyntaxKind::Duration
+                } else if matches!(bytes.get(offset), Some(b's' | b'm')) {
+                    offset += 1;
+                    SyntaxKind::Duration
+                } else {
+                    kind
+                }
             }
             byte if is_ident_start(byte) => {
                 offset += 1;
@@ -96,6 +182,13 @@ pub(crate) fn lex(source: &str) -> Vec<Token> {
                 match &source[start..offset] {
                     "test" => SyntaxKind::TestKw,
                     "browser" => SyntaxKind::BrowserKw,
+                    "server" => SyntaxKind::ServerKw,
+                    "let" => SyntaxKind::LetKw,
+                    "true" => SyntaxKind::TrueKw,
+                    "false" => SyntaxKind::FalseKw,
+                    "null" => SyntaxKind::NullKw,
+                    "contains" => SyntaxKind::ContainsKw,
+                    "matches" => SyntaxKind::MatchesKw,
                     "open" => SyntaxKind::OpenKw,
                     "evaluate" => SyntaxKind::EvaluateKw,
                     "click" => SyntaxKind::ClickKw,

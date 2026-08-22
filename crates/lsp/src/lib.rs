@@ -120,6 +120,9 @@ impl LanguageServer for Backend {
                                 SemanticTokenType::STRING,
                                 SemanticTokenType::COMMENT,
                                 SemanticTokenType::FUNCTION,
+                                SemanticTokenType::VARIABLE,
+                                SemanticTokenType::PROPERTY,
+                                SemanticTokenType::TYPE,
                             ],
                             token_modifiers: Vec::new(),
                         },
@@ -132,6 +135,7 @@ impl LanguageServer for Backend {
                     commands: vec!["webtest.runFile".into()],
                     ..Default::default()
                 }),
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
                 ..Default::default()
             },
             offset_encoding: None,
@@ -223,6 +227,28 @@ impl LanguageServer for Backend {
         })))
     }
 
+    async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+        let Some(document) = self
+            .documents
+            .get(&params.text_document_position_params.text_document.uri)
+        else {
+            return Ok(None);
+        };
+        let source = self
+            .editor
+            .source(document.file)
+            .map_err(|error| Error::invalid_params(error.to_string()))?;
+        let offset = position_to_offset(&source, params.text_document_position_params.position);
+        let hover = self
+            .editor
+            .hover(document.file, TextSize::from(offset as u32))
+            .map_err(|error| Error::invalid_params(error.to_string()))?;
+        Ok(hover.map(|hover| Hover {
+            contents: HoverContents::Scalar(MarkedString::String(hover.contents)),
+            range: Some(text_range_to_lsp(&source, hover.range)),
+        }))
+    }
+
     async fn execute_command(&self, params: ExecuteCommandParams) -> Result<Option<LSPAny>> {
         if params.command != "webtest.runFile" {
             return Err(Error::invalid_request());
@@ -290,6 +316,31 @@ fn offset_to_position(text: &str, requested_offset: usize) -> Position {
     Position::new(line, character)
 }
 
+fn position_to_offset(text: &str, position: Position) -> usize {
+    let mut line = 0u32;
+    let mut utf16_column = 0u32;
+    for (offset, character) in text.char_indices() {
+        if line == position.line {
+            let width = character.len_utf16() as u32;
+            if utf16_column + width > position.character {
+                return offset;
+            }
+            if utf16_column == position.character {
+                return offset;
+            }
+            utf16_column += width;
+        }
+        if character == '\n' {
+            if line == position.line {
+                return offset;
+            }
+            line += 1;
+            utf16_column = 0;
+        }
+    }
+    text.len()
+}
+
 fn diagnostic_to_lsp(text: &str, diagnostic: CoreDiagnostic) -> Diagnostic {
     Diagnostic {
         range: text_range_to_lsp(text, diagnostic.range),
@@ -349,6 +400,9 @@ fn semantic_tokens_to_lsp(text: &str, tokens: &[CoreSemanticToken]) -> Vec<Seman
                         CoreSemanticTokenKind::String => 1,
                         CoreSemanticTokenKind::Comment => 2,
                         CoreSemanticTokenKind::Function => 3,
+                        CoreSemanticTokenKind::Variable => 4,
+                        CoreSemanticTokenKind::Property => 5,
+                        CoreSemanticTokenKind::Type => 6,
                     },
                     token_modifiers_bitset: 0,
                 });

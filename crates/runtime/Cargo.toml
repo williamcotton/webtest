@@ -6,13 +6,16 @@ license.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 webtest-browser.workspace = true
 webtest-hir.workspace = true
 webtest-observation.workspace = true
 webtest-plan.workspace = true
+webtest-provider = { workspace = true, features = ["native"] }
 
 [dev-dependencies]
 tempfile.workspace = true
-tokio.workspace = true
 webtest-text.workspace = true

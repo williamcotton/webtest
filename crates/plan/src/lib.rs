@@ -1,19 +1,93 @@
-//! Runtime-facing, syntax-independent test plan.
+//! Runtime-facing, syntax-independent, serializable test plans.
 
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 
 use serde::{Deserialize, Serialize};
-use webtest_hir::{HirBrowserOp, HirFile, HirLocatorKind, HirStmt, StepId, TestId};
+use webtest_hir::{BinaryOperator, BindingId, StepId, TestId, UnaryOperator};
+use webtest_provider::{Capability, Type, Value};
 use webtest_text::{FileId, SourceRevision, SyntaxOrigin};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TestPlan {
-    pub file: FileId,
-    pub source_revision: SourceRevision,
+pub const PLAN_FORMAT_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PlanEnvelope {
+    pub format_version: u32,
+    pub compiler_version: String,
+    pub project_identity: String,
+    pub source_files: Vec<PlanSourceFile>,
+    pub required_host_capabilities: Vec<Capability>,
+    pub provider_schema_hashes: BTreeMap<String, String>,
     pub tests: Vec<PlannedTest>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanSourceFile {
+    pub file: FileId,
+    pub path: String,
+    pub revision: SourceRevision,
+}
+
+impl PlanEnvelope {
+    pub fn from_plan(
+        plan: &TestPlan,
+        path: impl Into<String>,
+        project_identity: impl Into<String>,
+        provider_schema_hashes: BTreeMap<String, String>,
+    ) -> Self {
+        Self {
+            format_version: PLAN_FORMAT_VERSION,
+            compiler_version: env!("CARGO_PKG_VERSION").into(),
+            project_identity: project_identity.into(),
+            source_files: vec![PlanSourceFile {
+                file: plan.file,
+                path: path.into(),
+                revision: plan.source_revision,
+            }],
+            required_host_capabilities: plan.required_host_capabilities.clone(),
+            provider_schema_hashes,
+            tests: plan.tests.clone(),
+        }
+    }
+
+    pub fn validate_version(&self) -> Result<(), UnsupportedPlanVersion> {
+        if self.format_version == PLAN_FORMAT_VERSION {
+            Ok(())
+        } else {
+            Err(UnsupportedPlanVersion {
+                found: self.format_version,
+                supported: PLAN_FORMAT_VERSION,
+            })
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnsupportedPlanVersion {
+    pub found: u32,
+    pub supported: u32,
+}
+
+impl std::fmt::Display for UnsupportedPlanVersion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "unsupported plan format version {}; this executable supports version {}",
+            self.found, self.supported
+        )
+    }
+}
+
+impl std::error::Error for UnsupportedPlanVersion {}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TestPlan {
+    pub file: FileId,
+    pub source_revision: SourceRevision,
+    pub required_host_capabilities: Vec<Capability>,
+    pub tests: Vec<PlannedTest>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PlannedTest {
     pub id: TestId,
     pub name: String,
@@ -21,23 +95,76 @@ pub struct PlannedTest {
     pub origin: SyntaxOrigin,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PlannedStep {
     pub id: StepId,
     pub operation: TestOperation,
     pub origin: SyntaxOrigin,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "operation", rename_all = "snake_case")]
 pub enum TestOperation {
+    EvaluatePure(EvaluatePureOperation),
+    ServerProviderCall(ServerProviderCall),
     Browser(BrowserOperation),
     Assertion(AssertionOperation),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EvaluatePureOperation {
+    pub expression: PlanExpr,
+    pub result_binding: Option<BindingId>,
+    pub result_name: Option<String>,
+    pub result_type: Type,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ServerProviderCall {
+    pub provider: String,
+    pub operation: String,
+    pub arguments: BTreeMap<String, PlanExpr>,
+    pub result_binding: Option<BindingId>,
+    pub result_name: Option<String>,
+    pub result_type: Type,
+    pub schema_hash: String,
+    pub timeout: Option<Duration>,
+    pub redacted_arguments: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum PlanExpr {
+    Literal(Value),
+    Binding(BindingId),
+    List(Vec<PlanExpr>),
+    Record(BTreeMap<String, PlanExpr>),
+    Type(Type),
+    Member {
+        receiver: Box<PlanExpr>,
+        member: String,
+    },
+    Unary {
+        operator: UnaryOperator,
+        operand: Box<PlanExpr>,
+    },
+    Binary {
+        operator: BinaryOperator,
+        left: Box<PlanExpr>,
+        right: Box<PlanExpr>,
+    },
+    Decode {
+        value: Box<PlanExpr>,
+        target: Type,
+        response_operation: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BrowserOperation {
     Navigate {
-        url: String,
+        url: PlanExpr,
     },
     Evaluate {
         expression: String,
@@ -47,15 +174,15 @@ pub enum BrowserOperation {
     },
     Fill {
         locator: Locator,
-        value: String,
+        value: PlanExpr,
     },
     Type {
         locator: Locator,
-        value: String,
+        value: PlanExpr,
     },
     Press {
         locator: Locator,
-        key: String,
+        key: PlanExpr,
     },
     Check {
         locator: Locator,
@@ -63,7 +190,7 @@ pub enum BrowserOperation {
     },
     Select {
         locator: Locator,
-        option: String,
+        option: PlanExpr,
     },
     Hover {
         locator: Locator,
@@ -74,12 +201,13 @@ pub enum BrowserOperation {
         timeout: Option<Duration>,
     },
     WaitForUrl {
-        url: String,
+        url: PlanExpr,
         timeout: Option<Duration>,
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AssertionOperation {
     Locator {
         locator: Locator,
@@ -87,12 +215,33 @@ pub enum AssertionOperation {
         timeout: Option<Duration>,
     },
     Url {
-        url: String,
+        url: PlanExpr,
         timeout: Option<Duration>,
+    },
+    Value {
+        matcher: ValueMatcher,
+        actual: PlanExpr,
+        expected: Option<PlanExpr>,
+        value_type: Type,
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValueMatcher {
+    Truthy,
+    Equal,
+    NotEqual,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+    Contains,
+    Matches,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum Locator {
     Id(String),
     Role { role: String, name: Option<String> },
@@ -105,6 +254,7 @@ pub enum Locator {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LocatorState {
     Visible,
     Hidden,
@@ -131,155 +281,23 @@ impl std::fmt::Display for LocatorState {
     }
 }
 
-pub fn lower(file: FileId, source_revision: SourceRevision, hir: &HirFile) -> TestPlan {
-    let mut next_step = 0u32;
-    let tests = hir
-        .tests
-        .iter()
-        .map(|test| {
-            let mut steps = Vec::new();
-            for statement in &test.body {
-                let HirStmt::Browser(block) = statement;
-                for operation in &block.operations {
-                    let (operation, origin) = lower_operation(operation);
-                    steps.push(PlannedStep {
-                        id: StepId(next_step),
-                        operation,
-                        origin,
-                    });
-                    next_step += 1;
-                }
-            }
-            PlannedTest {
-                id: test.id,
-                name: test.name.clone(),
-                steps,
-                origin: test.origin,
-            }
-        })
-        .collect();
-    TestPlan {
-        file,
-        source_revision,
-        tests,
-    }
-}
-
-fn lower_operation(operation: &HirBrowserOp) -> (TestOperation, SyntaxOrigin) {
-    match operation {
-        HirBrowserOp::Open(open) => (
-            TestOperation::Browser(BrowserOperation::Navigate {
-                url: open.url.value.clone(),
-            }),
-            open.url.origin,
-        ),
-        HirBrowserOp::Evaluate(evaluate) => (
-            TestOperation::Browser(BrowserOperation::Evaluate {
-                expression: evaluate.expression.value.clone(),
-            }),
-            evaluate.expression.origin,
-        ),
-        HirBrowserOp::Click(action) => {
-            locator_browser(action, |locator| BrowserOperation::Click { locator })
-        }
-        HirBrowserOp::Fill(action) => value_browser(action, |locator, value| {
-            BrowserOperation::Fill { locator, value }
-        }),
-        HirBrowserOp::Type(action) => value_browser(action, |locator, value| {
-            BrowserOperation::Type { locator, value }
-        }),
-        HirBrowserOp::Press(action) => value_browser(action, |locator, key| {
-            BrowserOperation::Press { locator, key }
-        }),
-        HirBrowserOp::Check(action) => locator_browser(action, |locator| BrowserOperation::Check {
-            locator,
-            checked: true,
-        }),
-        HirBrowserOp::Uncheck(action) => {
-            locator_browser(action, |locator| BrowserOperation::Check {
-                locator,
-                checked: false,
-            })
-        }
-        HirBrowserOp::Select(action) => value_browser(action, |locator, option| {
-            BrowserOperation::Select { locator, option }
-        }),
-        HirBrowserOp::Hover(action) => {
-            locator_browser(action, |locator| BrowserOperation::Hover { locator })
-        }
-        HirBrowserOp::WaitLocator(wait) => (
-            TestOperation::Browser(BrowserOperation::WaitForLocator {
-                locator: lower_locator(&wait.locator.kind),
-                state: lower_state(wait.state),
-                timeout: wait.timeout,
-            }),
-            wait.locator.origin,
-        ),
-        HirBrowserOp::WaitUrl(wait) => (
-            TestOperation::Browser(BrowserOperation::WaitForUrl {
-                url: wait.url.value.clone(),
-                timeout: wait.timeout,
-            }),
-            wait.url.origin,
-        ),
-        HirBrowserOp::ExpectLocator(expectation) => (
-            TestOperation::Assertion(AssertionOperation::Locator {
-                locator: lower_locator(&expectation.locator.kind),
-                state: lower_state(expectation.state),
-                timeout: expectation.timeout,
-            }),
-            expectation.locator.origin,
-        ),
-        HirBrowserOp::ExpectUrl(expectation) => (
-            TestOperation::Assertion(AssertionOperation::Url {
-                url: expectation.url.value.clone(),
-                timeout: expectation.timeout,
-            }),
-            expectation.url.origin,
-        ),
-    }
-}
-
-fn locator_browser(
-    action: &webtest_hir::HirLocatorAction,
-    build: impl FnOnce(Locator) -> BrowserOperation,
-) -> (TestOperation, SyntaxOrigin) {
-    (
-        TestOperation::Browser(build(lower_locator(&action.locator.kind))),
-        action.locator.origin,
-    )
-}
-
-fn value_browser(
-    action: &webtest_hir::HirValueAction,
-    build: impl FnOnce(Locator, String) -> BrowserOperation,
-) -> (TestOperation, SyntaxOrigin) {
-    (
-        TestOperation::Browser(build(
-            lower_locator(&action.locator.kind),
-            action.value.value.clone(),
-        )),
-        action.locator.origin,
-    )
-}
-
-fn lower_locator(locator: &HirLocatorKind) -> Locator {
+pub fn locator_from_hir(locator: &webtest_hir::HirLocatorKind) -> Locator {
     match locator {
-        HirLocatorKind::Id(value) => Locator::Id(value.clone()),
-        HirLocatorKind::Role { role, name } => Locator::Role {
+        webtest_hir::HirLocatorKind::Id(value) => Locator::Id(value.clone()),
+        webtest_hir::HirLocatorKind::Role { role, name } => Locator::Role {
             role: role.clone(),
             name: name.clone(),
         },
-        HirLocatorKind::Label(value) => Locator::Label(value.clone()),
-        HirLocatorKind::Text(value) => Locator::Text(value.clone()),
-        HirLocatorKind::Placeholder(value) => Locator::Placeholder(value.clone()),
-        HirLocatorKind::TestId(value) => Locator::TestId(value.clone()),
-        HirLocatorKind::Css(value) => Locator::Css(value.clone()),
-        HirLocatorKind::XPath(value) => Locator::XPath(value.clone()),
+        webtest_hir::HirLocatorKind::Label(value) => Locator::Label(value.clone()),
+        webtest_hir::HirLocatorKind::Text(value) => Locator::Text(value.clone()),
+        webtest_hir::HirLocatorKind::Placeholder(value) => Locator::Placeholder(value.clone()),
+        webtest_hir::HirLocatorKind::TestId(value) => Locator::TestId(value.clone()),
+        webtest_hir::HirLocatorKind::Css(value) => Locator::Css(value.clone()),
+        webtest_hir::HirLocatorKind::XPath(value) => Locator::XPath(value.clone()),
     }
 }
 
-fn lower_state(state: webtest_hir::LocatorState) -> LocatorState {
+pub fn locator_state_from_hir(state: webtest_hir::LocatorState) -> LocatorState {
     match state {
         webtest_hir::LocatorState::Visible => LocatorState::Visible,
         webtest_hir::LocatorState::Hidden => LocatorState::Hidden,
@@ -295,46 +313,38 @@ fn lower_state(state: webtest_hir::LocatorState) -> LocatorState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use webtest_text::TextRange;
 
     #[test]
-    fn plan_has_deterministic_steps_revision_and_all_operation_shapes() {
-        let source = r#"test "x" { browser {
-            open "/login"
-            fill label("Email") with "alice"
-            evaluate "window.saveDraft()"
-            click role("button", name: "Sign in")
-            expect text("Welcome").visible within 5s
-            expect url("/dashboard")
-        } }"#;
+    fn envelope_is_versioned_serializable_and_rejects_unknown_versions() {
         let file = FileId::new(4);
-        let revision = SourceRevision::of(source);
-        let parsed = webtest_syntax::parse(source);
-        let hir = webtest_hir::lower(file, &parsed);
-        let plan = lower(file, revision, &hir);
-        assert_eq!(plan.source_revision, revision);
-        for (index, step) in plan.tests[0].steps.iter().enumerate() {
-            assert_eq!(step.id, StepId(index as u32));
-        }
-        assert!(matches!(
-            plan.tests[0].steps[1].operation,
-            TestOperation::Browser(BrowserOperation::Fill {
-                locator: Locator::Label(_),
-                ..
-            })
-        ));
-        assert!(matches!(
-            &plan.tests[0].steps[2].operation,
-            TestOperation::Browser(BrowserOperation::Evaluate { expression })
-                if expression == "window.saveDraft()"
-        ));
-        assert!(matches!(
-            plan.tests[0].steps[3].operation,
-            TestOperation::Browser(BrowserOperation::Click {
-                locator: Locator::Role { .. },
-            })
-        ));
-        assert!(matches!(plan.tests[0].steps[4].operation,
-            TestOperation::Assertion(AssertionOperation::Locator { timeout: Some(value), .. })
-                if value == Duration::from_secs(5)));
+        let revision = SourceRevision::of("test");
+        let plan = TestPlan {
+            file,
+            source_revision: revision,
+            required_host_capabilities: vec![Capability::Server],
+            tests: vec![PlannedTest {
+                id: TestId(0),
+                name: "x".into(),
+                steps: vec![PlannedStep {
+                    id: StepId(0),
+                    operation: TestOperation::EvaluatePure(EvaluatePureOperation {
+                        expression: PlanExpr::Literal(Value::Int(1)),
+                        result_binding: Some(BindingId(0)),
+                        result_name: Some("value".into()),
+                        result_type: Type::Int,
+                    }),
+                    origin: SyntaxOrigin::new(file, TextRange::default()),
+                }],
+                origin: SyntaxOrigin::new(file, TextRange::default()),
+            }],
+        };
+        let envelope = PlanEnvelope::from_plan(&plan, "x.webtest", "project", BTreeMap::new());
+        let encoded = serde_json::to_string(&envelope).expect("serialize plan");
+        let decoded: PlanEnvelope = serde_json::from_str(&encoded).expect("deserialize plan");
+        assert_eq!(decoded, envelope);
+        let mut unsupported = decoded;
+        unsupported.format_version += 1;
+        assert!(unsupported.validate_version().is_err());
     }
 }

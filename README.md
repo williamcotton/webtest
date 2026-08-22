@@ -1,13 +1,22 @@
 # WebTest
 
-WebTest is a small, statically analyzable language for browser tests. This repository contains the first complete vertical slice: one lossless parser feeds checking, formatting, execution, and editor diagnostics, while a direct Chrome DevTools Protocol backend runs the browser steps.
+WebTest is a statically analyzable language for typed web-system tests. One lossless parser feeds checking, formatting, plan compilation, execution, debugging, and editor diagnostics. Native HTTP, process, filesystem, and direct Chrome DevTools Protocol backends run behind shared typed contracts.
 
 ```webtest
-test "submit button" {
+test "created user can sign in" {
+    server {
+        let response = http.post("/api/test/users", json: {
+            email: "alice@example.com",
+        })
+        expect response.status == 201
+        let user: { id: Int, email: String } = response.json
+    }
+
     browser {
-        open "http://127.0.0.1:3000"
-        click id("submit")
-        expect text("submitted").visible
+        open "/login"
+        fill label("Email") with user.email
+        click role("button", name: "Sign in")
+        expect text("Welcome").visible
     }
 }
 ```
@@ -22,15 +31,16 @@ target/debug/webtest browser install
 target/debug/webtest browser path
 target/debug/webtest check
 target/debug/webtest test
+target/debug/webtest build --emit plan.json
 ```
 
 All file-oriented commands accept zero or more files/directories. With no paths, WebTest finds the nearest `webtest.toml` and deterministically discovers `.webtest` files under `project.test_roots`. Useful variants are:
 
 ```sh
-target/debug/webtest check examples/minimal --reporter json
-target/debug/webtest fmt examples/minimal --check
-target/debug/webtest test examples/minimal/passing.webtest --headed
-target/debug/webtest test examples/minimal --reporter junit
+target/debug/webtest check examples/plain-html/sign-in.webtest --reporter json
+target/debug/webtest fmt examples/plain-html --check
+target/debug/webtest test examples/plain-html/sign-in.webtest --headed
+target/debug/webtest test examples/plain-html --reporter junit
 target/debug/webtest browser list
 target/debug/webtest browser clean
 target/debug/webtest lsp
@@ -56,6 +66,25 @@ headless = true
 channel = "managed" # or "system"
 # path = "/absolute/path/to/chrome"
 
+[server]
+base_url = "http://127.0.0.1:3000"
+
+[server.http]
+follow_redirects = true
+max_response_bytes = 8388608
+
+[server.process]
+allowed_working_roots = ["."]
+max_output_bytes = 1048576
+
+[server.fs]
+read_roots = ["fixtures"]
+write_root = ".webtest/tmp"
+
+[redaction]
+headers = ["authorization", "cookie", "set-cookie"]
+json_fields = ["password", "token", "secret"]
+
 [timeouts]
 browser_command = "10s"
 navigation = "30s"
@@ -65,7 +94,9 @@ test = "60s"
 directory = ".webtest/artifacts"
 ```
 
-Durations accept positive `ms`, `s`, or `m` values. Test roots and artifact paths must remain project-relative. Excludes use slash-normalized glob syntax: `*` matches within one path component and `**` crosses directories. Hidden and symlinked directories are not traversed. Unknown keys warn; malformed values and contradictory `browser.channel = "system"` plus `browser.path` are errors.
+Durations accept positive `ms`, `s`, or `m` values. Test roots, provider roots, and artifact paths must remain project-relative. Filesystem and process working roots are canonicalized before use. Excludes use slash-normalized glob syntax: `*` matches within one path component and `**` crosses directories. Hidden and symlinked discovery directories are not traversed. Unknown keys warn; malformed values and contradictory `browser.channel = "system"` plus `browser.path` are errors.
+
+`webtest build --emit` writes a versioned plan only after successful static analysis. Emission refuses literal values in configured secret fields or schema-secret provider arguments; it never writes a redacted placeholder that would alter execution semantics.
 
 ## Manual example
 
@@ -95,7 +126,7 @@ npm run smoke:activation
 
 Reload VS Code/Cursor after installing the VSIX, then open the repository and a `.webtest` file. The extension discovers `target/debug/webtest` in the workspace automatically. The command **WebTest: Run Current File** asks the language server to run the currently synchronized buffer, including unsaved changes. Set `webtest.serverPath` explicitly when the executable lives elsewhere.
 
-For interactive debugging, set a breakpoint on any `open`, `click`, or `expect` line and choose **WebTest: Debug Current File** (or press F5 and select **Debug WebTest**). Debug sessions show Chrome by default and pause immediately before the selected step, leaving the page available for inspection and Chrome DevTools. Continue or step from VS Code/Cursor's debug toolbar. No `launch.json` is required.
+For interactive debugging, set a breakpoint on a provider call, assertion, or browser operation and choose **WebTest: Debug Current File** (or press F5 and select **Debug WebTest**). Debug sessions show Chrome by default, pause before the selected source-mapped plan step, and expose already-evaluated transferable bindings with configured secrets redacted. Continue or step from VS Code/Cursor's debug toolbar. No `launch.json` is required.
 
 ## Architecture
 

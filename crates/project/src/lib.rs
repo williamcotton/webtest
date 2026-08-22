@@ -41,6 +41,8 @@ pub struct ProjectConfig {
     pub timeouts: TimeoutSection,
     pub artifacts: ArtifactSection,
     pub evidence: EvidenceSection,
+    pub server: ServerSection,
+    pub redaction: RedactionSection,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -100,6 +102,38 @@ pub struct EvidenceSection {
     pub max_dom_bytes: usize,
 }
 
+#[derive(Clone, Debug)]
+pub struct ServerSection {
+    pub base_url: Option<String>,
+    pub http: ServerHttpSection,
+    pub process: ServerProcessSection,
+    pub fs: ServerFsSection,
+}
+
+#[derive(Clone, Debug)]
+pub struct ServerHttpSection {
+    pub follow_redirects: bool,
+    pub max_response_bytes: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct ServerProcessSection {
+    pub allowed_working_roots: Vec<PathBuf>,
+    pub max_output_bytes: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct ServerFsSection {
+    pub read_roots: Vec<PathBuf>,
+    pub write_root: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub struct RedactionSection {
+    pub headers: Vec<String>,
+    pub json_fields: Vec<String>,
+}
+
 impl Default for ProjectConfig {
     fn default() -> Self {
         Self {
@@ -129,6 +163,25 @@ impl Default for ProjectConfig {
                 screenshot: EvidenceMode::OnFailure,
                 dom_snapshot: EvidenceMode::OnFailure,
                 max_dom_bytes: 1_048_576,
+            },
+            server: ServerSection {
+                base_url: None,
+                http: ServerHttpSection {
+                    follow_redirects: true,
+                    max_response_bytes: 8_388_608,
+                },
+                process: ServerProcessSection {
+                    allowed_working_roots: vec![PathBuf::from(".")],
+                    max_output_bytes: 1_048_576,
+                },
+                fs: ServerFsSection {
+                    read_roots: vec![PathBuf::from("fixtures")],
+                    write_root: PathBuf::from(".webtest/tmp"),
+                },
+            },
+            redaction: RedactionSection {
+                headers: vec!["authorization".into(), "cookie".into(), "set-cookie".into()],
+                json_fields: vec!["password".into(), "token".into(), "secret".into()],
             },
         }
     }
@@ -184,6 +237,10 @@ struct RawConfig {
     artifacts: RawArtifacts,
     #[serde(default)]
     evidence: RawEvidence,
+    #[serde(default)]
+    server: RawServer,
+    #[serde(default)]
+    redaction: RawRedaction,
     #[serde(flatten)]
     extra: toml::Table,
 }
@@ -240,6 +297,55 @@ struct RawEvidence {
     screenshot: Option<String>,
     dom_snapshot: Option<String>,
     max_dom_bytes: Option<usize>,
+    #[serde(flatten)]
+    extra: toml::Table,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawServer {
+    base_url: Option<String>,
+    #[serde(default)]
+    http: RawServerHttp,
+    #[serde(default)]
+    process: RawServerProcess,
+    #[serde(default)]
+    fs: RawServerFs,
+    #[serde(flatten)]
+    extra: toml::Table,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawServerHttp {
+    follow_redirects: Option<bool>,
+    max_response_bytes: Option<usize>,
+    #[serde(flatten)]
+    extra: toml::Table,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawServerProcess {
+    #[serde(default)]
+    allowed_working_roots: Vec<PathBuf>,
+    max_output_bytes: Option<usize>,
+    #[serde(flatten)]
+    extra: toml::Table,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawServerFs {
+    #[serde(default)]
+    read_roots: Vec<PathBuf>,
+    write_root: Option<PathBuf>,
+    #[serde(flatten)]
+    extra: toml::Table,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawRedaction {
+    #[serde(default)]
+    headers: Vec<String>,
+    #[serde(default)]
+    json_fields: Vec<String>,
     #[serde(flatten)]
     extra: toml::Table,
 }
@@ -360,6 +466,11 @@ fn parse_config(
     collect_unknown(&mut warnings, "timeouts", &raw.timeouts.extra);
     collect_unknown(&mut warnings, "artifacts", &raw.artifacts.extra);
     collect_unknown(&mut warnings, "evidence", &raw.evidence.extra);
+    collect_unknown(&mut warnings, "server", &raw.server.extra);
+    collect_unknown(&mut warnings, "server.http", &raw.server.http.extra);
+    collect_unknown(&mut warnings, "server.process", &raw.server.process.extra);
+    collect_unknown(&mut warnings, "server.fs", &raw.server.fs.extra);
+    collect_unknown(&mut warnings, "redaction", &raw.redaction.extra);
 
     let channel = match raw.browser.channel.as_deref().unwrap_or("managed") {
         "managed" => BrowserChannel::Managed,
@@ -384,6 +495,26 @@ fn parse_config(
         return Err(ProjectError::InvalidConfig {
             path: path.to_path_buf(),
             message: "browser.base_url must be an absolute URL".into(),
+        });
+    }
+    if let Some(base_url) = &raw.server.base_url
+        && !is_absolute_url(base_url)
+    {
+        return Err(ProjectError::InvalidConfig {
+            path: path.to_path_buf(),
+            message: "server.base_url must be an absolute URL".into(),
+        });
+    }
+    if raw.server.http.max_response_bytes == Some(0) {
+        return Err(ProjectError::InvalidConfig {
+            path: path.to_path_buf(),
+            message: "server.http.max_response_bytes must be positive".into(),
+        });
+    }
+    if raw.server.process.max_output_bytes == Some(0) {
+        return Err(ProjectError::InvalidConfig {
+            path: path.to_path_buf(),
+            message: "server.process.max_output_bytes must be positive".into(),
         });
     }
     if raw
@@ -413,6 +544,15 @@ fn parse_config(
     }
     if let Some(directory) = &raw.artifacts.directory {
         validate_project_relative(path, "artifacts.directory", directory)?;
+    }
+    for root in &raw.server.process.allowed_working_roots {
+        validate_project_relative(path, "server.process.allowed_working_roots", root)?;
+    }
+    for root in &raw.server.fs.read_roots {
+        validate_project_relative(path, "server.fs.read_roots", root)?;
+    }
+    if let Some(root) = &raw.server.fs.write_root {
+        validate_project_relative(path, "server.fs.write_root", root)?;
     }
     let timeout = |key: &str, value: Option<String>, default: Duration| {
         value.map_or(Ok(default), |value| {
@@ -514,6 +654,57 @@ fn parse_config(
                     .evidence
                     .max_dom_bytes
                     .unwrap_or(defaults.evidence.max_dom_bytes),
+            },
+            server: ServerSection {
+                base_url: raw.server.base_url,
+                http: ServerHttpSection {
+                    follow_redirects: raw
+                        .server
+                        .http
+                        .follow_redirects
+                        .unwrap_or(defaults.server.http.follow_redirects),
+                    max_response_bytes: raw
+                        .server
+                        .http
+                        .max_response_bytes
+                        .unwrap_or(defaults.server.http.max_response_bytes),
+                },
+                process: ServerProcessSection {
+                    allowed_working_roots: if raw.server.process.allowed_working_roots.is_empty() {
+                        defaults.server.process.allowed_working_roots
+                    } else {
+                        raw.server.process.allowed_working_roots
+                    },
+                    max_output_bytes: raw
+                        .server
+                        .process
+                        .max_output_bytes
+                        .unwrap_or(defaults.server.process.max_output_bytes),
+                },
+                fs: ServerFsSection {
+                    read_roots: if raw.server.fs.read_roots.is_empty() {
+                        defaults.server.fs.read_roots
+                    } else {
+                        raw.server.fs.read_roots
+                    },
+                    write_root: raw
+                        .server
+                        .fs
+                        .write_root
+                        .unwrap_or(defaults.server.fs.write_root),
+                },
+            },
+            redaction: RedactionSection {
+                headers: if raw.redaction.headers.is_empty() {
+                    defaults.redaction.headers
+                } else {
+                    raw.redaction.headers
+                },
+                json_fields: if raw.redaction.json_fields.is_empty() {
+                    defaults.redaction.json_fields
+                } else {
+                    raw.redaction.json_fields
+                },
             },
         },
         warnings,
@@ -808,7 +999,55 @@ mod tests {
     }
 
     #[test]
-    fn parses_milestone_b_browser_timeouts_and_evidence() {
+    fn parses_typed_server_provider_and_redaction_configuration() {
+        let path = Path::new("webtest.toml");
+        let (config, warnings) = parse_config(
+            path,
+            r#"
+[server]
+base_url = "http://127.0.0.1:3000"
+
+[server.http]
+follow_redirects = false
+max_response_bytes = 4096
+
+[server.process]
+allowed_working_roots = ["bin"]
+max_output_bytes = 2048
+
+[server.fs]
+read_roots = ["fixtures", "data"]
+write_root = ".webtest/generated"
+
+[redaction]
+headers = ["authorization"]
+json_fields = ["credential"]
+"#,
+        )
+        .expect("server configuration");
+        assert!(warnings.is_empty());
+        assert_eq!(
+            config.server.base_url.as_deref(),
+            Some("http://127.0.0.1:3000")
+        );
+        assert!(!config.server.http.follow_redirects);
+        assert_eq!(config.server.http.max_response_bytes, 4096);
+        assert_eq!(
+            config.server.process.allowed_working_roots,
+            [PathBuf::from("bin")]
+        );
+        assert_eq!(
+            config.server.fs.write_root,
+            PathBuf::from(".webtest/generated")
+        );
+        assert_eq!(config.redaction.json_fields, ["credential"]);
+
+        assert!(parse_config(path, "[server]\nbase_url = \"/relative\"\n").is_err());
+        assert!(parse_config(path, "[server.fs]\nwrite_root = \"../outside\"\n").is_err());
+    }
+
+    #[test]
+    fn parses_browser_timeouts_and_evidence() {
         let path = Path::new("webtest.toml");
         let (config, warnings) = parse_config(
             path,
@@ -830,7 +1069,7 @@ dom_snapshot = "off"
 max_dom_bytes = 4096
 "#,
         )
-        .expect("Milestone B config");
+        .expect("browser config");
         assert!(warnings.is_empty());
         assert_eq!(
             config.browser.base_url.as_deref(),
