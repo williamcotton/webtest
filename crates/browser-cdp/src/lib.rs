@@ -729,25 +729,29 @@ impl Page for CdpPage {
             .await
     }
 
-    async fn evaluate_expression(&mut self, expression: &str) -> Result<(), BrowserError> {
-        let evaluation = self
-            .connection
-            .command(
-                "Runtime.evaluate",
-                Some(json!({
-                    "expression": expression,
-                    "returnByValue": true
-                })),
-                Some(&self.session_id),
-            )
-            .await?;
+    async fn evaluate(&mut self, expression: &str) -> Result<(), BrowserError> {
+        let evaluation = self.evaluate_expression(expression.to_owned()).await?;
         if let Some(message) = evaluation.get("errorText").and_then(Value::as_str) {
             return Err(BrowserError::EvaluationFailed {
                 expression: expression.to_owned(),
                 message: message.to_owned(),
             });
         }
-        return Ok(());
+        if let Some(message) = evaluation
+            .pointer("/exceptionDetails/exception/description")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                evaluation
+                    .pointer("/exceptionDetails/text")
+                    .and_then(Value::as_str)
+            })
+        {
+            return Err(BrowserError::EvaluationFailed {
+                expression: expression.to_owned(),
+                message: message.to_owned(),
+            });
+        }
+        Ok(())
     }
 
     async fn perform(&mut self, action: &Action, timeout: Duration) -> Result<(), BrowserError> {
@@ -874,7 +878,7 @@ impl Page for CdpPage {
     }
 
     async fn current_url(&mut self) -> Result<String, BrowserError> {
-        let result = self.evaluate("location.href".into()).await?;
+        let result = self.evaluate_expression("location.href".into()).await?;
         evaluation_value(&result)
             .and_then(Value::as_str)
             .map(str::to_owned)
@@ -909,7 +913,7 @@ impl Page for CdpPage {
             }
         }
         let page_state = self
-            .evaluate("({url: location.href, title: document.title})".into())
+            .evaluate_expression("({url: location.href, title: document.title})".into())
             .await;
         match page_state.and_then(|result| {
             evaluation_value(&result)
@@ -940,7 +944,7 @@ impl Page for CdpPage {
         }
         if request.include_dom {
             let expression = "(() => { const root = document.documentElement.cloneNode(true); root.querySelectorAll('input,textarea').forEach(e => { e.removeAttribute('value'); if (e.tagName === 'TEXTAREA') e.textContent = ''; }); return '<!doctype html>' + root.outerHTML; })()";
-            match self.evaluate(expression.into()).await {
+            match self.evaluate_expression(expression.into()).await {
                 Ok(result) => match evaluation_value(&result).and_then(Value::as_str) {
                     Some(dom) => {
                         evidence.dom_snapshot = Some(truncate_utf8(dom, request.max_dom_bytes))
@@ -965,7 +969,7 @@ fn duration_millis(duration: Duration) -> u64 {
 }
 
 impl CdpPage {
-    async fn evaluate(&self, expression: String) -> Result<Value, BrowserError> {
+    async fn evaluate_expression(&self, expression: String) -> Result<Value, BrowserError> {
         self.connection
             .command(
                 "Runtime.evaluate",
@@ -977,7 +981,7 @@ impl CdpPage {
 
     async fn resolve(&self, locator: &Locator) -> Result<ResolveSnapshot, BrowserError> {
         let expression = resolver_expression(locator, &self.test_id_attribute)?;
-        let result = self.evaluate(expression).await?;
+        let result = self.evaluate_expression(expression).await?;
         let value = evaluation_value(&result)
             .ok_or_else(|| invalid_evaluation("locator result was missing"))?;
         let snapshot: ResolveSnapshot = serde_json::from_value(value.clone())
@@ -1231,7 +1235,7 @@ impl CdpPage {
             select.dispatchEvent(new Event('change', {{bubbles:true}})); return {{matches:1, options:1}};
             }} catch (error) {{ return {{invalid:String(error)}}; }} }})()"#
         );
-        let result = self.evaluate(expression).await?;
+        let result = self.evaluate_expression(expression).await?;
         let value =
             evaluation_value(&result).ok_or_else(|| invalid_evaluation("select result missing"))?;
         if let Some(message) = value.get("invalid").and_then(Value::as_str) {
@@ -2161,13 +2165,13 @@ mod tests {
         if host.locate().is_none() {
             return;
         }
-    
+
         let Ok(listener) = tokio::net::TcpListener::bind("127.0.0.1:0").await else {
             return;
         };
-    
+
         let address = listener.local_addr().expect("fixture address");
-    
+
         let body = r#"<!doctype html><style>
             #covered { position:absolute;left:20px;top:20px;width:100px;height:30px }
             #overlay { position:absolute;left:20px;top:20px;width:100px;height:30px;z-index:2 }
@@ -2224,16 +2228,16 @@ mod tests {
                 };
             </script>
         </body>"#;
-    
+
         tokio::spawn(async move {
             let (mut stream, _) = listener
                 .accept()
                 .await
                 .expect("accept actionability request");
-    
+
             let mut request = [0u8; 1024];
             let _ = stream.read(&mut request).await;
-    
+
             let response = format!(
                 "HTTP/1.1 200 OK\r\n\
                  Content-Type: text/html\r\n\
@@ -2243,22 +2247,22 @@ mod tests {
                  {body}",
                 body.len()
             );
-    
+
             stream
                 .write_all(response.as_bytes())
                 .await
                 .expect("serve actionability fixture");
         });
-    
+
         let mut browser = host.start().await.expect("start Chrome");
         let mut page = browser.new_page().await.expect("page");
-    
+
         page.open(&format!("http://{address}"))
             .await
             .expect("open fixture");
-    
+
         let click = |locator| Action::Click { locator };
-    
+
         assert!(matches!(
             page.perform(
                 &click(Locator::Id("missing".into())),
@@ -2267,7 +2271,7 @@ mod tests {
             .await,
             Err(BrowserError::LocatorNotFound { .. })
         ));
-    
+
         assert!(matches!(
             page.perform(
                 &click(Locator::Css(".duplicate".into())),
@@ -2276,7 +2280,7 @@ mod tests {
             .await,
             Err(BrowserError::LocatorAmbiguous { .. })
         ));
-    
+
         assert!(matches!(
             page.perform(
                 &click(Locator::Id("disabled".into())),
@@ -2285,7 +2289,7 @@ mod tests {
             .await,
             Err(BrowserError::ElementDisabled { .. })
         ));
-    
+
         assert!(matches!(
             page.perform(
                 &click(Locator::Id("covered".into())),
@@ -2294,7 +2298,7 @@ mod tests {
             .await,
             Err(BrowserError::ElementObscured { .. })
         ));
-    
+
         assert!(matches!(
             page.perform(
                 &click(Locator::Id("hidden".into())),
@@ -2303,7 +2307,7 @@ mod tests {
             .await,
             Err(BrowserError::LocatorNotVisible { .. })
         ));
-    
+
         assert!(matches!(
             page.perform(
                 &click(Locator::Id("unstable".into())),
@@ -2312,20 +2316,17 @@ mod tests {
             .await,
             Err(BrowserError::ElementUnstable { .. })
         ));
-    
+
         assert!(matches!(
-            page.perform(
-                &click(Locator::Css("[".into())),
-                Duration::from_millis(100)
-            )
-            .await,
+            page.perform(&click(Locator::Css("[".into())), Duration::from_millis(100))
+                .await,
             Err(BrowserError::LocatorInvalid { .. })
         ));
-    
-        page.evaluate_expression("window.startTransient()")
+
+        page.evaluate("window.startTransient()")
             .await
             .expect("start transient fixture");
-    
+
         assert!(matches!(
             page.perform(
                 &click(Locator::Css(".transient".into())),
@@ -2334,7 +2335,7 @@ mod tests {
             .await,
             Err(BrowserError::ActionTimeout { .. })
         ));
-    
+
         page.wait_for_locator(
             &Locator::Placeholder("Search products".into()),
             LocatorState::Visible,
@@ -2342,7 +2343,7 @@ mod tests {
         )
         .await
         .expect("placeholder locator");
-    
+
         page.wait_for_locator(
             &Locator::TestId("search-box".into()),
             LocatorState::Visible,
@@ -2350,7 +2351,7 @@ mod tests {
         )
         .await
         .expect("test-ID locator");
-    
+
         page.wait_for_locator(
             &Locator::Text("Hello World".into()),
             LocatorState::Visible,
@@ -2358,7 +2359,7 @@ mod tests {
         )
         .await
         .expect("rendered whitespace normalization");
-    
+
         page.wait_for_locator(
             &Locator::XPath("//*[@id='space']".into()),
             LocatorState::Visible,
@@ -2366,7 +2367,7 @@ mod tests {
         )
         .await
         .expect("XPath locator");
-    
+
         assert!(matches!(
             page.wait_for_locator(
                 &Locator::Text("Inside shadow".into()),
@@ -2376,7 +2377,7 @@ mod tests {
             .await,
             Err(BrowserError::LocatorNotFound { .. })
         ));
-    
+
         assert!(matches!(
             page.wait_for_locator(
                 &Locator::Text("Inside frame".into()),
@@ -2386,7 +2387,7 @@ mod tests {
             .await,
             Err(BrowserError::LocatorNotFound { .. })
         ));
-    
+
         let evidence = page
             .capture_evidence(&EvidenceRequest {
                 locator: Some(Locator::Css(".duplicate".into())),
@@ -2396,9 +2397,9 @@ mod tests {
                 redactions: Vec::new(),
             })
             .await;
-    
+
         assert_eq!(evidence.candidates.len(), 5);
-    
+
         browser.close().await.expect("close browser");
     }
 

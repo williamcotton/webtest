@@ -726,6 +726,7 @@ fn dap_variable(name: &str, value: &str, kind: &str) -> Value {
 fn operation_name(operation: &TestOperation) -> String {
     match operation {
         TestOperation::Browser(BrowserOperation::Navigate { url }) => format!("open {url:?}"),
+        TestOperation::Browser(BrowserOperation::Evaluate { .. }) => "evaluate <script>".into(),
         TestOperation::Browser(BrowserOperation::Click { locator }) => {
             format!("click {}", locator_name(locator))
         }

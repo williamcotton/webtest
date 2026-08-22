@@ -319,6 +319,9 @@ async fn execute_step(
             page.open(&resolve_url(options.base_url.as_deref(), url)?)
                 .await
         }
+        TestOperation::Browser(BrowserOperation::Evaluate { expression }) => {
+            page.evaluate(expression).await
+        }
         TestOperation::Browser(BrowserOperation::Click { locator }) => {
             page.perform(
                 &Action::Click {
@@ -463,6 +466,7 @@ fn step_browser_locator(step: &PlannedStep) -> Option<BrowserLocator> {
             Some(browser_locator(locator))
         }
         TestOperation::Browser(BrowserOperation::Navigate { .. })
+        | TestOperation::Browser(BrowserOperation::Evaluate { .. })
         | TestOperation::Browser(BrowserOperation::WaitForUrl { .. })
         | TestOperation::Assertion(AssertionOperation::Url { .. }) => None,
     }
@@ -617,6 +621,9 @@ mod tests {
     struct FakePage {
         result: Mutex<Result<(), BrowserError>>,
     }
+    struct RecordingPage {
+        evaluations: Arc<Mutex<Vec<String>>>,
+    }
     struct ContextHost {
         starts: Arc<AtomicUsize>,
         contexts: Arc<AtomicUsize>,
@@ -713,11 +720,30 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone()
         }
-        async fn evaluate_expression(&mut self, _expression: &str) -> Result<(), BrowserError> {
+        async fn evaluate(&mut self, _expression: &str) -> Result<(), BrowserError> {
             self.result
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone()
+        }
+    }
+    #[async_trait]
+    impl Page for RecordingPage {
+        async fn open(&mut self, _url: &str) -> Result<(), BrowserError> {
+            Ok(())
+        }
+        async fn click(&mut self, _locator: &BrowserLocator) -> Result<(), BrowserError> {
+            Ok(())
+        }
+        async fn expect_visible(&mut self, _locator: &BrowserLocator) -> Result<(), BrowserError> {
+            Ok(())
+        }
+        async fn evaluate(&mut self, expression: &str) -> Result<(), BrowserError> {
+            self.evaluations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(expression.into());
+            Ok(())
         }
     }
 
@@ -794,6 +820,34 @@ mod tests {
             "http://example.test/"
         );
         assert!(resolve_url(None, "/login").is_err());
+    }
+
+    #[tokio::test]
+    async fn evaluate_step_calls_page_evaluate() {
+        let evaluations = Arc::new(Mutex::new(Vec::new()));
+        let mut page = RecordingPage {
+            evaluations: Arc::clone(&evaluations),
+        };
+        let file = FileId::new(0);
+        let step = PlannedStep {
+            id: StepId(0),
+            origin: SyntaxOrigin::new(file, TextRange::new(TextSize::new(10), TextSize::new(31))),
+            operation: TestOperation::Browser(BrowserOperation::Evaluate {
+                expression: "window.saveDraft()".into(),
+            }),
+        };
+
+        execute_step(&mut page, &step, &RunnerOptions::default())
+            .await
+            .expect("evaluate step");
+
+        assert_eq!(
+            evaluations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
+            ["window.saveDraft()"]
+        );
     }
 
     #[test]

@@ -29,6 +29,7 @@ ast_node!(Root, Root);
 ast_node!(TestDecl, TestDecl);
 ast_node!(BrowserBlock, BrowserBlock);
 ast_node!(OpenStmt, OpenStmt);
+ast_node!(EvaluateStmt, EvaluateStmt);
 ast_node!(ClickStmt, ClickStmt);
 ast_node!(FillStmt, FillStmt);
 ast_node!(TypeStmt, TypeStmt);
@@ -135,6 +136,12 @@ impl OpenStmt {
     }
 }
 
+impl EvaluateStmt {
+    pub fn expression(&self) -> Option<StringToken> {
+        direct_string(&self.syntax)
+    }
+}
+
 macro_rules! locator_action {
     ($name:ident) => {
         impl $name {
@@ -231,6 +238,7 @@ impl RoleLocator {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum BrowserOperation {
     Open(OpenStmt),
+    Evaluate(EvaluateStmt),
     Click(ClickStmt),
     Fill(FillStmt),
     Type(TypeStmt),
@@ -249,6 +257,7 @@ impl BrowserOperation {
     fn cast(node: SyntaxNode) -> Option<Self> {
         match node.kind() {
             SyntaxKind::OpenStmt => OpenStmt::cast(node).map(Self::Open),
+            SyntaxKind::EvaluateStmt => EvaluateStmt::cast(node).map(Self::Evaluate),
             SyntaxKind::ClickStmt => ClickStmt::cast(node).map(Self::Click),
             SyntaxKind::FillStmt => FillStmt::cast(node).map(Self::Fill),
             SyntaxKind::TypeStmt => TypeStmt::cast(node).map(Self::Type),

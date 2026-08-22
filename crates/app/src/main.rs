@@ -810,7 +810,7 @@ fn runtime_code(error: &BrowserError) -> &'static str {
         BrowserError::MalformedProtocol { .. } => "runtime.browser_malformed_protocol",
         BrowserError::Protocol { .. } => "runtime.browser_protocol",
         BrowserError::Launch(_) => "runtime.browser_launch",
-        BrowserError::EvaluationFailed { .. } => "runtime.evaluation_failed"
+        BrowserError::EvaluationFailed { .. } => "runtime.evaluation_failed",
     }
 }
 

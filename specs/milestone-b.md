@@ -35,6 +35,7 @@ Milestone B includes:
 
 - role, label, text, placeholder, test-ID, CSS, and XPath locators;
 - click, fill, type, press, check, uncheck, select, and hover actions;
+- raw JavaScript `evaluate` steps as an escape hatch for browser-side setup;
 - locator, URL, navigation, and bounded wait operations;
 - actionability checks and auto-waiting;
 - browser-process reuse with a fresh isolated context per test;
@@ -84,6 +85,7 @@ Locator string arguments retain their decoded semantic value and precise token/s
 
 ```webtest
 open "/settings"
+evaluate "window.bootstrap && window.bootstrap();"
 click role("button", name: "Edit profile")
 fill label("Display name") with "Alice"
 type label("Biography") with "hello"

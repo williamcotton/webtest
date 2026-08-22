@@ -40,6 +40,7 @@ pub struct HirBrowserBlock {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HirBrowserOp {
     Open(HirOpen),
+    Evaluate(HirEvaluate),
     Click(HirLocatorAction),
     Fill(HirValueAction),
     Type(HirValueAction),
@@ -57,6 +58,12 @@ pub enum HirBrowserOp {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HirOpen {
     pub url: HirString,
+    pub origin: SyntaxOrigin,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HirEvaluate {
+    pub expression: HirString,
     pub origin: SyntaxOrigin,
 }
 
@@ -181,6 +188,10 @@ fn lower_operation(file: FileId, operation: BrowserOperation) -> Option<HirBrows
     match operation {
         BrowserOperation::Open(statement) => Some(HirBrowserOp::Open(HirOpen {
             url: lower_string(file, statement.url()?)?,
+            origin: origin(file, statement.syntax()),
+        })),
+        BrowserOperation::Evaluate(statement) => Some(HirBrowserOp::Evaluate(HirEvaluate {
+            expression: lower_string(file, statement.expression()?)?,
             origin: origin(file, statement.syntax()),
         })),
         BrowserOperation::Click(statement) => Some(HirBrowserOp::Click(locator_action(
@@ -375,6 +386,7 @@ mod tests {
     fn lowers_all_milestone_b_operations_with_precise_origins() {
         let source = r#"test "x" { browser {
             fill role("textbox", name: "Email") with "alice"
+            evaluate "window.saveDraft()"
             press label("Search") key "Enter"
             expect test_id("saved").visible within 5s
             wait url("/done")
@@ -383,7 +395,7 @@ mod tests {
         assert!(parsed.errors().is_empty(), "{:?}", parsed.errors());
         let hir = lower(FileId::new(7), &parsed);
         let HirStmt::Browser(block) = &hir.tests[0].body[0];
-        assert_eq!(block.operations.len(), 4);
+        assert_eq!(block.operations.len(), 5);
         let HirBrowserOp::Fill(fill) = &block.operations[0] else {
             panic!("fill")
         };
@@ -399,7 +411,16 @@ mod tests {
             &source[usize::from(range.start())..usize::from(range.end())],
             "role(\"textbox\", name: \"Email\")"
         );
-        let HirBrowserOp::ExpectLocator(expectation) = &block.operations[2] else {
+        let HirBrowserOp::Evaluate(evaluate) = &block.operations[1] else {
+            panic!("evaluate")
+        };
+        assert_eq!(evaluate.expression.value, "window.saveDraft()");
+        let range = evaluate.expression.origin.range;
+        assert_eq!(
+            &source[usize::from(range.start())..usize::from(range.end())],
+            "\"window.saveDraft()\""
+        );
+        let HirBrowserOp::ExpectLocator(expectation) = &block.operations[3] else {
             panic!("expect")
         };
         assert_eq!(expectation.state, LocatorState::Visible);

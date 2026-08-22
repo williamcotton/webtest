@@ -1022,6 +1022,7 @@ Implemented.
 
 - semantic locators;
 - fill, press, select, check, hover, and waits;
+- raw JavaScript evaluate steps as a browser escape hatch;
 - actionability and auto-waiting;
 - locator and page-state assertions;
 - browser reuse with isolated contexts;

@@ -97,6 +97,7 @@ pub(crate) fn lex(source: &str) -> Vec<Token> {
                     "test" => SyntaxKind::TestKw,
                     "browser" => SyntaxKind::BrowserKw,
                     "open" => SyntaxKind::OpenKw,
+                    "evaluate" => SyntaxKind::EvaluateKw,
                     "click" => SyntaxKind::ClickKw,
                     "fill" => SyntaxKind::FillKw,
                     "type" => SyntaxKind::TypeKw,

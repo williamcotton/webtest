@@ -211,8 +211,8 @@ pub enum BrowserError {
     Protocol { method: String, message: String },
     #[error("could not launch the browser: {0}")]
     Launch(String),
-    #[error("Evaluation of '{expression}' failed: ")]
-    EvaluationFailed { expression: String, message: String }
+    #[error("evaluation of {expression:?} failed: {message}")]
+    EvaluationFailed { expression: String, message: String },
 }
 
 impl BrowserError {
@@ -241,7 +241,7 @@ impl BrowserError {
             Self::MalformedProtocol { .. } => "browser_malformed_protocol",
             Self::Protocol { .. } => "browser_protocol",
             Self::Launch(_) => "browser_launch",
-            Self::EvaluationFailed { .. } => "evaluation_failed"
+            Self::EvaluationFailed { .. } => "evaluation_failed",
         }
     }
 
@@ -310,7 +310,7 @@ pub trait Page: Send {
     async fn open(&mut self, url: &str) -> Result<(), BrowserError>;
     async fn click(&mut self, locator: &Locator) -> Result<(), BrowserError>;
     async fn expect_visible(&mut self, locator: &Locator) -> Result<(), BrowserError>;
-    async fn evaluate_expression(&mut self, expression: &str) -> Result<(), BrowserError>;
+    async fn evaluate(&mut self, expression: &str) -> Result<(), BrowserError>;
 
     async fn perform(&mut self, action: &Action, _timeout: Duration) -> Result<(), BrowserError> {
         match action {

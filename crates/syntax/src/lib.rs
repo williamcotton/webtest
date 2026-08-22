@@ -20,6 +20,7 @@ mod tests {
     // retained
     browser {
         open "http://example.test"
+        evaluate "window.bootstrap && window.bootstrap();"
         fill label("Email") with "alice@example.com"
         press placeholder("Search") key "Enter"
         click role("button", name: "Submit")
@@ -46,8 +47,18 @@ mod tests {
         );
         let block = test.browser_blocks().next().expect("browser block");
         let operations: Vec<_> = block.operations().collect();
-        assert_eq!(operations.len(), 6);
-        let ast::BrowserOperation::Fill(fill) = &operations[1] else {
+        assert_eq!(operations.len(), 7);
+        let ast::BrowserOperation::Evaluate(evaluate) = &operations[1] else {
+            panic!("evaluate")
+        };
+        assert_eq!(
+            evaluate
+                .expression()
+                .and_then(|token| token.value())
+                .as_deref(),
+            Some("window.bootstrap && window.bootstrap();")
+        );
+        let ast::BrowserOperation::Fill(fill) = &operations[2] else {
             panic!("fill")
         };
         assert!(matches!(fill.locator(), Some(ast::Locator::Label(_))));
@@ -55,7 +66,7 @@ mod tests {
             fill.value().and_then(|token| token.value()).as_deref(),
             Some("alice@example.com")
         );
-        let ast::BrowserOperation::Click(click) = &operations[3] else {
+        let ast::BrowserOperation::Click(click) = &operations[4] else {
             panic!("click")
         };
         let Some(ast::Locator::Role(role)) = click.locator() else {
@@ -69,7 +80,7 @@ mod tests {
             role.name().and_then(|token| token.value()).as_deref(),
             Some("Submit")
         );
-        let ast::BrowserOperation::ExpectLocator(expectation) = &operations[4] else {
+        let ast::BrowserOperation::ExpectLocator(expectation) = &operations[5] else {
             panic!("expect")
         };
         assert_eq!(expectation.state(), Some(ast::LocatorState::Visible));
@@ -104,6 +115,7 @@ mod tests {
     fn all_locator_action_and_state_forms_are_lossless() {
         let source = r##"test "all" { browser {
             click id("one")
+            evaluate "window.ready = true"
             fill label("Email") with "a"
             type placeholder("Search") with "b"
             press role("textbox", name: "Query") key "Control+a"
@@ -135,6 +147,30 @@ mod tests {
                 .syntax()
                 .descendants()
                 .filter(|node| node.kind() == SyntaxKind::BrowserBlock)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn half_typed_evaluate_does_not_consume_enclosing_block() {
+        let source = "test \"x\" { browser { evaluate click id(\"x\") } }";
+        let parsed = parse(source);
+        assert!(!parsed.errors().is_empty());
+        assert_eq!(parsed.syntax().text().to_string(), source);
+        assert_eq!(
+            parsed
+                .errors()
+                .iter()
+                .filter(|error| error.code == "syntax.expected_expression")
+                .count(),
+            1
+        );
+        assert_eq!(
+            parsed
+                .syntax()
+                .descendants()
+                .filter(|node| node.kind() == SyntaxKind::ClickStmt)
                 .count(),
             1
         );

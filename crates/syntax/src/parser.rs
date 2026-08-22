@@ -125,6 +125,7 @@ impl<'a> Parser<'a> {
             self.eat_trivia();
             match self.current() {
                 SyntaxKind::OpenKw => self.open_statement(),
+                SyntaxKind::EvaluateKw => self.evaluate_statement(),
                 SyntaxKind::ClickKw => self.locator_action(SyntaxKind::ClickStmt),
                 SyntaxKind::FillKw => {
                     self.value_action(SyntaxKind::FillStmt, SyntaxKind::WithKw, "with")
@@ -170,6 +171,17 @@ impl<'a> Parser<'a> {
             SyntaxKind::String,
             "syntax.expected_url",
             "expected URL string after `open`",
+        );
+        self.finish();
+    }
+
+    fn evaluate_statement(&mut self) {
+        self.start(SyntaxKind::EvaluateStmt);
+        self.bump();
+        self.expect(
+            SyntaxKind::String,
+            "syntax.expected_expression",
+            "expected JavaScript string after `evaluate`",
         );
         self.finish();
     }

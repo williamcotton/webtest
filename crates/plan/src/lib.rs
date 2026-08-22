@@ -39,6 +39,9 @@ pub enum BrowserOperation {
     Navigate {
         url: String,
     },
+    Evaluate {
+        expression: String,
+    },
     Click {
         locator: Locator,
     },
@@ -170,6 +173,12 @@ fn lower_operation(operation: &HirBrowserOp) -> (TestOperation, SyntaxOrigin) {
             }),
             open.url.origin,
         ),
+        HirBrowserOp::Evaluate(evaluate) => (
+            TestOperation::Browser(BrowserOperation::Evaluate {
+                expression: evaluate.expression.value.clone(),
+            }),
+            evaluate.expression.origin,
+        ),
         HirBrowserOp::Click(action) => {
             locator_browser(action, |locator| BrowserOperation::Click { locator })
         }
@@ -292,6 +301,7 @@ mod tests {
         let source = r#"test "x" { browser {
             open "/login"
             fill label("Email") with "alice"
+            evaluate "window.saveDraft()"
             click role("button", name: "Sign in")
             expect text("Welcome").visible within 5s
             expect url("/dashboard")
@@ -312,7 +322,18 @@ mod tests {
                 ..
             })
         ));
-        assert!(matches!(plan.tests[0].steps[3].operation,
+        assert!(matches!(
+            &plan.tests[0].steps[2].operation,
+            TestOperation::Browser(BrowserOperation::Evaluate { expression })
+                if expression == "window.saveDraft()"
+        ));
+        assert!(matches!(
+            plan.tests[0].steps[3].operation,
+            TestOperation::Browser(BrowserOperation::Click {
+                locator: Locator::Role { .. },
+            })
+        ));
+        assert!(matches!(plan.tests[0].steps[4].operation,
             TestOperation::Assertion(AssertionOperation::Locator { timeout: Some(value), .. })
                 if value == Duration::from_secs(5)));
     }

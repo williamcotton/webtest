@@ -337,13 +337,13 @@ mod tests {
             }
         }
 
-        async fn evaluate_expression(&mut self, expression: &str) -> Result<(), BrowserError> {
+        async fn evaluate(&mut self, expression: &str) -> Result<(), BrowserError> {
             if self.0 {
                 Ok(())
             } else {
                 Err(BrowserError::EvaluationFailed {
                     expression: expression.into(),
-                    message: "".into()
+                    message: "".into(),
                 })
             }
         }
