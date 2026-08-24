@@ -6,6 +6,7 @@ members = [
     "crates/syntax",
     "crates/hir",
     "crates/provider",
+    "crates/app-bridge",
     "crates/feedback",
     "crates/analysis",
     "crates/format",
@@ -53,6 +54,7 @@ base64 = "0.22"
 blake3 = "1"
 clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
+getrandom = "0.3"
 globset = "0.4"
 libc = "0.2"
 md-5 = "0.10"

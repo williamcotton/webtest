@@ -2,6 +2,12 @@
 
 ## 0. Status and dependencies
 
+**Status: implemented (2026-08-24).** Protocol-1 schemas and generated DTOs, offline analysis,
+runtime transports/adapters/lifecycle, Node and Ruby SDKs, the no-SDK executable, native/LSP/DAP/WASM
+editor parity, shared black-box conformance, and all nine web-server examples are present. The
+repository verification commands and CI matrix enforce deterministic schemas, stopped-app analysis,
+end-to-end execution, and owned-process/port cleanup.
+
 This specification expands Milestone D in [`future-functionality.md`](./future-functionality.md). It depends on the typed values, provider schemas, capability analysis, `ServerProviderCall` IR, and built-in providers from [`milestone-c.md`](./milestone-c.md), plus the static description, machine-diagnostic, and repair-hint contracts from [`milestone-c-5.md`](./milestone-c-5.md).
 
 Milestone D adds one stable application-fixture integration contract. Node, Ruby, Go, Python, Elixir, Java, .NET, Rust, PHP, and unofficial tools do not implement WebTest; they implement or bind the same small bridge protocol.

@@ -1,0 +1,15 @@
+{
+  "name": "@webtest/node",
+  "version": "0.1.0",
+  "description": "WebTest App Bridge protocol 1 SDK for Node.js and TypeScript",
+  "type": "module",
+  "main": "src/index.js",
+  "types": "src/index.d.ts",
+  "engines": { "node": ">=18" },
+  "license": "MIT OR Apache-2.0",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "conformance": "python3 ../../protocol/conformance/harness.py node conformance.js"
+  }
+}
+

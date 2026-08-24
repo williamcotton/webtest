@@ -1,7 +1,7 @@
 //! Project configuration, root selection, and deterministic WebTest file discovery.
 
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fs,
     path::{Path, PathBuf},
     time::Duration,
@@ -42,6 +42,7 @@ pub struct ProjectConfig {
     pub artifacts: ArtifactSection,
     pub evidence: EvidenceSection,
     pub server: ServerSection,
+    pub app: Option<ApplicationSection>,
     pub redaction: RedactionSection,
     pub inspection: InspectionSection,
     pub description: DescriptionSection,
@@ -110,6 +111,62 @@ pub struct ServerSection {
     pub http: ServerHttpSection,
     pub process: ServerProcessSection,
     pub fs: ServerFsSection,
+    pub app: Option<ServerAppSection>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ServerAppAdapter {
+    #[default]
+    Bridge,
+    Command,
+    Http,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ServerAppTransport {
+    #[default]
+    Auto,
+    Unix,
+    NamedPipe,
+    Tcp,
+    Stdio,
+}
+
+#[derive(Clone, Debug)]
+pub struct ServerAppSection {
+    pub adapter: ServerAppAdapter,
+    pub transport: ServerAppTransport,
+    pub schema: PathBuf,
+    pub command: Vec<String>,
+    pub http_base_url: Option<String>,
+    pub http_operations: BTreeMap<String, ServerAppHttpOperation>,
+    pub startup_timeout: Duration,
+    pub shutdown_timeout: Duration,
+    pub max_message_bytes: usize,
+    pub max_stderr_bytes: usize,
+    pub max_pending_calls: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServerAppHttpOperation {
+    pub method: String,
+    pub path: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ApplicationSection {
+    pub command: Option<String>,
+    pub args: Vec<String>,
+    pub working_directory: PathBuf,
+    pub environment: BTreeMap<String, String>,
+    pub owned: bool,
+    pub health: Option<AppHealthSection>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AppHealthSection {
+    pub url: String,
+    pub timeout: Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -199,7 +256,9 @@ impl Default for ProjectConfig {
                     read_roots: vec![PathBuf::from("fixtures")],
                     write_root: PathBuf::from(".webtest/tmp"),
                 },
+                app: None,
             },
+            app: None,
             redaction: RedactionSection {
                 headers: vec!["authorization".into(), "cookie".into(), "set-cookie".into()],
                 json_fields: vec!["password".into(), "token".into(), "secret".into()],
@@ -275,6 +334,7 @@ struct RawConfig {
     evidence: RawEvidence,
     #[serde(default)]
     server: RawServer,
+    app: Option<RawApplication>,
     #[serde(default)]
     redaction: RawRedaction,
     #[serde(default)]
@@ -350,6 +410,7 @@ struct RawServer {
     process: RawServerProcess,
     #[serde(default)]
     fs: RawServerFs,
+    app: Option<RawServerApp>,
     #[serde(flatten)]
     extra: toml::Table,
 }
@@ -376,6 +437,71 @@ struct RawServerFs {
     #[serde(default)]
     read_roots: Vec<PathBuf>,
     write_root: Option<PathBuf>,
+    #[serde(flatten)]
+    extra: toml::Table,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawServerApp {
+    adapter: Option<String>,
+    transport: Option<String>,
+    schema: Option<PathBuf>,
+    command: Option<String>,
+    #[serde(default)]
+    args: Vec<String>,
+    startup_timeout: Option<String>,
+    shutdown_timeout: Option<String>,
+    max_message_bytes: Option<usize>,
+    max_stderr_bytes: Option<usize>,
+    max_pending_calls: Option<usize>,
+    #[serde(default)]
+    http: RawServerAppHttp,
+    #[serde(flatten)]
+    extra: toml::Table,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawServerAppHttp {
+    base_url: Option<String>,
+    #[serde(default)]
+    operations: BTreeMap<String, RawServerAppHttpOperation>,
+    #[serde(flatten)]
+    extra: toml::Table,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawServerAppHttpOperation {
+    Path(String),
+    Detailed {
+        path: String,
+        #[serde(default = "default_http_method")]
+        method: String,
+    },
+}
+
+fn default_http_method() -> String {
+    "POST".into()
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawApplication {
+    command: Option<String>,
+    #[serde(default)]
+    args: Vec<String>,
+    working_directory: Option<PathBuf>,
+    owned: Option<bool>,
+    #[serde(default)]
+    environment: BTreeMap<String, String>,
+    health: Option<RawAppHealth>,
+    #[serde(flatten)]
+    extra: toml::Table,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawAppHealth {
+    url: String,
+    timeout: Option<String>,
     #[serde(flatten)]
     extra: toml::Table,
 }
@@ -534,6 +660,16 @@ fn parse_config(
     collect_unknown(&mut warnings, "server.http", &raw.server.http.extra);
     collect_unknown(&mut warnings, "server.process", &raw.server.process.extra);
     collect_unknown(&mut warnings, "server.fs", &raw.server.fs.extra);
+    if let Some(app) = &raw.server.app {
+        collect_unknown(&mut warnings, "server.app", &app.extra);
+        collect_unknown(&mut warnings, "server.app.http", &app.http.extra);
+    }
+    if let Some(app) = &raw.app {
+        collect_unknown(&mut warnings, "app", &app.extra);
+        if let Some(health) = &app.health {
+            collect_unknown(&mut warnings, "app.health", &health.extra);
+        }
+    }
     collect_unknown(&mut warnings, "redaction", &raw.redaction.extra);
     collect_unknown(&mut warnings, "inspection", &raw.inspection.extra);
     collect_unknown(&mut warnings, "description", &raw.description.extra);
@@ -582,6 +718,42 @@ fn parse_config(
             path: path.to_path_buf(),
             message: "server.process.max_output_bytes must be positive".into(),
         });
+    }
+    if let Some(app) = &raw.server.app {
+        for (key, value) in [
+            ("max_message_bytes", app.max_message_bytes),
+            ("max_stderr_bytes", app.max_stderr_bytes),
+            ("max_pending_calls", app.max_pending_calls),
+        ] {
+            if value == Some(0) {
+                return Err(ProjectError::InvalidConfig {
+                    path: path.to_path_buf(),
+                    message: format!("server.app.{key} must be positive"),
+                });
+            }
+        }
+        if let Some(schema) = &app.schema {
+            validate_project_relative(path, "server.app.schema", schema)?;
+        }
+    }
+    if let Some(app) = &raw.app {
+        if app.owned.unwrap_or(true) && app.command.as_deref().is_none_or(str::is_empty) {
+            return Err(ProjectError::InvalidConfig {
+                path: path.to_path_buf(),
+                message: "app.command is required when app.owned is true".into(),
+            });
+        }
+        if let Some(working_directory) = &app.working_directory {
+            validate_project_relative(path, "app.working_directory", working_directory)?;
+        }
+        if let Some(health) = &app.health
+            && !is_absolute_url(&health.url)
+        {
+            return Err(ProjectError::InvalidConfig {
+                path: path.to_path_buf(),
+                message: "app.health.url must be an absolute URL".into(),
+            });
+        }
     }
     if raw
         .browser
@@ -647,6 +819,15 @@ fn parse_config(
         )?,
         test: timeout("test", raw.timeouts.test, defaults.timeouts.test)?,
     };
+    let server_app = raw
+        .server
+        .app
+        .map(|app| resolve_server_app(path, app))
+        .transpose()?;
+    let application = raw
+        .app
+        .map(|app| resolve_application(path, app))
+        .transpose()?;
     for (name, value) in [
         ("action", resolved_timeouts.action),
         ("assertion", resolved_timeouts.assertion),
@@ -801,7 +982,9 @@ fn parse_config(
                         .write_root
                         .unwrap_or(defaults.server.fs.write_root),
                 },
+                app: server_app,
             },
+            app: application,
             redaction: RedactionSection {
                 headers: if raw.redaction.headers.is_empty() {
                     defaults.redaction.headers
@@ -885,6 +1068,154 @@ fn is_absolute_url(value: &str) -> bool {
                 character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
             })
             && !rest.is_empty()
+    })
+}
+
+fn resolve_server_app(
+    config_path: &Path,
+    raw: RawServerApp,
+) -> Result<ServerAppSection, ProjectError> {
+    let invalid = |message: String| ProjectError::InvalidConfig {
+        path: config_path.to_path_buf(),
+        message,
+    };
+    let adapter = match raw.adapter.as_deref().unwrap_or("bridge") {
+        "bridge" => ServerAppAdapter::Bridge,
+        "command" => ServerAppAdapter::Command,
+        "http" => ServerAppAdapter::Http,
+        value => {
+            return Err(invalid(format!(
+                "server.app.adapter must be `bridge`, `command`, or `http`, got `{value}`"
+            )));
+        }
+    };
+    let transport = match raw.transport.as_deref().unwrap_or("auto") {
+        "auto" => ServerAppTransport::Auto,
+        "unix" => ServerAppTransport::Unix,
+        "named_pipe" | "named-pipe" => ServerAppTransport::NamedPipe,
+        "tcp" => ServerAppTransport::Tcp,
+        "stdio" => ServerAppTransport::Stdio,
+        value => {
+            return Err(invalid(format!(
+                "server.app.transport must be `auto`, `unix`, `named_pipe`, `tcp`, or `stdio`, got `{value}`"
+            )));
+        }
+    };
+    if adapter != ServerAppAdapter::Bridge && transport != ServerAppTransport::Auto {
+        return Err(invalid(
+            "server.app.transport only applies to adapter = `bridge`".into(),
+        ));
+    }
+    let mut command = raw.command.into_iter().collect::<Vec<_>>();
+    command.extend(raw.args);
+    if (adapter == ServerAppAdapter::Command
+        || (adapter == ServerAppAdapter::Bridge && transport == ServerAppTransport::Stdio))
+        && command.is_empty()
+    {
+        return Err(invalid(
+            "server.app.command is required for command and stdio bridge adapters".into(),
+        ));
+    }
+    if let Some(base_url) = &raw.http.base_url
+        && !is_absolute_url(base_url)
+    {
+        return Err(invalid(
+            "server.app.http.base_url must be an absolute URL".into(),
+        ));
+    }
+    if adapter == ServerAppAdapter::Http
+        && (raw.http.base_url.is_none() || raw.http.operations.is_empty())
+    {
+        return Err(invalid(
+            "HTTP app adapters require server.app.http.base_url and explicit operations".into(),
+        ));
+    }
+    let mut http_operations = BTreeMap::new();
+    for (name, operation) in raw.http.operations {
+        let (method, endpoint) = match operation {
+            RawServerAppHttpOperation::Path(path) => ("POST".into(), path),
+            RawServerAppHttpOperation::Detailed { path, method } => {
+                (method.to_ascii_uppercase(), path)
+            }
+        };
+        if !matches!(method.as_str(), "GET" | "POST" | "PUT" | "PATCH" | "DELETE") {
+            return Err(invalid(format!(
+                "server.app.http.operations.{name}.method is not supported"
+            )));
+        }
+        if endpoint.contains("://") || endpoint.trim().is_empty() {
+            return Err(invalid(format!(
+                "server.app.http.operations.{name} must be an explicit relative path"
+            )));
+        }
+        http_operations.insert(
+            name,
+            ServerAppHttpOperation {
+                method,
+                path: endpoint,
+            },
+        );
+    }
+    let duration = |key: &str, value: Option<String>, default| {
+        value.map_or(Ok(default), |value| {
+            parse_duration(&value)
+                .ok_or_else(|| invalid(format!("server.app.{key} has invalid duration `{value}`")))
+        })
+    };
+    Ok(ServerAppSection {
+        adapter,
+        transport,
+        schema: raw
+            .schema
+            .unwrap_or_else(|| ".webtest/app-schema.json".into()),
+        command,
+        http_base_url: raw.http.base_url,
+        http_operations,
+        startup_timeout: duration(
+            "startup_timeout",
+            raw.startup_timeout,
+            Duration::from_secs(10),
+        )?,
+        shutdown_timeout: duration(
+            "shutdown_timeout",
+            raw.shutdown_timeout,
+            Duration::from_secs(2),
+        )?,
+        max_message_bytes: raw.max_message_bytes.unwrap_or(1_048_576),
+        max_stderr_bytes: raw.max_stderr_bytes.unwrap_or(65_536),
+        max_pending_calls: raw.max_pending_calls.unwrap_or(1_024),
+    })
+}
+
+fn resolve_application(
+    config_path: &Path,
+    raw: RawApplication,
+) -> Result<ApplicationSection, ProjectError> {
+    let health = raw
+        .health
+        .map(|health| {
+            let timeout = health
+                .timeout
+                .as_deref()
+                .map(parse_duration)
+                .unwrap_or(Some(Duration::from_secs(10)))
+                .ok_or_else(|| ProjectError::InvalidConfig {
+                    path: config_path.to_path_buf(),
+                    message: "app.health.timeout has an invalid duration".into(),
+                })?;
+            Ok(AppHealthSection {
+                url: health.url,
+                timeout,
+            })
+        })
+        .transpose()?;
+    Ok(ApplicationSection {
+        command: raw.command,
+        args: raw.args,
+        working_directory: raw.working_directory.unwrap_or_else(|| PathBuf::from(".")),
+        environment: raw.environment,
+        owned: raw.owned.unwrap_or(true),
+        health,
     })
 }
 
@@ -1285,6 +1616,68 @@ max_dom_bytes = 4096
         assert!(parse_config(path, "[browser]\nbase_url = \"/relative\"\n").is_err());
         assert!(parse_config(path, "[browser]\nviewport = { width = 0, height = 10 }\n").is_err());
         assert!(parse_config(path, "[timeouts]\naction = \"61s\"\ntest = \"60s\"\n").is_err());
+    }
+
+    #[test]
+    fn parses_typed_application_bridge_and_lifecycle_configuration() {
+        let path = Path::new("webtest.toml");
+        let (config, warnings) = parse_config(
+            path,
+            r#"
+[app]
+command = "node"
+args = ["server.js"]
+working_directory = "app"
+owned = true
+
+[app.environment]
+WEBTEST = "1"
+
+[app.health]
+url = "http://127.0.0.1:3000/health"
+timeout = "3s"
+
+[server.app]
+adapter = "bridge"
+transport = "tcp"
+schema = ".webtest/app-schema.json"
+startup_timeout = "4s"
+shutdown_timeout = "500ms"
+max_message_bytes = 4096
+max_stderr_bytes = 1024
+max_pending_calls = 12
+"#,
+        )
+        .expect("app configuration");
+        assert!(warnings.is_empty());
+        let application = config.app.expect("application lifecycle");
+        assert_eq!(application.command.as_deref(), Some("node"));
+        assert_eq!(application.environment["WEBTEST"], "1");
+        assert_eq!(
+            application.health.expect("health").timeout,
+            Duration::from_secs(3)
+        );
+        let app = config.server.app.expect("app provider");
+        assert_eq!(app.adapter, ServerAppAdapter::Bridge);
+        assert_eq!(app.transport, ServerAppTransport::Tcp);
+        assert_eq!(app.max_message_bytes, 4096);
+        assert_eq!(app.max_pending_calls, 12);
+
+        assert!(parse_config(path, "[server.app]\ntransport = \"stdio\"\n").is_err());
+        assert!(
+            parse_config(
+                path,
+                "[server.app]\nadapter = \"http\"\n[server.app.http]\nbase_url = \"http://127.0.0.1:3000\"\n"
+            )
+            .is_err()
+        );
+        assert!(
+            parse_config(
+                path,
+                "[app]\ncommand = \"node\"\nworking_directory = \"../outside\"\n"
+            )
+            .is_err()
+        );
     }
 
     #[test]

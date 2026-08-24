@@ -1,4 +1,7 @@
-use std::io::{self, Write};
+use std::{
+    collections::BTreeMap,
+    io::{self, Write},
+};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -178,6 +181,12 @@ pub struct EventReport {
     pub code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub arguments: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagnostic_schema_version: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]

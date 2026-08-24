@@ -1,0 +1,131 @@
+{
+  "manifest_version": 1,
+  "protocol": 1,
+  "provider": "app",
+  "sdk": "webtest-conformance",
+  "sdk_version": "0.1.0",
+  "schema_hash": "blake3:29e6acf49ddd7fc908434e84f27ac390a8e75490e0656184872842ad3e7bcc15",
+  "functions": {
+    "create_user": {
+      "documentation": "Create a user for protocol conformance.",
+      "retry_safe": false,
+      "params": {
+        "type": "object",
+        "fields": {
+          "admin": {
+            "type": "boolean",
+            "documentation": "Grant administrative access.",
+            "optional": true,
+            "secret": false,
+            "default": false
+          },
+          "email": {
+            "type": "string",
+            "documentation": "Unique sign-in email.",
+            "optional": false,
+            "secret": false
+          }
+        }
+      },
+      "returns": {
+        "type": "object",
+        "fields": {
+          "admin": { "type": "boolean", "optional": false, "secret": false },
+          "email": { "type": "string", "optional": false, "secret": false },
+          "id": { "type": "integer", "optional": false, "secret": false }
+        }
+      }
+    },
+    "echo_array": {
+      "documentation": "Round-trip a string array.",
+      "retry_safe": true,
+      "params": { "type": "object", "fields": { "value": { "type": "array", "items": { "type": "string" }, "optional": false, "secret": false } } },
+      "returns": { "type": "array", "items": { "type": "string" } }
+    },
+    "echo_boolean": {
+      "documentation": "Round-trip a boolean.",
+      "retry_safe": true,
+      "params": { "type": "object", "fields": { "value": { "type": "boolean", "optional": false, "secret": false } } },
+      "returns": { "type": "boolean" }
+    },
+    "echo_float": {
+      "documentation": "Round-trip a float.",
+      "retry_safe": true,
+      "params": { "type": "object", "fields": { "value": { "type": "float", "optional": false, "secret": false } } },
+      "returns": { "type": "float" }
+    },
+    "echo_integer": {
+      "documentation": "Round-trip an integer.",
+      "retry_safe": true,
+      "params": { "type": "object", "fields": { "value": { "type": "integer", "optional": false, "secret": false } } },
+      "returns": { "type": "integer" }
+    },
+    "echo_null": {
+      "documentation": "Round-trip null.",
+      "retry_safe": true,
+      "params": { "type": "object", "fields": { "value": { "type": "null", "optional": false, "secret": false } } },
+      "returns": { "type": "null" }
+    },
+    "echo_object": {
+      "documentation": "Round-trip a nested object.",
+      "retry_safe": true,
+      "params": {
+        "type": "object",
+        "fields": {
+          "value": {
+            "type": "object",
+            "optional": false,
+            "secret": false,
+            "fields": {
+              "metadata": {
+                "type": "object",
+                "optional": false,
+                "secret": false,
+                "fields": {
+                  "active": { "type": "boolean", "optional": false, "secret": false },
+                  "score": { "type": "float", "optional": false, "secret": false }
+                }
+              },
+              "name": { "type": "string", "optional": false, "secret": false },
+              "tags": { "type": "array", "items": { "type": "string" }, "optional": false, "secret": false }
+            }
+          }
+        }
+      },
+      "returns": {
+        "type": "object",
+        "fields": {
+          "metadata": {
+            "type": "object",
+            "optional": false,
+            "secret": false,
+            "fields": {
+              "active": { "type": "boolean", "optional": false, "secret": false },
+              "score": { "type": "float", "optional": false, "secret": false }
+            }
+          },
+          "name": { "type": "string", "optional": false, "secret": false },
+          "tags": { "type": "array", "items": { "type": "string" }, "optional": false, "secret": false }
+        }
+      }
+    },
+    "echo_optional": {
+      "documentation": "Round-trip an optional string.",
+      "retry_safe": true,
+      "params": { "type": "object", "fields": { "value": { "type": "optional", "item": { "type": "string" }, "optional": true, "secret": false, "default": null } } },
+      "returns": { "type": "optional", "item": { "type": "string" } }
+    },
+    "echo_string": {
+      "documentation": "Round-trip a Unicode string.",
+      "retry_safe": true,
+      "params": { "type": "object", "fields": { "value": { "type": "string", "optional": false, "secret": false } } },
+      "returns": { "type": "string" }
+    },
+    "wait": {
+      "documentation": "Wait until completion or cooperative cancellation.",
+      "retry_safe": true,
+      "params": { "type": "object", "fields": { "delay_ms": { "type": "integer", "optional": false, "secret": false } } },
+      "returns": { "type": "string" }
+    }
+  }
+}

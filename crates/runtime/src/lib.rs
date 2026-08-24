@@ -256,7 +256,20 @@ pub struct Runner {
 
 #[async_trait]
 pub trait RunControl: Send + Sync {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+
     async fn before_step(&self, test: &webtest_plan::PlannedTest, step: &PlannedStep);
+
+    async fn after_step_failure(
+        &self,
+        _test: &webtest_plan::PlannedTest,
+        _step: &PlannedStep,
+        _error: &StepError,
+        _bindings: &BTreeMap<String, Value>,
+    ) {
+    }
 
     async fn before_step_with_bindings(
         &self,
@@ -319,6 +332,9 @@ impl Runner {
         let mut tests = Vec::with_capacity(plan.tests.len());
 
         for (index, test) in plan.tests.iter().enumerate() {
+            if control.is_some_and(RunControl::is_cancelled) {
+                break;
+            }
             let (result, tainted) = self
                 .run_test(plan, test, execution_id, &mut events, &mut session, control)
                 .await?;
@@ -372,26 +388,29 @@ impl Runner {
         let mut environment = HashMap::new();
         let mut binding_names = HashMap::new();
         let mut secrets = Vec::new();
+        let mut redacted_fields = self.options.redacted_json_fields.clone();
 
         for step in &test.steps {
+            if control.is_some_and(RunControl::is_cancelled) {
+                break;
+            }
             if let TestOperation::ServerProviderCall(call) = &step.operation {
-                collect_provider_secrets(
-                    call,
-                    &environment,
-                    &self.options.redacted_json_fields,
-                    &mut secrets,
-                );
+                collect_provider_secrets(call, &environment, &redacted_fields, &mut secrets);
             }
             if let Some(control) = control {
-                let bindings = visible_bindings(
+                let bindings = visible_step_bindings(
+                    step,
                     &environment,
                     &binding_names,
-                    &self.options.redacted_json_fields,
+                    &redacted_fields,
                     &secrets,
                 );
                 control
                     .before_step_with_bindings(test, step, &bindings)
                     .await;
+                if control.is_cancelled() {
+                    break;
+                }
             }
             events.push(ExecutionEvent::StepStarted {
                 execution_id,
@@ -399,12 +418,16 @@ impl Runner {
                 step_id: step.id,
             });
             if let TestOperation::ServerProviderCall(call) = &step.operation {
+                let arguments =
+                    provider_argument_summaries(call, &environment, &redacted_fields, &secrets);
                 events.push(ExecutionEvent::ProviderCallStarted {
                     execution_id,
                     test_id: test.id,
                     step_id: step.id,
                     provider: call.provider.clone(),
                     operation: call.operation.clone(),
+                    transport_kind: self.providers.transport_kind(&call.provider),
+                    arguments,
                 });
             }
             let step_started = std::time::Instant::now();
@@ -414,6 +437,15 @@ impl Runner {
             match result {
                 Ok(()) => {
                     if let TestOperation::ServerProviderCall(call) = &step.operation {
+                        redacted_fields.extend(call.redacted_result_fields.iter().cloned());
+                        redacted_fields.sort();
+                        redacted_fields.dedup();
+                        collect_provider_result_secrets(
+                            call,
+                            &environment,
+                            &redacted_fields,
+                            &mut secrets,
+                        );
                         events.push(ExecutionEvent::ProviderCallFinished {
                             execution_id,
                             test_id: test.id,
@@ -421,6 +453,15 @@ impl Runner {
                             provider: call.provider.clone(),
                             operation: call.operation.clone(),
                             elapsed_ms: duration_millis(step_started.elapsed()),
+                            transport_kind: self.providers.transport_kind(&call.provider),
+                            result: call
+                                .result_binding
+                                .and_then(|binding| environment.get(&binding))
+                                .map(|value| {
+                                    bounded_value_summary(
+                                        &value.redacted_with_secrets(&redacted_fields, &secrets),
+                                    )
+                                }),
                         });
                     }
                     events.push(ExecutionEvent::StepPassed {
@@ -432,10 +473,22 @@ impl Runner {
                 Err(error) => {
                     let error = redact_step_error(
                         error,
-                        &self.options.redacted_json_fields,
+                        &redacted_fields,
                         &secrets,
                         &self.options.inspection.redacted_query_parameters,
                     );
+                    if let Some(control) = control {
+                        let bindings = visible_step_bindings(
+                            step,
+                            &environment,
+                            &binding_names,
+                            &redacted_fields,
+                            &secrets,
+                        );
+                        control
+                            .after_step_failure(test, step, &error, &bindings)
+                            .await;
+                    }
                     let mut evidence =
                         if matches!(error, StepError::Browser(_)) && !error.is_infrastructure() {
                             if let Some(page) = page.as_deref_mut() {
@@ -517,6 +570,7 @@ impl Runner {
                             code: error.code().into(),
                             message: error.to_string(),
                             elapsed_ms,
+                            transport_kind: self.providers.transport_kind(&call.provider),
                         });
                     }
                     if !error.is_infrastructure() {
@@ -676,6 +730,7 @@ impl Runner {
                     provider: ProviderName(call.provider.clone()),
                     operation: OperationName(call.operation.clone()),
                     arguments,
+                    schema_hash: call.schema_hash.clone(),
                 },
                 CallContext {
                     project_root: self.options.project_root.clone(),
@@ -1742,6 +1797,90 @@ fn collect_provider_secrets(
     secrets.dedup();
 }
 
+fn collect_provider_result_secrets(
+    call: &ServerProviderCall,
+    environment: &HashMap<BindingId, Value>,
+    redacted_fields: &[String],
+    secrets: &mut Vec<String>,
+) {
+    let Some(value) = call
+        .result_binding
+        .and_then(|binding| environment.get(&binding))
+    else {
+        return;
+    };
+    let fields = redacted_fields
+        .iter()
+        .chain(&call.redacted_result_fields)
+        .cloned()
+        .collect::<Vec<_>>();
+    collect_sensitive_values(value, &fields, false, secrets);
+    secrets.sort();
+    secrets.dedup();
+}
+
+fn provider_argument_summaries(
+    call: &ServerProviderCall,
+    environment: &HashMap<BindingId, Value>,
+    redacted_fields: &[String],
+    secrets: &[String],
+) -> BTreeMap<String, String> {
+    call.arguments
+        .iter()
+        .map(|(name, expression)| {
+            let summary = if call.redacted_arguments.contains(name) {
+                "[redacted]".into()
+            } else {
+                evaluate(expression, environment)
+                    .map(|value| {
+                        bounded_value_summary(
+                            &value.redacted_with_secrets(redacted_fields, secrets),
+                        )
+                    })
+                    .unwrap_or_else(|_| "<unavailable>".into())
+            };
+            (name.clone(), summary)
+        })
+        .collect()
+}
+
+fn visible_step_bindings(
+    step: &PlannedStep,
+    environment: &HashMap<BindingId, Value>,
+    binding_names: &HashMap<BindingId, String>,
+    redacted_fields: &[String],
+    secrets: &[String],
+) -> BTreeMap<String, Value> {
+    let mut visible = visible_bindings(environment, binding_names, redacted_fields, secrets);
+    let TestOperation::ServerProviderCall(call) = &step.operation else {
+        return visible;
+    };
+    for (name, expression) in &call.arguments {
+        let value = if call.redacted_arguments.contains(name) {
+            Value::String("[redacted]".into())
+        } else {
+            evaluate(expression, environment)
+                .map(|value| value.redacted_with_secrets(redacted_fields, secrets))
+                .unwrap_or_else(|_| Value::String("<unavailable>".into()))
+        };
+        visible.insert(format!("argument.{name}"), value);
+    }
+    visible
+}
+
+fn bounded_value_summary(value: &Value) -> String {
+    let mut summary = display_value(value);
+    if summary.len() > 256 {
+        let mut end = 256;
+        while !summary.is_char_boundary(end) {
+            end -= 1;
+        }
+        summary.truncate(end);
+        summary.push_str("...");
+    }
+    summary
+}
+
 fn collect_sensitive_values(
     value: &Value,
     redacted_fields: &[String],
@@ -2103,6 +2242,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn debugger_step_bindings_include_evaluated_redacted_provider_arguments() {
+        let file = FileId::new(0);
+        let step = PlannedStep {
+            id: StepId(0),
+            origin: SyntaxOrigin::new(file, TextRange::empty(TextSize::new(0))),
+            operation: TestOperation::ServerProviderCall(ServerProviderCall {
+                provider: "app".into(),
+                operation: "create_user".into(),
+                arguments: [
+                    (
+                        "email".into(),
+                        PlanExpr::Literal(Value::String("alice@example.test".into())),
+                    ),
+                    (
+                        "token".into(),
+                        PlanExpr::Literal(Value::String("private".into())),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                result_binding: None,
+                result_name: None,
+                result_type: webtest_provider::Type::String,
+                schema_hash: "schema".into(),
+                timeout: None,
+                redacted_arguments: vec!["token".into()],
+                redacted_result_fields: Vec::new(),
+                retry_safe: false,
+            }),
+        };
+        let visible = visible_step_bindings(&step, &HashMap::new(), &HashMap::new(), &[], &[]);
+        assert_eq!(
+            visible.get("argument.email"),
+            Some(&Value::String("alice@example.test".into()))
+        );
+        assert_eq!(
+            visible.get("argument.token"),
+            Some(&Value::String("[redacted]".into()))
+        );
+    }
+
     #[tokio::test]
     async fn failure_records_revision_bound_observation_and_success_clears_it() {
         let store = Arc::new(ObservationStore::default());
@@ -2231,6 +2412,8 @@ mod tests {
                 webtest_provider::RecordField {
                     ty: Type::Int,
                     optional: false,
+                    documentation: String::new(),
+                    secret: false,
                 },
             )]
             .into_iter()

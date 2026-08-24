@@ -137,6 +137,8 @@ pub struct ConstructDescription {
     #[serde(rename = "returns", skip_serializing_if = "Option::is_none")]
     pub return_type: Option<Type>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_safe: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub produces_value: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result_rule: Option<String>,
@@ -172,6 +174,8 @@ pub struct ParameterDescription {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default: Option<serde_json::Value>,
     pub secret: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub documentation: String,
     pub syntax_role: String,
     pub grammar_rule: String,
 }
@@ -793,6 +797,7 @@ fn base_construct(
         search_terms: Vec::new(),
         parameters: Vec::new(),
         return_type: None,
+        retry_safe: None,
         produces_value: None,
         result_rule: None,
         requires_capabilities: Vec::new(),
@@ -834,6 +839,7 @@ fn parameter(
         named,
         default: None,
         secret: false,
+        documentation: String::new(),
         syntax_role: syntax_role.into(),
         grammar_rule: grammar_rule.into(),
     }
@@ -2183,6 +2189,7 @@ fn provider_construct(
         .map(|(index, schema)| provider_parameter(schema, index))
         .collect();
     value.return_type = Some(operation.result.clone());
+    value.retry_safe = Some(operation.retry_safe);
     value.requires_capabilities = vec![operation.capability];
     value.allowed_contexts = vec!["scope.server".into()];
     value.effects = vec![
@@ -2238,8 +2245,12 @@ fn provider_parameter(schema: &ParameterSchema, index: usize) -> ParameterDescri
         required: schema.required,
         position: schema.positional.then_some(index),
         named: !schema.positional,
-        default: None,
+        default: schema
+            .default
+            .as_ref()
+            .and_then(webtest_provider::value_to_json),
         secret: schema.secret,
+        documentation: sanitize_documentation(&schema.documentation),
         syntax_role: "argument".into(),
         grammar_rule: "expression".into(),
     }
@@ -2346,6 +2357,15 @@ fn provider_failures(provider: &str) -> Vec<String> {
             "path_escape".into(),
             "provider_unavailable".into(),
         ],
+        "app" => vec![
+            "app_provider_failure".into(),
+            "app_bridge_handshake".into(),
+            "app_bridge_protocol".into(),
+            "app_bridge_transport".into(),
+            "app_schema_drift".into(),
+            "app_bridge_validation".into(),
+            "app_bridge_timeout".into(),
+        ],
         _ => vec!["provider_failure".into(), "provider_unavailable".into()],
     }
 }
@@ -2364,6 +2384,11 @@ fn provider_search_terms(provider: &str, operation: &str) -> Vec<String> {
             "file".into(),
             "fixture".into(),
             "temporary directory".into(),
+        ],
+        "app" => vec![
+            "application bridge".into(),
+            "application fixture".into(),
+            "test data".into(),
         ],
         _ => Vec::new(),
     });
@@ -2649,14 +2674,18 @@ mod tests {
                 required: true,
                 positional: true,
                 secret: false,
+                documentation: String::new(),
+                default: None,
             }],
             result: Type::String,
             capability: Capability::Server,
             documentation,
+            retry_safe: false,
         };
         let schema = ProviderSchema {
             name: ProviderName("agent".into()),
             operations: [("activate".into(), operation)].into_iter().collect(),
+            schema_identity: None,
         };
         let mut providers = ProviderRegistry::built_in_schemas();
         providers.register_schema(schema);

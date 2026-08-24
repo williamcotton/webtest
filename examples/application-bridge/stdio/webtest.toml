@@ -1,0 +1,11 @@
+[project]
+name = "application-bridge-stdio"
+test_roots = ["."]
+
+[server.app]
+adapter = "bridge"
+transport = "stdio"
+command = "python3"
+args = ["../../../protocol/conformance/reference_bridge.py"]
+schema = ".webtest/app-schema.json"
+

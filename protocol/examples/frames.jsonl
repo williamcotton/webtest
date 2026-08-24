@@ -1,0 +1,10 @@
+{"type":"hello","protocol_versions":[1],"sdk":"webtest-reference","sdk_version":"0.1.0","token":"per-run-token","capabilities":{"cancel":true,"events":true}}
+{"type":"hello_ok","protocol":1,"run_id":"example-run","max_message_bytes":1048576}
+{"type":"describe","id":1}
+{"type":"call","id":42,"function":"create_user","arguments":{"email":"alice@example.com"},"deadline_ms":10000}
+{"type":"result","id":42,"value":{"id":123,"email":"alice@example.com","admin":false}}
+{"type":"ping","id":7}
+{"type":"pong","id":7}
+{"type":"shutdown","id":9}
+{"type":"shutdown_ok","id":9}
+

@@ -18,6 +18,10 @@ use webtest_analysis::{
     AnalysisDatabase, DescriptionLimits, DescriptionProject, DescriptionRequest,
     DescriptionResponse, Diagnostic, DiagnosticSeverity,
 };
+use webtest_app_bridge::{
+    AppAdapter, AppHttpConfig, AppManifest, AppProcessConfig, AppProvider, AppProviderConfig,
+    AppTransport, HealthCheck, HttpOperation,
+};
 use webtest_browser::{
     BrowserContextOptions, BrowserError, BrowserHost, InspectionOptions, Locator, Viewport,
 };
@@ -31,6 +35,7 @@ use webtest_plan::{
 use webtest_project::{DiscoveredFile, Project};
 use webtest_provider::{
     Capability, FsProviderConfig, HttpProviderConfig, NativeProviderConfig, ProcessProviderConfig,
+    ProviderRegistry,
 };
 use webtest_runtime::{EvidenceOptions, RunError, Runner, RunnerOptions, StepError, StepFailure};
 use webtest_text::{SourceRevision, TextRange};
@@ -289,10 +294,18 @@ async fn run(cli: Cli) -> Result<ExitClass, AppError> {
                 project.config.timeouts.browser_command,
                 project.config.timeouts.navigation,
             );
-            let editor = Arc::new(webtest_editor::EditorService::with_runner_options(
-                runner_options(&project),
+            let options = runner_options(&project);
+            let (providers, app_provider) = runtime_provider_registry(&project, &options)?;
+            let editor = Arc::new(webtest_editor::EditorService::with_provider_registry(
+                options, providers,
             ));
             webtest_lsp::serve_with_editor(Arc::new(browser), editor).await;
+            if let Some(provider) = app_provider {
+                provider
+                    .shutdown()
+                    .await
+                    .map_err(AppError::infrastructure)?;
+            }
             Ok(ExitClass::Success)
         }
         Command::Dap {
@@ -309,9 +322,17 @@ async fn run(cli: Cli) -> Result<ExitClass, AppError> {
                     project.config.timeouts.browser_command,
                     project.config.timeouts.navigation,
                 );
-            webtest_dap::serve_with_options(Arc::new(browser), runner_options(&project))
-                .await
-                .map_err(AppError::infrastructure)?;
+            let options = runner_options(&project);
+            let (providers, app_provider) = runtime_provider_registry(&project, &options)?;
+            let serve_result =
+                webtest_dap::serve_with_configuration(Arc::new(browser), options, providers).await;
+            if let Some(provider) = app_provider {
+                provider
+                    .shutdown()
+                    .await
+                    .map_err(AppError::infrastructure)?;
+            }
+            serve_result.map_err(AppError::infrastructure)?;
             Ok(ExitClass::Success)
         }
     }
@@ -450,11 +471,18 @@ fn describe_reference(
             .find(|directory| directory.join("webtest.toml").is_file())
             .map(Path::to_path_buf)
     };
-    let resolved_project = project_input
-        .as_ref()
-        .map(|path| webtest_project::discover(std::slice::from_ref(path)));
-    let (project_reference, limits) = match resolved_project {
-        Some(Ok(project)) => {
+    let resolved_project =
+        project_input.as_ref().and_then(|path| {
+            match webtest_project::discover(std::slice::from_ref(path)) {
+                Ok(project) => Some(project),
+                Err(error) => {
+                    eprintln!("warning[description.project]: {error}");
+                    None
+                }
+            }
+        });
+    let (project_reference, limits) = match resolved_project.as_ref() {
+        Some(project) => {
             let configuration = project
                 .config_path
                 .as_deref()
@@ -476,10 +504,6 @@ fn describe_reference(
                 },
             )
         }
-        Some(Err(error)) => {
-            eprintln!("warning[description.project]: {error}");
-            (None, DescriptionLimits::default())
-        }
         None => (None, DescriptionLimits::default()),
     };
     let request = if let Some(search) = search {
@@ -489,7 +513,12 @@ fn describe_reference(
     } else {
         DescriptionRequest::Index
     };
-    let response = AnalysisDatabase::default().describe(request, project_reference, limits);
+    let database = resolved_project
+        .as_ref()
+        .map(analysis_database_for_project)
+        .transpose()?
+        .unwrap_or_default();
+    let response = database.describe(request, project_reference, limits);
     let failed = matches!(response, DescriptionResponse::Diagnostic(_));
     let stdout = io::stdout();
     let mut output = stdout.lock();
@@ -554,6 +583,37 @@ fn write_description_human(
                 )
                 .map_err(AppError::infrastructure)?;
             }
+            if !construct.parameters.is_empty() {
+                writeln!(output, "parameters:").map_err(AppError::infrastructure)?;
+                for parameter in &construct.parameters {
+                    let requirement = if parameter.required {
+                        "required"
+                    } else {
+                        "optional"
+                    };
+                    let secret = if parameter.secret { ", secret" } else { "" };
+                    write!(
+                        output,
+                        "  {}: {} ({requirement}{secret})",
+                        parameter.name, parameter.ty
+                    )
+                    .map_err(AppError::infrastructure)?;
+                    if let Some(default) = &parameter.default {
+                        write!(output, ", default {default}").map_err(AppError::infrastructure)?;
+                    }
+                    writeln!(output).map_err(AppError::infrastructure)?;
+                    if !parameter.documentation.is_empty() {
+                        writeln!(output, "    {}", parameter.documentation)
+                            .map_err(AppError::infrastructure)?;
+                    }
+                }
+            }
+            if let Some(return_type) = &construct.return_type {
+                writeln!(output, "returns: {return_type}").map_err(AppError::infrastructure)?;
+            }
+            if let Some(retry_safe) = construct.retry_safe {
+                writeln!(output, "retry safe: {retry_safe}").map_err(AppError::infrastructure)?;
+            }
             for example in &construct.examples {
                 writeln!(
                     output,
@@ -587,7 +647,7 @@ fn check_project(project: &Project) -> Result<CommandReport, AppError> {
     for file in &project.files {
         let started = Instant::now();
         let source = read_source(&file.path)?;
-        let (mut database, file_id) = database_for(&file.path, &source);
+        let (mut database, file_id) = database_for(project, &file.path, &source)?;
         let diagnostics = database.diagnostics(file_id).map_err(AppError::internal)?;
         let mut diagnostics = diagnostics
             .iter()
@@ -676,7 +736,7 @@ fn build_project(project: &Project, emit: &Path) -> Result<ExitClass, AppError> 
         return Ok(report.exit_class);
     }
 
-    let mut database = AnalysisDatabase::default();
+    let mut database = analysis_database_for_project(project)?;
     let mut opened = Vec::new();
     for file in &project.files {
         let source = read_source(&file.path)?;
@@ -898,12 +958,14 @@ async fn test_project(
     let mut report = base_report("test", project);
     let show_browser = headed || !project.config.browser.headless;
     let mut browser = None;
+    let options = runner_options(project);
+    let (providers, app_provider) = runtime_provider_registry(project, &options)?;
 
     for file in &project.files {
         let started = Instant::now();
         let source = read_source(&file.path)?;
         let revision = SourceRevision::of(&source);
-        let (mut database, file_id) = database_for(&file.path, &source);
+        let (mut database, file_id) = database_for(project, &file.path, &source)?;
         let diagnostics = database.diagnostics(file_id).map_err(AppError::internal)?;
         let mut diagnostic_reports = diagnostics
             .iter()
@@ -943,7 +1005,9 @@ async fn test_project(
         }
 
         let observations = Arc::new(ObservationStore::default());
-        let runner = Runner::new(observations).with_options(runner_options(project));
+        let runner = Runner::new(observations)
+            .with_options(options.clone())
+            .with_provider_registry(providers.clone());
         let mut file_report = FileReport {
             path: display_path(file),
             exit_class: ExitClass::Success,
@@ -954,6 +1018,28 @@ async fn test_project(
             infrastructure_error: None,
             events: Vec::new(),
         };
+        if let Some(provider) = &app_provider
+            && let Err(error) = provider.start(&project.root).await
+        {
+            file_report.infrastructure_error = Some(FailureReport {
+                diagnostic_schema_version: webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
+                repair_hint_schema_version: webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
+                code: format!("runtime.{}", error.code()),
+                message: error.to_string(),
+                span: None,
+                diff: None,
+                artifacts: Vec::new(),
+                semantic_details: None,
+                repair_hints: Vec::new(),
+                page: None,
+                secondary: Vec::new(),
+            });
+            file_report.duration_nanos = nanos(started.elapsed());
+            file_report.exit_class = ExitClass::Infrastructure;
+            report.exit_class = report.exit_class.combine(ExitClass::Infrastructure);
+            report.files.push(file_report);
+            continue;
+        }
         let needs_browser = plan
             .required_host_capabilities
             .contains(&Capability::Browser);
@@ -1070,6 +1156,16 @@ async fn test_project(
             file_report.duration_nanos = nanos(started.elapsed());
         }
         report.files.push(file_report);
+    }
+    if let Some(provider) = app_provider
+        && let Err(error) = provider.shutdown().await
+    {
+        report.exit_class = report.exit_class.combine(ExitClass::Infrastructure);
+        report.warnings.push(WarningReport {
+            code: "app.teardown".into(),
+            key: "server.app".into(),
+            message: error.to_string(),
+        });
     }
     report.finish();
     Ok(report)
@@ -1286,10 +1382,110 @@ fn write_report(report: &CommandReport, reporter: Reporter) -> Result<(), AppErr
         .map_err(AppError::infrastructure)
 }
 
-fn database_for(path: &Path, source: &str) -> (AnalysisDatabase, webtest_text::FileId) {
-    let mut database = AnalysisDatabase::default();
+fn database_for(
+    project: &Project,
+    path: &Path,
+    source: &str,
+) -> Result<(AnalysisDatabase, webtest_text::FileId), AppError> {
+    let mut database = analysis_database_for_project(project)?;
     let file = database.open_file(path.display().to_string(), source);
-    (database, file)
+    Ok((database, file))
+}
+
+fn analysis_database_for_project(project: &Project) -> Result<AnalysisDatabase, AppError> {
+    let mut providers = ProviderRegistry::built_in_schemas();
+    if let Some(manifest) = app_manifest(project)? {
+        providers.register_schema(manifest.provider_schema());
+    }
+    Ok(AnalysisDatabase::with_provider_registry(providers))
+}
+
+fn app_manifest(project: &Project) -> Result<Option<AppManifest>, AppError> {
+    let Some(app) = &project.config.server.app else {
+        return Ok(None);
+    };
+    AppManifest::read(&project.root.join(&app.schema))
+        .map(Some)
+        .map_err(AppError::usage)
+}
+
+fn runtime_provider_registry(
+    project: &Project,
+    options: &RunnerOptions,
+) -> Result<(ProviderRegistry, Option<Arc<AppProvider>>), AppError> {
+    let mut providers = ProviderRegistry::built_in(options.provider_config.clone());
+    let Some(manifest) = app_manifest(project)? else {
+        return Ok((providers, None));
+    };
+    let config = app_provider_config(project)?;
+    let provider = Arc::new(AppProvider::new(manifest, config).map_err(AppError::usage)?);
+    providers.register(provider.clone());
+    Ok((providers, Some(provider)))
+}
+
+fn app_provider_config(project: &Project) -> Result<AppProviderConfig, AppError> {
+    let app = project
+        .config
+        .server
+        .app
+        .as_ref()
+        .ok_or_else(|| AppError::internal("app provider configuration was not resolved"))?;
+    let adapter = match app.adapter {
+        webtest_project::ServerAppAdapter::Bridge => AppAdapter::Bridge,
+        webtest_project::ServerAppAdapter::Command => AppAdapter::Command,
+        webtest_project::ServerAppAdapter::Http => AppAdapter::Http,
+    };
+    let transport = match app.transport {
+        webtest_project::ServerAppTransport::Auto => AppTransport::Auto,
+        webtest_project::ServerAppTransport::Unix => AppTransport::Unix,
+        webtest_project::ServerAppTransport::NamedPipe => AppTransport::NamedPipe,
+        webtest_project::ServerAppTransport::Tcp => AppTransport::Tcp,
+        webtest_project::ServerAppTransport::Stdio => AppTransport::Stdio,
+    };
+    let application = project
+        .config
+        .app
+        .as_ref()
+        .map(|application| AppProcessConfig {
+            command: application.command.clone().unwrap_or_default(),
+            args: application.args.clone(),
+            working_directory: application.working_directory.clone(),
+            environment: application.environment.clone(),
+            owned: application.owned,
+            health: application.health.as_ref().map(|health| HealthCheck {
+                url: health.url.clone(),
+                timeout: health.timeout,
+            }),
+        });
+    let http = AppHttpConfig {
+        base_url: app.http_base_url.clone().unwrap_or_default(),
+        operations: app
+            .http_operations
+            .iter()
+            .map(|(name, operation)| {
+                (
+                    name.clone(),
+                    HttpOperation {
+                        method: operation.method.clone(),
+                        path: operation.path.clone(),
+                    },
+                )
+            })
+            .collect(),
+    };
+    Ok(AppProviderConfig {
+        adapter,
+        transport,
+        command: app.command.clone(),
+        application,
+        http,
+        startup_timeout: app.startup_timeout,
+        shutdown_timeout: app.shutdown_timeout,
+        max_message_bytes: app.max_message_bytes,
+        max_stderr_bytes: app.max_stderr_bytes,
+        max_pending_calls: app.max_pending_calls,
+        ..AppProviderConfig::default()
+    })
 }
 
 fn read_source(path: &Path) -> Result<String, AppError> {
@@ -1736,6 +1932,8 @@ fn event_reports(path: &str, events: &[ExecutionEvent]) -> Vec<EventReport> {
                 step_id,
                 provider,
                 operation,
+                transport_kind,
+                arguments,
             } => {
                 let mut event = event_report(
                     path,
@@ -1745,6 +1943,8 @@ fn event_reports(path: &str, events: &[ExecutionEvent]) -> Vec<EventReport> {
                     Some(step_id.0),
                 );
                 event.name = Some(format!("{provider}.{operation}"));
+                event.transport_kind = transport_kind.clone();
+                event.arguments = arguments.clone();
                 event
             }
             ExecutionEvent::ProviderCallFinished {
@@ -1754,6 +1954,8 @@ fn event_reports(path: &str, events: &[ExecutionEvent]) -> Vec<EventReport> {
                 provider,
                 operation,
                 elapsed_ms,
+                transport_kind,
+                result,
             } => {
                 let mut event = event_report(
                     path,
@@ -1764,6 +1966,8 @@ fn event_reports(path: &str, events: &[ExecutionEvent]) -> Vec<EventReport> {
                 );
                 event.name = Some(format!("{provider}.{operation}"));
                 event.message = Some(format!("completed in {elapsed_ms}ms"));
+                event.transport_kind = transport_kind.clone();
+                event.result = result.clone();
                 event
             }
             ExecutionEvent::ProviderCallFailed {
@@ -1775,6 +1979,7 @@ fn event_reports(path: &str, events: &[ExecutionEvent]) -> Vec<EventReport> {
                 code,
                 message,
                 elapsed_ms,
+                transport_kind,
             } => {
                 let mut event = event_report(
                     path,
@@ -1786,6 +1991,7 @@ fn event_reports(path: &str, events: &[ExecutionEvent]) -> Vec<EventReport> {
                 event.name = Some(format!("{provider}.{operation}"));
                 event.code = Some(format!("runtime.{code}"));
                 event.message = Some(format!("{message} (failed after {elapsed_ms}ms)"));
+                event.transport_kind = transport_kind.clone();
                 event
             }
             ExecutionEvent::StepFailed {
@@ -1879,6 +2085,9 @@ fn event_report(
         exit_class: None,
         code: None,
         message: None,
+        transport_kind: None,
+        arguments: Default::default(),
+        result: None,
         diagnostic_schema_version: None,
         repair_hint_schema_version: None,
         diff: None,

@@ -1,0 +1,25 @@
+[project]
+name = "application-bridge-ruby"
+test_roots = ["created-user.webtest"]
+
+[app]
+command = "ruby"
+args = ["server.rb"]
+working_directory = "."
+
+[app.environment]
+WEBTEST = "1"
+PORT = "3102"
+
+[app.health]
+url = "http://127.0.0.1:3102/health"
+timeout = "10s"
+
+[server.app]
+adapter = "bridge"
+transport = "tcp"
+schema = ".webtest/app-schema.json"
+startup_timeout = "60s"
+
+[browser]
+base_url = "http://127.0.0.1:3102"

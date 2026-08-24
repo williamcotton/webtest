@@ -2,8 +2,9 @@
 
 use serde::Serialize;
 use webtest_analysis::{AnalysisDatabase, DiagnosticSeverity};
+use webtest_app_bridge::AppManifest;
 use webtest_plan::TestPlan;
-use webtest_provider::Capability;
+use webtest_provider::{Capability, ProviderRegistry};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct PortableDiagnostic {
@@ -28,8 +29,31 @@ pub struct PortableCompilation {
     executable_on_wasm: bool,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct PortableDocumentation {
+    start: u32,
+    end: u32,
+    contents: String,
+}
+
 pub fn diagnostics(source: &str) -> Vec<PortableDiagnostic> {
-    let mut database = AnalysisDatabase::default();
+    diagnostics_with_database(source, AnalysisDatabase::default())
+}
+
+pub fn diagnostics_with_manifest(
+    source: &str,
+    manifest_json: &str,
+) -> Result<Vec<PortableDiagnostic>, String> {
+    Ok(diagnostics_with_database(
+        source,
+        database_with_manifest(manifest_json)?,
+    ))
+}
+
+fn diagnostics_with_database(
+    source: &str,
+    mut database: AnalysisDatabase,
+) -> Vec<PortableDiagnostic> {
     let file = database.open_file("memory://document.webtest", source);
     database
         .diagnostics(file)
@@ -47,7 +71,20 @@ pub fn format(source: &str) -> String {
 }
 
 pub fn compile(source: &str) -> PortableCompilation {
-    let mut database = AnalysisDatabase::default();
+    compile_with_database(source, AnalysisDatabase::default())
+}
+
+pub fn compile_with_manifest(
+    source: &str,
+    manifest_json: &str,
+) -> Result<PortableCompilation, String> {
+    Ok(compile_with_database(
+        source,
+        database_with_manifest(manifest_json)?,
+    ))
+}
+
+fn compile_with_database(source: &str, mut database: AnalysisDatabase) -> PortableCompilation {
     let file = database.open_file("memory://document.webtest", source);
     let diagnostics = database.diagnostics(file).ok();
     let has_errors = diagnostics.as_ref().is_some_and(|diagnostics| {
@@ -132,6 +169,140 @@ pub fn describe(
     )
 }
 
+pub fn describe_with_manifest(
+    query: Option<&str>,
+    search: Option<&str>,
+    manifest_json: &str,
+) -> Result<webtest_analysis::DescriptionResponse, String> {
+    let request = search.map_or_else(
+        || {
+            query.map_or(webtest_analysis::DescriptionRequest::Index, |query| {
+                webtest_analysis::DescriptionRequest::Query(query.into())
+            })
+        },
+        |search| webtest_analysis::DescriptionRequest::Search(search.into()),
+    );
+    Ok(database_with_manifest(manifest_json)?.describe(
+        request,
+        None,
+        webtest_analysis::DescriptionLimits::default(),
+    ))
+}
+
+fn database_with_manifest(manifest_json: &str) -> Result<AnalysisDatabase, String> {
+    let manifest = AppManifest::from_json(manifest_json).map_err(|error| error.to_string())?;
+    let mut providers = ProviderRegistry::built_in_schemas();
+    providers.register_schema(manifest.provider_schema());
+    Ok(AnalysisDatabase::with_provider_registry(providers))
+}
+
+pub fn completions(source: &str, byte_offset: u32) -> Vec<webtest_analysis::Completion> {
+    completions_with_database(source, byte_offset, AnalysisDatabase::default())
+}
+
+pub fn completions_with_manifest(
+    source: &str,
+    byte_offset: u32,
+    manifest_json: &str,
+) -> Result<Vec<webtest_analysis::Completion>, String> {
+    Ok(completions_with_database(
+        source,
+        byte_offset,
+        database_with_manifest(manifest_json)?,
+    ))
+}
+
+fn completions_with_database(
+    source: &str,
+    byte_offset: u32,
+    mut database: AnalysisDatabase,
+) -> Vec<webtest_analysis::Completion> {
+    let file = database.open_file("memory://document.webtest", source);
+    database
+        .completions(
+            file,
+            webtest_text::TextSize::from(clamp_byte_offset(source, byte_offset)),
+        )
+        .unwrap_or_default()
+}
+
+pub fn signature_help(source: &str, byte_offset: u32) -> Option<webtest_analysis::Signature> {
+    signature_help_with_database(source, byte_offset, AnalysisDatabase::default())
+}
+
+pub fn signature_help_with_manifest(
+    source: &str,
+    byte_offset: u32,
+    manifest_json: &str,
+) -> Result<Option<webtest_analysis::Signature>, String> {
+    Ok(signature_help_with_database(
+        source,
+        byte_offset,
+        database_with_manifest(manifest_json)?,
+    ))
+}
+
+fn signature_help_with_database(
+    source: &str,
+    byte_offset: u32,
+    mut database: AnalysisDatabase,
+) -> Option<webtest_analysis::Signature> {
+    let file = database.open_file("memory://document.webtest", source);
+    database
+        .signature_help(
+            file,
+            webtest_text::TextSize::from(clamp_byte_offset(source, byte_offset)),
+        )
+        .ok()
+        .flatten()
+}
+
+pub fn hover(source: &str, byte_offset: u32) -> Option<PortableDocumentation> {
+    hover_with_database(source, byte_offset, AnalysisDatabase::default())
+}
+
+pub fn hover_with_manifest(
+    source: &str,
+    byte_offset: u32,
+    manifest_json: &str,
+) -> Result<Option<PortableDocumentation>, String> {
+    Ok(hover_with_database(
+        source,
+        byte_offset,
+        database_with_manifest(manifest_json)?,
+    ))
+}
+
+fn hover_with_database(
+    source: &str,
+    byte_offset: u32,
+    mut database: AnalysisDatabase,
+) -> Option<PortableDocumentation> {
+    let file = database.open_file("memory://document.webtest", source);
+    database
+        .documentation_at(
+            file,
+            webtest_text::TextSize::from(clamp_byte_offset(source, byte_offset)),
+        )
+        .ok()
+        .flatten()
+        .map(|documentation| PortableDocumentation {
+            start: documentation.range.start().into(),
+            end: documentation.range.end().into(),
+            contents: documentation.contents,
+        })
+}
+
+fn clamp_byte_offset(source: &str, requested: u32) -> u32 {
+    let mut offset = usize::try_from(requested)
+        .unwrap_or(usize::MAX)
+        .min(source.len());
+    while offset > 0 && !source.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    u32::try_from(offset).unwrap_or(u32::MAX)
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct PortableHostCapability {
     supported: bool,
@@ -158,6 +329,12 @@ mod exports {
         serde_json::to_string(&super::diagnostics(source)).unwrap_or_else(|_| "[]".into())
     }
 
+    #[wasm_bindgen(js_name = diagnosticsWithAppSchema)]
+    pub fn diagnostics_with_app_schema_js(source: &str, manifest: &str) -> String {
+        serde_json::to_string(&super::diagnostics_with_manifest(source, manifest))
+            .unwrap_or_else(|_| "{}".into())
+    }
+
     #[wasm_bindgen(js_name = format)]
     pub fn format_js(source: &str) -> String {
         super::format(source)
@@ -168,9 +345,80 @@ mod exports {
         serde_json::to_string(&super::compile(source)).unwrap_or_else(|_| "{}".into())
     }
 
+    #[wasm_bindgen(js_name = compileWithAppSchema)]
+    pub fn compile_with_app_schema_js(source: &str, manifest: &str) -> String {
+        serde_json::to_string(&super::compile_with_manifest(source, manifest))
+            .unwrap_or_else(|_| "{}".into())
+    }
+
     #[wasm_bindgen(js_name = describe)]
     pub fn describe_js(query: Option<String>, search: Option<String>) -> String {
         serde_json::to_string(&super::describe(query.as_deref(), search.as_deref()))
+            .unwrap_or_else(|_| "{}".into())
+    }
+
+    #[wasm_bindgen(js_name = describeWithAppSchema)]
+    pub fn describe_with_app_schema_js(
+        query: Option<String>,
+        search: Option<String>,
+        manifest: &str,
+    ) -> String {
+        serde_json::to_string(&super::describe_with_manifest(
+            query.as_deref(),
+            search.as_deref(),
+            manifest,
+        ))
+        .unwrap_or_else(|_| "{}".into())
+    }
+
+    #[wasm_bindgen(js_name = completions)]
+    pub fn completions_js(source: &str, byte_offset: u32) -> String {
+        serde_json::to_string(&super::completions(source, byte_offset))
+            .unwrap_or_else(|_| "[]".into())
+    }
+
+    #[wasm_bindgen(js_name = completionsWithAppSchema)]
+    pub fn completions_with_app_schema_js(
+        source: &str,
+        byte_offset: u32,
+        manifest: &str,
+    ) -> String {
+        serde_json::to_string(&super::completions_with_manifest(
+            source,
+            byte_offset,
+            manifest,
+        ))
+        .unwrap_or_else(|_| "{}".into())
+    }
+
+    #[wasm_bindgen(js_name = signatureHelp)]
+    pub fn signature_help_js(source: &str, byte_offset: u32) -> String {
+        serde_json::to_string(&super::signature_help(source, byte_offset))
+            .unwrap_or_else(|_| "null".into())
+    }
+
+    #[wasm_bindgen(js_name = signatureHelpWithAppSchema)]
+    pub fn signature_help_with_app_schema_js(
+        source: &str,
+        byte_offset: u32,
+        manifest: &str,
+    ) -> String {
+        serde_json::to_string(&super::signature_help_with_manifest(
+            source,
+            byte_offset,
+            manifest,
+        ))
+        .unwrap_or_else(|_| "{}".into())
+    }
+
+    #[wasm_bindgen(js_name = hover)]
+    pub fn hover_js(source: &str, byte_offset: u32) -> String {
+        serde_json::to_string(&super::hover(source, byte_offset)).unwrap_or_else(|_| "null".into())
+    }
+
+    #[wasm_bindgen(js_name = hoverWithAppSchema)]
+    pub fn hover_with_app_schema_js(source: &str, byte_offset: u32, manifest: &str) -> String {
+        serde_json::to_string(&super::hover_with_manifest(source, byte_offset, manifest))
             .unwrap_or_else(|_| "{}".into())
     }
 
@@ -241,5 +489,72 @@ mod tests {
         assert_eq!(capability["supported"], false);
         assert_eq!(capability["code"], "unsupported_host_capability");
         assert_eq!(capability["capability"], "native_browser");
+    }
+
+    #[test]
+    fn offline_app_manifest_has_native_wasm_analysis_and_description_parity() {
+        let manifest = include_str!("../../../protocol/examples/app-schema.json");
+        let source =
+            r#"test "x" { server { let user = app.create_user(email: "a@example.com") } }"#;
+        let diagnostics = diagnostics_with_manifest(source, manifest).expect("diagnostics");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let compilation = compile_with_manifest(source, manifest).expect("compilation");
+        let plan = compilation.plan.expect("portable plan");
+        let webtest_plan::TestOperation::ServerProviderCall(call) =
+            &plan.tests[0].steps[0].operation
+        else {
+            panic!("app call")
+        };
+        assert_eq!(
+            call.schema_hash,
+            "blake3:b1254e79ab8984797e49f26190f9fa181239cb0d4c0d279f4d627b7d101e1e2a"
+        );
+        let description = describe_with_manifest(Some("provider.app.create_user"), None, manifest)
+            .expect("description");
+        let webtest_analysis::DescriptionResponse::Construct(construct) = description else {
+            panic!("construct")
+        };
+        assert_eq!(construct.name, "app.create_user");
+        assert_eq!(construct.retry_safe, Some(false));
+        assert_eq!(
+            construct.parameters[0].documentation,
+            "Grant administrative access."
+        );
+        assert_eq!(
+            construct.parameters[0].default,
+            Some(serde_json::json!(false))
+        );
+
+        let completion_source = r#"test "x" { server { let user = app. } }"#;
+        let completion_offset = completion_source.find("app.").expect("app") as u32 + 4;
+        let completions = completions_with_manifest(completion_source, completion_offset, manifest)
+            .expect("completions");
+        assert!(
+            completions
+                .iter()
+                .any(|completion| completion.label == "create_user")
+        );
+        let member_source = r#"test "x" { server {
+    let user = app.create_user(email: "a@example.com")
+    let email = user.
+} }"#;
+        let member_offset = member_source.find("user.").expect("member") as u32 + 5;
+        let members = completions_with_manifest(member_source, member_offset, manifest)
+            .expect("member completions");
+        assert!(members.iter().any(|completion| completion.label == "email"));
+
+        let call_offset = source.find("email:").expect("argument") as u32;
+        let signature = signature_help_with_manifest(source, call_offset, manifest)
+            .expect("signature help")
+            .expect("signature");
+        assert!(signature.label.starts_with("app.create_user("));
+        let documentation = hover_with_manifest(
+            source,
+            source.find("create_user").expect("operation") as u32,
+            manifest,
+        )
+        .expect("hover")
+        .expect("documentation");
+        assert!(documentation.contents.contains("Create a user"));
     }
 }

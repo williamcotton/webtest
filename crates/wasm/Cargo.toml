@@ -11,6 +11,7 @@ crate-type = ["cdylib", "rlib"]
 serde.workspace = true
 serde_json.workspace = true
 webtest-analysis.workspace = true
+webtest-app-bridge = { path = "../app-bridge", default-features = false }
 webtest-format.workspace = true
 webtest-feedback.workspace = true
 webtest-plan.workspace = true

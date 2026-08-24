@@ -1152,6 +1152,9 @@ Acceptance: an external client using only `webtest describe`, `inspect`, `check`
 
 ### [Milestone D — Language-neutral application bridge](./milestone-d.md)
 
+Status: implemented in the current repository. Milestone E remains responsible for general
+structured concurrency, retries, and traces; those are not implied by the bridge's bounded lifecycle.
+
 - canonical versioned protocol schemas, documentation, generated Rust DTOs, and conformance corpus;
 - typed, documented `app.*` provider calls and deterministic `.webtest/app-schema.json` loading;
 - optional/default/secret/retry-safety metadata projected through the C.5 static description and repair interfaces;

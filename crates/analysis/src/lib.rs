@@ -64,6 +64,43 @@ pub struct TypeFact {
     pub capability: Capability,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionKind {
+    Function,
+    Parameter,
+    Property,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Completion {
+    pub label: String,
+    pub detail: String,
+    pub documentation: String,
+    pub kind: CompletionKind,
+    pub insert_text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct SignatureParameter {
+    pub label: String,
+    pub documentation: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Signature {
+    pub label: String,
+    pub documentation: String,
+    pub parameters: Vec<SignatureParameter>,
+    pub active_parameter: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DocumentationFact {
+    pub range: TextRange,
+    pub contents: String,
+}
+
 #[derive(Debug, Error)]
 pub enum AnalysisError {
     #[error("unknown source file {0:?}")]
@@ -225,6 +262,217 @@ impl AnalysisDatabase {
             .collect()
     }
 
+    pub fn completions(
+        &mut self,
+        file: FileId,
+        offset: TextSize,
+    ) -> Result<Vec<Completion>, AnalysisError> {
+        self.ensure_queries(file)?;
+        let parsed = self.cache[&file].parse.clone();
+        let syntax = parsed.syntax();
+        let offset_u32 = u32::from(offset);
+        let containing = |node: &webtest_syntax::SyntaxNode| {
+            let range = node.text_range();
+            u32::from(range.start()) <= offset_u32 && u32::from(range.end()) >= offset_u32
+        };
+        if let Some(call) = syntax
+            .descendants()
+            .filter(|node| node.kind() == webtest_syntax::SyntaxKind::CallExpr && containing(node))
+            .min_by_key(|node| node.text_range().len())
+            && let Some((provider, operation)) = provider_operation_tokens(&call)
+            && let Some(operation) = self
+                .providers
+                .schema(&provider)
+                .and_then(|schema| schema.operation(&operation))
+        {
+            let present = call
+                .children()
+                .filter(|node| node.kind() == webtest_syntax::SyntaxKind::CallArg)
+                .filter_map(|argument| named_argument_token(&argument))
+                .collect::<HashSet<_>>();
+            return Ok(operation
+                .parameters
+                .iter()
+                .filter(|parameter| !parameter.positional && !present.contains(&parameter.name))
+                .map(|parameter| Completion {
+                    label: parameter.name.clone(),
+                    detail: format!(
+                        "{}{}",
+                        parameter.ty,
+                        if parameter.required {
+                            ""
+                        } else {
+                            " (optional)"
+                        }
+                    ),
+                    documentation: parameter.documentation.clone(),
+                    kind: CompletionKind::Parameter,
+                    insert_text: format!("{}: ", parameter.name),
+                })
+                .collect());
+        }
+        if let Some(member) = syntax
+            .descendants()
+            .filter(|node| {
+                node.kind() == webtest_syntax::SyntaxKind::MemberExpr && containing(node)
+            })
+            .min_by_key(|node| node.text_range().len())
+        {
+            let tokens = meaningful_tokens(&member);
+            if let Some(provider) = tokens.first().map(|token| token.text().to_string())
+                && tokens
+                    .iter()
+                    .any(|token| token.kind() == webtest_syntax::SyntaxKind::Dot)
+                && let Some(schema) = self.providers.schema(&provider)
+            {
+                return Ok(schema
+                    .operations
+                    .values()
+                    .map(|operation| Completion {
+                        label: operation.name.0.clone(),
+                        detail: provider_signature(&provider, operation),
+                        documentation: operation.documentation.clone(),
+                        kind: CompletionKind::Function,
+                        insert_text: format!("{}(", operation.name.0),
+                    })
+                    .collect());
+            }
+            if let Some(receiver) = member.children().next() {
+                let facts = self.type_facts(file)?;
+                let receiver_fact = facts
+                    .iter()
+                    .filter(|fact| {
+                        fact.range.contains(receiver.text_range().start())
+                            || fact.range == receiver.text_range()
+                    })
+                    .min_by_key(|fact| fact.range.len())
+                    .or_else(|| {
+                        // A half-typed `value.` is deliberately absent from HIR because the
+                        // member token is missing. Recover the receiver's declaration fact from
+                        // the lossless CST so completion remains useful while editing.
+                        let receiver_name = meaningful_tokens(&receiver)
+                            .first()
+                            .map(|token| token.text().to_string())?;
+                        syntax
+                            .descendants()
+                            .filter(|node| {
+                                node.kind() == webtest_syntax::SyntaxKind::LetStmt
+                                    && node.text_range().end() <= member.text_range().start()
+                            })
+                            .filter_map(|declaration| {
+                                let tokens = meaningful_tokens(&declaration);
+                                let name = tokens.get(1)?;
+                                (name.text() == receiver_name).then_some(name.text_range())
+                            })
+                            .last()
+                            .and_then(|range| facts.iter().find(|fact| fact.range == range))
+                    });
+                let Some(fact) = receiver_fact else {
+                    return Ok(Vec::new());
+                };
+                let Type::Record(fields) = &fact.ty else {
+                    return Ok(Vec::new());
+                };
+                return Ok(fields
+                    .iter()
+                    .map(|(name, field)| Completion {
+                        label: name.clone(),
+                        detail: field.ty.to_string(),
+                        documentation: field.documentation.clone(),
+                        kind: CompletionKind::Property,
+                        insert_text: name.clone(),
+                    })
+                    .collect());
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    pub fn signature_help(
+        &mut self,
+        file: FileId,
+        offset: TextSize,
+    ) -> Result<Option<Signature>, AnalysisError> {
+        self.ensure_queries(file)?;
+        let syntax = self.cache[&file].parse.syntax();
+        let offset_u32 = u32::from(offset);
+        let Some(call) = syntax
+            .descendants()
+            .filter(|node| {
+                node.kind() == webtest_syntax::SyntaxKind::CallExpr
+                    && u32::from(node.text_range().start()) <= offset_u32
+                    && u32::from(node.text_range().end()) >= offset_u32
+            })
+            .min_by_key(|node| node.text_range().len())
+        else {
+            return Ok(None);
+        };
+        let Some((provider, operation_name)) = provider_operation_tokens(&call) else {
+            return Ok(None);
+        };
+        let Some(operation) = self
+            .providers
+            .schema(&provider)
+            .and_then(|schema| schema.operation(&operation_name))
+        else {
+            return Ok(None);
+        };
+        let active_parameter = call
+            .children()
+            .filter(|node| node.kind() == webtest_syntax::SyntaxKind::CallArg)
+            .take_while(|node| u32::from(node.text_range().start()) <= offset_u32)
+            .count()
+            .saturating_sub(1)
+            .min(operation.parameters.len().saturating_sub(1));
+        Ok(Some(Signature {
+            label: provider_signature(&provider, operation),
+            documentation: operation.documentation.clone(),
+            parameters: operation
+                .parameters
+                .iter()
+                .map(|parameter| SignatureParameter {
+                    label: format!("{}: {}", parameter.name, parameter.ty),
+                    documentation: parameter.documentation.clone(),
+                })
+                .collect(),
+            active_parameter,
+        }))
+    }
+
+    pub fn documentation_at(
+        &mut self,
+        file: FileId,
+        offset: TextSize,
+    ) -> Result<Option<DocumentationFact>, AnalysisError> {
+        self.ensure_queries(file)?;
+        let syntax = self.cache[&file].parse.syntax();
+        let offset_u32 = u32::from(offset);
+        for call in syntax.descendants().filter(|node| {
+            node.kind() == webtest_syntax::SyntaxKind::CallExpr
+                && u32::from(node.text_range().start()) <= offset_u32
+                && u32::from(node.text_range().end()) >= offset_u32
+        }) {
+            if let Some((provider, operation_name)) = provider_operation_tokens(&call)
+                && let Some(operation) = self
+                    .providers
+                    .schema(&provider)
+                    .and_then(|schema| schema.operation(&operation_name))
+            {
+                return Ok(Some(DocumentationFact {
+                    range: call
+                        .children()
+                        .next()
+                        .map_or(call.text_range(), |node| node.text_range()),
+                    contents: format!(
+                        "{}\n\nReturns `{}`. Retry-safe: {}.",
+                        operation.documentation, operation.result, operation.retry_safe
+                    ),
+                }));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn describe(
         &self,
         request: DescriptionRequest,
@@ -279,6 +527,52 @@ impl AnalysisDatabase {
         );
         Ok(())
     }
+}
+
+fn meaningful_tokens(node: &webtest_syntax::SyntaxNode) -> Vec<webtest_syntax::SyntaxToken> {
+    node.descendants_with_tokens()
+        .filter_map(|element| element.into_token())
+        .filter(|token| !token.kind().is_trivia())
+        .collect()
+}
+
+fn provider_operation_tokens(node: &webtest_syntax::SyntaxNode) -> Option<(String, String)> {
+    let tokens = meaningful_tokens(node);
+    let dot = tokens
+        .iter()
+        .position(|token| token.kind() == webtest_syntax::SyntaxKind::Dot)?;
+    Some((
+        tokens.get(dot.checked_sub(1)?)?.text().into(),
+        tokens.get(dot + 1)?.text().into(),
+    ))
+}
+
+fn named_argument_token(node: &webtest_syntax::SyntaxNode) -> Option<String> {
+    let tokens = meaningful_tokens(node);
+    tokens
+        .iter()
+        .any(|token| token.kind() == webtest_syntax::SyntaxKind::Colon)
+        .then(|| tokens.first().map(|token| token.text().into()))?
+}
+
+fn provider_signature(provider: &str, operation: &OperationSchema) -> String {
+    let parameters = operation
+        .parameters
+        .iter()
+        .map(|parameter| {
+            format!(
+                "{}{}: {}",
+                parameter.name,
+                if parameter.required { "" } else { "?" },
+                parameter.ty
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{provider}.{}({parameters}) -> {}",
+        operation.name.0, operation.result
+    )
 }
 
 fn syntax_reference_queries(parsed: &Parse, error: &webtest_syntax::SyntaxError) -> Vec<String> {
@@ -371,6 +665,8 @@ struct CompiledProviderCall {
     result_type: Type,
     schema_hash: String,
     redacted_arguments: Vec<String>,
+    redacted_result_fields: Vec<String>,
+    retry_safe: bool,
 }
 
 struct Compiler<'a> {
@@ -475,6 +771,8 @@ impl<'a> Compiler<'a> {
                             schema_hash: call.schema_hash,
                             timeout: None,
                             redacted_arguments: call.redacted_arguments,
+                            redacted_result_fields: call.redacted_result_fields,
+                            retry_safe: call.retry_safe,
                         }),
                     );
                 } else {
@@ -552,6 +850,8 @@ impl<'a> Compiler<'a> {
                     schema_hash: call.schema_hash,
                     timeout: None,
                     redacted_arguments: call.redacted_arguments,
+                    redacted_result_fields: call.redacted_result_fields,
+                    retry_safe: call.retry_safe,
                 }),
             );
             return;
@@ -915,6 +1215,8 @@ impl<'a> Compiler<'a> {
                 result_type: Type::Unknown,
                 schema_hash: String::new(),
                 redacted_arguments: Vec::new(),
+                redacted_result_fields: Vec::new(),
+                retry_safe: false,
             });
         };
         let Some(operation_schema) = schema.operation(operation) else {
@@ -943,6 +1245,8 @@ impl<'a> Compiler<'a> {
                 result_type: Type::Unknown,
                 schema_hash: schema.hash(),
                 redacted_arguments: Vec::new(),
+                redacted_result_fields: Vec::new(),
+                retry_safe: false,
             });
         };
         if domain != operation_schema.capability {
@@ -970,6 +1274,8 @@ impl<'a> Compiler<'a> {
                 .filter(|parameter| parameter.secret)
                 .map(|parameter| parameter.name.clone())
                 .collect(),
+            redacted_result_fields: secret_record_fields(&operation_schema.result),
+            retry_safe: operation_schema.retry_safe,
         })
     }
 
@@ -1197,6 +1503,8 @@ impl<'a> Compiler<'a> {
                         RecordField {
                             ty: value.ty,
                             optional: false,
+                            documentation: String::new(),
+                            secret: false,
                         },
                     );
                 }
@@ -1434,6 +1742,8 @@ impl<'a> Compiler<'a> {
                             RecordField {
                                 ty: self.pattern_type(&field.value),
                                 optional: false,
+                                documentation: String::new(),
+                                secret: false,
                             },
                         )
                     })
@@ -1488,6 +1798,8 @@ impl<'a> Compiler<'a> {
                             RecordField {
                                 ty: self.lower_type(&field.ty),
                                 optional: field.optional,
+                                documentation: String::new(),
+                                secret: false,
                             },
                         )
                     })
@@ -1642,6 +1954,26 @@ fn known_members(ty: &Type) -> Vec<String> {
         .collect(),
         _ => Vec::new(),
     }
+}
+
+fn secret_record_fields(ty: &Type) -> Vec<String> {
+    fn collect(ty: &Type, fields: &mut BTreeSet<String>) {
+        match ty {
+            Type::Record(record) => {
+                for (name, field) in record {
+                    if field.secret {
+                        fields.insert(name.clone());
+                    }
+                    collect(&field.ty, fields);
+                }
+            }
+            Type::List(item) | Type::Option(item) | Type::Response(item) => collect(item, fields),
+            _ => {}
+        }
+    }
+    let mut fields = BTreeSet::new();
+    collect(ty, &mut fields);
+    fields.into_iter().collect()
 }
 
 fn receiver_type_reference(ty: &Type) -> &'static str {

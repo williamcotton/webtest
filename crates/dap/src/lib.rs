@@ -23,7 +23,8 @@ use webtest_observation::ObservationStore;
 use webtest_plan::{
     AssertionOperation, BrowserOperation, PlannedStep, PlannedTest, TestOperation, TestPlan,
 };
-use webtest_runtime::{RunControl, Runner, RunnerOptions};
+use webtest_provider::ProviderRegistry;
+use webtest_runtime::{RunControl, Runner, RunnerOptions, StepError};
 use webtest_text::TextRange;
 
 const THREAD_ID: i64 = 1;
@@ -125,14 +126,23 @@ struct LoadedProgram {
 }
 
 impl LoadedProgram {
+    #[cfg(test)]
     fn load(path: PathBuf, source_override: Option<String>) -> Result<Self, String> {
+        Self::load_with_registry(path, source_override, &ProviderRegistry::built_in_schemas())
+    }
+
+    fn load_with_registry(
+        path: PathBuf,
+        source_override: Option<String>,
+        providers: &ProviderRegistry,
+    ) -> Result<Self, String> {
         let path = normalize_path(&path);
         let source = match source_override {
             Some(source) => source,
             None => std::fs::read_to_string(&path)
                 .map_err(|error| format!("could not read {}: {error}", path.display()))?,
         };
-        let mut database = AnalysisDatabase::default();
+        let mut database = AnalysisDatabase::with_provider_registry(providers.clone());
         let file = database.open_file(path.display().to_string(), &source);
         let diagnostics = database
             .diagnostics(file)
@@ -212,8 +222,10 @@ struct DebugState {
     writer: ProtocolWriter,
     browser: Arc<dyn BrowserHost>,
     runner_options: RunnerOptions,
+    providers: ProviderRegistry,
     program: Mutex<Option<LoadedProgram>>,
     breakpoints: Mutex<HashMap<PathBuf, HashSet<u32>>>,
+    exception_breakpoints: Mutex<HashSet<String>>,
     paused: Mutex<Option<PausedFrame>>,
     pending_pause: Mutex<Option<&'static str>>,
     resume_sender: mpsc::UnboundedSender<ResumeCommand>,
@@ -229,13 +241,25 @@ impl DebugState {
         browser: Arc<dyn BrowserHost>,
         runner_options: RunnerOptions,
     ) -> Arc<Self> {
+        let providers = ProviderRegistry::built_in(runner_options.provider_config.clone());
+        Self::new_with_configuration(writer, browser, runner_options, providers)
+    }
+
+    fn new_with_configuration(
+        writer: ProtocolWriter,
+        browser: Arc<dyn BrowserHost>,
+        runner_options: RunnerOptions,
+        providers: ProviderRegistry,
+    ) -> Arc<Self> {
         let (resume_sender, resume_receiver) = mpsc::unbounded_channel();
         Arc::new(Self {
             writer,
             browser,
             runner_options,
+            providers,
             program: Mutex::new(None),
             breakpoints: Mutex::new(HashMap::new()),
+            exception_breakpoints: Mutex::new(HashSet::new()),
             paused: Mutex::new(None),
             pending_pause: Mutex::new(None),
             resume_sender,
@@ -261,13 +285,38 @@ impl DebugState {
                             "supportsPauseRequest": true,
                             "supportsStepInTargetsRequest": false,
                             "supportsEvaluateForHovers": false,
+                            "exceptionBreakpointFilters": [
+                                {
+                                    "filter": "appProviderFailure",
+                                    "label": "Application provider failures",
+                                    "description": "Pause when app.* returns an application error",
+                                    "default": false
+                                },
+                                {
+                                    "filter": "appInfrastructure",
+                                    "label": "Application bridge infrastructure failures",
+                                    "description": "Pause on app bridge lifecycle, transport, protocol, or schema failures",
+                                    "default": false
+                                }
+                            ],
                         }),
                     )
                     .await?;
             }
             "launch" => self.launch(&request).await?,
             "setBreakpoints" => self.set_breakpoints(&request).await?,
-            "setExceptionBreakpoints" => self.writer.response(&request, json!({})).await?,
+            "setExceptionBreakpoints" => {
+                *lock(&self.exception_breakpoints) = request
+                    .arguments
+                    .get("filters")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect();
+                self.writer.response(&request, json!({})).await?;
+            }
             "configurationDone" => {
                 self.configured.store(true, Ordering::Release);
                 self.writer.response(&request, json!({})).await?;
@@ -334,7 +383,11 @@ impl DebugState {
             .get("sourceText")
             .and_then(Value::as_str)
             .map(str::to_owned);
-        let loaded = match LoadedProgram::load(PathBuf::from(program), source_override) {
+        let loaded = match LoadedProgram::load_with_registry(
+            PathBuf::from(program),
+            source_override,
+            &self.providers,
+        ) {
             Ok(program) => program,
             Err(error) => {
                 self.writer.failure(request, &error).await?;
@@ -383,7 +436,9 @@ impl DebugState {
             .as_ref()
             .filter(|program| program.path == path)
             .cloned()
-            .or_else(|| LoadedProgram::load(path.clone(), None).ok());
+            .or_else(|| {
+                LoadedProgram::load_with_registry(path.clone(), None, &self.providers).ok()
+            });
         let Some(program) = program else {
             self.writer
                 .response(
@@ -539,7 +594,8 @@ impl DebugState {
             .await;
 
         let runner = Runner::new(Arc::new(ObservationStore::default()))
-            .with_options(self.runner_options.clone());
+            .with_options(self.runner_options.clone())
+            .with_provider_registry(self.providers.clone());
         let result = runner
             .run_with_control(&program.plan, self.browser.as_ref(), Some(self.as_ref()))
             .await;
@@ -686,10 +742,88 @@ impl DebugState {
         let _ = self.resume_receiver.lock().await.recv().await;
         *lock(&self.paused) = None;
     }
+
+    async fn pause_after_app_failure(
+        &self,
+        test: &PlannedTest,
+        step: &PlannedStep,
+        error: &StepError,
+        bindings: BTreeMap<String, webtest_provider::Value>,
+    ) {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return;
+        }
+        let TestOperation::ServerProviderCall(call) = &step.operation else {
+            return;
+        };
+        if call.provider != "app" {
+            return;
+        }
+        let StepError::Provider(provider_error) = error else {
+            return;
+        };
+        let filter = if provider_error.is_infrastructure() {
+            "appInfrastructure"
+        } else {
+            "appProviderFailure"
+        };
+        if !lock(&self.exception_breakpoints).contains(filter) {
+            return;
+        }
+        let Some(program) = lock(&self.program).clone() else {
+            return;
+        };
+        let location = StepLocation::new(&program.source, step.origin.range);
+        let source_line = program
+            .source
+            .lines()
+            .nth(location.line.saturating_sub(1) as usize)
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        *lock(&self.paused) = Some(PausedFrame {
+            test_name: test.name.clone(),
+            operation: format!(
+                "{} failed: {provider_error}",
+                operation_name(&step.operation)
+            ),
+            source_line,
+            path: program.path,
+            location,
+            bindings: bindings
+                .into_iter()
+                .map(|(name, value)| {
+                    (
+                        name,
+                        value.redacted(&self.runner_options.redacted_json_fields),
+                    )
+                })
+                .collect(),
+        });
+        let _ = self
+            .writer
+            .event(
+                "stopped",
+                json!({
+                    "reason": "exception",
+                    "description": provider_error.to_string(),
+                    "text": provider_error.code(),
+                    "threadId": THREAD_ID,
+                    "allThreadsStopped": true,
+                }),
+            )
+            .await;
+        let _ = self.resume_receiver.lock().await.recv().await;
+        *lock(&self.paused) = None;
+    }
 }
 
 #[async_trait]
 impl RunControl for DebugState {
+    fn is_cancelled(&self) -> bool {
+        self.shutting_down.load(Ordering::Acquire)
+    }
+
     async fn before_step(&self, test: &PlannedTest, step: &PlannedStep) {
         self.pause_before_step(test, step, BTreeMap::new()).await;
     }
@@ -701,6 +835,17 @@ impl RunControl for DebugState {
         bindings: &BTreeMap<String, webtest_provider::Value>,
     ) {
         self.pause_before_step(test, step, bindings.clone()).await;
+    }
+
+    async fn after_step_failure(
+        &self,
+        test: &PlannedTest,
+        step: &PlannedStep,
+        error: &StepError,
+        bindings: &BTreeMap<String, webtest_provider::Value>,
+    ) {
+        self.pause_after_app_failure(test, step, error, bindings.clone())
+            .await;
     }
 }
 
@@ -714,6 +859,20 @@ pub async fn serve_with_options(
 ) -> Result<(), DapError> {
     let writer = ProtocolWriter::new(tokio::io::stdout());
     let state = DebugState::new_with_options(writer, browser, options);
+    serve_state(state).await
+}
+
+pub async fn serve_with_configuration(
+    browser: Arc<dyn BrowserHost>,
+    options: RunnerOptions,
+    providers: ProviderRegistry,
+) -> Result<(), DapError> {
+    let writer = ProtocolWriter::new(tokio::io::stdout());
+    let state = DebugState::new_with_configuration(writer, browser, options, providers);
+    serve_state(state).await
+}
+
+async fn serve_state(state: Arc<DebugState>) -> Result<(), DapError> {
     let mut reader = BufReader::new(tokio::io::stdin());
     while let Some(request) = read_request(&mut reader).await? {
         if state.handle(request).await? {

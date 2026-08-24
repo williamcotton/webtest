@@ -1,0 +1,8 @@
+test "stdio bridge creates a typed user" {
+    server {
+        let user = app.create_user(email: "alice@example.com")
+        expect user.email == "alice@example.com"
+        expect user.admin == false
+    }
+}
+

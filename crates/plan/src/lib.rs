@@ -130,6 +130,10 @@ pub struct ServerProviderCall {
     pub schema_hash: String,
     pub timeout: Option<Duration>,
     pub redacted_arguments: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redacted_result_fields: Vec<String>,
+    #[serde(default)]
+    pub retry_safe: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

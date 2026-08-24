@@ -1,0 +1,15 @@
+{
+  "name": "webtest-application-bridge-node-example",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node --experimental-strip-types server.ts",
+    "check:types": "tsc --noEmit"
+  },
+  "engines": { "node": ">=22.6" },
+  "dependencies": { "@webtest/node": "file:../../../sdks/node" },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.0"
+  }
+}

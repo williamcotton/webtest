@@ -17,6 +17,7 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 webtest-analysis.workspace = true
+webtest-app-bridge = { path = "../app-bridge" }
 webtest-browser.workspace = true
 webtest-browser-cdp.workspace = true
 webtest-browser-manager.workspace = true

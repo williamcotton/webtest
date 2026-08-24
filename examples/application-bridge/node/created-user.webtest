@@ -1,0 +1,11 @@
+test "created user can sign in" {
+    server {
+        let user = app.create_user(email: "alice@example.com")
+    }
+    browser {
+        open "/login"
+        fill label("Email") with user.email
+        click role("button", name: "Sign in")
+        expect text("Welcome, alice@example.com").visible
+    }
+}

@@ -42,6 +42,10 @@ impl fmt::Display for Capability {
 pub struct RecordField {
     pub ty: Type,
     pub optional: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub documentation: String,
+    #[serde(default)]
+    pub secret: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -423,28 +427,37 @@ pub struct ProviderName(pub String);
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct OperationName(pub String);
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ParameterSchema {
     pub name: String,
     pub ty: Type,
     pub required: bool,
     pub positional: bool,
     pub secret: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub documentation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<Value>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct OperationSchema {
     pub name: OperationName,
     pub parameters: Vec<ParameterSchema>,
     pub result: Type,
     pub capability: Capability,
     pub documentation: String,
+    #[serde(default)]
+    pub retry_safe: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProviderSchema {
     pub name: ProviderName,
     pub operations: BTreeMap<String, OperationSchema>,
+    /// Optional externally specified semantic identity (for example an app manifest hash).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_identity: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -460,6 +473,9 @@ impl ProviderSchema {
     }
 
     pub fn hash(&self) -> String {
+        if let Some(identity) = &self.schema_identity {
+            return identity.clone();
+        }
         let bytes = serde_json::to_vec(self).unwrap_or_default();
         blake3::hash(&bytes).to_hex().to_string()
     }
@@ -470,6 +486,9 @@ pub struct ProviderCall {
     pub provider: ProviderName,
     pub operation: OperationName,
     pub arguments: BTreeMap<String, Value>,
+    /// Schema identity embedded in the plan that produced this call.
+    #[serde(default)]
+    pub schema_hash: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -511,6 +530,29 @@ pub enum ProviderError {
     PathEscape { path: String },
     #[error("provider operation is unavailable on this host")]
     Unavailable,
+    #[error("application bridge handshake failed ({code}): {message}")]
+    BridgeHandshake { code: String, message: String },
+    #[error("application bridge protocol failure ({code}): {message}")]
+    BridgeProtocol { code: String, message: String },
+    #[error("application bridge transport failed: {message}")]
+    BridgeTransport { message: String },
+    #[error("application bridge process exited before readiness: {message}")]
+    BridgeProcess { message: String },
+    #[error(
+        "application schema drift: planned {expected}, live {live}; regenerate .webtest/app-schema.json"
+    )]
+    BridgeSchemaDrift { expected: String, live: String },
+    #[error("application bridge value validation failed at {path}: {message}")]
+    BridgeValidation { path: String, message: String },
+    #[error("application bridge call timed out after {timeout_ms}ms")]
+    BridgeTimeout { timeout_ms: u64 },
+    #[error("application function failed ({code}): {message}")]
+    Application {
+        code: String,
+        message: String,
+        retryable: bool,
+        data: serde_json::Value,
+    },
 }
 
 impl ProviderError {
@@ -527,11 +569,22 @@ impl ProviderError {
             Self::Filesystem { .. } => "filesystem",
             Self::PathEscape { .. } => "path_escape",
             Self::Unavailable => "provider_unavailable",
+            Self::BridgeHandshake { .. } => "app_bridge_handshake",
+            Self::BridgeProtocol { .. } => "app_bridge_protocol",
+            Self::BridgeTransport { .. } => "app_bridge_transport",
+            Self::BridgeProcess { .. } => "app_bridge_process",
+            Self::BridgeSchemaDrift { .. } => "app_schema_drift",
+            Self::BridgeValidation { .. } => "app_bridge_validation",
+            Self::BridgeTimeout { .. } => "app_bridge_timeout",
+            Self::Application { .. } => "app_provider_failure",
         }
     }
 
     pub fn is_infrastructure(&self) -> bool {
-        !matches!(self, Self::InvalidArgument { .. } | Self::PathEscape { .. })
+        !matches!(
+            self,
+            Self::InvalidArgument { .. } | Self::PathEscape { .. } | Self::Application { .. }
+        )
     }
 
     pub fn redacted(&self, secrets: &[String]) -> Self {
@@ -572,6 +625,45 @@ impl ProviderError {
                 path: redact_text(path, secrets),
             },
             Self::Unavailable => Self::Unavailable,
+            Self::BridgeHandshake { code, message } => Self::BridgeHandshake {
+                code: code.clone(),
+                message: redact_text(message, secrets),
+            },
+            Self::BridgeProtocol { code, message } => Self::BridgeProtocol {
+                code: code.clone(),
+                message: redact_text(message, secrets),
+            },
+            Self::BridgeTransport { message } => Self::BridgeTransport {
+                message: redact_text(message, secrets),
+            },
+            Self::BridgeProcess { message } => Self::BridgeProcess {
+                message: redact_text(message, secrets),
+            },
+            Self::BridgeSchemaDrift { expected, live } => Self::BridgeSchemaDrift {
+                expected: expected.clone(),
+                live: live.clone(),
+            },
+            Self::BridgeValidation { path, message } => Self::BridgeValidation {
+                path: path.clone(),
+                message: redact_text(message, secrets),
+            },
+            Self::BridgeTimeout { timeout_ms } => Self::BridgeTimeout {
+                timeout_ms: *timeout_ms,
+            },
+            Self::Application {
+                code,
+                message,
+                retryable,
+                data,
+            } => Self::Application {
+                code: code.clone(),
+                message: redact_text(message, secrets),
+                retryable: *retryable,
+                data: value_to_json(
+                    &value_from_json(data.clone()).redacted_with_secrets(&[], secrets),
+                )
+                .unwrap_or_else(|| serde_json::json!({})),
+            },
         }
     }
 }
@@ -579,6 +671,9 @@ impl ProviderError {
 #[async_trait]
 pub trait ServerProvider: Send + Sync {
     fn schema(&self) -> ProviderSchema;
+    fn transport_kind(&self) -> Option<String> {
+        None
+    }
     async fn call(
         &self,
         call: ProviderCall,
@@ -665,6 +760,12 @@ impl ProviderRegistry {
                 })?;
         provider.call(call, context).await
     }
+
+    pub fn transport_kind(&self, provider: &str) -> Option<String> {
+        self.providers
+            .get(provider)
+            .and_then(|provider| provider.transport_kind())
+    }
 }
 
 fn parameter(name: &str, ty: Type, required: bool, positional: bool) -> ParameterSchema {
@@ -674,6 +775,8 @@ fn parameter(name: &str, ty: Type, required: bool, positional: bool) -> Paramete
         required,
         positional,
         secret: false,
+        documentation: String::new(),
+        default: None,
     }
 }
 
@@ -684,6 +787,8 @@ fn secret_parameter(name: &str, ty: Type, required: bool, positional: bool) -> P
         required,
         positional,
         secret: true,
+        documentation: String::new(),
+        default: None,
     }
 }
 
@@ -712,12 +817,14 @@ pub fn http_schema() -> ProviderSchema {
                 result: Type::Response(Box::new(Type::Json)),
                 capability: Capability::Server,
                 documentation: format!("Send an HTTP {} request.", method.to_uppercase()),
+                retry_safe: matches!(method, "get"),
             },
         );
     }
     ProviderSchema {
         name: ProviderName("http".into()),
         operations,
+        schema_identity: None,
     }
 }
 
@@ -735,10 +842,12 @@ pub fn process_schema() -> ProviderSchema {
         result: Type::ProcessResult,
         capability: Capability::Server,
         documentation: "Run an executable directly without a shell.".into(),
+        retry_safe: false,
     };
     ProviderSchema {
         name: ProviderName("process".into()),
         operations: [("run".into(), operation)].into_iter().collect(),
+        schema_identity: None,
     }
 }
 
@@ -752,6 +861,7 @@ pub fn fs_schema() -> ProviderSchema {
             result: Type::String,
             capability: Capability::Server,
             documentation: "Read a project-relative UTF-8 file.".into(),
+            retry_safe: true,
         },
     );
     operations.insert(
@@ -765,6 +875,7 @@ pub fn fs_schema() -> ProviderSchema {
             result: Type::FilePath,
             capability: Capability::Server,
             documentation: "Write a project-relative UTF-8 file.".into(),
+            retry_safe: false,
         },
     );
     operations.insert(
@@ -778,6 +889,7 @@ pub fn fs_schema() -> ProviderSchema {
             result: Type::FilePath,
             capability: Capability::Server,
             documentation: "Copy a fixture inside the project.".into(),
+            retry_safe: false,
         },
     );
     operations.insert(
@@ -788,11 +900,13 @@ pub fn fs_schema() -> ProviderSchema {
             result: Type::TempDirectory,
             capability: Capability::Server,
             documentation: "Create a managed temporary directory.".into(),
+            retry_safe: false,
         },
     );
     ProviderSchema {
         name: ProviderName("fs".into()),
         operations,
+        schema_identity: None,
     }
 }
 
@@ -1405,6 +1519,7 @@ mod tests {
             provider: ProviderName(provider.into()),
             operation: OperationName(operation.into()),
             arguments,
+            schema_hash: String::new(),
         }
     }
 
@@ -1420,6 +1535,8 @@ mod tests {
             RecordField {
                 ty: Type::BrowserPage,
                 optional: false,
+                documentation: String::new(),
+                secret: false,
             },
         )]
         .into_iter()

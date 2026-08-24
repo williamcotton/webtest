@@ -1781,6 +1781,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "webtest-analysis",
+ "webtest-app-bridge",
  "webtest-browser",
  "webtest-browser-cdp",
  "webtest-browser-manager",
@@ -1811,6 +1812,28 @@ dependencies = [
  "webtest-plan",
  "webtest-provider",
  "webtest-syntax",
+ "webtest-text",
+]
+
+[[package]]
+name = "webtest-app-bridge"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "futures",
+ "getrandom 0.3.4",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "ureq",
+ "url",
+ "webtest-analysis",
+ "webtest-plan",
+ "webtest-provider",
  "webtest-text",
 ]
 
@@ -1890,6 +1913,7 @@ dependencies = [
  "webtest-format",
  "webtest-observation",
  "webtest-plan",
+ "webtest-provider",
  "webtest-runtime",
  "webtest-syntax",
  "webtest-text",
@@ -2033,6 +2057,7 @@ dependencies = [
  "serde_json",
  "wasm-bindgen",
  "webtest-analysis",
+ "webtest-app-bridge",
  "webtest-feedback",
  "webtest-format",
  "webtest-plan",

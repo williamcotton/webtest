@@ -10,7 +10,10 @@ use tower_lsp_server::{
     jsonrpc::{Error, Result},
     ls_types::*,
 };
-use webtest_analysis::{Diagnostic as CoreDiagnostic, DiagnosticSeverity, DiagnosticSource};
+use webtest_analysis::{
+    CompletionKind as CoreCompletionKind, Diagnostic as CoreDiagnostic, DiagnosticSeverity,
+    DiagnosticSource,
+};
 use webtest_browser::BrowserHost;
 use webtest_editor::{
     EditorService, SemanticToken as CoreSemanticToken, SemanticTokenKind as CoreSemanticTokenKind,
@@ -136,6 +139,15 @@ impl LanguageServer for Backend {
                     ..Default::default()
                 }),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
+                completion_provider: Some(CompletionOptions {
+                    trigger_characters: Some(vec![".".into(), ",".into()]),
+                    ..Default::default()
+                }),
+                signature_help_provider: Some(SignatureHelpOptions {
+                    trigger_characters: Some(vec!["(".into(), ",".into()]),
+                    retrigger_characters: Some(vec![",".into()]),
+                    work_done_progress_options: WorkDoneProgressOptions::default(),
+                }),
                 ..Default::default()
             },
             offset_encoding: None,
@@ -246,6 +258,75 @@ impl LanguageServer for Backend {
         Ok(hover.map(|hover| Hover {
             contents: HoverContents::Scalar(MarkedString::String(hover.contents)),
             range: Some(text_range_to_lsp(&source, hover.range)),
+        }))
+    }
+
+    async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+        let position = params.text_document_position;
+        let Some(document) = self.documents.get(&position.text_document.uri) else {
+            return Ok(None);
+        };
+        let source = self
+            .editor
+            .source(document.file)
+            .map_err(|error| Error::invalid_params(error.to_string()))?;
+        let offset = position_to_offset(&source, position.position);
+        let completions = self
+            .editor
+            .completions(document.file, TextSize::from(offset as u32))
+            .map_err(|error| Error::invalid_params(error.to_string()))?
+            .into_iter()
+            .map(|completion| CompletionItem {
+                label: completion.label,
+                kind: Some(match completion.kind {
+                    CoreCompletionKind::Function => CompletionItemKind::FUNCTION,
+                    CoreCompletionKind::Parameter => CompletionItemKind::FIELD,
+                    CoreCompletionKind::Property => CompletionItemKind::PROPERTY,
+                }),
+                detail: Some(completion.detail),
+                documentation: (!completion.documentation.is_empty())
+                    .then_some(Documentation::String(completion.documentation)),
+                insert_text: Some(completion.insert_text),
+                ..Default::default()
+            })
+            .collect();
+        Ok(Some(CompletionResponse::Array(completions)))
+    }
+
+    async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
+        let position = params.text_document_position_params;
+        let Some(document) = self.documents.get(&position.text_document.uri) else {
+            return Ok(None);
+        };
+        let source = self
+            .editor
+            .source(document.file)
+            .map_err(|error| Error::invalid_params(error.to_string()))?;
+        let offset = position_to_offset(&source, position.position);
+        let signature = self
+            .editor
+            .signature_help(document.file, TextSize::from(offset as u32))
+            .map_err(|error| Error::invalid_params(error.to_string()))?;
+        Ok(signature.map(|signature| SignatureHelp {
+            signatures: vec![SignatureInformation {
+                label: signature.label,
+                documentation: (!signature.documentation.is_empty())
+                    .then_some(Documentation::String(signature.documentation)),
+                parameters: Some(
+                    signature
+                        .parameters
+                        .into_iter()
+                        .map(|parameter| ParameterInformation {
+                            label: ParameterLabel::Simple(parameter.label),
+                            documentation: (!parameter.documentation.is_empty())
+                                .then_some(Documentation::String(parameter.documentation)),
+                        })
+                        .collect(),
+                ),
+                active_parameter: Some(signature.active_parameter as u32),
+            }],
+            active_signature: Some(0),
+            active_parameter: Some(signature.active_parameter as u32),
         }))
     }
 

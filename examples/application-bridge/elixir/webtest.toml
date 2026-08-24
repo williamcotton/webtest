@@ -1,0 +1,25 @@
+[project]
+name = "application-bridge-elixir"
+test_roots = ["created-user.webtest"]
+
+[app]
+command = "elixir"
+args = ["app.exs"]
+working_directory = "."
+
+[app.environment]
+WEBTEST = "1"
+PORT = "3105"
+
+[app.health]
+url = "http://127.0.0.1:3105/health"
+timeout = "10s"
+
+[server.app]
+adapter = "bridge"
+transport = "tcp"
+schema = ".webtest/app-schema.json"
+startup_timeout = "60s"
+
+[browser]
+base_url = "http://127.0.0.1:3105"

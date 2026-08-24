@@ -1,0 +1,52 @@
+{
+  "manifest_version": 1,
+  "protocol": 1,
+  "provider": "app",
+  "sdk": "webtest-java-example",
+  "sdk_version": "0.1.0",
+  "schema_hash": "blake3:b1254e79ab8984797e49f26190f9fa181239cb0d4c0d279f4d627b7d101e1e2a",
+  "functions": {
+    "create_user": {
+      "documentation": "Create a user directly in the test application's in-memory store.",
+      "retry_safe": false,
+      "params": {
+        "type": "object",
+        "fields": {
+          "admin": {
+            "type": "boolean",
+            "documentation": "Grant administrative access.",
+            "optional": true,
+            "secret": false,
+            "default": false
+          },
+          "email": {
+            "type": "string",
+            "documentation": "Unique sign-in email.",
+            "optional": false,
+            "secret": false
+          }
+        }
+      },
+      "returns": {
+        "type": "object",
+        "fields": {
+          "admin": {
+            "type": "boolean",
+            "optional": false,
+            "secret": false
+          },
+          "email": {
+            "type": "string",
+            "optional": false,
+            "secret": false
+          },
+          "id": {
+            "type": "integer",
+            "optional": false,
+            "secret": false
+          }
+        }
+      }
+    }
+  }
+}

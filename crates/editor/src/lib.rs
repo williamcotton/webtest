@@ -4,10 +4,12 @@ use std::sync::{Arc, RwLock};
 
 use thiserror::Error;
 use webtest_analysis::{
-    AnalysisDatabase, AnalysisError, Diagnostic, DiagnosticSeverity, DiagnosticSource,
+    AnalysisDatabase, AnalysisError, Completion, Diagnostic, DiagnosticSeverity, DiagnosticSource,
+    Signature,
 };
 use webtest_browser::{BrowserError, BrowserHost, Locator};
 use webtest_observation::{ObservationStore, RuntimeObservationKind};
+use webtest_provider::ProviderRegistry;
 use webtest_runtime::{RunError, RunResult, Runner, RunnerOptions};
 use webtest_syntax::SyntaxKind;
 use webtest_text::{FileId, TextRange};
@@ -47,11 +49,17 @@ pub enum EditorError {
     StaticErrors,
 }
 
-#[derive(Default)]
 pub struct EditorService {
     database: RwLock<AnalysisDatabase>,
     observations: Arc<ObservationStore>,
     runner_options: RunnerOptions,
+    providers: ProviderRegistry,
+}
+
+impl Default for EditorService {
+    fn default() -> Self {
+        Self::with_runner_options(RunnerOptions::default())
+    }
 }
 
 impl EditorService {
@@ -60,10 +68,19 @@ impl EditorService {
     }
 
     pub fn with_runner_options(runner_options: RunnerOptions) -> Self {
+        let providers = ProviderRegistry::built_in(runner_options.provider_config.clone());
+        Self::with_provider_registry(runner_options, providers)
+    }
+
+    pub fn with_provider_registry(
+        runner_options: RunnerOptions,
+        providers: ProviderRegistry,
+    ) -> Self {
         Self {
-            database: RwLock::new(AnalysisDatabase::default()),
+            database: RwLock::new(AnalysisDatabase::with_provider_registry(providers.clone())),
             observations: Arc::new(ObservationStore::default()),
             runner_options,
+            providers,
         }
     }
 
@@ -231,13 +248,33 @@ impl EditorService {
         file: FileId,
         offset: webtest_text::TextSize,
     ) -> Result<Option<Hover>, EditorError> {
-        Ok(self
-            .write_database()
-            .type_at(file, offset)?
-            .map(|fact| Hover {
-                range: fact.range,
-                contents: format!("{} ({})", fact.ty, fact.capability),
-            }))
+        let mut database = self.write_database();
+        if let Some(documentation) = database.documentation_at(file, offset)? {
+            return Ok(Some(Hover {
+                range: documentation.range,
+                contents: documentation.contents,
+            }));
+        }
+        Ok(database.type_at(file, offset)?.map(|fact| Hover {
+            range: fact.range,
+            contents: format!("{} ({})", fact.ty, fact.capability),
+        }))
+    }
+
+    pub fn completions(
+        &self,
+        file: FileId,
+        offset: webtest_text::TextSize,
+    ) -> Result<Vec<Completion>, EditorError> {
+        Ok(self.write_database().completions(file, offset)?)
+    }
+
+    pub fn signature_help(
+        &self,
+        file: FileId,
+        offset: webtest_text::TextSize,
+    ) -> Result<Option<Signature>, EditorError> {
+        Ok(self.write_database().signature_help(file, offset)?)
     }
 
     pub fn semantic_tokens(&self, file: FileId) -> Result<Vec<SemanticToken>, EditorError> {
@@ -334,8 +371,9 @@ impl EditorService {
             }
             database.test_plan(file)?
         };
-        let runner =
-            Runner::new(Arc::clone(&self.observations)).with_options(self.runner_options.clone());
+        let runner = Runner::new(Arc::clone(&self.observations))
+            .with_options(self.runner_options.clone())
+            .with_provider_registry(self.providers.clone());
         Ok(runner.run(&plan, browser).await?)
     }
 

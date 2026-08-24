@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://webtest.dev/protocol/1/types.json",
+  "title": "WebTest App Bridge protocol 1 types",
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,127}$"
+    },
+    "documentation": {
+      "type": "string",
+      "maxLength": 1024
+    },
+    "typeSchema": {
+      "oneOf": [
+        { "type": "object", "required": ["type"], "properties": { "type": { "const": "null" } } },
+        { "type": "object", "required": ["type"], "properties": { "type": { "const": "boolean" } } },
+        { "type": "object", "required": ["type"], "properties": { "type": { "const": "integer" } } },
+        { "type": "object", "required": ["type"], "properties": { "type": { "const": "float" } } },
+        { "type": "object", "required": ["type"], "properties": { "type": { "const": "string" } } },
+        {
+          "type": "object",
+          "required": ["type", "items"],
+          "properties": { "type": { "const": "array" }, "items": { "$ref": "#/$defs/typeSchema" } }
+        },
+        {
+          "type": "object",
+          "required": ["type", "item"],
+          "properties": { "type": { "const": "optional" }, "item": { "$ref": "#/$defs/typeSchema" } }
+        },
+        {
+          "type": "object",
+          "required": ["type", "fields"],
+          "properties": {
+            "type": { "const": "object" },
+            "fields": {
+              "type": "object",
+              "propertyNames": { "$ref": "#/$defs/identifier" },
+              "additionalProperties": { "$ref": "#/$defs/fieldSchema" }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["type", "name", "base"],
+          "properties": {
+            "type": { "const": "alias" },
+            "name": { "$ref": "#/$defs/identifier" },
+            "base": { "$ref": "#/$defs/typeSchema" },
+            "validation": { "type": "object" },
+            "display": { "type": "object" }
+          }
+        }
+      ]
+    },
+    "fieldSchema": {
+      "allOf": [
+        { "$ref": "#/$defs/typeSchema" },
+        {
+          "type": "object",
+          "properties": {
+            "documentation": { "$ref": "#/$defs/documentation" },
+            "optional": { "type": "boolean", "default": false },
+            "secret": { "type": "boolean", "default": false },
+            "default": {}
+          }
+        }
+      ]
+    },
+    "functionSchema": {
+      "type": "object",
+      "required": ["params", "returns"],
+      "properties": {
+        "documentation": { "$ref": "#/$defs/documentation" },
+        "retry_safe": { "type": "boolean", "default": false },
+        "params": { "$ref": "#/$defs/typeSchema" },
+        "returns": { "$ref": "#/$defs/typeSchema" }
+      }
+    },
+    "transferableValue": {
+      "description": "null, boolean, integer/float, string, or recursively bounded array/object",
+      "type": ["null", "boolean", "number", "string", "array", "object"]
+    }
+  }
+}
+

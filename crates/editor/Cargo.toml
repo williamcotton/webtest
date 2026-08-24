@@ -12,6 +12,7 @@ webtest-browser.workspace = true
 webtest-format.workspace = true
 webtest-observation.workspace = true
 webtest-plan.workspace = true
+webtest-provider.workspace = true
 webtest-runtime.workspace = true
 webtest-syntax.workspace = true
 webtest-text.workspace = true

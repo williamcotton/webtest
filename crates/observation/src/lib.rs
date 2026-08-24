@@ -1,6 +1,7 @@
 //! Structured execution events and revision-safe source observations.
 
 use std::{
+    collections::BTreeMap,
     collections::HashMap,
     sync::{
         Mutex,
@@ -88,6 +89,8 @@ pub enum ExecutionEvent {
         step_id: StepId,
         provider: String,
         operation: String,
+        transport_kind: Option<String>,
+        arguments: BTreeMap<String, String>,
     },
     ProviderCallFinished {
         execution_id: ExecutionId,
@@ -96,6 +99,8 @@ pub enum ExecutionEvent {
         provider: String,
         operation: String,
         elapsed_ms: u64,
+        transport_kind: Option<String>,
+        result: Option<String>,
     },
     ProviderCallFailed {
         execution_id: ExecutionId,
@@ -106,6 +111,7 @@ pub enum ExecutionEvent {
         code: String,
         message: String,
         elapsed_ms: u64,
+        transport_kind: Option<String>,
     },
     StepFailed {
         execution_id: ExecutionId,

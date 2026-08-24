@@ -1,6 +1,6 @@
 # WebTest
 
-WebTest is a statically analyzable language for typed web-system tests. One lossless parser feeds checking, formatting, plan compilation, execution, debugging, and editor diagnostics. Native HTTP, process, filesystem, and direct Chrome DevTools Protocol backends run behind shared typed contracts.
+WebTest is a statically analyzable language for typed web-system tests. One lossless parser feeds checking, formatting, plan compilation, execution, debugging, and editor diagnostics. Native HTTP, process, filesystem, language-neutral application bridge, and direct Chrome DevTools Protocol backends run behind shared typed contracts.
 
 ```webtest
 test "created user can sign in" {
@@ -81,6 +81,24 @@ max_output_bytes = 1048576
 read_roots = ["fixtures"]
 write_root = ".webtest/tmp"
 
+# Optional runner-owned application plus typed app.* bridge.
+[app]
+command = "node"
+args = ["server.js"]
+working_directory = "."
+
+[app.environment]
+WEBTEST = "1"
+
+[app.health]
+url = "http://127.0.0.1:3000/health"
+timeout = "10s"
+
+[server.app]
+adapter = "bridge"
+transport = "auto"
+schema = ".webtest/app-schema.json"
+
 [redaction]
 headers = ["authorization", "cookie", "set-cookie"]
 json_fields = ["password", "token", "secret"]
@@ -125,6 +143,20 @@ Then run its typed server-to-browser workflow:
 target/debug/webtest test examples/simple-server/created-user.webtest --headed
 ```
 
+The [application-bridge matrix](examples/application-bridge/README.md) runs the same typed
+`app.create_user` flow against Node, Ruby, Go, Python, Elixir, Java, .NET, Rust, and PHP applications.
+The checked manifest powers `describe`, `check`, LSP, and WASM services while those applications are
+stopped. Build once, verify the matrix, then smoke any installed host runtime:
+
+```sh
+cargo build
+python3 scripts/check-application-bridge-examples.py
+python3 scripts/check-application-bridge-examples.py --example node --smoke
+```
+
+Protocol compatibility and SDK commands are documented in [protocol/protocol.md](protocol/protocol.md),
+[sdks/node/README.md](sdks/node/README.md), and [sdks/ruby/README.md](sdks/ruby/README.md).
+
 ## VS Code / Cursor extension development
 
 ```sh
@@ -149,6 +181,7 @@ The architectural invariants are deliberate:
 - the formatter consumes CST tokens so comments are retained;
 - runtime executes a source-mapped `TestPlan`, never syntax nodes;
 - browser behavior is protocol-neutral and CDP is only one backend;
+- application integration uses one generated, authenticated bridge protocol and the shared provider path;
 - runtime failures remain structured observations tagged with a BLAKE3 source revision;
 - editor services contain no LSP types; Tower LSP and VS Code are adapters;
 - stdout belongs exclusively to LSP while `webtest lsp` is running.

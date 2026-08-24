@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://webtest.dev/protocol/1/schema.json",
+  "title": "WebTest App Bridge protocol 1",
+  "oneOf": [
+    { "$ref": "#/$defs/message" },
+    { "$ref": "#/$defs/manifest" }
+  ],
+  "$defs": {
+    "id": { "type": "integer", "minimum": 0 },
+    "message": {
+      "oneOf": [
+        { "$ref": "#/$defs/hello" }, { "$ref": "#/$defs/helloOk" },
+        { "$ref": "#/$defs/helloError" }, { "$ref": "#/$defs/describe" },
+        { "$ref": "#/$defs/schema" }, { "$ref": "#/$defs/call" },
+        { "$ref": "#/$defs/result" }, { "$ref": "#/$defs/error" },
+        { "$ref": "#/$defs/cancel" }, { "$ref": "#/$defs/event" },
+        { "$ref": "#/$defs/ping" }, { "$ref": "#/$defs/pong" },
+        { "$ref": "#/$defs/shutdown" }, { "$ref": "#/$defs/shutdownOk" }
+      ]
+    },
+    "hello": {
+      "type": "object", "required": ["type", "protocol_versions", "sdk", "sdk_version", "token", "capabilities"],
+      "properties": {
+        "type": { "const": "hello" }, "protocol_versions": { "type": "array", "items": { "type": "integer", "minimum": 1 }, "minItems": 1, "uniqueItems": true },
+        "sdk": { "type": "string", "maxLength": 128 }, "sdk_version": { "type": "string", "maxLength": 64 },
+        "token": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "capabilities": { "type": "object", "properties": { "cancel": { "type": "boolean" }, "events": { "type": "boolean" } } }
+      }
+    },
+    "helloOk": { "type": "object", "required": ["type", "protocol", "run_id", "max_message_bytes"], "properties": { "type": { "const": "hello_ok" }, "protocol": { "const": 1 }, "run_id": { "type": "string" }, "max_message_bytes": { "type": "integer", "minimum": 1 } } },
+    "helloError": { "type": "object", "required": ["type", "code", "message"], "properties": { "type": { "const": "hello_error" }, "code": { "type": "string" }, "message": { "type": "string" } } },
+    "describe": { "type": "object", "required": ["type", "id"], "properties": { "type": { "const": "describe" }, "id": { "$ref": "#/$defs/id" } } },
+    "schema": { "type": "object", "required": ["type", "id", "protocol", "schema_hash", "functions"], "properties": { "type": { "const": "schema" }, "id": { "$ref": "#/$defs/id" }, "protocol": { "const": 1 }, "schema_hash": { "type": "string", "pattern": "^blake3:[0-9a-f]{64}$" }, "functions": { "type": "object", "propertyNames": { "$ref": "types.json#/$defs/identifier" }, "additionalProperties": { "$ref": "types.json#/$defs/functionSchema" } } } },
+    "call": { "type": "object", "required": ["type", "id", "function", "arguments", "deadline_ms"], "properties": { "type": { "const": "call" }, "id": { "$ref": "#/$defs/id" }, "function": { "$ref": "types.json#/$defs/identifier" }, "arguments": { "type": "object" }, "deadline_ms": { "type": "integer", "minimum": 1 } } },
+    "result": { "type": "object", "required": ["type", "id", "value"], "properties": { "type": { "const": "result" }, "id": { "$ref": "#/$defs/id" }, "value": { "$ref": "types.json#/$defs/transferableValue" } } },
+    "error": { "type": "object", "required": ["type", "id", "code", "message", "retryable", "data"], "properties": { "type": { "const": "error" }, "id": { "$ref": "#/$defs/id" }, "code": { "type": "string", "maxLength": 128 }, "message": { "type": "string", "maxLength": 4096 }, "retryable": { "type": "boolean" }, "data": { "$ref": "types.json#/$defs/transferableValue" }, "debug": { "type": "string", "maxLength": 8192 } } },
+    "cancel": { "type": "object", "required": ["type", "id", "reason"], "properties": { "type": { "const": "cancel" }, "id": { "$ref": "#/$defs/id" }, "reason": { "type": "string", "maxLength": 128 } } },
+    "event": { "type": "object", "required": ["type", "call_id", "kind", "value"], "properties": { "type": { "const": "event" }, "call_id": { "$ref": "#/$defs/id" }, "kind": { "type": "string", "maxLength": 128 }, "value": { "$ref": "types.json#/$defs/transferableValue" } } },
+    "ping": { "type": "object", "required": ["type", "id"], "properties": { "type": { "const": "ping" }, "id": { "$ref": "#/$defs/id" } } },
+    "pong": { "type": "object", "required": ["type", "id"], "properties": { "type": { "const": "pong" }, "id": { "$ref": "#/$defs/id" } } },
+    "shutdown": { "type": "object", "required": ["type", "id"], "properties": { "type": { "const": "shutdown" }, "id": { "$ref": "#/$defs/id" } } },
+    "shutdownOk": { "type": "object", "required": ["type", "id"], "properties": { "type": { "const": "shutdown_ok" }, "id": { "$ref": "#/$defs/id" } } },
+    "manifest": {
+      "type": "object", "required": ["manifest_version", "protocol", "provider", "sdk", "sdk_version", "schema_hash", "functions"],
+      "properties": {
+        "manifest_version": { "const": 1 }, "protocol": { "const": 1 }, "provider": { "const": "app" },
+        "sdk": { "type": "string", "minLength": 1, "maxLength": 128 }, "sdk_version": { "type": "string", "minLength": 1, "maxLength": 64 }, "schema_hash": { "type": "string", "pattern": "^blake3:[0-9a-f]{64}$" },
+        "functions": { "type": "object", "propertyNames": { "$ref": "types.json#/$defs/identifier" }, "additionalProperties": { "$ref": "types.json#/$defs/functionSchema" } }
+      }
+    }
+  }
+}
