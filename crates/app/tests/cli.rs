@@ -14,6 +14,117 @@ fn webtest(directory: &Path) -> Command {
 }
 
 #[test]
+fn describe_bootstraps_exact_alias_category_and_search_without_source_files() {
+    let directory = tempfile::tempdir().expect("temp directory");
+    let index = webtest(directory.path())
+        .args(["describe", "--reporter", "json"])
+        .output()
+        .expect("describe index");
+    assert!(
+        index.status.success(),
+        "{}",
+        String::from_utf8_lossy(&index.stderr)
+    );
+    let index: serde_json::Value = serde_json::from_slice(&index.stdout).expect("index JSON");
+    assert_eq!(index["kind"], "description_index");
+    assert_eq!(index["description_schema_version"], 1);
+    assert!(
+        index["categories"]["locators"]
+            .as_array()
+            .expect("locators")
+            .contains(&serde_json::json!("locator.role"))
+    );
+
+    let role = webtest(directory.path())
+        .args(["describe", "role", "--reporter", "json"])
+        .output()
+        .expect("describe role");
+    assert!(role.status.success());
+    let role: serde_json::Value = serde_json::from_slice(&role.stdout).expect("role JSON");
+    assert_eq!(role["id"], "locator.role");
+    assert_eq!(role["syntax_forms"][0]["elements"][1]["parameter"], "role");
+    assert_eq!(role["allowed_contexts"][0], "scope.browser");
+    assert_eq!(role["examples"].as_array().expect("examples").len(), 2);
+
+    let category = webtest(directory.path())
+        .args(["describe", "provider.http", "--reporter", "json"])
+        .output()
+        .expect("provider category");
+    let category: serde_json::Value =
+        serde_json::from_slice(&category.stdout).expect("category JSON");
+    assert!(
+        category["children"]
+            .as_array()
+            .expect("children")
+            .contains(&serde_json::json!("provider.http.get"))
+    );
+
+    let search = webtest(directory.path())
+        .args([
+            "describe",
+            "--search",
+            "activate button pointer",
+            "--reporter",
+            "json",
+        ])
+        .output()
+        .expect("description search");
+    let search: serde_json::Value = serde_json::from_slice(&search.stdout).expect("search JSON");
+    assert_eq!(search["results"][0]["id"], "browser.click");
+
+    let unknown = webtest(directory.path())
+        .args(["describe", "locator.rol", "--reporter", "json"])
+        .output()
+        .expect("unknown description");
+    assert_eq!(unknown.status.code(), Some(2));
+    let unknown: serde_json::Value = serde_json::from_slice(&unknown.stdout).expect("unknown JSON");
+    assert_eq!(unknown["code"], "description_unknown_query");
+    assert_eq!(unknown["repair_hints"][0]["kind"], "name_candidate");
+}
+
+#[test]
+fn check_json_contains_versioned_source_identity_semantic_details_and_repairs() {
+    let directory = tempfile::tempdir().expect("temp directory");
+    write(
+        &directory.path().join("machine.webtest"),
+        r#"test "machine" {
+    server {
+        let user: { email: String } = { email: "alice@example.test" }
+        let typo = user.emial
+    }
+}
+"#,
+    );
+    let output = webtest(directory.path())
+        .args(["check", "machine.webtest", "--reporter", "json"])
+        .output()
+        .expect("machine check");
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("check JSON");
+    let diagnostic = report["files"][0]["diagnostics"]
+        .as_array()
+        .expect("diagnostics")
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "semantic.unknown_member")
+        .expect("unknown member");
+    assert_eq!(diagnostic["diagnostic_schema_version"], 1);
+    assert_eq!(diagnostic["repair_hint_schema_version"], 1);
+    assert_eq!(diagnostic["semantic_details"]["requested"], "emial");
+    assert_eq!(diagnostic["repair_hints"][0]["replacement"], "email");
+    assert_eq!(diagnostic["source"]["path"], "machine.webtest");
+    assert_eq!(
+        diagnostic["source"]["source_revision"],
+        report["files"][0]["source_revision"]
+    );
+    assert!(
+        diagnostic["source"]["byte_range"]["end"].as_u64().unwrap()
+            > diagnostic["source"]["byte_range"]["start"]
+                .as_u64()
+                .unwrap()
+    );
+}
+
+#[test]
 fn check_without_paths_discovers_configured_tests_in_order() {
     let directory = tempfile::tempdir().expect("temp directory");
     write(

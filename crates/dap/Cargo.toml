@@ -12,6 +12,7 @@ thiserror.workspace = true
 tokio.workspace = true
 webtest-analysis.workspace = true
 webtest-browser.workspace = true
+webtest-feedback.workspace = true
 webtest-observation.workspace = true
 webtest-plan.workspace = true
 webtest-provider.workspace = true

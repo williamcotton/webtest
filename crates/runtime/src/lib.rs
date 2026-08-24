@@ -11,8 +11,9 @@ use async_trait::async_trait;
 use thiserror::Error;
 use tracing::instrument;
 use webtest_browser::{
-    Action, BrowserContextOptions, BrowserError, BrowserHost, EvidenceRequest,
+    Action, BrowserContextOptions, BrowserError, BrowserHost, EvidenceRequest, InspectionOptions,
     Locator as BrowserLocator, LocatorState as BrowserLocatorState, Page, PageEvidence,
+    PageInspection, RepairHint, RepairHintKind, locator_repair_hints,
 };
 use webtest_hir::{BinaryOperator, BindingId, UnaryOperator};
 use webtest_observation::{
@@ -47,6 +48,9 @@ pub struct StepFailure {
     pub error: StepError,
     pub evidence: PageEvidence,
     pub artifacts: Vec<Artifact>,
+    pub inspection: Option<PageInspection>,
+    pub repair_hints: Vec<RepairHint>,
+    pub secondary_failures: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -217,6 +221,7 @@ pub struct RunnerOptions {
     pub project_root: PathBuf,
     pub redacted_json_fields: Vec<String>,
     pub provider_config: NativeProviderConfig,
+    pub inspection: InspectionOptions,
 }
 
 impl Default for RunnerOptions {
@@ -238,6 +243,7 @@ impl Default for RunnerOptions {
                 "set-cookie".into(),
             ],
             provider_config: NativeProviderConfig::default(),
+            inspection: InspectionOptions::default(),
         }
     }
 }
@@ -424,38 +430,82 @@ impl Runner {
                     });
                 }
                 Err(error) => {
-                    let error =
-                        redact_step_error(error, &self.options.redacted_json_fields, &secrets);
-                    let mut evidence = if matches!(error, StepError::Browser(_))
-                        && !error.is_infrastructure()
-                        && (self.options.evidence.screenshot_on_failure
-                            || self.options.evidence.dom_snapshot_on_failure)
-                    {
-                        if let Some(page) = page.as_deref_mut() {
-                            page.capture_evidence(&EvidenceRequest {
-                                locator: step_browser_locator(step),
-                                include_screenshot: self.options.evidence.screenshot_on_failure,
-                                include_dom: self.options.evidence.dom_snapshot_on_failure,
-                                max_dom_bytes: self.options.evidence.max_dom_bytes,
-                                redactions: secrets.clone(),
-                            })
-                            .await
+                    let error = redact_step_error(
+                        error,
+                        &self.options.redacted_json_fields,
+                        &secrets,
+                        &self.options.inspection.redacted_query_parameters,
+                    );
+                    let mut evidence =
+                        if matches!(error, StepError::Browser(_)) && !error.is_infrastructure() {
+                            if let Some(page) = page.as_deref_mut() {
+                                page.capture_evidence(&EvidenceRequest {
+                                    locator: step_browser_locator(step),
+                                    include_screenshot: self.options.evidence.screenshot_on_failure,
+                                    include_dom: self.options.evidence.dom_snapshot_on_failure,
+                                    max_dom_bytes: self.options.evidence.max_dom_bytes,
+                                    redactions: secrets.clone(),
+                                    redacted_query_parameters: self
+                                        .options
+                                        .inspection
+                                        .redacted_query_parameters
+                                        .clone(),
+                                })
+                                .await
+                            } else {
+                                PageEvidence::default()
+                            }
                         } else {
                             PageEvidence::default()
+                        };
+                    let (inspection, secondary_failures) = if matches!(error, StepError::Browser(_))
+                        && !error.is_infrastructure()
+                    {
+                        if let Some(page) = page.as_deref_mut() {
+                            let mut options = self.options.inspection.clone();
+                            options.redacted_values.extend(secrets.clone());
+                            match page.inspect(&options).await {
+                                Ok(inspection) => (Some(inspection), Vec::new()),
+                                Err(secondary) => (
+                                    None,
+                                    vec![format!("semantic inspection unavailable: {secondary}")],
+                                ),
+                            }
+                        } else {
+                            (
+                                None,
+                                vec!["semantic inspection unavailable: page is closed".into()],
+                            )
                         }
                     } else {
-                        PageEvidence::default()
+                        (None, Vec::new())
                     };
+                    let mut repair_hints = inspection
+                        .as_ref()
+                        .map(|inspection| repair_hints_for_error(&error, inspection))
+                        .unwrap_or_default();
+                    for hint in &mut repair_hints {
+                        hint.source_range = Some(webtest_feedback::ByteRange {
+                            start: step.origin.range.start().into(),
+                            end: step.origin.range.end().into(),
+                        });
+                    }
                     if !self.options.evidence.screenshot_on_failure {
                         evidence.screenshot_png = None;
                     }
-                    let artifacts = write_artifacts(
-                        &self.options.evidence.artifact_directory,
-                        execution_id,
-                        test.id,
-                        step.id,
-                        &mut evidence,
-                    );
+                    let artifacts = if self.options.evidence.screenshot_on_failure
+                        || self.options.evidence.dom_snapshot_on_failure
+                    {
+                        write_artifacts(
+                            &self.options.evidence.artifact_directory,
+                            execution_id,
+                            test.id,
+                            step.id,
+                            &mut evidence,
+                        )
+                    } else {
+                        Vec::new()
+                    };
                     let elapsed_ms = duration_millis(step_started.elapsed());
                     if let TestOperation::ServerProviderCall(call) = &step.operation {
                         events.push(ExecutionEvent::ProviderCallFailed {
@@ -477,6 +527,7 @@ impl Runner {
                             execution_id,
                             &error,
                             &evidence,
+                            &repair_hints,
                             &artifacts,
                             elapsed_ms,
                         );
@@ -486,6 +537,10 @@ impl Runner {
                         test_id: test.id,
                         step_id: step.id,
                         failure: runtime_failure(&error),
+                        repair_hints: repair_hints.clone(),
+                        page: inspection
+                            .as_ref()
+                            .map(|inspection| inspection.page.clone()),
                     });
                     if error.is_infrastructure() {
                         drop(page);
@@ -503,6 +558,9 @@ impl Runner {
                         error,
                         evidence,
                         artifacts,
+                        inspection,
+                        repair_hints,
+                        secondary_failures,
                     });
                     break;
                 }
@@ -639,6 +697,7 @@ impl Runner {
         execution_id: ExecutionId,
         error: &StepError,
         evidence: &PageEvidence,
+        repair_hints: &[RepairHint],
         artifacts: &[Artifact],
         elapsed_ms: u64,
     ) {
@@ -655,6 +714,7 @@ impl Runner {
                     .map(|artifact| artifact.path.display().to_string())
                     .collect(),
                 elapsed_ms,
+                repair_hints: repair_hints.to_vec(),
             },
             StepError::Decode(error) => RuntimeObservationKind::ValueFailure {
                 code: "json_decode_failed".into(),
@@ -730,7 +790,71 @@ fn runtime_failure(error: &StepError) -> RuntimeFailure {
     }
 }
 
-fn redact_step_error(error: StepError, fields: &[String], secrets: &[String]) -> StepError {
+fn repair_hints_for_error(error: &StepError, inspection: &PageInspection) -> Vec<RepairHint> {
+    match error {
+        StepError::Browser(BrowserError::LocatorNotFound { locator })
+        | StepError::Browser(BrowserError::LocatorAmbiguous { locator, .. }) => {
+            locator_repair_hints(locator, inspection, webtest_browser::MAX_CANDIDATES)
+        }
+        StepError::Browser(BrowserError::OptionNotFound { locator, option }) => {
+            let requested_source = locator.to_string();
+            let mut candidates = inspection
+                .elements
+                .iter()
+                .filter(|element| {
+                    element.preferred_locator.source == requested_source
+                        || element
+                            .alternate_locators
+                            .iter()
+                            .any(|candidate| candidate.source == requested_source)
+                })
+                .flat_map(|element| element.options.iter())
+                .map(|candidate| (runtime_edit_distance(candidate, option), candidate.clone()))
+                .collect::<Vec<_>>();
+            candidates.sort();
+            candidates.dedup_by(|left, right| left.1 == right.1);
+            candidates
+                .into_iter()
+                .take(webtest_browser::MAX_CANDIDATES)
+                .map(|(_, candidate)| {
+                    let mut hint = RepairHint::text(RepairHintKind::OptionCandidate, candidate);
+                    hint.reason = Some("available option with a nearby label or value".into());
+                    hint
+                })
+                .collect()
+        }
+        StepError::Browser(BrowserError::UrlMismatch { actual, .. }) => {
+            let mut hint = RepairHint::text(RepairHintKind::NameCandidate, actual.clone());
+            hint.reason = Some("current URL observed when the assertion failed".into());
+            vec![hint]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn runtime_edit_distance(left: &str, right: &str) -> usize {
+    let right = right.chars().collect::<Vec<_>>();
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    for (left_index, left_char) in left.chars().enumerate() {
+        let mut current = vec![left_index + 1];
+        for (right_index, right_char) in right.iter().enumerate() {
+            current.push(
+                (previous[right_index + 1] + 1)
+                    .min(current[right_index] + 1)
+                    .min(previous[right_index] + usize::from(left_char != *right_char)),
+            );
+        }
+        previous = current;
+    }
+    previous[right.len()]
+}
+
+fn redact_step_error(
+    error: StepError,
+    fields: &[String],
+    secrets: &[String],
+    query_parameters: &[String],
+) -> StepError {
     match error {
         StepError::Assertion(error) => {
             let expected = error
@@ -746,8 +870,184 @@ fn redact_step_error(error: StepError, fields: &[String], secrets: &[String]) ->
             }))
         }
         StepError::Provider(error) => StepError::Provider(error.redacted(secrets)),
+        StepError::Browser(error) => {
+            StepError::Browser(redact_browser_error(error, secrets, query_parameters))
+        }
         error => error,
     }
+}
+
+fn redact_browser_error(
+    error: BrowserError,
+    secrets: &[String],
+    query_parameters: &[String],
+) -> BrowserError {
+    let locator = |locator| redact_locator(locator, secrets);
+    let text = |value: String| redact_text(value, secrets);
+    let url = |value: String| redact_url(value, secrets, query_parameters);
+    match error {
+        BrowserError::LocatorNotFound { locator: value } => BrowserError::LocatorNotFound {
+            locator: locator(value),
+        },
+        BrowserError::LocatorAmbiguous {
+            locator: value,
+            matches,
+        } => BrowserError::LocatorAmbiguous {
+            locator: locator(value),
+            matches,
+        },
+        BrowserError::LocatorInvalid {
+            locator: value,
+            message,
+        } => BrowserError::LocatorInvalid {
+            locator: locator(value),
+            message: text(message),
+        },
+        BrowserError::ElementDetached { locator: value } => BrowserError::ElementDetached {
+            locator: locator(value),
+        },
+        BrowserError::LocatorNotVisible { locator: value } => BrowserError::LocatorNotVisible {
+            locator: locator(value),
+        },
+        BrowserError::ElementUnstable { locator: value } => BrowserError::ElementUnstable {
+            locator: locator(value),
+        },
+        BrowserError::ElementDisabled { locator: value } => BrowserError::ElementDisabled {
+            locator: locator(value),
+        },
+        BrowserError::ElementObscured { locator: value } => BrowserError::ElementObscured {
+            locator: locator(value),
+        },
+        BrowserError::ElementNotEditable { locator: value } => BrowserError::ElementNotEditable {
+            locator: locator(value),
+        },
+        BrowserError::OptionNotFound {
+            locator: value,
+            option,
+        } => BrowserError::OptionNotFound {
+            locator: locator(value),
+            option: text(option),
+        },
+        BrowserError::OptionAmbiguous {
+            locator: value,
+            option,
+            matches,
+        } => BrowserError::OptionAmbiguous {
+            locator: locator(value),
+            option: text(option),
+            matches,
+        },
+        BrowserError::InvalidKey { key } => BrowserError::InvalidKey { key: text(key) },
+        BrowserError::ActionTimeout {
+            locator: value,
+            timeout_ms,
+        } => BrowserError::ActionTimeout {
+            locator: locator(value),
+            timeout_ms,
+        },
+        BrowserError::AssertionFailed {
+            locator: value,
+            expected,
+            actual,
+        } => BrowserError::AssertionFailed {
+            locator: locator(value),
+            expected,
+            actual: text(actual),
+        },
+        BrowserError::UrlMismatch { expected, actual } => BrowserError::UrlMismatch {
+            expected: url(expected),
+            actual: url(actual),
+        },
+        BrowserError::NavigationFailed { url: value, reason } => BrowserError::NavigationFailed {
+            url: url(value),
+            reason: text(reason),
+        },
+        BrowserError::NavigationTimeout {
+            url: value,
+            timeout_ms,
+        } => BrowserError::NavigationTimeout {
+            url: url(value),
+            timeout_ms,
+        },
+        BrowserError::CommandTimeout { method, timeout_ms } => BrowserError::CommandTimeout {
+            method: text(method),
+            timeout_ms,
+        },
+        BrowserError::BrowserDisconnected => BrowserError::BrowserDisconnected,
+        BrowserError::BrowserCrashed { status } => BrowserError::BrowserCrashed {
+            status: text(status),
+        },
+        BrowserError::MalformedProtocol { message } => BrowserError::MalformedProtocol {
+            message: text(message),
+        },
+        BrowserError::Protocol { method, message } => BrowserError::Protocol {
+            method: text(method),
+            message: text(message),
+        },
+        BrowserError::Launch(message) => BrowserError::Launch(text(message)),
+        BrowserError::EvaluationFailed {
+            expression,
+            message,
+        } => BrowserError::EvaluationFailed {
+            expression: text(expression),
+            message: text(message),
+        },
+        BrowserError::UnsupportedCapability { capability } => BrowserError::UnsupportedCapability {
+            capability: text(capability),
+        },
+    }
+}
+
+fn redact_locator(locator: BrowserLocator, secrets: &[String]) -> BrowserLocator {
+    match locator {
+        BrowserLocator::Id(value) => BrowserLocator::Id(redact_text(value, secrets)),
+        BrowserLocator::Role { role, name } => BrowserLocator::Role {
+            role: redact_text(role, secrets),
+            name: name.map(|value| redact_text(value, secrets)),
+        },
+        BrowserLocator::Label(value) => BrowserLocator::Label(redact_text(value, secrets)),
+        BrowserLocator::Text(value) => BrowserLocator::Text(redact_text(value, secrets)),
+        BrowserLocator::Placeholder(value) => {
+            BrowserLocator::Placeholder(redact_text(value, secrets))
+        }
+        BrowserLocator::TestId(value) => BrowserLocator::TestId(redact_text(value, secrets)),
+        BrowserLocator::Css(value) => BrowserLocator::Css(redact_text(value, secrets)),
+        BrowserLocator::XPath(value) => BrowserLocator::XPath(redact_text(value, secrets)),
+    }
+}
+
+fn redact_text(mut value: String, secrets: &[String]) -> String {
+    for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
+        value = value.replace(secret, "[redacted]");
+    }
+    value
+}
+
+fn redact_url(value: String, secrets: &[String], query_parameters: &[String]) -> String {
+    let mut value = if let Ok(mut parsed) = url::Url::parse(&value) {
+        let pairs = parsed
+            .query_pairs()
+            .map(|(name, value)| {
+                let value = if query_parameters
+                    .iter()
+                    .any(|candidate| candidate.eq_ignore_ascii_case(&name))
+                {
+                    "[redacted]".into()
+                } else {
+                    value.into_owned()
+                };
+                (name.into_owned(), value)
+            })
+            .collect::<Vec<_>>();
+        if !pairs.is_empty() {
+            parsed.query_pairs_mut().clear().extend_pairs(pairs);
+        }
+        parsed.to_string()
+    } else {
+        value
+    };
+    value = redact_text(value, secrets);
+    value
 }
 
 async fn execute_browser(
@@ -1538,15 +1838,13 @@ fn step_browser_locator(step: &PlannedStep) -> Option<BrowserLocator> {
     }
 }
 
-fn resolve_url(base_url: Option<&str>, value: &str) -> Result<String, StepError> {
+pub fn resolve_browser_url(base_url: Option<&str>, value: &str) -> Result<String, BrowserError> {
     if is_absolute_url(value) {
         return Ok(normalize_url(value));
     }
-    let base = base_url.ok_or_else(|| {
-        StepError::Browser(BrowserError::NavigationFailed {
-            url: value.into(),
-            reason: "relative URL requires browser.base_url".into(),
-        })
+    let base = base_url.ok_or_else(|| BrowserError::NavigationFailed {
+        url: value.into(),
+        reason: "relative URL requires browser.base_url".into(),
     })?;
     let resolved = if value.starts_with('/') {
         let scheme_end = base.find("://").map(|index| index + 3).unwrap_or(0);
@@ -1559,6 +1857,10 @@ fn resolve_url(base_url: Option<&str>, value: &str) -> Result<String, StepError>
         format!("{}/{}", base.trim_end_matches('/'), value)
     };
     Ok(normalize_url(&resolved))
+}
+
+fn resolve_url(base_url: Option<&str>, value: &str) -> Result<String, StepError> {
+    resolve_browser_url(base_url, value).map_err(StepError::Browser)
 }
 
 fn is_absolute_url(value: &str) -> bool {
@@ -1690,6 +1992,42 @@ mod tests {
         result: Mutex<Result<(), BrowserError>>,
     }
 
+    fn semantic_inspection() -> PageInspection {
+        PageInspection {
+            kind: "inspection".into(),
+            inspection_schema_version: webtest_browser::INSPECTION_SCHEMA_VERSION,
+            snapshot_id: "fake-snapshot".into(),
+            browser_version: "fake".into(),
+            page: webtest_browser::PageSummary {
+                url: "http://example.test/login".into(),
+                title: "Sign in".into(),
+            },
+            elements: vec![webtest_browser::InspectableElement {
+                role: Some("button".into()),
+                accessible_name: Some("Sign in".into()),
+                label: None,
+                placeholder: None,
+                test_id: None,
+                dom_id: None,
+                states: webtest_browser::ElementStates {
+                    visible: true,
+                    enabled: Some(true),
+                    receives_pointer_input: Some(true),
+                    ..webtest_browser::ElementStates::default()
+                },
+                supported_actions: vec![webtest_browser::SupportedAction::Click],
+                preferred_locator: webtest_browser::LocatorCandidate {
+                    source: "role(\"button\", name: \"Sign in\")".into(),
+                    kind: webtest_browser::LocatorCandidateKind::Role,
+                    reason: "unique accessible role and name".into(),
+                },
+                alternate_locators: Vec::new(),
+                options: Vec::new(),
+            }],
+            truncation: webtest_browser::InspectionTruncation::default(),
+        }
+    }
+
     #[async_trait]
     impl BrowserHost for FakeHost {
         async fn start(&self) -> Result<Box<dyn BrowserSession>, BrowserError> {
@@ -1732,6 +2070,13 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone()
         }
+
+        async fn inspect(
+            &mut self,
+            _options: &InspectionOptions,
+        ) -> Result<PageInspection, BrowserError> {
+            Ok(semantic_inspection())
+        }
     }
 
     fn plan(revision: SourceRevision) -> TestPlan {
@@ -1770,13 +2115,17 @@ mod tests {
             }),
             starts: Arc::clone(&starts),
         };
+        let failed_result = runner.run(&plan(revision), &failed).await.expect("run");
+        assert_eq!(failed_result.failed(), 1);
+        let failure = failed_result.tests[0].failure.as_ref().expect("failure");
         assert_eq!(
-            runner
-                .run(&plan(revision), &failed)
-                .await
-                .expect("run")
-                .failed(),
-            1
+            failure.inspection.as_ref().expect("inspection").page.title,
+            "Sign in"
+        );
+        assert!(!failure.repair_hints.is_empty());
+        assert_eq!(
+            failure.repair_hints[0].source_range,
+            Some(webtest_feedback::ByteRange { start: 10, end: 19 })
         );
         assert_eq!(store.observations_for(FileId::new(0), revision).len(), 1);
         let passed = FakeHost {
@@ -1785,6 +2134,85 @@ mod tests {
         };
         runner.run(&plan(revision), &passed).await.expect("run");
         assert!(store.observations_for(FileId::new(0), revision).is_empty());
+    }
+
+    #[test]
+    fn repair_hints_are_failure_specific_bounded_and_never_claim_actionability_healing() {
+        let inspection = semantic_inspection();
+        let requested = BrowserLocator::Role {
+            role: "button".into(),
+            name: Some("Log in".into()),
+        };
+        let ambiguous = repair_hints_for_error(
+            &StepError::Browser(BrowserError::LocatorAmbiguous {
+                locator: requested,
+                matches: 2,
+            }),
+            &inspection,
+        );
+        assert_eq!(ambiguous[0].kind, RepairHintKind::LocatorCandidate);
+
+        let mut option_inspection = inspection.clone();
+        let element = &mut option_inspection.elements[0];
+        element.preferred_locator = webtest_browser::LocatorCandidate {
+            source: "label(\"Timezone\")".into(),
+            kind: webtest_browser::LocatorCandidateKind::Label,
+            reason: "unique associated label".into(),
+        };
+        element.options = vec![
+            "Zulu".into(),
+            "UTC".into(),
+            "UCT".into(),
+            "GMT".into(),
+            "CST".into(),
+            "EST".into(),
+        ];
+        let options = repair_hints_for_error(
+            &StepError::Browser(BrowserError::OptionNotFound {
+                locator: BrowserLocator::Label("Timezone".into()),
+                option: "UT".into(),
+            }),
+            &option_inspection,
+        );
+        assert_eq!(options.len(), webtest_browser::MAX_CANDIDATES);
+        assert_eq!(options[0].kind, RepairHintKind::OptionCandidate);
+        assert_eq!(
+            options[0].replacement,
+            webtest_browser::RepairReplacement::text("UCT")
+        );
+
+        let url = repair_hints_for_error(
+            &StepError::Browser(BrowserError::UrlMismatch {
+                expected: "http://example.test/home".into(),
+                actual: "http://example.test/dashboard".into(),
+            }),
+            &inspection,
+        );
+        assert_eq!(url[0].kind, RepairHintKind::NameCandidate);
+
+        let actionability = repair_hints_for_error(
+            &StepError::Browser(BrowserError::ElementDisabled {
+                locator: BrowserLocator::Id("submit".into()),
+            }),
+            &inspection,
+        );
+        assert!(actionability.is_empty());
+
+        let redacted = redact_step_error(
+            StepError::Browser(BrowserError::UrlMismatch {
+                expected: "http://example.test/?token=must-not-leak".into(),
+                actual: "http://example.test/?token=private&view=secret-value".into(),
+            }),
+            &[],
+            &["secret-value".into()],
+            &["token".into()],
+        );
+        let rendered = redacted.to_string();
+        assert!(!rendered.contains("must-not-leak"));
+        assert!(!rendered.contains("private"));
+        assert!(!rendered.contains("secret-value"));
+        let hints = repair_hints_for_error(&redacted, &inspection);
+        assert!(!format!("{hints:?}").contains("private"));
     }
 
     #[test]

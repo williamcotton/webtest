@@ -342,6 +342,17 @@ fn position_to_offset(text: &str, position: Position) -> usize {
 }
 
 fn diagnostic_to_lsp(text: &str, diagnostic: CoreDiagnostic) -> Diagnostic {
+    let data = serde_json::json!({
+        "diagnostic_schema_version": webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
+        "repair_hint_schema_version": webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
+        "byte_range": {
+            "start": u32::from(diagnostic.range.start()),
+            "end": u32::from(diagnostic.range.end()),
+        },
+        "semantic_details": diagnostic.semantic_details,
+        "repair_hints": diagnostic.repair_hints,
+        "reference_queries": diagnostic.reference_queries,
+    });
     Diagnostic {
         range: text_range_to_lsp(text, diagnostic.range),
         severity: Some(match diagnostic.severity {
@@ -362,6 +373,7 @@ fn diagnostic_to_lsp(text: &str, diagnostic: CoreDiagnostic) -> Diagnostic {
             .into(),
         ),
         message: diagnostic.message,
+        data: Some(data),
         ..Default::default()
     }
 }
@@ -433,6 +445,39 @@ mod tests {
             Range::new(Position::new(1, 0), Position::new(1, 1))
         );
         assert_eq!(offset_to_position(text, "a😀".len()), Position::new(0, 3));
+    }
+
+    #[test]
+    fn lsp_ranges_are_utf16_while_machine_data_preserves_canonical_bytes() {
+        let text = "😀 emial";
+        let start = text.find("emial").expect("member");
+        let range = TextRange::new(
+            TextSize::from(start as u32),
+            TextSize::from((start + "emial".len()) as u32),
+        );
+        let diagnostic = diagnostic_to_lsp(
+            text,
+            CoreDiagnostic {
+                range,
+                severity: DiagnosticSeverity::Error,
+                code: "semantic.unknown_member",
+                message: "unknown member".into(),
+                source: DiagnosticSource::Semantic,
+                semantic_details: Some(serde_json::json!({"requested": "emial"})),
+                repair_hints: vec![webtest_feedback::RepairHint::text(
+                    webtest_feedback::RepairHintKind::MemberCandidate,
+                    "email",
+                )],
+                reference_queries: vec!["type.Record".into()],
+            },
+        );
+        assert_eq!(diagnostic.range.start, Position::new(0, 3));
+        let data = diagnostic.data.expect("machine diagnostic data");
+        assert_eq!(data["repair_hint_schema_version"], 1);
+        assert_eq!(data["byte_range"]["start"], start as u32);
+        assert_eq!(data["byte_range"]["end"], (start + 5) as u32);
+        assert_eq!(data["repair_hints"][0]["replacement"], "email");
+        assert_eq!(data["reference_queries"][0], "type.Record");
     }
 
     #[test]

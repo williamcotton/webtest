@@ -6,6 +6,7 @@ members = [
     "crates/syntax",
     "crates/hir",
     "crates/provider",
+    "crates/feedback",
     "crates/analysis",
     "crates/format",
     "crates/plan",
@@ -33,6 +34,7 @@ webtest-project = { path = "crates/project" }
 webtest-syntax = { path = "crates/syntax" }
 webtest-hir = { path = "crates/hir" }
 webtest-provider = { path = "crates/provider", default-features = false }
+webtest-feedback = { path = "crates/feedback" }
 webtest-analysis = { path = "crates/analysis" }
 webtest-format = { path = "crates/format" }
 webtest-plan = { path = "crates/plan" }

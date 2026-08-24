@@ -1,0 +1,11 @@
+test "user signs in" {
+    browser {
+        open "/login"
+        fill label("Email") with "alice@example.com"
+        fill label("Password") with "secret"
+        click role("button", name: "Sign in")
+        expect url("/dashboard")
+        expect text("Welcome, Alice").visible
+    }
+}
+

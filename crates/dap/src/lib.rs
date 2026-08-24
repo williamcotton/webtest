@@ -546,15 +546,26 @@ impl DebugState {
         let exit_code = match result {
             Ok(result) => {
                 for test in &result.tests {
-                    let (category, status) = if test.passed {
-                        ("stdout", "ok".to_owned())
+                    let (category, status, data) = if test.passed {
+                        ("stdout", "ok".to_owned(), Value::Null)
                     } else {
                         let error = test
                             .failure
                             .as_ref()
                             .map(|failure| failure.error.to_string())
                             .unwrap_or_else(|| "failed".into());
-                        ("stderr", format!("FAILED: {error}"))
+                        let details = test
+                            .failure
+                            .as_ref()
+                            .map_or(Value::Null, failure_output_data);
+                        let hints = test
+                            .failure
+                            .as_ref()
+                            .filter(|failure| !failure.repair_hints.is_empty())
+                            .and_then(|failure| serde_json::to_string(&failure.repair_hints).ok())
+                            .map(|hints| format!("\nsemantic repair candidates: {hints}"))
+                            .unwrap_or_default();
+                        ("stderr", format!("FAILED: {error}{hints}"), details)
                     };
                     let _ = self
                         .writer
@@ -563,6 +574,7 @@ impl DebugState {
                             json!({
                                 "category": category,
                                 "output": format!("test {:?} ... {status}\n", test.name),
+                                "data": data,
                             }),
                         )
                         .await;
@@ -599,6 +611,17 @@ impl DebugState {
             .await;
         let _ = self.writer.event("terminated", json!({})).await;
     }
+}
+
+fn failure_output_data(failure: &webtest_runtime::StepFailure) -> Value {
+    json!({
+        "diagnostic_schema_version": webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
+        "repair_hint_schema_version": webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
+        "code": failure.error.code(),
+        "repair_hints": failure.repair_hints,
+        "page": failure.inspection.as_ref().map(|inspection| &inspection.page),
+        "secondary": failure.secondary_failures,
+    })
 }
 
 impl DebugState {
@@ -909,7 +932,10 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use webtest_browser::{BrowserError, BrowserSession};
+    use webtest_browser::{
+        BrowserError, BrowserSession, InspectionTruncation, Locator, PageEvidence, PageInspection,
+        PageSummary, RepairHint,
+    };
 
     use super::*;
 
@@ -992,6 +1018,54 @@ mod tests {
         );
         assert!(names.iter().any(|name| name.starts_with("expect url(")));
         assert!(names.iter().all(|name| !name.contains("alice@example.com")));
+    }
+
+    #[test]
+    fn failure_output_exposes_semantic_hints_without_raw_evidence_secrets() {
+        let source = r#"test "x" { browser { click role("button", name: "Log in") } }"#;
+        let directory = tempfile::tempdir().expect("temp directory");
+        let program = LoadedProgram::load(
+            directory.path().join("failure.webtest"),
+            Some(source.into()),
+        )
+        .expect("program");
+        let step = program.plan.tests[0].steps[0].clone();
+        let locator = Locator::Role {
+            role: "button".into(),
+            name: Some("Log in".into()),
+        };
+        let failure = webtest_runtime::StepFailure {
+            step,
+            error: webtest_runtime::StepError::Browser(BrowserError::LocatorNotFound { locator }),
+            evidence: PageEvidence {
+                dom_snapshot: Some("password=must-not-leak".into()),
+                ..PageEvidence::default()
+            },
+            artifacts: Vec::new(),
+            inspection: Some(PageInspection {
+                kind: "inspection".into(),
+                inspection_schema_version: 1,
+                snapshot_id: "snapshot-1".into(),
+                browser_version: "Chrome/1".into(),
+                page: PageSummary {
+                    url: "http://example.test/login?token=%5Bredacted%5D".into(),
+                    title: "Sign in".into(),
+                },
+                elements: Vec::new(),
+                truncation: InspectionTruncation::default(),
+            }),
+            repair_hints: vec![RepairHint::locator(
+                "role(\"button\", name: \"Sign in\")",
+                "same role",
+            )],
+            secondary_failures: Vec::new(),
+        };
+        let details = failure_output_data(&failure);
+        let serialized = serde_json::to_string(&details).expect("details JSON");
+        assert_eq!(details["code"], "locator_not_found");
+        assert_eq!(details["repair_hints"][0]["kind"], "locator_candidate");
+        assert!(!serialized.contains("must-not-leak"));
+        assert!(!serialized.contains("dom_snapshot"));
     }
 
     #[test]

@@ -8,7 +8,8 @@ use std::{
     },
 };
 
-use webtest_browser::{CandidateEvidence, Locator};
+use webtest_browser::{CandidateEvidence, Locator, PageSummary};
+use webtest_feedback::RepairHint;
 use webtest_hir::{StepId, TestId};
 use webtest_text::{FileId, SourceRevision, TextRange};
 
@@ -111,6 +112,8 @@ pub enum ExecutionEvent {
         test_id: TestId,
         step_id: StepId,
         failure: RuntimeFailure,
+        repair_hints: Vec<RepairHint>,
+        page: Option<PageSummary>,
     },
     TestFinished {
         execution_id: ExecutionId,
@@ -144,6 +147,7 @@ pub enum RuntimeObservationKind {
         actionability: Vec<String>,
         artifacts: Vec<String>,
         elapsed_ms: u64,
+        repair_hints: Vec<RepairHint>,
     },
     ValueFailure {
         code: String,

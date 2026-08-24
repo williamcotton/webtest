@@ -1,0 +1,8 @@
+// Rename this file to repair.webtest to exercise structured locator repair.
+test "incorrect locator is repairable" {
+    browser {
+        open "/login"
+        click role("button", name: "Log in")
+    }
+}
+

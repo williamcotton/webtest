@@ -1,11 +1,22 @@
 //! Incremental workspace, static semantics, and deterministic plan construction.
 
+mod description;
+
+pub use description::{
+    Availability, CategoryDescription, ConstraintDescription, ConstructDescription,
+    DescriptionDiagnostic, DescriptionIndex, DescriptionLimits, DescriptionProject,
+    DescriptionRequest, DescriptionResponse, GuidanceDescription, LanguageDescription,
+    ParameterDescription, Provenance, SearchDescription, SearchResult, SourceExample,
+    SyntaxElement, SyntaxForm, describe,
+};
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
 };
 
 use thiserror::Error;
+pub use webtest_feedback::{RepairHint, RepairHintKind, RepairReplacement};
 use webtest_hir::{
     BinaryOperator, BindingId, HirBrowserOp, HirExpr, HirExprKind, HirFile, HirLiteral, HirNameRef,
     HirStmt, HirType, HirTypeKind, StepId, UnaryOperator,
@@ -41,6 +52,9 @@ pub struct Diagnostic {
     pub code: &'static str,
     pub message: String,
     pub source: DiagnosticSource,
+    pub semantic_details: Option<serde_json::Value>,
+    pub repair_hints: Vec<RepairHint>,
+    pub reference_queries: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -211,6 +225,15 @@ impl AnalysisDatabase {
             .collect()
     }
 
+    pub fn describe(
+        &self,
+        request: DescriptionRequest,
+        project: Option<DescriptionProject>,
+        limits: DescriptionLimits,
+    ) -> DescriptionResponse {
+        description::describe(&self.providers, request, project, limits)
+    }
+
     fn ensure_queries(&mut self, file: FileId) -> Result<(), AnalysisError> {
         let source = self
             .files
@@ -234,6 +257,9 @@ impl AnalysisDatabase {
                 code: error.code,
                 message: error.message.clone(),
                 source: DiagnosticSource::Syntax,
+                semantic_details: None,
+                repair_hints: Vec::new(),
+                reference_queries: syntax_reference_queries(&parsed, error),
             })
             .collect::<Vec<_>>();
         diagnostics.extend(invalid_duration_diagnostics(&parsed));
@@ -253,6 +279,39 @@ impl AnalysisDatabase {
         );
         Ok(())
     }
+}
+
+fn syntax_reference_queries(parsed: &Parse, error: &webtest_syntax::SyntaxError) -> Vec<String> {
+    let mut queries = vec!["grammar".into()];
+    match error.code {
+        "syntax.expected_server_statement" => queries.push("scope.server".into()),
+        "syntax.expected_browser_statement" => queries.push("scope.browser".into()),
+        _ => return queries,
+    }
+    let offending = parsed
+        .syntax()
+        .descendants_with_tokens()
+        .filter_map(|element| element.into_token())
+        .find(|token| token.text_range() == error.range)
+        .map(|token| token.text().to_owned());
+    let reference = match offending.as_deref() {
+        Some("open") => Some("browser.open"),
+        Some("evaluate") => Some("browser.evaluate"),
+        Some("click") => Some("browser.click"),
+        Some("fill") => Some("browser.fill"),
+        Some("type") => Some("browser.type"),
+        Some("press") => Some("browser.press"),
+        Some("check") => Some("browser.check"),
+        Some("uncheck") => Some("browser.uncheck"),
+        Some("select") => Some("browser.select"),
+        Some("hover") => Some("browser.hover"),
+        Some("wait") => Some("browser.wait.locator"),
+        _ => None,
+    };
+    if let Some(reference) = reference {
+        queries.push(reference.into());
+    }
+    queries
 }
 
 fn invalid_duration_diagnostics(parsed: &Parse) -> Vec<Diagnostic> {
@@ -277,6 +336,9 @@ fn invalid_duration_diagnostics(parsed: &Parse) -> Vec<Diagnostic> {
                 code: "semantic.invalid_duration",
                 message: format!("invalid positive duration `{}`", token.text()),
                 source: DiagnosticSource::Semantic,
+                semantic_details: Some(serde_json::json!({ "literal": token.text() })),
+                repair_hints: Vec::new(),
+                reference_queries: vec!["grammar".into(), "type.Duration".into()],
             })
         })
         .collect()
@@ -626,10 +688,20 @@ impl<'a> Compiler<'a> {
         steps: &mut Vec<PlannedStep>,
     ) {
         if domain != Capability::Browser {
-            self.error(
+            self.error_with_details(
                 browser_origin(operation).range,
                 "semantic.capability_mismatch",
                 format!("Browser operation is not allowed in {domain} context"),
+                serde_json::json!({
+                    "required_capability": "Browser",
+                    "actual_capability": domain.to_string(),
+                    "construct": browser_reference(operation),
+                }),
+                Vec::new(),
+                vec![
+                    browser_reference(operation).into(),
+                    "capability.Browser".into(),
+                ],
             );
         }
         self.required.insert(Capability::Browser);
@@ -817,10 +889,23 @@ impl<'a> Compiler<'a> {
                     "`app` is reserved for the application bridge".into(),
                 );
             } else {
-                self.error(
+                let known = self
+                    .providers
+                    .schemas()
+                    .map(|schema| schema.name.0.clone())
+                    .collect::<Vec<_>>();
+                let candidates = nearest_strings(&known, provider, 5);
+                self.error_with_details(
                     receiver.origin.range,
                     "semantic.unknown_provider",
                     format!("unknown provider `{provider}`"),
+                    serde_json::json!({"requested": provider, "known_providers": known}),
+                    text_hints(
+                        RepairHintKind::NameCandidate,
+                        candidates,
+                        receiver.origin.range,
+                    ),
+                    vec!["provider".into()],
                 );
             }
             return Some(CompiledProviderCall {
@@ -833,10 +918,23 @@ impl<'a> Compiler<'a> {
             });
         };
         let Some(operation_schema) = schema.operation(operation) else {
-            self.error(
+            let known = schema.operations.keys().cloned().collect::<Vec<_>>();
+            let candidates = nearest_strings(&known, operation, 5);
+            self.error_with_details(
                 callee.origin.range,
                 "semantic.unknown_provider_operation",
                 format!("provider `{provider}` has no operation `{operation}`"),
+                serde_json::json!({
+                    "provider": provider,
+                    "requested": operation,
+                    "known_operations": known,
+                }),
+                text_hints(
+                    RepairHintKind::NameCandidate,
+                    candidates,
+                    callee.origin.range,
+                ),
+                vec![format!("provider.{provider}")],
             );
             return Some(CompiledProviderCall {
                 provider: provider.clone(),
@@ -902,13 +1000,33 @@ impl<'a> Compiler<'a> {
                 parameter
             };
             let Some(parameter) = parameter else {
-                self.error(
+                let requested = argument.name.clone();
+                let known = schema
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.name.clone())
+                    .collect::<Vec<_>>();
+                let candidates = requested
+                    .as_deref()
+                    .map(|requested| nearest_strings(&known, requested, 5))
+                    .unwrap_or_default();
+                self.error_with_details(
                     argument.origin.range,
                     "semantic.unknown_argument",
                     argument.name.as_ref().map_or_else(
                         || "too many positional arguments".into(),
                         |name| format!("unknown argument `{name}`"),
                     ),
+                    serde_json::json!({
+                        "requested": requested,
+                        "known_arguments": known,
+                    }),
+                    text_hints(
+                        RepairHintKind::ArgumentCandidate,
+                        candidates,
+                        argument.origin.range,
+                    ),
+                    vec!["provider".into()],
                 );
                 continue;
             };
@@ -1009,10 +1127,19 @@ impl<'a> Compiler<'a> {
                         format!("binding `{name}` is used before its declaration"),
                     );
                 } else {
-                    self.error(
+                    let known = self.declared_names.iter().cloned().collect::<Vec<_>>();
+                    let candidates = nearest_strings(&known, name, 5);
+                    self.error_with_details(
                         expression.origin.range,
                         "semantic.unknown_name",
                         format!("unknown name `{name}`"),
+                        serde_json::json!({"requested": name, "known_names": known}),
+                        text_hints(
+                            RepairHintKind::NameCandidate,
+                            candidates,
+                            expression.origin.range,
+                        ),
+                        Vec::new(),
                     );
                 }
                 unknown_expr()
@@ -1096,10 +1223,23 @@ impl<'a> Compiler<'a> {
                     }
                 } else {
                     if receiver.ty != Type::Unknown {
-                        self.error(
+                        let known = known_members(&receiver.ty);
+                        let candidates = nearest_strings(&known, member, 5);
+                        self.error_with_details(
                             member_origin.range,
                             "semantic.unknown_member",
                             format!("type {} has no member `{member}`", receiver.ty),
+                            serde_json::json!({
+                                "requested": member,
+                                "receiver_type": receiver.ty.to_string(),
+                                "known_members": known,
+                            }),
+                            text_hints(
+                                RepairHintKind::MemberCandidate,
+                                candidates,
+                                member_origin.range,
+                            ),
+                            vec![format!("type.{}", receiver_type_reference(&receiver.ty))],
                         );
                     }
                     unknown_expr()
@@ -1379,10 +1519,19 @@ impl<'a> Compiler<'a> {
 
     fn type_mismatch(&mut self, range: TextRange, expected: &Type, actual: &Type) {
         if expected != &Type::Unknown && actual != &Type::Unknown {
-            self.error(
+            self.error_with_details(
                 range,
                 "semantic.type_mismatch",
                 format!("expected {expected}, got {actual}"),
+                serde_json::json!({
+                    "expected_type": expected.to_string(),
+                    "actual_type": actual.to_string(),
+                }),
+                Vec::new(),
+                vec![
+                    format!("type.{}", receiver_type_reference(expected)),
+                    format!("type.{}", receiver_type_reference(actual)),
+                ],
             );
         }
     }
@@ -1402,7 +1551,140 @@ impl<'a> Compiler<'a> {
             code,
             message,
             source: DiagnosticSource::Semantic,
+            semantic_details: None,
+            repair_hints: Vec::new(),
+            reference_queries: default_reference_queries(code),
         });
+    }
+
+    fn error_with_details(
+        &mut self,
+        range: TextRange,
+        code: &'static str,
+        message: String,
+        semantic_details: serde_json::Value,
+        repair_hints: Vec<RepairHint>,
+        reference_queries: Vec<String>,
+    ) {
+        self.diagnostics.push(Diagnostic {
+            range,
+            severity: DiagnosticSeverity::Error,
+            code,
+            message,
+            source: DiagnosticSource::Semantic,
+            semantic_details: Some(semantic_details),
+            repair_hints,
+            reference_queries,
+        });
+    }
+}
+
+fn text_hints(kind: RepairHintKind, candidates: Vec<String>, range: TextRange) -> Vec<RepairHint> {
+    candidates
+        .into_iter()
+        .map(|candidate| {
+            let mut hint = RepairHint::text(kind, candidate);
+            hint.source_range = Some(webtest_feedback::ByteRange {
+                start: range.start().into(),
+                end: range.end().into(),
+            });
+            hint
+        })
+        .collect()
+}
+
+fn nearest_strings(values: &[String], requested: &str, limit: usize) -> Vec<String> {
+    let mut values = values
+        .iter()
+        .map(|value| (string_edit_distance(value, requested), value.clone()))
+        .collect::<Vec<_>>();
+    values.sort();
+    values
+        .into_iter()
+        .take(limit)
+        .map(|(_, value)| value)
+        .collect()
+}
+
+fn string_edit_distance(left: &str, right: &str) -> usize {
+    let right = right.chars().collect::<Vec<_>>();
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    for (left_index, left_char) in left.chars().enumerate() {
+        let mut current = vec![left_index + 1];
+        for (right_index, right_char) in right.iter().enumerate() {
+            current.push(
+                (previous[right_index + 1] + 1)
+                    .min(current[right_index] + 1)
+                    .min(previous[right_index] + usize::from(left_char != *right_char)),
+            );
+        }
+        previous = current;
+    }
+    previous[right.len()]
+}
+
+fn known_members(ty: &Type) -> Vec<String> {
+    match ty {
+        Type::Record(fields) => fields.keys().cloned().collect(),
+        Type::Response(_) => ["status", "headers", "body", "text", "json"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        Type::ProcessResult => [
+            "exit_code",
+            "stdout",
+            "stderr",
+            "stdout_bytes",
+            "stderr_bytes",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn receiver_type_reference(ty: &Type) -> &'static str {
+    match ty {
+        Type::Unknown => "Json",
+        Type::Null => "Null",
+        Type::Bool => "Bool",
+        Type::Int => "Int",
+        Type::Float => "Float",
+        Type::String => "String",
+        Type::Duration => "Duration",
+        Type::Url => "Url",
+        Type::Json => "Json",
+        Type::List(_) => "List",
+        Type::Option(_) => "Option",
+        Type::Record(_) => "Record",
+        Type::StatusCode => "StatusCode",
+        Type::Headers => "Headers",
+        Type::Bytes => "Bytes",
+        Type::Response(_) => "Response",
+        Type::ProcessResult => "ProcessResult",
+        Type::FilePath => "FilePath",
+        Type::TempDirectory => "TempDirectory",
+        Type::Locator => "Locator",
+        Type::BrowserPage => "BrowserPage",
+    }
+}
+
+fn default_reference_queries(code: &str) -> Vec<String> {
+    match code {
+        "semantic.unknown_provider" | "semantic.reserved_provider" => vec!["provider".into()],
+        "semantic.unknown_provider_operation"
+        | "semantic.unknown_argument"
+        | "semantic.missing_argument"
+        | "semantic.duplicate_argument"
+        | "semantic.conflicting_arguments" => vec!["provider".into()],
+        "semantic.capability_mismatch" => vec!["capability".into(), "language".into()],
+        "semantic.type_mismatch"
+        | "semantic.unknown_type"
+        | "semantic.invalid_type_pattern"
+        | "semantic.non_transferable_value" => vec!["type".into()],
+        "semantic.invalid_matcher" => vec!["assertion.value".into()],
+        _ => Vec::new(),
     }
 }
 
@@ -1519,6 +1801,25 @@ fn browser_origin(operation: &HirBrowserOp) -> SyntaxOrigin {
         | HirBrowserOp::Select(value) => value.origin,
         HirBrowserOp::WaitLocator(value) | HirBrowserOp::ExpectLocator(value) => value.origin,
         HirBrowserOp::WaitUrl(value) | HirBrowserOp::ExpectUrl(value) => value.origin,
+    }
+}
+
+fn browser_reference(operation: &HirBrowserOp) -> &'static str {
+    match operation {
+        HirBrowserOp::Open(_) => "browser.open",
+        HirBrowserOp::Evaluate(_) => "browser.evaluate",
+        HirBrowserOp::Click(_) => "browser.click",
+        HirBrowserOp::Fill(_) => "browser.fill",
+        HirBrowserOp::Type(_) => "browser.type",
+        HirBrowserOp::Press(_) => "browser.press",
+        HirBrowserOp::Check(_) => "browser.check",
+        HirBrowserOp::Uncheck(_) => "browser.uncheck",
+        HirBrowserOp::Select(_) => "browser.select",
+        HirBrowserOp::Hover(_) => "browser.hover",
+        HirBrowserOp::WaitLocator(_) => "browser.wait.locator",
+        HirBrowserOp::WaitUrl(_) => "browser.wait.url",
+        HirBrowserOp::ExpectLocator(_) => "assertion.locator_state",
+        HirBrowserOp::ExpectUrl(_) => "assertion.url",
     }
 }
 
@@ -1693,5 +1994,91 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(database.test_plan(file).expect("plan").tests.len(), 1);
+    }
+
+    #[test]
+    fn machine_diagnostics_preserve_typed_details_references_and_bounded_corrections() {
+        let source = r#"test "machine" {
+            server {
+                let user: { id: Int, email: String } = { id: 1, email: "a@example.test" }
+                let typo = user.emial
+                let response = htp.get("http://example.test")
+                let other = http.gte("http://example.test")
+                let final = http.get("http://example.test", heders: {})
+            }
+        }"#;
+        let mut database = AnalysisDatabase::default();
+        let file = database.open_file("machine.webtest", source);
+        let diagnostics = database.diagnostics(file).expect("diagnostics");
+        let member = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "semantic.unknown_member")
+            .expect("member diagnostic");
+        assert_eq!(
+            member.semantic_details.as_ref().expect("details")["requested"],
+            "emial"
+        );
+        assert!(
+            member
+                .repair_hints
+                .iter()
+                .any(|hint| { hint.replacement == RepairReplacement::text("email") })
+        );
+        assert!(member.reference_queries.contains(&"type.Record".into()));
+
+        let provider = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "semantic.unknown_provider")
+            .expect("provider diagnostic");
+        assert!(
+            provider
+                .repair_hints
+                .iter()
+                .any(|hint| { hint.replacement == RepairReplacement::text("http") })
+        );
+        let operation = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "semantic.unknown_provider_operation")
+            .expect("operation diagnostic");
+        assert!(
+            operation
+                .repair_hints
+                .iter()
+                .any(|hint| { hint.replacement == RepairReplacement::text("get") })
+        );
+        let argument = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "semantic.unknown_argument")
+            .expect("argument diagnostic");
+        assert!(
+            argument
+                .repair_hints
+                .iter()
+                .any(|hint| { hint.replacement == RepairReplacement::text("headers") })
+        );
+    }
+
+    #[test]
+    fn illegal_browser_action_in_server_scope_links_to_the_authoritative_reference() {
+        let mut database = AnalysisDatabase::default();
+        let file = database.open_file(
+            "illegal.webtest",
+            r#"test "illegal" { server { click role("button", name: "Sign in") } }"#,
+        );
+        let diagnostics = database.diagnostics(file).expect("diagnostics");
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == "syntax.expected_server_statement")
+            .expect("server-scope syntax diagnostic");
+        assert!(
+            diagnostic
+                .reference_queries
+                .contains(&"scope.server".into())
+        );
+        assert!(
+            diagnostic
+                .reference_queries
+                .contains(&"browser.click".into())
+        );
     }
 }

@@ -1786,6 +1786,7 @@ dependencies = [
  "webtest-browser-manager",
  "webtest-dap",
  "webtest-editor",
+ "webtest-feedback",
  "webtest-format",
  "webtest-hir",
  "webtest-lsp",
@@ -1802,7 +1803,10 @@ dependencies = [
 name = "webtest-analysis"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "thiserror",
+ "webtest-feedback",
  "webtest-hir",
  "webtest-plan",
  "webtest-provider",
@@ -1816,7 +1820,9 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "serde",
+ "serde_json",
  "thiserror",
+ "webtest-feedback",
 ]
 
 [[package]]
@@ -1832,6 +1838,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tracing",
+ "url",
  "webtest-browser",
 ]
 
@@ -1861,6 +1868,7 @@ dependencies = [
  "tokio",
  "webtest-analysis",
  "webtest-browser",
+ "webtest-feedback",
  "webtest-observation",
  "webtest-plan",
  "webtest-provider",
@@ -1873,6 +1881,7 @@ name = "webtest-editor"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "serde_json",
  "thiserror",
  "tokio",
  "webtest-analysis",
@@ -1884,6 +1893,14 @@ dependencies = [
  "webtest-runtime",
  "webtest-syntax",
  "webtest-text",
+]
+
+[[package]]
+name = "webtest-feedback"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1915,6 +1932,7 @@ dependencies = [
  "webtest-analysis",
  "webtest-browser",
  "webtest-editor",
+ "webtest-feedback",
  "webtest-text",
 ]
 
@@ -1924,6 +1942,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "webtest-browser",
+ "webtest-feedback",
  "webtest-hir",
  "webtest-provider",
  "webtest-text",
@@ -1978,7 +1997,9 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "url",
  "webtest-browser",
+ "webtest-feedback",
  "webtest-hir",
  "webtest-observation",
  "webtest-plan",
@@ -1991,6 +2012,7 @@ name = "webtest-syntax"
 version = "0.1.0"
 dependencies = [
  "rowan",
+ "serde",
  "webtest-text",
 ]
 
@@ -2011,10 +2033,12 @@ dependencies = [
  "serde_json",
  "wasm-bindgen",
  "webtest-analysis",
+ "webtest-feedback",
  "webtest-format",
  "webtest-plan",
  "webtest-provider",
  "webtest-syntax",
+ "webtest-text",
 ]
 
 [[package]]

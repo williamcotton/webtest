@@ -69,12 +69,13 @@ Milestone D includes:
 - persistent bridge, stdio executable, per-call command, and declarative HTTP adapters;
 - runner-managed application start, health check, bridge readiness, and teardown;
 - thin reference SDKs in at least two distinct ecosystems;
+- a runnable cross-language example suite in which real web servers share application state with the bridge;
 - a language-neutral protocol conformance suite;
 - optional framework lifecycle helpers that depend on a core language SDK.
 
 ## 4. Non-goals
 
-This milestone does not execute arbitrary source code named in the DSL, expose a privileged public HTTP endpoint by default, transmit live ORM/browser/process objects, define framework-specific DSL syntax, load arbitrary native plugins into the `webtest` process, provide remote/cloud bridges, implement an agent-specific protocol, or implement mail/database/queue providers. Structured concurrency beyond lifecycle-safe cleanup remains Milestone E.
+This milestone does not execute arbitrary source code named in the DSL, expose a privileged public HTTP endpoint by default, transmit live ORM/browser/process objects, define framework-specific DSL syntax, load arbitrary native plugins into the `webtest` process, provide remote/cloud bridges, implement an agent-specific protocol, or implement mail/database/queue providers. The cross-language examples are not production starter templates or a commitment to support every framework in each ecosystem. Structured concurrency beyond lifecycle-safe cleanup remains Milestone E.
 
 ## 5. Protocol package and compatibility
 
@@ -453,6 +454,50 @@ Do not implement the protocol separately in Express, Nest, Next, Rails, Sinatra,
 
 Reference SDK APIs should feel native while producing identical schemas/messages. Milestone D ships at least two independently implemented SDKs—recommended TypeScript/Node and Ruby—to prove the contract, plus the stdio fixture executable. Generated type packages/templates should make Go, Python, Elixir, JVM, and .NET SDKs straightforward follow-up work.
 
+### 12.1 Cross-language web-server examples
+
+Milestone D ships a visible product example for every host-language family named by this specification, not only protocol-level fixtures. The initial matrix is:
+
+| Directory | Host language/runtime |
+| --- | --- |
+| `examples/application-bridge/node/` | TypeScript on Node.js |
+| `examples/application-bridge/ruby/` | Ruby |
+| `examples/application-bridge/go/` | Go |
+| `examples/application-bridge/python/` | Python |
+| `examples/application-bridge/elixir/` | Elixir |
+| `examples/application-bridge/java/` | Java on the JVM |
+| `examples/application-bridge/dotnet/` | C# on .NET |
+| `examples/application-bridge/rust/` | Rust |
+| `examples/application-bridge/php/` | PHP |
+
+These are runnable application examples, distinct from the transport-independent protocol examples and conformance corpus under `protocol/`. Each directory is a self-contained WebTest project and contains:
+
+- one byte-identical `created-user.webtest` scenario shared by the matrix;
+- a checked-in `.webtest/app-schema.json` so `describe`, `check`, editor features, and WASM analysis work without starting the application;
+- a minimal, conventional HTTP server written in the named host language;
+- bridge registration and startup in that application's test boot path;
+- native dependency and lock files where that ecosystem supports them;
+- a README with exact prerequisites, install, schema-regeneration, check, and test commands.
+
+The common scenario calls `app.create_user`, then signs in through the application's public browser UI. `create_user` must write to the same in-process application store read by the login handler. It must not call a test-only HTTP route, write a canned result, or delegate state to a separately implemented sample server. This demonstrates the defining bridge property: typed fixture code and the web application can use host-language objects internally while only a declared transferable record crosses into WebTest.
+
+All examples expose the same semantic operation schema and browser-observable behavior:
+
+```text
+create_user(email: String, admin?: Bool = false)
+    -> { id: Int, email: String, admin: Bool }
+
+GET /health
+GET /login
+POST /login
+```
+
+Markup, package layout, and server libraries may follow host conventions, but accessible labels, status text, and navigation used by `created-user.webtest` remain equivalent. Each application starts with isolated in-memory state, binds only to loopback, supports runner-owned startup and teardown, and connects outward through the authenticated runner-managed bridge endpoint. Examples use the generic core SDK when one exists. An ecosystem without a published SDK may keep a small example-local binding generated from the canonical protocol types; that binding implements only protocol transport, registration, schema export, validation, and error conversion, and must not parse the DSL or duplicate WebTest semantics. Example-local bindings are not advertised as supported SDK packages.
+
+`examples/application-bridge/README.md` presents the matrix from one entry point, explains which examples use official SDKs versus example-local bindings, and gives a command that selects and runs one host at a time. The existing `examples/simple-server/` remains the built-in `http.*` provider example; it must not be relabeled as an application-bridge example.
+
+Repository checks enforce byte equality of the common `.webtest` scenario, semantic equality of exported operation schemas, and clean deterministic schema regeneration. Each example has an end-to-end smoke job on at least one supported CI platform. Smoke jobs allocate loopback ports dynamically and prove process cleanup; they do not depend on the fixed ports documented for optional manual runs. A missing local host toolchain may produce an explicit skip, but release CI for the example's declared platform may not treat a missing toolchain or bridge connection as success.
+
 ## 13. Runtime and plan integration
 
 `app.*` lowers to the existing Milestone C shape:
@@ -530,7 +575,9 @@ The corpus consists of transport-independent input/output fixtures plus an execu
 6. Add application process/health/bridge lifecycle orchestration.
 7. Build the conformance harness and no-SDK reference executable.
 8. Implement and package the first language SDK, then a structurally different second SDK.
-9. Add editor completion/hover/signature behavior, C.5 description/repair parity, DAP values/failures, examples, and documentation.
+9. Add the shared application-bridge scenario and the Node/Ruby examples using the reference SDKs.
+10. Add the Go, Python, Elixir, Java, .NET, Rust, and PHP web-server examples using generated example-local bindings where an official SDK does not yet exist.
+11. Add editor completion/hover/signature behavior, C.5 description/repair parity, DAP values/failures, the cross-language example matrix, and documentation.
 
 Do not begin framework helper packages until their generic language SDK passes conformance independently.
 
@@ -544,6 +591,8 @@ Milestone D is complete only when:
 4. `webtest describe`, `check`, LSP, and WASM expose the same documented `app.*` signatures, call/member diagnostics, semantic details, repair hints, and completion from `.webtest/app-schema.json` with the applications stopped.
 5. Runtime rejects schema drift, bad authentication, invalid values, malformed frames, and oversized messages with distinct structured failures.
 6. Owned app/bridge processes and endpoints are cleaned after success, timeout, test failure, and DAP termination.
-7. No framework-specific parser, plan operation, runtime branch, or editor semantic model is introduced.
+7. The byte-identical `created-user.webtest` scenario passes against the Node, Ruby, Go, Python, Elixir, Java, .NET, Rust, and PHP web-server examples, with `app.create_user` mutating the same application state used by each login handler.
+8. Every cross-language example regenerates the same semantic operation schema deterministically, can be checked while stopped, has reproducible run instructions, and has an end-to-end CI smoke job that verifies cleanup.
+9. No framework-specific parser, plan operation, runtime branch, or editor semantic model is introduced.
 
-The roadmap acceptance statement is thereby satisfied: different language stacks and a no-SDK executable expose the same typed application function through one stable bridge protocol.
+The roadmap acceptance statement is thereby satisfied: different language stacks and a no-SDK executable expose the same typed application function through one stable bridge protocol. The broader example matrix additionally demonstrates that the contract is practical across the host-language families named by this milestone.

@@ -11,11 +11,16 @@ use std::{
 
 use clap::{Parser, Subcommand, ValueEnum};
 use report::{
-    CommandReport, DiagnosticReport, EventReport, ExitClass, FailureReport, FileReport, Reporter,
-    SourceSpanReport, TestReport, WarningReport,
+    ByteRangeReport, CommandReport, DiagnosticReport, EventReport, ExitClass, FailureReport,
+    FileReport, MachineSourceReport, Reporter, SourceSpanReport, TestReport, WarningReport,
 };
-use webtest_analysis::{AnalysisDatabase, Diagnostic, DiagnosticSeverity};
-use webtest_browser::{BrowserContextOptions, BrowserError, Locator, Viewport};
+use webtest_analysis::{
+    AnalysisDatabase, DescriptionLimits, DescriptionProject, DescriptionRequest,
+    DescriptionResponse, Diagnostic, DiagnosticSeverity,
+};
+use webtest_browser::{
+    BrowserContextOptions, BrowserError, BrowserHost, InspectionOptions, Locator, Viewport,
+};
 use webtest_browser_cdp::{ChromeHost, find_system_chrome};
 use webtest_browser_manager::{BrowserManager, BrowserManagerError};
 use webtest_observation::{ExecutionEvent, ObservationStore, RuntimeFailure};
@@ -27,7 +32,7 @@ use webtest_project::{DiscoveredFile, Project};
 use webtest_provider::{
     Capability, FsProviderConfig, HttpProviderConfig, NativeProviderConfig, ProcessProviderConfig,
 };
-use webtest_runtime::{EvidenceOptions, RunError, Runner, RunnerOptions, StepError};
+use webtest_runtime::{EvidenceOptions, RunError, Runner, RunnerOptions, StepError, StepFailure};
 use webtest_text::{SourceRevision, TextRange};
 
 #[derive(Parser)]
@@ -73,6 +78,28 @@ enum Command {
         headed: bool,
         #[arg(long, value_enum, default_value_t = TestReporter::Human)]
         reporter: TestReporter,
+    },
+    /// Inspect the semantic interaction and assertion surface of one page.
+    Inspect {
+        url: Option<String>,
+        #[arg(long)]
+        chrome_path: Option<PathBuf>,
+        /// Show the Chrome window while inspecting.
+        #[arg(long)]
+        headed: bool,
+        #[arg(long, value_enum, default_value_t = ReferenceReporter::Human)]
+        reporter: ReferenceReporter,
+    },
+    /// Describe the installed language and project-visible provider surface.
+    Describe {
+        #[arg(conflicts_with = "search")]
+        query: Option<String>,
+        #[arg(long, conflicts_with = "query")]
+        search: Option<String>,
+        #[arg(long)]
+        project: Option<PathBuf>,
+        #[arg(long, value_enum, default_value_t = ReferenceReporter::Human)]
+        reporter: ReferenceReporter,
     },
     /// Install and inspect managed Chrome for Testing versions.
     Browser {
@@ -136,6 +163,12 @@ enum TestReporter {
     Json,
     Junit,
     Events,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ReferenceReporter {
+    Human,
+    Json,
 }
 
 impl From<TestReporter> for Reporter {
@@ -234,6 +267,18 @@ async fn run(cli: Cli) -> Result<ExitClass, AppError> {
             write_report(&report, reporter.into())?;
             Ok(report.exit_class)
         }
+        Command::Inspect {
+            url,
+            chrome_path,
+            headed,
+            reporter,
+        } => inspect_page(url.as_deref(), chrome_path, headed, reporter).await,
+        Command::Describe {
+            query,
+            search,
+            project: project_path,
+            reporter,
+        } => describe_reference(query, search, project_path.as_deref(), reporter),
         Command::Browser { command } => browser_command(command),
         Command::Lsp { chrome_path } => {
             let project = project(&[])?;
@@ -276,6 +321,267 @@ fn project(paths: &[PathBuf]) -> Result<Project, AppError> {
     webtest_project::discover(paths).map_err(AppError::usage)
 }
 
+async fn inspect_page(
+    requested_url: Option<&str>,
+    chrome_path: Option<PathBuf>,
+    headed: bool,
+    reporter: ReferenceReporter,
+) -> Result<ExitClass, AppError> {
+    let project = project(&[])?;
+    let requested_url = requested_url
+        .or(project.config.browser.base_url.as_deref())
+        .ok_or_else(|| AppError::usage("inspect requires a URL or configured browser.base_url"))?;
+    let url = webtest_runtime::resolve_browser_url(
+        project.config.browser.base_url.as_deref(),
+        requested_url,
+    )
+    .map_err(AppError::usage)?;
+    let resolved = resolve_chrome(&project, chrome_path)?;
+    let host = ChromeHost::new(Some(resolved.path))
+        .with_headed(headed || !project.config.browser.headless)
+        .with_timeouts(
+            project.config.timeouts.browser_command,
+            project.config.timeouts.navigation,
+        );
+    let mut session = host.start().await.map_err(AppError::infrastructure)?;
+    let context_options = BrowserContextOptions {
+        viewport: Viewport {
+            width: project.config.browser.viewport.width,
+            height: project.config.browser.viewport.height,
+        },
+        test_id_attribute: project.config.browser.test_id_attribute.clone(),
+    };
+    let mut context = match session.new_context(&context_options).await {
+        Ok(context) => context,
+        Err(error) => {
+            let _ = session.close().await;
+            return Err(AppError::infrastructure(error));
+        }
+    };
+    let mut page = match context.new_page().await {
+        Ok(page) => page,
+        Err(error) => {
+            let _ = context.close().await;
+            let _ = session.close().await;
+            return Err(AppError::infrastructure(error));
+        }
+    };
+    let primary = match page.open(&url).await {
+        Ok(()) => {
+            page.inspect(&InspectionOptions {
+                max_elements: project.config.inspection.max_elements,
+                max_candidates_per_element: project.config.inspection.max_candidates_per_element,
+                max_text_bytes: project.config.inspection.max_text_bytes,
+                include_hidden: project.config.inspection.include_hidden,
+                redacted_query_parameters: project.config.redaction.query_params.clone(),
+                redacted_values: Vec::new(),
+            })
+            .await
+        }
+        Err(error) => Err(error),
+    };
+    drop(page);
+    let context_cleanup = context.close().await;
+    let session_cleanup = session.close().await;
+    let inspection = primary.map_err(AppError::infrastructure)?;
+    context_cleanup.map_err(AppError::infrastructure)?;
+    session_cleanup.map_err(AppError::infrastructure)?;
+
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    match reporter {
+        ReferenceReporter::Json => {
+            serde_json::to_writer_pretty(&mut output, &inspection)
+                .map_err(AppError::infrastructure)?;
+            writeln!(output).map_err(AppError::infrastructure)?;
+        }
+        ReferenceReporter::Human => {
+            writeln!(
+                output,
+                "{} — {}",
+                inspection.page.url, inspection.page.title
+            )
+            .map_err(AppError::infrastructure)?;
+            for element in &inspection.elements {
+                let actions = element
+                    .supported_actions
+                    .iter()
+                    .map(|action| format!("{action:?}").to_ascii_lowercase())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let description = match (&element.role, &element.accessible_name) {
+                    (Some(role), Some(name)) => format!("{role} {name:?}"),
+                    (Some(role), None) => role.clone(),
+                    (None, Some(name)) => format!("text {name:?}"),
+                    (None, None) => "element".into(),
+                };
+                writeln!(
+                    output,
+                    "  {:<44} {:<24} {}",
+                    element.preferred_locator.source, description, actions
+                )
+                .map_err(AppError::infrastructure)?;
+            }
+            if inspection.truncation.elements_truncated {
+                writeln!(
+                    output,
+                    "  … {} additional semantic element(s) omitted",
+                    inspection.truncation.omitted_elements
+                )
+                .map_err(AppError::infrastructure)?;
+            }
+        }
+    }
+    Ok(ExitClass::Success)
+}
+
+fn describe_reference(
+    query: Option<String>,
+    search: Option<String>,
+    project_path: Option<&Path>,
+    reporter: ReferenceReporter,
+) -> Result<ExitClass, AppError> {
+    let project_input = if let Some(path) = project_path {
+        Some(path.to_path_buf())
+    } else {
+        std::env::current_dir()
+            .map_err(AppError::usage)?
+            .ancestors()
+            .find(|directory| directory.join("webtest.toml").is_file())
+            .map(Path::to_path_buf)
+    };
+    let resolved_project = project_input
+        .as_ref()
+        .map(|path| webtest_project::discover(std::slice::from_ref(path)));
+    let (project_reference, limits) = match resolved_project {
+        Some(Ok(project)) => {
+            let configuration = project
+                .config_path
+                .as_deref()
+                .map(read_source)
+                .transpose()?
+                .unwrap_or_default();
+            (
+                Some(DescriptionProject {
+                    root: normalized_path(&project.root),
+                    configuration_revision: revision_hex(SourceRevision::of(&configuration)),
+                }),
+                DescriptionLimits {
+                    max_category_children: project.config.description.max_category_children,
+                    max_search_results: project.config.description.max_search_results,
+                    max_summary_bytes: project.config.description.max_summary_bytes,
+                    max_guidance_entries: project.config.description.max_guidance_entries,
+                    max_examples: project.config.description.max_examples,
+                    max_example_bytes: project.config.description.max_example_bytes,
+                },
+            )
+        }
+        Some(Err(error)) => {
+            eprintln!("warning[description.project]: {error}");
+            (None, DescriptionLimits::default())
+        }
+        None => (None, DescriptionLimits::default()),
+    };
+    let request = if let Some(search) = search {
+        DescriptionRequest::Search(search)
+    } else if let Some(query) = query {
+        DescriptionRequest::Query(query)
+    } else {
+        DescriptionRequest::Index
+    };
+    let response = AnalysisDatabase::default().describe(request, project_reference, limits);
+    let failed = matches!(response, DescriptionResponse::Diagnostic(_));
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    match reporter {
+        ReferenceReporter::Json => {
+            serde_json::to_writer_pretty(&mut output, &response)
+                .map_err(AppError::infrastructure)?;
+            writeln!(output).map_err(AppError::infrastructure)?;
+        }
+        ReferenceReporter::Human => write_description_human(&response, &mut output)?,
+    }
+    Ok(if failed {
+        ExitClass::Usage
+    } else {
+        ExitClass::Success
+    })
+}
+
+fn write_description_human(
+    response: &DescriptionResponse,
+    output: &mut dyn Write,
+) -> Result<(), AppError> {
+    match response {
+        DescriptionResponse::Index(index) => {
+            writeln!(output, "WebTest {} reference", index.language_version)
+                .map_err(AppError::infrastructure)?;
+            for (category, children) in &index.categories {
+                writeln!(output, "{category}").map_err(AppError::infrastructure)?;
+                for child in children {
+                    writeln!(output, "  {child}").map_err(AppError::infrastructure)?;
+                }
+            }
+        }
+        DescriptionResponse::Language(language) => {
+            writeln!(output, "WebTest {} language", language.language_version)
+                .map_err(AppError::infrastructure)?;
+            for (rule, syntax) in &language.language.grammar {
+                writeln!(output, "  {rule:<20} {syntax}").map_err(AppError::infrastructure)?;
+            }
+        }
+        DescriptionResponse::Grammar(grammar) => {
+            for (rule, syntax) in &grammar.grammar {
+                writeln!(output, "{rule:<20} {syntax}").map_err(AppError::infrastructure)?;
+            }
+        }
+        DescriptionResponse::Category(category) => {
+            writeln!(output, "{} — {}", category.id, category.summary)
+                .map_err(AppError::infrastructure)?;
+            for child in &category.children {
+                writeln!(output, "  {child}").map_err(AppError::infrastructure)?;
+            }
+        }
+        DescriptionResponse::Construct(construct) => {
+            writeln!(output, "{}\n  {}", construct.id, construct.syntax)
+                .map_err(AppError::infrastructure)?;
+            writeln!(output, "\n{}", construct.summary).map_err(AppError::infrastructure)?;
+            if !construct.allowed_contexts.is_empty() {
+                writeln!(
+                    output,
+                    "contexts: {}",
+                    construct.allowed_contexts.join(", ")
+                )
+                .map_err(AppError::infrastructure)?;
+            }
+            for example in &construct.examples {
+                writeln!(
+                    output,
+                    "\n{}:\n  {}",
+                    example.name,
+                    example.source.replace('\n', "\n  ")
+                )
+                .map_err(AppError::infrastructure)?;
+            }
+        }
+        DescriptionResponse::Search(search) => {
+            for result in &search.results {
+                writeln!(
+                    output,
+                    "{:<32} {:<44} {}",
+                    result.id, result.syntax, result.summary
+                )
+                .map_err(AppError::infrastructure)?;
+            }
+        }
+        DescriptionResponse::Diagnostic(diagnostic) => {
+            writeln!(output, "error[{}]: {}", diagnostic.code, diagnostic.message)
+                .map_err(AppError::infrastructure)?;
+        }
+    }
+    Ok(())
+}
+
 fn check_project(project: &Project) -> Result<CommandReport, AppError> {
     let mut report = base_report("check", project);
     for file in &project.files {
@@ -285,10 +591,23 @@ fn check_project(project: &Project) -> Result<CommandReport, AppError> {
         let diagnostics = database.diagnostics(file_id).map_err(AppError::internal)?;
         let mut diagnostics = diagnostics
             .iter()
-            .map(|diagnostic| diagnostic_report(&source, diagnostic))
+            .map(|diagnostic| {
+                diagnostic_report(
+                    &display_path(file),
+                    &revision_hex(SourceRevision::of(&source)),
+                    &source,
+                    diagnostic,
+                )
+            })
             .collect::<Vec<_>>();
         let plan = database.test_plan(file_id).map_err(AppError::internal)?;
-        diagnostics.extend(config_diagnostics(project, &source, &plan));
+        diagnostics.extend(config_diagnostics(
+            project,
+            &display_path(file),
+            &revision_hex(SourceRevision::of(&source)),
+            &source,
+            &plan,
+        ));
         if diagnostics
             .iter()
             .any(|diagnostic| diagnostic.severity == "error")
@@ -588,10 +907,23 @@ async fn test_project(
         let diagnostics = database.diagnostics(file_id).map_err(AppError::internal)?;
         let mut diagnostic_reports = diagnostics
             .iter()
-            .map(|diagnostic| diagnostic_report(&source, diagnostic))
+            .map(|diagnostic| {
+                diagnostic_report(
+                    &display_path(file),
+                    &revision_hex(revision),
+                    &source,
+                    diagnostic,
+                )
+            })
             .collect::<Vec<_>>();
         let plan = database.test_plan(file_id).map_err(AppError::internal)?;
-        diagnostic_reports.extend(config_diagnostics(project, &source, &plan));
+        diagnostic_reports.extend(config_diagnostics(
+            project,
+            &display_path(file),
+            &revision_hex(revision),
+            &source,
+            &plan,
+        ));
         if diagnostic_reports
             .iter()
             .any(|diagnostic| diagnostic.severity == "error")
@@ -639,11 +971,17 @@ async fn test_project(
                 }
                 Err(error) => {
                     file_report.infrastructure_error = Some(FailureReport {
+                        diagnostic_schema_version: webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
+                        repair_hint_schema_version: webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
                         code: "runtime.browser_launch".into(),
                         message: error.message,
                         span: None,
                         diff: None,
                         artifacts: Vec::new(),
+                        semantic_details: None,
+                        repair_hints: Vec::new(),
+                        page: None,
+                        secondary: Vec::new(),
                     });
                     file_report.duration_nanos = nanos(started.elapsed());
                     report.exit_class = report.exit_class.combine(ExitClass::Infrastructure);
@@ -660,6 +998,8 @@ async fn test_project(
         match run {
             Err(_) => {
                 file_report.infrastructure_error = Some(FailureReport {
+                    diagnostic_schema_version: webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
+                    repair_hint_schema_version: webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
                     code: "runtime.test_timeout".into(),
                     message: format!(
                         "test file exceeded its {}ms timeout",
@@ -668,17 +1008,31 @@ async fn test_project(
                     span: None,
                     diff: None,
                     artifacts: Vec::new(),
+                    semantic_details: Some(serde_json::json!({
+                        "timeout_ms": project.config.timeouts.test.as_millis(),
+                    })),
+                    repair_hints: Vec::new(),
+                    page: None,
+                    secondary: Vec::new(),
                 });
                 report.exit_class = report.exit_class.combine(ExitClass::Infrastructure);
                 file_report.exit_class = ExitClass::Infrastructure;
             }
             Ok(Err(error)) => {
                 file_report.infrastructure_error = Some(FailureReport {
+                    diagnostic_schema_version: webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
+                    repair_hint_schema_version: webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
                     code: run_error_code(&error),
                     message: run_error_message(&error),
                     span: None,
                     diff: None,
                     artifacts: Vec::new(),
+                    semantic_details: Some(serde_json::json!({
+                        "failure_class": "infrastructure",
+                    })),
+                    repair_hints: Vec::new(),
+                    page: None,
+                    secondary: Vec::new(),
                 });
                 report.exit_class = report.exit_class.combine(ExitClass::Infrastructure);
                 file_report.exit_class = ExitClass::Infrastructure;
@@ -690,20 +1044,9 @@ async fn test_project(
                     .tests
                     .into_iter()
                     .map(|test| {
-                        let failure = test.failure.map(|failure| FailureReport {
-                            code: step_error_code(&failure.error),
-                            message: failure.error.to_string(),
-                            span: Some(source_span(&source, failure.step.origin.range)),
-                            diff: match &failure.error {
-                                StepError::Assertion(error) => Some(error.diff.clone()),
-                                _ => None,
-                            },
-                            artifacts: failure
-                                .artifacts
-                                .into_iter()
-                                .map(|artifact| normalized_path(&artifact.path))
-                                .collect(),
-                        });
+                        let failure = test
+                            .failure
+                            .map(|failure| step_failure_report(failure, &source));
                         TestReport {
                             name: test.name,
                             exit_class: if test.passed {
@@ -790,6 +1133,14 @@ fn runner_options(project: &Project) -> RunnerOptions {
                 read_roots: project.config.server.fs.read_roots.clone(),
                 write_root: project.config.server.fs.write_root.clone(),
             },
+        },
+        inspection: InspectionOptions {
+            max_elements: project.config.inspection.max_elements,
+            max_candidates_per_element: project.config.inspection.max_candidates_per_element,
+            max_text_bytes: project.config.inspection.max_text_bytes,
+            include_hidden: project.config.inspection.include_hidden,
+            redacted_query_parameters: project.config.redaction.query_params.clone(),
+            redacted_values: Vec::new(),
         },
     }
 }
@@ -946,8 +1297,16 @@ fn read_source(path: &Path) -> Result<String, AppError> {
         .map_err(|error| AppError::usage(format!("could not read {}: {error}", path.display())))
 }
 
-fn diagnostic_report(source: &str, diagnostic: &Diagnostic) -> DiagnosticReport {
+fn diagnostic_report(
+    path: &str,
+    source_revision: &str,
+    source: &str,
+    diagnostic: &Diagnostic,
+) -> DiagnosticReport {
+    let span = source_span(source, diagnostic.range);
     DiagnosticReport {
+        diagnostic_schema_version: webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
+        repair_hint_schema_version: webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
         severity: match diagnostic.severity {
             DiagnosticSeverity::Error => "error",
             DiagnosticSeverity::Warning => "warning",
@@ -957,11 +1316,21 @@ fn diagnostic_report(source: &str, diagnostic: &Diagnostic) -> DiagnosticReport 
         .into(),
         code: diagnostic.code.into(),
         message: diagnostic.message.clone(),
-        span: source_span(source, diagnostic.range),
+        source: machine_source(path, source_revision, &span),
+        span,
+        semantic_details: diagnostic.semantic_details.clone(),
+        repair_hints: diagnostic.repair_hints.clone(),
+        reference_queries: diagnostic.reference_queries.clone(),
     }
 }
 
-fn config_diagnostics(project: &Project, source: &str, plan: &TestPlan) -> Vec<DiagnosticReport> {
+fn config_diagnostics(
+    project: &Project,
+    path: &str,
+    source_revision: &str,
+    source: &str,
+    plan: &TestPlan,
+) -> Vec<DiagnosticReport> {
     let mut diagnostics = Vec::new();
     for test in &plan.tests {
         for step in &test.steps {
@@ -983,19 +1352,42 @@ fn config_diagnostics(project: &Project, source: &str, plan: &TestPlan) -> Vec<D
                 && !is_absolute_config_url(url)
                 && project.config.browser.base_url.is_none()
             {
+                let span = source_span(source, step.origin.range);
                 diagnostics.push(DiagnosticReport {
+                    diagnostic_schema_version: webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
+                    repair_hint_schema_version: webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
                     severity: "error".into(),
                     code: "config.missing_base_url".into(),
                     message: format!("relative URL {url:?} requires browser.base_url"),
-                    span: source_span(source, step.origin.range),
+                    source: machine_source(path, source_revision, &span),
+                    span,
+                    semantic_details: Some(serde_json::json!({
+                        "url": url,
+                        "required_configuration": "browser.base_url",
+                    })),
+                    repair_hints: Vec::new(),
+                    reference_queries: vec!["browser.open".into()],
                 });
             }
             if timeout.is_some_and(|timeout| timeout > project.config.timeouts.test) {
+                let span = source_span(source, step.origin.range);
                 diagnostics.push(DiagnosticReport {
+                    diagnostic_schema_version: webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
+                    repair_hint_schema_version: webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
                     severity: "error".into(),
                     code: "config.timeout_exceeds_test".into(),
                     message: "step timeout must not exceed timeouts.test".into(),
-                    span: source_span(source, step.origin.range),
+                    source: machine_source(path, source_revision, &span),
+                    span,
+                    semantic_details: Some(serde_json::json!({
+                        "test_timeout_ms": project.config.timeouts.test.as_millis(),
+                        "step_timeout_ms": timeout.map(|timeout| timeout.as_millis()),
+                    })),
+                    repair_hints: Vec::new(),
+                    reference_queries: vec![
+                        "browser.wait.locator".into(),
+                        "browser.wait.url".into(),
+                    ],
                 });
             }
         }
@@ -1023,13 +1415,51 @@ fn literal_string(expression: &webtest_plan::PlanExpr) -> Option<&str> {
 
 fn source_span(source: &str, range: TextRange) -> SourceSpanReport {
     let (line, column, line_text, width) = line_details(source, range);
+    let end_offset =
+        floor_char_boundary(source, (u32::from(range.end()) as usize).min(source.len()));
+    let (end_line, end_column) = offset_line_column(source, end_offset);
     SourceSpanReport {
         line: line + 1,
         column: column + 1,
         source_line: line_text.into(),
         underline_start: column,
         underline_width: width.max(1),
+        end_line: end_line + 1,
+        end_column: end_column + 1,
+        byte_start: range.start().into(),
+        byte_end: range.end().into(),
     }
+}
+
+fn machine_source(
+    path: &str,
+    source_revision: &str,
+    span: &SourceSpanReport,
+) -> MachineSourceReport {
+    MachineSourceReport {
+        path: path.into(),
+        source_revision: source_revision.into(),
+        byte_range: ByteRangeReport {
+            start: span.byte_start,
+            end: span.byte_end,
+        },
+        start_line: span.line,
+        start_column: span.column,
+        end_line: span.end_line,
+        end_column: span.end_column,
+    }
+}
+
+fn offset_line_column(source: &str, offset: usize) -> (usize, usize) {
+    let line_start = source[..offset]
+        .rfind('\n')
+        .map_or(0, |line_break| line_break + 1);
+    let line = source[..line_start]
+        .chars()
+        .filter(|character| *character == '\n')
+        .count();
+    let column = source[line_start..offset].chars().count();
+    (line, column)
 }
 
 fn line_details(source: &str, range: TextRange) -> (usize, usize, &str, usize) {
@@ -1084,6 +1514,7 @@ fn runtime_code(error: &BrowserError) -> &'static str {
         BrowserError::Protocol { .. } => "runtime.browser_protocol",
         BrowserError::Launch(_) => "runtime.browser_launch",
         BrowserError::EvaluationFailed { .. } => "runtime.evaluation_failed",
+        BrowserError::UnsupportedCapability { .. } => "runtime.unsupported_browser_capability",
     }
 }
 
@@ -1131,6 +1562,123 @@ fn step_error_code(error: &StepError) -> String {
     match error {
         StepError::Browser(error) => runtime_code(error).into(),
         _ => format!("runtime.{}", error.code()),
+    }
+}
+
+fn step_failure_report(mut failure: StepFailure, source: &str) -> FailureReport {
+    let range = failure.step.origin.range;
+    for hint in &mut failure.repair_hints {
+        if hint.source_range.is_none() {
+            hint.source_range = Some(webtest_feedback::ByteRange {
+                start: range.start().into(),
+                end: range.end().into(),
+            });
+        }
+    }
+    let semantic_details = step_semantic_details(&failure);
+    let page = failure
+        .inspection
+        .as_ref()
+        .map(|inspection| inspection.page.clone())
+        .or_else(|| {
+            failure
+                .evidence
+                .current_url
+                .as_ref()
+                .map(|url| webtest_browser::PageSummary {
+                    url: url.clone(),
+                    title: failure.evidence.title.clone().unwrap_or_default(),
+                })
+        });
+    FailureReport {
+        diagnostic_schema_version: webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
+        repair_hint_schema_version: webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
+        code: step_error_code(&failure.error),
+        message: failure.error.to_string(),
+        span: Some(source_span(source, range)),
+        diff: match &failure.error {
+            StepError::Assertion(error) => Some(error.diff.clone()),
+            _ => None,
+        },
+        artifacts: failure
+            .artifacts
+            .into_iter()
+            .map(|artifact| normalized_path(&artifact.path))
+            .collect(),
+        semantic_details,
+        repair_hints: failure.repair_hints,
+        page,
+        secondary: failure.secondary_failures,
+    }
+}
+
+fn step_semantic_details(failure: &StepFailure) -> Option<serde_json::Value> {
+    match &failure.error {
+        StepError::Browser(error) => {
+            let locator = browser_error_locator(error);
+            let requested = locator.map(ToString::to_string);
+            let target = locator.and_then(|locator| {
+                let source = locator.to_string();
+                failure
+                    .inspection
+                    .as_ref()?
+                    .elements
+                    .iter()
+                    .find(|element| {
+                        element.preferred_locator.source == source
+                            || element
+                                .alternate_locators
+                                .iter()
+                                .any(|candidate| candidate.source == source)
+                    })
+            });
+            Some(serde_json::json!({
+                "code": error.code(),
+                "requested": requested.map(|source| serde_json::json!({"source": source})),
+                "states": target.map(|target| &target.states),
+                "supported_actions": target.map(|target| &target.supported_actions),
+                "available_options": target.map(|target| &target.options),
+                "actionability": failure.evidence.actionability,
+                "nearby_candidates": failure.evidence.candidates,
+            }))
+        }
+        StepError::Provider(error) => Some(serde_json::json!({
+            "provider_error_code": error.code(),
+        })),
+        StepError::Assertion(error) => Some(serde_json::json!({
+            "matcher": format!("{:?}", error.matcher).to_ascii_lowercase(),
+            "expected": error.expected,
+            "actual": error.actual,
+        })),
+        StepError::Decode(error) => Some(serde_json::json!({
+            "path": error.path,
+            "expected_type": error.expected.to_string(),
+            "actual": error.actual,
+            "response_operation": error.response_operation,
+        })),
+        StepError::Evaluation(error) => Some(serde_json::json!({
+            "evaluation_code": error.code,
+        })),
+        StepError::Internal(_) => None,
+    }
+}
+
+fn browser_error_locator(error: &BrowserError) -> Option<&Locator> {
+    match error {
+        BrowserError::LocatorNotFound { locator }
+        | BrowserError::LocatorAmbiguous { locator, .. }
+        | BrowserError::LocatorInvalid { locator, .. }
+        | BrowserError::ElementDetached { locator }
+        | BrowserError::LocatorNotVisible { locator }
+        | BrowserError::ElementUnstable { locator }
+        | BrowserError::ElementDisabled { locator }
+        | BrowserError::ElementObscured { locator }
+        | BrowserError::ElementNotEditable { locator }
+        | BrowserError::OptionNotFound { locator, .. }
+        | BrowserError::OptionAmbiguous { locator, .. }
+        | BrowserError::ActionTimeout { locator, .. }
+        | BrowserError::AssertionFailed { locator, .. } => Some(locator),
+        _ => None,
     }
 }
 
@@ -1245,6 +1793,8 @@ fn event_reports(path: &str, events: &[ExecutionEvent]) -> Vec<EventReport> {
                 test_id,
                 step_id,
                 failure,
+                repair_hints,
+                page,
             } => {
                 let mut event = event_report(
                     path,
@@ -1259,6 +1809,11 @@ fn event_reports(path: &str, events: &[ExecutionEvent]) -> Vec<EventReport> {
                 if let RuntimeFailure::Assertion { diff, .. } = failure {
                     event.diff = Some(diff.clone());
                 }
+                event.repair_hints = repair_hints.clone();
+                event.page = page.clone();
+                event.diagnostic_schema_version = Some(webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION);
+                event.repair_hint_schema_version =
+                    Some(webtest_feedback::REPAIR_HINT_SCHEMA_VERSION);
                 event
             }
             ExecutionEvent::TestFinished {
@@ -1324,7 +1879,11 @@ fn event_report(
         exit_class: None,
         code: None,
         message: None,
+        diagnostic_schema_version: None,
+        repair_hint_schema_version: None,
         diff: None,
+        repair_hints: Vec::new(),
+        page: None,
     }
 }
 

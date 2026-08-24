@@ -1,0 +1,19 @@
+[project]
+name = "semantic-discovery"
+test_roots = ["tests"]
+
+[browser]
+base_url = "http://127.0.0.1:3010"
+test_id_attribute = "data-testid"
+
+[inspection]
+max_elements = 100
+max_candidates_per_element = 4
+max_text_bytes = 256
+include_hidden = false
+
+[redaction]
+headers = ["authorization", "cookie", "set-cookie"]
+json_fields = ["password", "token", "secret"]
+query_params = ["token", "code", "key"]
+

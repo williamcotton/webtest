@@ -109,6 +109,12 @@ impl EditorService {
                         code,
                         message,
                         locator,
+                        page_url,
+                        candidates,
+                        actionability,
+                        artifacts,
+                        elapsed_ms,
+                        repair_hints,
                         ..
                     } => Diagnostic {
                         range: observation.range,
@@ -116,6 +122,21 @@ impl EditorService {
                         code: runtime_diagnostic_code(&code),
                         message: friendly_runtime_message(&code, locator.as_ref(), &message),
                         source: DiagnosticSource::Runtime,
+                        semantic_details: Some(serde_json::json!({
+                            "requested_locator": locator.as_ref().map(ToString::to_string),
+                            "page_url": page_url,
+                            "candidates": candidates,
+                            "actionability": actionability,
+                            "artifacts": artifacts,
+                            "elapsed_ms": elapsed_ms,
+                        })),
+                        repair_hints,
+                        reference_queries: locator
+                            .as_ref()
+                            .map(locator_reference_query)
+                            .into_iter()
+                            .map(str::to_owned)
+                            .collect(),
                     },
                     RuntimeObservationKind::ValueFailure {
                         code,
@@ -126,10 +147,10 @@ impl EditorService {
                         diff: _,
                     } => {
                         let mut details = message;
-                        if let Some(path) = path {
+                        if let Some(path) = &path {
                             details.push_str(&format!(" Path: {path}."));
                         }
-                        if let (Some(expected), Some(actual)) = (expected, actual) {
+                        if let (Some(expected), Some(actual)) = (&expected, &actual) {
                             details.push_str(&format!(" Expected {expected}; got {actual}."));
                         }
                         Diagnostic {
@@ -138,6 +159,13 @@ impl EditorService {
                             code: value_runtime_diagnostic_code(&code),
                             message: details,
                             source: DiagnosticSource::Runtime,
+                            semantic_details: Some(serde_json::json!({
+                                "path": path,
+                                "expected": expected,
+                                "actual": actual,
+                            })),
+                            repair_hints: Vec::new(),
+                            reference_queries: vec!["assertion.value".into()],
                         }
                     }
                     RuntimeObservationKind::LocatorNotFound { locator, .. } => Diagnostic {
@@ -149,6 +177,11 @@ impl EditorService {
                             locator_description(&locator)
                         ),
                         source: DiagnosticSource::Runtime,
+                        semantic_details: Some(serde_json::json!({
+                            "requested_locator": locator.to_string(),
+                        })),
+                        repair_hints: Vec::new(),
+                        reference_queries: vec![locator_reference_query(&locator).into()],
                     },
                     RuntimeObservationKind::LocatorAmbiguous {
                         locator, matches, ..
@@ -160,6 +193,12 @@ impl EditorService {
                             "The locator {locator} matched {matches} elements during the last test run."
                         ),
                         source: DiagnosticSource::Runtime,
+                        semantic_details: Some(serde_json::json!({
+                            "requested_locator": locator.to_string(),
+                            "matches": matches,
+                        })),
+                        repair_hints: Vec::new(),
+                        reference_queries: vec![locator_reference_query(&locator).into()],
                     },
                     RuntimeObservationKind::LocatorNotVisible { locator, .. } => Diagnostic {
                         range: observation.range,
@@ -170,6 +209,12 @@ impl EditorService {
                             locator_description(&locator)
                         ),
                         source: DiagnosticSource::Runtime,
+                        semantic_details: Some(serde_json::json!({
+                            "requested_locator": locator.to_string(),
+                            "visible": false,
+                        })),
+                        repair_hints: Vec::new(),
+                        reference_queries: vec![locator_reference_query(&locator).into()],
                     },
                 }),
         );
@@ -312,6 +357,19 @@ fn locator_description(locator: &Locator) -> String {
         Locator::Id(value) => format!("id {value:?}"),
         Locator::Text(value) => format!("text {value:?}"),
         _ => locator.to_string(),
+    }
+}
+
+fn locator_reference_query(locator: &Locator) -> &'static str {
+    match locator {
+        Locator::Id(_) => "locator.id",
+        Locator::Role { .. } => "locator.role",
+        Locator::Label(_) => "locator.label",
+        Locator::Text(_) => "locator.text",
+        Locator::Placeholder(_) => "locator.placeholder",
+        Locator::TestId(_) => "locator.test_id",
+        Locator::Css(_) => "locator.css",
+        Locator::XPath(_) => "locator.xpath",
     }
 }
 

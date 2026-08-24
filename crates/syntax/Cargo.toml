@@ -6,5 +6,5 @@ license.workspace = true
 
 [dependencies]
 rowan.workspace = true
+serde.workspace = true
 webtest-text.workspace = true
-

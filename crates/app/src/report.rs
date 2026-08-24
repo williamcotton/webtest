@@ -1,6 +1,9 @@
 use std::io::{self, Write};
 
 use serde::Serialize;
+use serde_json::Value;
+use webtest_browser::PageSummary;
+use webtest_feedback::RepairHint;
 use webtest_observation::ValueDiff;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
@@ -67,10 +70,19 @@ pub struct FileReport {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct DiagnosticReport {
+    pub diagnostic_schema_version: u32,
+    pub repair_hint_schema_version: u32,
     pub severity: String,
     pub code: String,
     pub message: String,
     pub span: SourceSpanReport,
+    pub source: MachineSourceReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_details: Option<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repair_hints: Vec<RepairHint>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reference_queries: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -84,6 +96,8 @@ pub struct TestReport {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct FailureReport {
+    pub diagnostic_schema_version: u32,
+    pub repair_hint_schema_version: u32,
     pub code: String,
     pub message: String,
     pub span: Option<SourceSpanReport>,
@@ -91,6 +105,31 @@ pub struct FailureReport {
     pub diff: Option<ValueDiff>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic_details: Option<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repair_hints: Vec<RepairHint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page: Option<PageSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secondary: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MachineSourceReport {
+    pub path: String,
+    pub source_revision: String,
+    pub byte_range: ByteRangeReport,
+    pub start_line: usize,
+    pub start_column: usize,
+    pub end_line: usize,
+    pub end_column: usize,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct ByteRangeReport {
+    pub start: u32,
+    pub end: u32,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -100,6 +139,10 @@ pub struct SourceSpanReport {
     pub source_line: String,
     pub underline_start: usize,
     pub underline_width: usize,
+    pub end_line: usize,
+    pub end_column: usize,
+    pub byte_start: u32,
+    pub byte_end: u32,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -136,7 +179,15 @@ pub struct EventReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostic_schema_version: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repair_hint_schema_version: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub diff: Option<ValueDiff>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repair_hints: Vec<RepairHint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page: Option<PageSummary>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -518,6 +569,8 @@ mod tests {
                 passed: false,
                 duration_nanos: 10,
                 failure: Some(FailureReport {
+                    diagnostic_schema_version: webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
+                    repair_hint_schema_version: webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
                     code: "runtime.locator_not_found".into(),
                     message: "missing & gone".into(),
                     span: Some(SourceSpanReport {
@@ -526,9 +579,17 @@ mod tests {
                         source_line: "click id(\"missing\")".into(),
                         underline_start: 6,
                         underline_width: 13,
+                        end_line: 2,
+                        end_column: 20,
+                        byte_start: 6,
+                        byte_end: 19,
                     }),
                     diff: None,
                     artifacts: Vec::new(),
+                    semantic_details: None,
+                    repair_hints: Vec::new(),
+                    page: None,
+                    secondary: Vec::new(),
                 }),
             }],
             infrastructure_error: None,

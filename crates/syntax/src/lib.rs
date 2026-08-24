@@ -5,10 +5,12 @@ mod error;
 mod kind;
 mod lexer;
 mod parser;
+mod reference;
 
 pub use error::SyntaxError;
 pub use kind::{SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken, WebtestLanguage};
 pub use parser::{Parse, parse};
+pub use reference::{AuthorFacingLanguage, GrammarExample, author_facing_language};
 
 #[cfg(test)]
 mod tests {

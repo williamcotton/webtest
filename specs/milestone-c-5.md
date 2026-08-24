@@ -8,7 +8,7 @@ Milestone C.5 makes WebTest's existing semantics directly discoverable and consu
 
 It does not depend on the application bridge in Milestone D. When Milestone D later adds statically known `app.*` functions, those functions participate in the same discovery interfaces introduced here.
 
-**Implementation status (2026-08-23): proposed.**
+**Implementation status (2026-08-23): implemented.** The shared Rust implementation now exposes versioned description/search, semantic page inspection, deterministic validated locator candidates, structured static/runtime details and repair hints, bounded/redacted CLI and event output, editor/LSP/DAP transport, WASM static parity, and the deterministic `examples/semantic-discovery` acceptance fixture. `inspect` remains an explicitly unsupported native capability in WASM.
 
 [`future-functionality.md`](./future-functionality.md) places this milestone after C and before D.
 

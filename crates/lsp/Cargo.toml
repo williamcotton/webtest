@@ -13,5 +13,5 @@ tracing.workspace = true
 webtest-analysis.workspace = true
 webtest-browser.workspace = true
 webtest-editor.workspace = true
+webtest-feedback.workspace = true
 webtest-text.workspace = true
-

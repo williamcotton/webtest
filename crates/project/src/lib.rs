@@ -43,6 +43,8 @@ pub struct ProjectConfig {
     pub evidence: EvidenceSection,
     pub server: ServerSection,
     pub redaction: RedactionSection,
+    pub inspection: InspectionSection,
+    pub description: DescriptionSection,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -132,6 +134,25 @@ pub struct ServerFsSection {
 pub struct RedactionSection {
     pub headers: Vec<String>,
     pub json_fields: Vec<String>,
+    pub query_params: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InspectionSection {
+    pub max_elements: usize,
+    pub max_candidates_per_element: usize,
+    pub max_text_bytes: usize,
+    pub include_hidden: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DescriptionSection {
+    pub max_category_children: usize,
+    pub max_search_results: usize,
+    pub max_summary_bytes: usize,
+    pub max_guidance_entries: usize,
+    pub max_examples: usize,
+    pub max_example_bytes: usize,
 }
 
 impl Default for ProjectConfig {
@@ -182,6 +203,21 @@ impl Default for ProjectConfig {
             redaction: RedactionSection {
                 headers: vec!["authorization".into(), "cookie".into(), "set-cookie".into()],
                 json_fields: vec!["password".into(), "token".into(), "secret".into()],
+                query_params: vec!["token".into(), "code".into(), "key".into()],
+            },
+            inspection: InspectionSection {
+                max_elements: 500,
+                max_candidates_per_element: 4,
+                max_text_bytes: 256,
+                include_hidden: false,
+            },
+            description: DescriptionSection {
+                max_category_children: 200,
+                max_search_results: 20,
+                max_summary_bytes: 1_024,
+                max_guidance_entries: 16,
+                max_examples: 4,
+                max_example_bytes: 4_096,
             },
         }
     }
@@ -241,6 +277,10 @@ struct RawConfig {
     server: RawServer,
     #[serde(default)]
     redaction: RawRedaction,
+    #[serde(default)]
+    inspection: RawInspection,
+    #[serde(default)]
+    description: RawDescription,
     #[serde(flatten)]
     extra: toml::Table,
 }
@@ -346,6 +386,30 @@ struct RawRedaction {
     headers: Vec<String>,
     #[serde(default)]
     json_fields: Vec<String>,
+    #[serde(default)]
+    query_params: Vec<String>,
+    #[serde(flatten)]
+    extra: toml::Table,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawInspection {
+    max_elements: Option<usize>,
+    max_candidates_per_element: Option<usize>,
+    max_text_bytes: Option<usize>,
+    include_hidden: Option<bool>,
+    #[serde(flatten)]
+    extra: toml::Table,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawDescription {
+    max_category_children: Option<usize>,
+    max_search_results: Option<usize>,
+    max_summary_bytes: Option<usize>,
+    max_guidance_entries: Option<usize>,
+    max_examples: Option<usize>,
+    max_example_bytes: Option<usize>,
     #[serde(flatten)]
     extra: toml::Table,
 }
@@ -471,6 +535,8 @@ fn parse_config(
     collect_unknown(&mut warnings, "server.process", &raw.server.process.extra);
     collect_unknown(&mut warnings, "server.fs", &raw.server.fs.extra);
     collect_unknown(&mut warnings, "redaction", &raw.redaction.extra);
+    collect_unknown(&mut warnings, "inspection", &raw.inspection.extra);
+    collect_unknown(&mut warnings, "description", &raw.description.extra);
 
     let channel = match raw.browser.channel.as_deref().unwrap_or("managed") {
         "managed" => BrowserChannel::Managed,
@@ -608,6 +674,48 @@ fn parse_config(
             message: "evidence.max_dom_bytes must be positive".into(),
         });
     }
+    for (key, value) in [
+        ("inspection.max_elements", raw.inspection.max_elements),
+        (
+            "inspection.max_candidates_per_element",
+            raw.inspection.max_candidates_per_element,
+        ),
+        ("inspection.max_text_bytes", raw.inspection.max_text_bytes),
+        (
+            "description.max_category_children",
+            raw.description.max_category_children,
+        ),
+        (
+            "description.max_search_results",
+            raw.description.max_search_results,
+        ),
+        (
+            "description.max_summary_bytes",
+            raw.description.max_summary_bytes,
+        ),
+        (
+            "description.max_guidance_entries",
+            raw.description.max_guidance_entries,
+        ),
+        ("description.max_examples", raw.description.max_examples),
+        (
+            "description.max_example_bytes",
+            raw.description.max_example_bytes,
+        ),
+    ] {
+        if value == Some(0) {
+            return Err(ProjectError::InvalidConfig {
+                path: path.to_path_buf(),
+                message: format!("{key} must be positive"),
+            });
+        }
+    }
+    if raw.description.max_examples.is_some_and(|value| value < 2) {
+        return Err(ProjectError::InvalidConfig {
+            path: path.to_path_buf(),
+            message: "description.max_examples must be at least 2".into(),
+        });
+    }
     Ok((
         ProjectConfig {
             project: ProjectSection {
@@ -705,6 +813,64 @@ fn parse_config(
                 } else {
                     raw.redaction.json_fields
                 },
+                query_params: if raw.redaction.query_params.is_empty() {
+                    defaults.redaction.query_params
+                } else {
+                    raw.redaction.query_params
+                },
+            },
+            inspection: InspectionSection {
+                max_elements: raw
+                    .inspection
+                    .max_elements
+                    .unwrap_or(defaults.inspection.max_elements)
+                    .min(2_000),
+                max_candidates_per_element: raw
+                    .inspection
+                    .max_candidates_per_element
+                    .unwrap_or(defaults.inspection.max_candidates_per_element)
+                    .min(8),
+                max_text_bytes: raw
+                    .inspection
+                    .max_text_bytes
+                    .unwrap_or(defaults.inspection.max_text_bytes)
+                    .min(4_096),
+                include_hidden: raw
+                    .inspection
+                    .include_hidden
+                    .unwrap_or(defaults.inspection.include_hidden),
+            },
+            description: DescriptionSection {
+                max_category_children: raw
+                    .description
+                    .max_category_children
+                    .unwrap_or(defaults.description.max_category_children)
+                    .min(1_000),
+                max_search_results: raw
+                    .description
+                    .max_search_results
+                    .unwrap_or(defaults.description.max_search_results)
+                    .min(100),
+                max_summary_bytes: raw
+                    .description
+                    .max_summary_bytes
+                    .unwrap_or(defaults.description.max_summary_bytes)
+                    .min(8_192),
+                max_guidance_entries: raw
+                    .description
+                    .max_guidance_entries
+                    .unwrap_or(defaults.description.max_guidance_entries)
+                    .min(64),
+                max_examples: raw
+                    .description
+                    .max_examples
+                    .unwrap_or(defaults.description.max_examples)
+                    .min(16),
+                max_example_bytes: raw
+                    .description
+                    .max_example_bytes
+                    .unwrap_or(defaults.description.max_example_bytes)
+                    .min(16_384),
             },
         },
         warnings,
@@ -1022,6 +1188,21 @@ write_root = ".webtest/generated"
 [redaction]
 headers = ["authorization"]
 json_fields = ["credential"]
+query_params = ["session"]
+
+[inspection]
+max_elements = 9999
+max_candidates_per_element = 99
+max_text_bytes = 99999
+include_hidden = true
+
+[description]
+max_category_children = 9999
+max_search_results = 999
+max_summary_bytes = 99999
+max_guidance_entries = 999
+max_examples = 999
+max_example_bytes = 99999
 "#,
         )
         .expect("server configuration");
@@ -1041,9 +1222,22 @@ json_fields = ["credential"]
             PathBuf::from(".webtest/generated")
         );
         assert_eq!(config.redaction.json_fields, ["credential"]);
+        assert_eq!(config.redaction.query_params, ["session"]);
+        assert_eq!(config.inspection.max_elements, 2_000);
+        assert_eq!(config.inspection.max_candidates_per_element, 8);
+        assert_eq!(config.inspection.max_text_bytes, 4_096);
+        assert!(config.inspection.include_hidden);
+        assert_eq!(config.description.max_category_children, 1_000);
+        assert_eq!(config.description.max_search_results, 100);
+        assert_eq!(config.description.max_summary_bytes, 8_192);
+        assert_eq!(config.description.max_guidance_entries, 64);
+        assert_eq!(config.description.max_examples, 16);
+        assert_eq!(config.description.max_example_bytes, 16_384);
 
         assert!(parse_config(path, "[server]\nbase_url = \"/relative\"\n").is_err());
         assert!(parse_config(path, "[server.fs]\nwrite_root = \"../outside\"\n").is_err());
+        assert!(parse_config(path, "[inspection]\nmax_elements = 0\n").is_err());
+        assert!(parse_config(path, "[description]\nmax_examples = 1\n").is_err());
     }
 
     #[test]

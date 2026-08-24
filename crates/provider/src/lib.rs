@@ -447,6 +447,13 @@ pub struct ProviderSchema {
     pub operations: BTreeMap<String, OperationSchema>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderSchemaProvenance {
+    BuiltIn,
+    ProjectSupplied,
+}
+
 impl ProviderSchema {
     pub fn operation(&self, name: &str) -> Option<&OperationSchema> {
         self.operations.get(name)
@@ -582,6 +589,7 @@ pub trait ServerProvider: Send + Sync {
 #[derive(Clone, Default)]
 pub struct ProviderRegistry {
     schemas: BTreeMap<String, ProviderSchema>,
+    schema_provenance: BTreeMap<String, ProviderSchemaProvenance>,
     providers: HashMap<String, Arc<dyn ServerProvider>>,
 }
 
@@ -589,7 +597,11 @@ impl ProviderRegistry {
     pub fn built_in_schemas() -> Self {
         let mut registry = Self::default();
         for schema in [http_schema(), process_schema(), fs_schema()] {
-            registry.schemas.insert(schema.name.0.clone(), schema);
+            let name = schema.name.0.clone();
+            registry.schemas.insert(name.clone(), schema);
+            registry
+                .schema_provenance
+                .insert(name, ProviderSchemaProvenance::BuiltIn);
         }
         registry
     }
@@ -605,8 +617,27 @@ impl ProviderRegistry {
 
     pub fn register(&mut self, provider: Arc<dyn ServerProvider>) {
         let schema = provider.schema();
-        self.providers.insert(schema.name.0.clone(), provider);
-        self.schemas.insert(schema.name.0.clone(), schema);
+        let name = schema.name.0.clone();
+        let provenance = self
+            .schemas
+            .get(&name)
+            .filter(|existing| *existing == &schema)
+            .and_then(|_| self.schema_provenance.get(&name).copied())
+            .unwrap_or(ProviderSchemaProvenance::ProjectSupplied);
+        self.providers.insert(name.clone(), provider);
+        self.schemas.insert(name.clone(), schema);
+        self.schema_provenance.insert(name, provenance);
+    }
+
+    /// Registers a statically visible provider schema without claiming that the
+    /// current host can execute it. This is used by portable/project adapters
+    /// that can analyze provider calls while keeping runtime availability
+    /// explicit.
+    pub fn register_schema(&mut self, schema: ProviderSchema) {
+        let name = schema.name.0.clone();
+        self.schemas.insert(name.clone(), schema);
+        self.schema_provenance
+            .insert(name, ProviderSchemaProvenance::ProjectSupplied);
     }
 
     pub fn schema(&self, provider: &str) -> Option<&ProviderSchema> {
@@ -615,6 +646,10 @@ impl ProviderRegistry {
 
     pub fn schemas(&self) -> impl Iterator<Item = &ProviderSchema> {
         self.schemas.values()
+    }
+
+    pub fn schema_provenance(&self, provider: &str) -> Option<ProviderSchemaProvenance> {
+        self.schema_provenance.get(provider).copied()
     }
 
     pub async fn call(
@@ -1390,6 +1425,19 @@ mod tests {
         .into_iter()
         .collect();
         assert!(!Type::Record(fields).is_transferable());
+
+        let mut registry = ProviderRegistry::built_in_schemas();
+        assert_eq!(
+            registry.schema_provenance("http"),
+            Some(ProviderSchemaProvenance::BuiltIn)
+        );
+        let mut project_schema = fs_schema();
+        project_schema.name = ProviderName("project_fs".into());
+        registry.register_schema(project_schema);
+        assert_eq!(
+            registry.schema_provenance("project_fs"),
+            Some(ProviderSchemaProvenance::ProjectSupplied)
+        );
     }
 
     #[test]
