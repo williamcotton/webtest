@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import {
     LanguageClient,
@@ -46,6 +47,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const debugAdapterFactory: vscode.DebugAdapterDescriptorFactory = {
         createDebugAdapterDescriptor: (session) => {
             const args = ["dap"];
+            const program = resolveDebugProgram(session);
+            if (program) {
+                args.push("--project", program);
+            }
             const configuredChrome = vscode.workspace
                 .getConfiguration("webtest", session.workspaceFolder?.uri)
                 .get<string>("chromePath", "")
@@ -62,7 +67,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 args.push("--headless");
             }
             return new vscode.DebugAdapterExecutable(serverPath, args, {
-                cwd: session.workspaceFolder?.uri.fsPath,
+                cwd: program
+                    ? path.dirname(program)
+                    : session.workspaceFolder?.uri.fsPath,
             });
         },
     };
@@ -162,13 +169,41 @@ async function resolveServerPath(): Promise<string> {
     const executable = process.platform === "win32" ? "webtest.exe" : "webtest";
     for (const folder of vscode.workspace.workspaceFolders ?? []) {
         const candidate = path.join(folder.uri.fsPath, "target", "debug", executable);
-        try {
-            await fs.promises.access(candidate, fs.constants.X_OK);
+        if (await isExecutable(candidate)) {
             return candidate;
-        } catch {
-            // Continue to the next workspace, then fall back to PATH.
         }
     }
 
+    const cargoHome = process.env.CARGO_HOME?.trim();
+    const cargoCandidate = path.join(
+        cargoHome ? path.resolve(cargoHome) : path.join(os.homedir(), ".cargo"),
+        "bin",
+        executable,
+    );
+    if (await isExecutable(cargoCandidate)) {
+        return cargoCandidate;
+    }
+
     return "webtest";
+}
+
+function resolveDebugProgram(session: vscode.DebugSession): string | undefined {
+    const program = session.configuration.program;
+    if (typeof program !== "string" || !program.trim() || program.includes("${")) {
+        return undefined;
+    }
+    if (path.isAbsolute(program)) {
+        return path.normalize(program);
+    }
+    const base = session.workspaceFolder?.uri.fsPath ?? process.cwd();
+    return path.resolve(base, program);
+}
+
+async function isExecutable(candidate: string): Promise<boolean> {
+    try {
+        await fs.promises.access(candidate, fs.constants.X_OK);
+        return true;
+    } catch {
+        return false;
+    }
 }

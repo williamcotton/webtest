@@ -120,6 +120,9 @@ enum Command {
     Dap {
         #[arg(long)]
         chrome_path: Option<PathBuf>,
+        /// File or directory used to discover the nearest WebTest project.
+        #[arg(long)]
+        project: Option<PathBuf>,
         /// Hide Chrome while debugging. Debug sessions are headed by default.
         #[arg(long)]
         headless: bool,
@@ -310,9 +313,13 @@ async fn run(cli: Cli) -> Result<ExitClass, AppError> {
         }
         Command::Dap {
             chrome_path,
+            project: project_path,
             headless,
         } => {
-            let project = project(&[])?;
+            let project = match project_path {
+                Some(path) => project(std::slice::from_ref(&path))?,
+                None => project(&[])?,
+            };
             let executable = resolve_chrome(&project, chrome_path)
                 .ok()
                 .map(|resolved| resolved.path);

@@ -2,13 +2,19 @@
 
 This standard VSIX connects Cursor or VS Code to the native `webtest` language and debug adapters. It provides CST-backed semantic syntax highlighting, diagnostics, document formatting, test execution, and source breakpoints.
 
-Build the Rust executable before using a development installation:
+Install the Rust executable from the repository checkout:
+
+```sh
+cargo install --path crates/app --locked
+```
+
+Or build it in place for extension development:
 
 ```sh
 cargo build
 ```
 
-When the repository is open as a workspace, the extension discovers `target/debug/webtest` automatically. Otherwise, put `webtest` on `PATH` or configure `webtest.serverPath` with an absolute executable path.
+The extension discovers `target/debug/webtest` in an open workspace and Cargo-installed binaries in `CARGO_HOME/bin` or `~/.cargo/bin`. Otherwise, put `webtest` on `PATH` or configure `webtest.serverPath` with an absolute executable path. Debug sessions select configuration from the nearest `webtest.toml` above the test file, rather than assuming the editor workspace is the project root.
 
 Package, install, and verify the current extension version in Cursor with:
 
@@ -20,4 +26,4 @@ npm run smoke:cursor
 
 Open a `.webtest` file and run **WebTest: Run Current File** from the Command Palette or the editor title button. Runtime failures are published against the source revision that was executed, so stale diagnostics disappear after an edit.
 
-Set a breakpoint on an `open`, `click`, or `expect` statement, then run **WebTest: Debug Current File**. The default debugger launches headed Chrome and pauses before the marked operation without requiring a `launch.json`. The WebTest scope shows the current test, operation, source line, and line number.
+Set a breakpoint on an `open`, `click`, or `expect` statement, then run **WebTest: Debug Current File**. The default debugger launches one headed Chrome window and pauses before the marked operation without requiring a `launch.json`. The WebTest scope shows the current test, operation, source line, line number, and every binding evaluated so far. Records, lists, responses, headers, decoded JSON, and process results are expandable. Server-only values remain available, with secrets redacted, while stepping into the browser block. The debug session closes automatically after the final step.

@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    io::BufRead,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -13,10 +14,8 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use thiserror::Error;
-use tokio::io::{
-    AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter,
-};
-use tokio::sync::{Mutex as AsyncMutex, mpsc};
+use tokio::io::{AsyncWrite, AsyncWriteExt, BufWriter};
+use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 use webtest_analysis::{AnalysisDatabase, DiagnosticSeverity};
 use webtest_browser::BrowserHost;
 use webtest_observation::ObservationStore;
@@ -233,6 +232,7 @@ struct DebugState {
     configured: AtomicBool,
     started: AtomicBool,
     shutting_down: AtomicBool,
+    completion: watch::Sender<bool>,
 }
 
 impl DebugState {
@@ -252,6 +252,7 @@ impl DebugState {
         providers: ProviderRegistry,
     ) -> Arc<Self> {
         let (resume_sender, resume_receiver) = mpsc::unbounded_channel();
+        let (completion, _) = watch::channel(false);
         Arc::new(Self {
             writer,
             browser,
@@ -267,6 +268,7 @@ impl DebugState {
             configured: AtomicBool::new(false),
             started: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
+            completion,
         })
     }
 
@@ -511,24 +513,13 @@ impl DebugState {
             .get("variablesReference")
             .and_then(Value::as_i64);
         let frame = lock(&self.paused).clone();
-        let variables =
-            if reference == Some(VARIABLES_REFERENCE) {
-                frame.map_or_else(Vec::new, |frame| {
-                    vec![
-                        dap_variable("test", &format!("{:?}", frame.test_name), "string"),
-                        dap_variable("operation", &format!("{:?}", frame.operation), "string"),
-                        dap_variable("source", &format!("{:?}", frame.source_line), "string"),
-                        dap_variable("line", &frame.location.line.to_string(), "number"),
-                    ]
-                    .into_iter()
-                    .chain(frame.bindings.iter().map(|(name, value)| {
-                        dap_variable(name, &dap_value(value), value.type_name())
-                    }))
-                    .collect()
-                })
-            } else {
-                Vec::new()
-            };
+        let variables = match (reference, frame) {
+            (Some(reference), Some(frame)) => DapVariableStore::for_frame(&frame)
+                .variables
+                .remove(&reference)
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
         self.writer
             .response(request, json!({ "variables": variables }))
             .await
@@ -666,6 +657,7 @@ impl DebugState {
             .event("exited", json!({ "exitCode": exit_code }))
             .await;
         let _ = self.writer.event("terminated", json!({})).await;
+        self.completion.send_replace(true);
     }
 }
 
@@ -873,22 +865,57 @@ pub async fn serve_with_configuration(
 }
 
 async fn serve_state(state: Arc<DebugState>) -> Result<(), DapError> {
-    let mut reader = BufReader::new(tokio::io::stdin());
-    while let Some(request) = read_request(&mut reader).await? {
-        if state.handle(request).await? {
-            break;
+    let mut requests = request_channel();
+    let mut completion = state.completion.subscribe();
+    loop {
+        if *completion.borrow() {
+            return Ok(());
+        }
+        tokio::select! {
+            request = requests.recv() => {
+                let Some(request) = request else {
+                    return Ok(());
+                };
+                if state.handle(request?).await? {
+                    return Ok(());
+                }
+            }
+            changed = completion.changed() => {
+                let _ = changed;
+                return Ok(());
+            }
         }
     }
-    Ok(())
 }
 
-async fn read_request(
-    reader: &mut (impl AsyncBufRead + Unpin),
-) -> Result<Option<Request>, DapError> {
+fn request_channel() -> mpsc::UnboundedReceiver<Result<Request, DapError>> {
+    let (sender, receiver) = mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        let input = std::io::stdin();
+        let mut reader = std::io::BufReader::new(input.lock());
+        loop {
+            match read_request(&mut reader) {
+                Ok(Some(request)) => {
+                    if sender.send(Ok(request)).is_err() {
+                        return;
+                    }
+                }
+                Ok(None) => return,
+                Err(error) => {
+                    let _ = sender.send(Err(error));
+                    return;
+                }
+            }
+        }
+    });
+    receiver
+}
+
+fn read_request(reader: &mut impl BufRead) -> Result<Option<Request>, DapError> {
     let mut content_length = None;
     loop {
         let mut header = String::new();
-        let read = reader.read_line(&mut header).await?;
+        let read = reader.read_line(&mut header)?;
         if read == 0 {
             return Ok(None);
         }
@@ -909,7 +936,7 @@ async fn read_request(
         )));
     };
     let mut body = vec![0; content_length];
-    reader.read_exact(&mut body).await?;
+    reader.read_exact(&mut body)?;
     Ok(Some(serde_json::from_slice(&body)?))
 }
 
@@ -933,19 +960,162 @@ fn unverified_breakpoints(requested: &[SourceBreakpoint], message: &str) -> Vec<
         .collect()
 }
 
-fn dap_variable(name: &str, value: &str, kind: &str) -> Value {
+struct DapVariableStore {
+    variables: HashMap<i64, Vec<Value>>,
+    next_reference: i64,
+}
+
+impl DapVariableStore {
+    fn new() -> Self {
+        Self {
+            variables: HashMap::new(),
+            next_reference: VARIABLES_REFERENCE + 1,
+        }
+    }
+
+    fn for_frame(frame: &PausedFrame) -> Self {
+        let mut store = Self::new();
+        let mut root = vec![
+            dap_leaf_variable("test", &format!("{:?}", frame.test_name), "string"),
+            dap_leaf_variable("operation", &format!("{:?}", frame.operation), "string"),
+            dap_leaf_variable("source", &format!("{:?}", frame.source_line), "string"),
+            dap_leaf_variable("line", &frame.location.line.to_string(), "number"),
+        ];
+        root.extend(
+            frame
+                .bindings
+                .iter()
+                .map(|(name, value)| store.provider_variable(name, value)),
+        );
+        store.variables.insert(VARIABLES_REFERENCE, root);
+        store
+    }
+
+    fn provider_variable(&mut self, name: &str, value: &webtest_provider::Value) -> Value {
+        let (children, indexed) = dap_children(value);
+        let (reference, child_count) = if children.is_empty() {
+            (0, 0)
+        } else {
+            let reference = self.next_reference;
+            self.next_reference += 1;
+            let child_count = children.len();
+            let variables = children
+                .into_iter()
+                .map(|(name, value)| self.provider_variable(&name, &value))
+                .collect();
+            self.variables.insert(reference, variables);
+            (reference, child_count)
+        };
+        let mut variable = dap_variable(name, &dap_value(value), value.type_name(), reference);
+        if reference != 0 {
+            let count_name = if indexed {
+                "indexedVariables"
+            } else {
+                "namedVariables"
+            };
+            variable[count_name] = child_count.into();
+        }
+        variable
+    }
+}
+
+fn dap_leaf_variable(name: &str, value: &str, kind: &str) -> Value {
+    dap_variable(name, value, kind, 0)
+}
+
+fn dap_variable(name: &str, value: &str, kind: &str, variables_reference: i64) -> Value {
     json!({
         "name": name,
         "value": value,
         "type": kind,
-        "variablesReference": 0,
+        "variablesReference": variables_reference,
     })
 }
 
+fn dap_children(value: &webtest_provider::Value) -> (Vec<(String, webtest_provider::Value)>, bool) {
+    use webtest_provider::Value as ProviderValue;
+
+    let named = |values| (values, false);
+    match value {
+        ProviderValue::List(values) => (
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| (format!("[{index}]"), value.clone()))
+                .collect(),
+            true,
+        ),
+        ProviderValue::Record(values) => named(
+            values
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+        ),
+        ProviderValue::Headers(values) => named(
+            values
+                .iter()
+                .map(|(name, value)| (name.clone(), ProviderValue::String(value.clone())))
+                .collect(),
+        ),
+        ProviderValue::Response(response) => {
+            let mut values = vec![
+                (
+                    "status".into(),
+                    ProviderValue::Int(i64::from(response.status)),
+                ),
+                (
+                    "headers".into(),
+                    ProviderValue::Headers(response.headers.clone()),
+                ),
+                ("body".into(), ProviderValue::Bytes(response.body.clone())),
+            ];
+            if let Ok(text) = std::str::from_utf8(&response.body) {
+                values.push(("text".into(), ProviderValue::String(text.to_owned())));
+            }
+            values.push((
+                "json".into(),
+                response
+                    .json
+                    .as_deref()
+                    .cloned()
+                    .unwrap_or(ProviderValue::Null),
+            ));
+            named(values)
+        }
+        ProviderValue::ProcessResult(result) => named(vec![
+            ("exit_code".into(), ProviderValue::Int(result.exit_code)),
+            (
+                "stdout".into(),
+                ProviderValue::String(result.stdout.clone()),
+            ),
+            (
+                "stderr".into(),
+                ProviderValue::String(result.stderr.clone()),
+            ),
+            (
+                "stdout_bytes".into(),
+                ProviderValue::Bytes(result.stdout_bytes.clone()),
+            ),
+            (
+                "stderr_bytes".into(),
+                ProviderValue::Bytes(result.stderr_bytes.clone()),
+            ),
+        ]),
+        ProviderValue::Null
+        | ProviderValue::Bool(_)
+        | ProviderValue::Int(_)
+        | ProviderValue::Float(_)
+        | ProviderValue::String(_)
+        | ProviderValue::DurationMillis(_)
+        | ProviderValue::Bytes(_)
+        | ProviderValue::FilePath(_)
+        | ProviderValue::TempDirectory(_) => (Vec::new(), false),
+    }
+}
+
 fn dap_value(value: &webtest_provider::Value) -> String {
-    let mut rendered = webtest_provider::value_to_json(value)
-        .and_then(|value| serde_json::to_string(&value).ok())
-        .unwrap_or_else(|| format!("<{}>", value.type_name()));
+    let mut rendered = serde_json::to_string(&dap_json_value(value))
+        .unwrap_or_else(|_| format!("<{}>", value.type_name()));
     if rendered.len() > 1024 {
         let mut end = 1024;
         while !rendered.is_char_boundary(end) {
@@ -955,6 +1125,46 @@ fn dap_value(value: &webtest_provider::Value) -> String {
         rendered.push_str("...");
     }
     rendered
+}
+
+fn dap_json_value(value: &webtest_provider::Value) -> Value {
+    use webtest_provider::Value as ProviderValue;
+
+    match value {
+        ProviderValue::Null
+        | ProviderValue::Bool(_)
+        | ProviderValue::Int(_)
+        | ProviderValue::Float(_)
+        | ProviderValue::String(_)
+        | ProviderValue::DurationMillis(_)
+        | ProviderValue::List(_)
+        | ProviderValue::Record(_) => webtest_provider::value_to_json(value).unwrap_or(Value::Null),
+        ProviderValue::Headers(headers) => json!(headers),
+        ProviderValue::Bytes(bytes) => debug_bytes(bytes),
+        ProviderValue::Response(response) => json!({
+            "status": response.status,
+            "headers": response.headers,
+            "body": debug_bytes(&response.body),
+            "json": response.json.as_deref().map(dap_json_value),
+        }),
+        ProviderValue::ProcessResult(result) => json!({
+            "exit_code": result.exit_code,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "stdout_bytes": debug_bytes(&result.stdout_bytes),
+            "stderr_bytes": debug_bytes(&result.stderr_bytes),
+        }),
+        ProviderValue::FilePath(path) | ProviderValue::TempDirectory(path) => {
+            Value::String(path.display().to_string())
+        }
+    }
+}
+
+fn debug_bytes(bytes: &[u8]) -> Value {
+    std::str::from_utf8(bytes).map_or_else(
+        |_| Value::String(format!("<{} bytes>", bytes.len())),
+        |text| Value::String(text.to_owned()),
+    )
 }
 
 fn operation_name(operation: &TestOperation) -> String {
@@ -1107,13 +1317,12 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn reads_content_length_framed_requests() {
+    #[test]
+    fn reads_content_length_framed_requests() {
         let body = r#"{"seq":7,"type":"request","command":"threads"}"#;
         let message = format!("Content-Length: {}\r\n\r\n{body}", body.len());
-        let mut reader = BufReader::new(message.as_bytes());
+        let mut reader = std::io::BufReader::new(message.as_bytes());
         let request = read_request(&mut reader)
-            .await
             .expect("valid frame")
             .expect("request");
         assert_eq!(request.seq, 7);
@@ -1236,6 +1445,55 @@ mod tests {
             webtest_text::TextSize::from((start + 7) as u32),
         );
         assert_eq!(StepLocation::new(source, range).column, 10);
+    }
+
+    #[test]
+    fn response_bindings_have_a_useful_debugger_preview() {
+        let value = webtest_provider::Value::Response(webtest_provider::ResponseValue {
+            status: 201,
+            headers: [("content-type".into(), "application/json".into())]
+                .into_iter()
+                .collect(),
+            body: br#"{"id":7,"email":"alice@example.test"}"#.to_vec(),
+            json: Some(Box::new(webtest_provider::Value::Record(
+                [
+                    (
+                        "email".into(),
+                        webtest_provider::Value::String("alice@example.test".into()),
+                    ),
+                    ("id".into(), webtest_provider::Value::Int(7)),
+                ]
+                .into_iter()
+                .collect(),
+            ))),
+        });
+
+        let rendered = dap_value(&value);
+        assert!(rendered.contains("\"status\":201"));
+        assert!(rendered.contains("alice@example.test"));
+        assert_ne!(rendered, "<response>");
+
+        let mut store = DapVariableStore::new();
+        let variable = store.provider_variable("response", &value);
+        let response_reference = variable["variablesReference"]
+            .as_i64()
+            .expect("response reference");
+        assert!(response_reference > VARIABLES_REFERENCE);
+        let response_children = &store.variables[&response_reference];
+        assert!(
+            response_children
+                .iter()
+                .any(|child| child["name"] == "status" && child["value"] == "201")
+        );
+        let json = response_children
+            .iter()
+            .find(|child| child["name"] == "json")
+            .expect("response JSON child");
+        let json_reference = json["variablesReference"].as_i64().expect("JSON reference");
+        let json_children = &store.variables[&json_reference];
+        assert!(json_children.iter().any(|child| {
+            child["name"] == "email" && child["value"] == "\"alice@example.test\""
+        }));
     }
 
     #[tokio::test]

@@ -1761,15 +1761,14 @@ fn visible_bindings(
     names
         .iter()
         .filter_map(|(id, name)| {
-            environment
-                .get(id)
-                .filter(|value| runtime_transferable(value))
-                .map(|value| {
-                    (
-                        name.clone(),
-                        value.redacted_with_secrets(redacted_fields, secrets),
-                    )
-                })
+            // Debugger snapshots may inspect server-only values. This does not make those values
+            // transferable to browser expressions or change the final transferable bindings.
+            environment.get(id).map(|value| {
+                (
+                    name.clone(),
+                    value.redacted_with_secrets(redacted_fields, secrets),
+                )
+            })
         })
         .collect()
 }
@@ -2281,6 +2280,70 @@ mod tests {
         assert_eq!(
             visible.get("argument.token"),
             Some(&Value::String("[redacted]".into()))
+        );
+    }
+
+    #[test]
+    fn debugger_step_bindings_keep_server_values_visible_in_later_steps() {
+        let file = FileId::new(0);
+        let step = PlannedStep {
+            id: StepId(2),
+            origin: SyntaxOrigin::new(file, TextRange::empty(TextSize::new(0))),
+            operation: TestOperation::Browser(BrowserOperation::Navigate {
+                url: PlanExpr::Literal(Value::String("/login".into())),
+            }),
+        };
+        let response_id = BindingId(0);
+        let user_id = BindingId(1);
+        let environment = HashMap::from([
+            (
+                response_id,
+                Value::Response(webtest_provider::ResponseValue {
+                    status: 201,
+                    headers: [("authorization".into(), "Bearer private".into())]
+                        .into_iter()
+                        .collect(),
+                    body: br#"{"id":7,"token":"private"}"#.to_vec(),
+                    json: Some(Box::new(Value::Record(
+                        [
+                            ("id".into(), Value::Int(7)),
+                            ("token".into(), Value::String("private".into())),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    ))),
+                }),
+            ),
+            (
+                user_id,
+                Value::Record(
+                    [
+                        ("email".into(), Value::String("alice@example.test".into())),
+                        ("id".into(), Value::Int(7)),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+            ),
+        ]);
+        let names = HashMap::from([(response_id, "response".into()), (user_id, "user".into())]);
+        let visible = visible_step_bindings(
+            &step,
+            &environment,
+            &names,
+            &["authorization".into(), "token".into()],
+            &["private".into()],
+        );
+
+        let Value::Response(response) = &visible["response"] else {
+            panic!("response should remain visible to the debugger");
+        };
+        assert_eq!(response.status, 201);
+        assert_eq!(response.headers["authorization"], "[redacted]");
+        assert!(!String::from_utf8_lossy(&response.body).contains("private"));
+        assert_eq!(
+            visible["user"].member("email"),
+            Some(Value::String("alice@example.test".into()))
         );
     }
 

@@ -23,15 +23,21 @@ test "created user can sign in" {
 
 ## Install and use
 
-Build the native executable with Rust stable, then install the tested Chrome for Testing release into WebTest's versioned cache. Ordinary test runs never download a browser.
+Install the native executable from this checkout with Rust stable. Cargo places `webtest` in its bin directory (normally `~/.cargo/bin`), so it is available to Cursor/VS Code and from any project directory:
 
 ```sh
-cargo build
-target/debug/webtest browser install
-target/debug/webtest browser path
-target/debug/webtest check examples/plain-html
-target/debug/webtest test examples/plain-html
-target/debug/webtest build examples/plain-html --emit plan.json
+cargo install --path crates/app --locked
+webtest --version
+```
+
+For development, `cargo build` keeps the executable at `target/debug/webtest`. Install the tested Chrome for Testing release into WebTest's versioned cache after either setup. Ordinary test runs never download a browser.
+
+```sh
+webtest browser install
+webtest browser path
+webtest check examples/plain-html
+webtest test examples/plain-html
+webtest build examples/plain-html --emit plan.json
 ```
 
 All file-oriented commands accept zero or more files/directories. With no paths, WebTest finds the nearest `webtest.toml` and deterministically discovers `.webtest` files under `project.test_roots`. Useful variants are:
@@ -168,9 +174,9 @@ npm run smoke:cursor
 npm run smoke:activation
 ```
 
-Reload VS Code/Cursor after installing the VSIX, then open the repository and a `.webtest` file. The extension discovers `target/debug/webtest` in the workspace automatically. The command **WebTest: Run Current File** asks the language server to run the currently synchronized buffer, including unsaved changes. Set `webtest.serverPath` explicitly when the executable lives elsewhere.
+Reload VS Code/Cursor after installing the VSIX, then open the repository and a `.webtest` file. The extension discovers `target/debug/webtest` in the workspace or a Cargo-installed `webtest` automatically, including in GUI-launched editor windows whose shell `PATH` omits `~/.cargo/bin`. The command **WebTest: Run Current File** asks the language server to run the currently synchronized buffer, including unsaved changes. Set `webtest.serverPath` explicitly when the executable lives elsewhere.
 
-For interactive debugging, set a breakpoint on a provider call, assertion, or browser operation and choose **WebTest: Debug Current File** (or press F5 and select **Debug WebTest**). Debug sessions show Chrome by default, pause before the selected source-mapped plan step, and expose already-evaluated transferable bindings with configured secrets redacted. Continue or step from VS Code/Cursor's debug toolbar. No `launch.json` is required.
+For interactive debugging, set a breakpoint on a provider call, assertion, or browser operation and choose **WebTest: Debug Current File** (or press F5 and select **Debug WebTest**). The adapter discovers the nearest `webtest.toml` from the selected test file even when a parent repository is the editor workspace. Debug sessions show one Chrome window by default, pause before the selected source-mapped plan step, and expose all already-evaluated bindings—including server-only HTTP responses and process results—with configured secrets redacted. Records, lists, headers, responses, decoded JSON, and process results expand into nested debugger variables. Bindings remain visible as execution moves into later browser steps, and the debug session closes when execution finishes. Continue or step from VS Code/Cursor's debug toolbar. No `launch.json` is required.
 
 ## Architecture
 

@@ -121,7 +121,7 @@ impl ChromeProcess {
             .arg(format!("--user-data-dir={}", profile.path().display()))
             .arg("--no-first-run")
             .arg("--no-default-browser-check")
-            .arg("about:blank")
+            .arg("--no-startup-window")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -2081,6 +2081,35 @@ mod tests {
         assert!(ChromeHost::default().headless);
         assert!(!ChromeHost::default().with_headed(true).headless);
         assert!(ChromeHost::default().with_headed(false).headless);
+    }
+
+    #[tokio::test]
+    async fn chrome_launch_waits_for_webtest_to_create_the_first_page_when_available() {
+        let host = ChromeHost::default();
+        let Some(executable) = host.locate() else {
+            return;
+        };
+        let Ok((mut process, websocket_url)) = ChromeProcess::launch(&executable, true).await
+        else {
+            return;
+        };
+        let connection = CdpConnection::connect(&websocket_url, Duration::from_secs(5))
+            .await
+            .expect("connect to Chrome");
+        let targets = connection
+            .command("Target.getTargets", None, None)
+            .await
+            .expect("list startup targets");
+        let page_targets = targets
+            .get("targetInfos")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|target| target.get("type").and_then(Value::as_str) == Some("page"))
+            .count();
+        assert_eq!(page_targets, 0, "Chrome created an extra startup page");
+        let _ = connection.command("Browser.close", None, None).await;
+        process.shutdown().await.expect("reap Chrome");
     }
 
     #[test]

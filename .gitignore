@@ -8,3 +8,4 @@ examples/application-bridge/*/.webtest/*
 **/.vscode-test
 editors/vscode/*.vsix
 .DS_Store
+**/obj

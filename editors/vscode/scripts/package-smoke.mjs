@@ -45,6 +45,8 @@ for (const marker of [
     "registerDebugAdapterDescriptorFactory",
     'args: ["lsp"]',
     'const args = ["dap"]',
+    'args.push("--project", program)',
+    'path.join(os.homedir(), ".cargo")',
     "sourceText",
 ]) {
     assert.ok(extension.includes(marker), `compiled extension is missing ${marker}`);

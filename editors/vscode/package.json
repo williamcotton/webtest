@@ -170,7 +170,7 @@
           "type": "string",
           "default": "webtest",
           "scope": "resource",
-          "description": "Path to the WebTest executable. When unset, the extension first checks target/debug/webtest in the open workspace, then PATH."
+          "description": "Path to the WebTest executable. When unset, the extension checks target/debug/webtest in the open workspace, Cargo's bin directory, then PATH."
         },
         "webtest.chromePath": {
           "type": "string",
