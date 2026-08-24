@@ -10,17 +10,21 @@ It does not depend on the application bridge in Milestone D. When Milestone D la
 
 **Implementation status (2026-08-23): proposed.**
 
-[`future-functionality.md`](./future-functionality.md) must be updated to place this milestone after C and before D.
+[`future-functionality.md`](./future-functionality.md) places this milestone after C and before D.
 
 ## 1. Outcome
 
 An external client with no private knowledge of WebTest internals can discover the semantic surface of a running page and use ordinary WebTest commands as a closed authoring and repair loop:
 
 ```sh
+webtest describe --reporter json
+webtest describe locator.role --reporter json
 webtest inspect /login --reporter json
 webtest check tests/login.webtest --reporter json
 webtest test tests/login.webtest --reporter json
 ```
+
+The first description call returns a compact index of the installed language and project-visible providers. The second returns a self-contained reference for `role(...)`, including canonical syntax, typed parameters, result type, context and capability restrictions, semantic constraints, and canonical source examples. A client is not expected to know WebTest syntax before entering this loop.
 
 For a page containing an email field, password field, and sign-in button, `inspect` returns bounded structured information including valid WebTest locator expressions:
 
@@ -140,7 +144,7 @@ Milestone C.5 includes:
 
 * a protocol-neutral semantic page-inspection model;
 * `webtest inspect` for one-shot inspection of a running page;
-* a static `webtest describe` command for discovering the WebTest/project capability surface;
+* a static, queryable `webtest describe` language-reference API for discovering author-facing grammar, construct syntax and semantics, and the project/provider capability surface;
 * preferred and alternate WebTest locator candidates derived from the shared locator semantics;
 * operation/action metadata for inspected elements;
 * stable machine-readable representations of static diagnostics and runtime failures;
@@ -393,100 +397,589 @@ clickable
 
 JSON exposes the complete bounded DTO.
 
-## 7. Static capability discovery
+## 7. Static language and project description
+
+`describe` is a machine-readable language reference and project-schema query API, not merely a feature inventory. Returning that `race`, `click`, or `role` exists is insufficient: an unfamiliar client must be able to learn how to write the construct, where it is legal, what it returns, and which semantic rules govern it.
+
+`describe` is static. It does not launch Chrome or execute tests, and it describes the exact installed language and resolved project inputs rather than a roadmap milestone or remotely hosted manual.
+
+### 7.1 Query model
 
 Add:
 
 ```sh
-webtest describe [paths...] --reporter human|json
+webtest describe [QUERY] [--project PATH] --reporter human|json
+webtest describe --search <TERMS> [--project PATH] --reporter human|json
 ```
 
-`describe` is static. It does not launch Chrome or execute tests.
-
-It reports the WebTest surface available for the resolved project:
+Project discovery otherwise starts at the current directory using the ordinary nearest-root rules. Core `language`, `grammar`, locator, operation, assertion, type, and capability queries succeed even when no project root exists. In that case project-derived sections are absent and any project-discovery/configuration problem is returned separately; the reference for the installed language is not held hostage by `webtest.toml`. `QUERY` is a stable semantic identifier or category prefix. The supported hierarchy begins with:
 
 ```text
-compiler/language version
-machine schema versions
-locator kinds
-browser operations
-assertion matcher families
-core types
-execution capabilities
-configured built-in provider schemas
-project-visible provider operations
-relevant configuration-derived capabilities
+language
+grammar
+declaration.<name>
+scope.<name>
+statement.<name>
+locator.<name>
+browser.<operation>
+assertion.<name>
+type.<name>
+capability.<name>
+provider.<name>
+provider.<name>.<operation>
 ```
 
-Example machine output:
+Later milestones extend the same hierarchy with identifiers such as `control.race`, `pattern`, `pattern.subset`, `event.websocket`, and `event.websocket.received_json` only when those constructs are implemented. A unique unqualified name such as `role` or `click` may be accepted as a convenience alias. Ambiguous names produce a structured diagnostic containing the canonical candidate identifiers; they never resolve according to hidden precedence.
+
+Exact hierarchical lookup alone has a bootstrap problem: an unfamiliar client may know that it needs to wait for a WebSocket message without knowing the words `select` or `received_json`. `--search` therefore performs a bounded deterministic lexical search over identifiers, names, summaries, declared use-case terms, parameter/result types, capabilities, and contexts. For example:
+
+```sh
+webtest describe --search "wait websocket message" --reporter json
+```
+
+Search results contain canonical query identifiers, compact syntax, one-line summaries, provenance, and the fields that matched. Search is local and schema-backed; it does not call a model, use an opaque embedding service, or invent constructs. Ranking and token normalization are specified and compatibility-tested. Exact identifier/name matches outrank authored keywords, results are bounded per provenance class, and project-supplied keyword spam cannot displace exact installed-language results. A result is only a discovery candidate, so a client drills into its canonical identifier before authoring source.
+
+With no query, `describe` returns a compact index suitable for deciding what to query next:
 
 ```json
 {
-  "kind": "description",
+  "kind": "description_index",
   "description_schema_version": 1,
-  "language": {
-    "locators": [
-      "id",
-      "role",
-      "label",
-      "text",
-      "placeholder",
-      "test_id",
-      "css",
-      "xpath"
-    ],
-    "browser_operations": [
-      "open",
-      "click",
-      "fill",
-      "type",
-      "press",
-      "check",
-      "uncheck",
-      "select",
-      "hover",
-      "wait",
-      "expect"
-    ]
+  "language_version": "<installed-version>",
+  "project": {
+    "root": "<normalized-project-root>",
+    "configuration_revision": "<revision>"
   },
-  "providers": {
-    "http": {
-      "operations": {
-        "get": {},
-        "post": {}
-      }
-    }
+  "search_supported": true,
+  "categories": {
+    "grammar": ["language", "grammar"],
+    "declarations": ["declaration.test"],
+    "scopes": ["scope.server", "scope.browser"],
+    "statements": ["statement.let"],
+    "browser_operations": [
+      "browser.open",
+      "browser.evaluate",
+      "browser.click",
+      "browser.fill",
+      "browser.type",
+      "browser.press",
+      "browser.check",
+      "browser.uncheck",
+      "browser.select",
+      "browser.hover",
+      "browser.wait.locator",
+      "browser.wait.url"
+    ],
+    "assertions": [
+      "assertion.locator_state",
+      "assertion.url",
+      "assertion.value"
+    ],
+    "locators": [
+      "locator.id",
+      "locator.role",
+      "locator.label",
+      "locator.text",
+      "locator.placeholder",
+      "locator.test_id",
+      "locator.css",
+      "locator.xpath"
+    ],
+    "types": [
+      "type.Null",
+      "type.Bool",
+      "type.Int",
+      "type.Float",
+      "type.String",
+      "type.Duration",
+      "type.Url",
+      "type.Json",
+      "type.List",
+      "type.Option",
+      "type.Record",
+      "type.StatusCode",
+      "type.Headers",
+      "type.Bytes",
+      "type.Response",
+      "type.ProcessResult",
+      "type.FilePath",
+      "type.TempDirectory",
+      "type.Locator",
+      "type.BrowserPage"
+    ],
+    "capabilities": [
+      "capability.Pure",
+      "capability.Server",
+      "capability.Browser",
+      "capability.Test"
+    ],
+    "providers": ["provider.fs", "provider.http", "provider.process"]
   }
 }
 ```
 
-Provider operation details are emitted from the same `ProviderSchema`, `OperationSchema`, `ParameterSchema`, and `TypeSchema` values used by static analysis.
+The concrete index reflects the resolved project and installed binary. It is deterministically ordered, bounded, and contains canonical query identifiers rather than complete details. Querying a category such as `provider.http` or a future `event.websocket` returns a bounded category description plus the identifiers of its children. A category may also expose composition syntax shared by those children—for example, a future `pattern` response includes declaration syntax, the `matches` expression form, and matcher children rather than returning matcher names alone. Querying a leaf returns a self-contained construct description; a client need not retain the top-level response to interpret it.
 
-`describe` must not maintain a handwritten duplicate registry of the grammar or providers.
+### 7.2 Stable author-facing grammar
 
-When Milestone D is implemented, the configured offline `app` manifest participates naturally:
+`webtest describe language --reporter json` returns the general composition rules needed to assemble a source file. This is a stable author-facing grammar, not a serialization of parser functions, Rowan kinds, recovery states, or every precedence production.
+
+For the C.5 language it includes at least:
 
 ```json
 {
-  "providers": {
-    "app": {
-      "operations": {
-        "create_user": {
-          "parameters": {
-            "email": "String"
-          },
-          "returns": {
-            "id": "Int",
-            "email": "String"
-          }
-        }
-      }
+  "kind": "language_description",
+  "description_schema_version": 1,
+  "language_version": "<installed-version>",
+  "grammar": {
+    "source_file": "<test_declaration>*",
+    "test_declaration": "test <StringLiteral> <flow_block>",
+    "flow_block": "{ <flow_statement>* }",
+    "flow_statement": "<let_binding> | <server_block> | <browser_block> | <value_assertion> | <expression_statement>",
+    "let_binding": "let <Identifier> [: <Type>] = <expression>",
+    "server_block": "server { <server_statement>* }",
+    "server_statement": "<let_binding> | <value_assertion> | <expression_statement>",
+    "browser_block": "browser { <browser_statement>* }",
+    "browser_statement": "<let_binding> | <browser_operation> | <browser_assertion> | <value_assertion> | <expression_statement>",
+    "value_assertion": "expect <expression>",
+    "provider_call": "<provider>.<operation>(<argument_list>?)",
+    "argument_list": "<expression> (, <expression>)* (, <name>: <expression>)*",
+    "locator_expression": "<locator>(<argument_list>?)"
+  },
+  "lexical_forms": {
+    "Identifier": "ASCII letter or underscore followed by ASCII letters, digits, underscores, or hyphens",
+    "StringLiteral": "double-quoted text using the installed language's documented escape table",
+    "Duration": "positive integer followed by ms, s, or m",
+    "LineComment": "// followed by text through the end of the line"
+  },
+  "composition": [
+    "top-level declarations are tests",
+    "server and browser are capability scopes inside a test flow",
+    "a binding is visible only after its declaration in the enclosing sequential flow",
+    "a transferable server value may be referenced by a later browser block"
+  ],
+  "examples": [
+    {
+      "name": "minimal browser test",
+      "source": "test \"home is visible\" {\n    browser {\n        open \"/\"\n        expect text(\"Home\").visible\n    }\n}",
+      "source_kind": "source_file",
+      "prerequisites": ["configured browser base URL for a relative URL"]
+    },
+    {
+      "name": "server value used by the browser",
+      "source": "test \"created user signs in\" {\n    server {\n        let response = http.post(\"/api/test/users\", json: { email: \"alice@example.com\" })\n        let user: { id: Int, email: String } = response.json\n    }\n    browser {\n        fill label(\"Email\") with user.email\n    }\n}",
+      "source_kind": "source_file",
+      "prerequisites": ["configured HTTP base URL for a relative URL"]
     }
-  }
+  ]
 }
 ```
 
-The application does not need to be running for such static discovery.
+Grammar rule identifiers are stable within a description schema version and can be referenced by construct descriptions. The installed escape table, operator precedence/associativity, literal forms, reserved words, type forms, and comment forms are required structured portions of the language response; they are omitted from the illustrative object above only for brevity. The full lossless/error-recovery grammar remains an implementation detail.
+
+`webtest describe grammar` may return only the `grammar`, precedence, literal, and type-form portions of the same language description when a smaller response is desired.
+
+### 7.3 Construct description schema
+
+Every public construct has one canonical description. Conceptually:
+
+```text
+ConstructDescription {
+    description_schema_version,
+    language_version,
+    id,
+    name,
+    kind,
+    syntax,
+    syntax_forms,
+    summary,
+    search_terms,
+    parameters,
+    returns,
+    produces_value,
+    result_rule,
+    requires_capabilities,
+    allowed_contexts,
+    effects,
+    failure_modes,
+    constraints,
+    guidance,
+    examples,
+    related,
+    availability,
+    provenance,
+}
+
+ParameterDescription {
+    name,
+    type,
+    required,
+    position,
+    named,
+    default,
+    secret,
+    syntax_role,
+    grammar_rule,
+}
+
+SyntaxForm {
+    id,
+    elements: [Literal | Slot | RuleReference | Optional | Repeat | Choice],
+}
+
+ConstraintDescription {
+    code,
+    phase,
+    subject,
+    summary,
+    details,
+}
+
+SourceExample {
+    name,
+    source,
+    source_kind,
+    enclosing_context,
+    prerequisites,
+}
+```
+
+Fields that do not apply are absent rather than populated with vague strings. Types use the same structured `TypeSchema` representation as analysis and provider calls; the compact strings below are illustrative JSON projections. `syntax_role` distinguishes call arguments from statement operands, bodies, clauses, and bound variables. `grammar_rule` distinguishes, for example, a string-valued expression from the string-literal-only slot accepted by the current locator grammar. `syntax` is the compact author/LLM rendering, while `syntax_forms` is the normative machine composition model linking literal tokens and grammar references to named parameter slots. Constructs with materially different forms expose multiple named forms instead of compressing alternatives into an ambiguous display string.
+
+An expression or call has `returns`; an effect-only statement sets `produces_value` to false instead of inventing a `Unit` type that the language does not define. A conditional or branch-dependent value uses `result_rule` instead of inventing one fixed return type. Constraints and guidance have stable codes plus bounded explanations, allowing tools to branch on the code without scraping English text. `source_kind` distinguishes a complete source file from a declaration, block, statement, expression, locator, matcher, or other grammar fragment. `enclosing_context` identifies the exact grammar slot used to validate a fragment, not merely a broad capability scope; for example, a locator-only snippet can be validated as `browser.click.target` even when locators are not general standalone expressions.
+
+Every leaf description includes at least:
+
+* canonical display syntax and structured syntax forms with named slots;
+* a typed schema for each argument, operand, clause, or body;
+* a return type, an explicit no-value statement result, or a result-unification rule;
+* required capability and legal source contexts;
+* semantic constraints, effects, and failure behavior relevant to correct use;
+* canonical source examples.
+
+Every public leaf description provides at least two canonical examples: a minimal fragment and a composed use in its legal context. Additional examples are required when they communicate optional forms, temporal ordering, ownership, result unification, or other behavior not apparent from the syntax form. Configured external schemas must supply examples that pass WebTest's validation; the description service does not fabricate plausible application values or present an invalid example as canonical.
+
+For example, `webtest describe locator.role --reporter json` returns a leaf shaped like:
+
+```json
+{
+  "kind": "construct_description",
+  "description_schema_version": 1,
+  "language_version": "<installed-version>",
+  "id": "locator.role",
+  "name": "role",
+  "construct_kind": "locator",
+  "syntax": "role(<role>, name: <String>?)",
+  "syntax_forms": [
+    {
+      "id": "default",
+      "elements": [
+        { "kind": "literal", "value": "role(" },
+        { "kind": "slot", "parameter": "role" },
+        {
+          "kind": "optional",
+          "elements": [
+            { "kind": "literal", "value": ", name: " },
+            { "kind": "slot", "parameter": "name" }
+          ]
+        },
+        { "kind": "literal", "value": ")" }
+      ]
+    }
+  ],
+  "summary": "Locate an element by accessibility role and optional accessible name.",
+  "search_terms": ["accessibility", "accessible name", "button", "control"],
+  "parameters": [
+    {
+      "name": "role",
+      "type": "String",
+      "required": true,
+      "position": 0,
+      "named": false,
+      "syntax_role": "argument",
+      "grammar_rule": "StringLiteral"
+    },
+    {
+      "name": "name",
+      "type": "String",
+      "required": false,
+      "named": true,
+      "syntax_role": "argument",
+      "grammar_rule": "StringLiteral"
+    }
+  ],
+  "returns": "Locator",
+  "requires_capabilities": ["Browser"],
+  "allowed_contexts": ["scope.browser"],
+  "effects": ["browser_pointer_input", "page_may_navigate"],
+  "failure_modes": [
+    "locator_not_found",
+    "locator_ambiguous",
+    "element_not_visible",
+    "element_disabled",
+    "element_obscured",
+    "action_timeout",
+    "browser_disconnected"
+  ],
+  "constraints": [
+    {
+      "code": "exact_accessible_match",
+      "phase": "runtime",
+      "subject": "role,name",
+      "summary": "Role and name use exact case-sensitive matching after documented whitespace normalization."
+    },
+    {
+      "code": "singular_consumer_requires_unique_match",
+      "phase": "runtime",
+      "subject": "locator result",
+      "summary": "An action or singular assertion requires exactly one matching element."
+    }
+  ],
+  "examples": [
+    {
+      "name": "role only",
+      "source": "role(\"button\")",
+      "source_kind": "locator_fragment",
+      "enclosing_context": "browser.click.target"
+    },
+    {
+      "name": "role and accessible name",
+      "source": "click role(\"button\", name: \"Sign in\")",
+      "source_kind": "statement_fragment",
+      "enclosing_context": "scope.browser"
+    }
+  ],
+  "related": ["browser.click", "assertion.locator_state"],
+  "availability": { "analysis": true, "runtime_requires": ["native_browser"] },
+  "provenance": { "kind": "core", "content_trust": "installed" }
+}
+```
+
+Statement-like constructs use the same schema. `webtest describe browser.click --reporter json` includes its target operand and the context restriction that makes a server-side click invalid:
+
+```json
+{
+  "kind": "construct_description",
+  "description_schema_version": 1,
+  "language_version": "<installed-version>",
+  "id": "browser.click",
+  "name": "click",
+  "construct_kind": "browser_operation",
+  "syntax": "click <target>",
+  "syntax_forms": [
+    {
+      "id": "default",
+      "elements": [
+        { "kind": "literal", "value": "click " },
+        { "kind": "slot", "parameter": "target" }
+      ]
+    }
+  ],
+  "summary": "Wait for one actionable element and activate it with pointer input.",
+  "search_terms": ["activate", "button", "pointer", "press control"],
+  "parameters": [
+    {
+      "name": "target",
+      "type": "Locator",
+      "required": true,
+      "position": 0,
+      "named": false,
+      "syntax_role": "operand",
+      "grammar_rule": "locator_expression"
+    }
+  ],
+  "produces_value": false,
+  "requires_capabilities": ["Browser"],
+  "allowed_contexts": ["scope.browser"],
+  "constraints": [
+    {
+      "code": "unique_target_before_deadline",
+      "phase": "runtime",
+      "subject": "target",
+      "summary": "The locator must resolve to exactly one element before the action deadline."
+    },
+    {
+      "code": "pointer_actionability",
+      "phase": "runtime",
+      "subject": "target",
+      "summary": "The element must be attached, visible, stable, enabled, and able to receive pointer input."
+    }
+  ],
+  "examples": [
+    {
+      "name": "click a named button",
+      "source": "click role(\"button\", name: \"Save\")",
+      "source_kind": "statement_fragment",
+      "enclosing_context": "scope.browser"
+    },
+    {
+      "name": "click an exact text target",
+      "source": "click text(\"Continue\")",
+      "source_kind": "statement_fragment",
+      "enclosing_context": "scope.browser"
+    }
+  ],
+  "related": ["locator.role", "locator.text"],
+  "availability": { "analysis": true, "runtime_requires": ["native_browser"] },
+  "provenance": { "kind": "core", "content_trust": "installed" }
+}
+```
+
+`allowed_contexts` and `requires_capabilities` are compiler facts, not documentation-only advice. They are sufficient to determine statically that this is illegal:
+
+```webtest
+server {
+    click role("button", name: "Save")
+}
+```
+
+`guidance` is reserved for bounded authoring advice that explains when a valid construct should be used. Later actor/event constructs can therefore state temporal or ownership patterns such as taking a checkpoint before an action that may immediately emit the event being observed. Guidance does not add semantics that are absent from HIR, analysis, or the relevant runtime contract.
+
+### 7.4 Provider and project-defined operations
+
+Provider operation details are emitted from the same `ProviderSchema`, `OperationSchema`, `ParameterSchema`, and `TypeSchema` values used by static analysis. A provider leaf looks like the same function-call schema used for core callable constructs:
+
+```json
+{
+  "kind": "construct_description",
+  "description_schema_version": 1,
+  "language_version": "<installed-version>",
+  "id": "provider.http.get",
+  "name": "http.get",
+  "construct_kind": "provider_operation",
+  "syntax": "http.get(<url>, query: <Record>?, headers: <Record>?, timeout: <Duration>?)",
+  "syntax_forms": [
+    {
+      "id": "call",
+      "elements": [
+        { "kind": "literal", "value": "http.get(" },
+        { "kind": "slot", "parameter": "url" },
+        {
+          "kind": "repeat",
+          "separator": ", ",
+          "elements": [{ "kind": "slot", "parameter_group": "named_arguments" }]
+        },
+        { "kind": "literal", "value": ")" }
+      ]
+    }
+  ],
+  "summary": "Send an HTTP GET request.",
+  "search_terms": ["request", "fetch", "REST", "JSON", "server setup"],
+  "parameters": [
+    {
+      "name": "url",
+      "type": "String",
+      "required": true,
+      "position": 0,
+      "named": false,
+      "syntax_role": "argument",
+      "grammar_rule": "expression"
+    },
+    {
+      "name": "query",
+      "type": "Record",
+      "required": false,
+      "named": true,
+      "syntax_role": "argument",
+      "grammar_rule": "expression"
+    },
+    {
+      "name": "headers",
+      "type": "Record",
+      "required": false,
+      "named": true,
+      "syntax_role": "argument",
+      "grammar_rule": "expression"
+    },
+    {
+      "name": "timeout",
+      "type": "Duration",
+      "required": false,
+      "named": true,
+      "syntax_role": "argument",
+      "grammar_rule": "expression"
+    }
+  ],
+  "returns": "Response<Json>",
+  "requires_capabilities": ["Server"],
+  "allowed_contexts": ["scope.server"],
+  "effects": ["network_request"],
+  "failure_modes": [
+    "http_transport",
+    "response_too_large",
+    "provider_invalid_argument",
+    "provider_unavailable"
+  ],
+  "constraints": [
+    {
+      "code": "relative_url_requires_base_url",
+      "phase": "analysis",
+      "subject": "url",
+      "summary": "A relative URL requires the applicable configured base URL."
+    },
+    {
+      "code": "http_status_is_data",
+      "phase": "runtime",
+      "subject": "result.status",
+      "summary": "An HTTP 4xx or 5xx status is returned as data until an assertion rejects it."
+    }
+  ],
+  "examples": [
+    {
+      "name": "GET a resource",
+      "source": "let response = http.get(\"/api/users\")",
+      "source_kind": "statement_fragment",
+      "enclosing_context": "scope.server",
+      "prerequisites": ["configured HTTP base URL for a relative URL"]
+    },
+    {
+      "name": "GET with query and timeout",
+      "source": "let response = http.get(\"/api/users\", query: { active: true }, timeout: 5s)",
+      "source_kind": "statement_fragment",
+      "enclosing_context": "scope.server",
+      "prerequisites": ["configured HTTP base URL for a relative URL"]
+    }
+  ],
+  "availability": { "analysis": true, "runtime_requires": ["native_http"] },
+  "provenance": { "kind": "built_in_provider", "content_trust": "installed" }
+}
+```
+
+The concrete operation description includes every registered parameter, including secret/redaction metadata and supported bodies such as `json`, `text`, `bytes`, or `form`; the shortened example above demonstrates the shape rather than replacing the provider schema.
+
+When Milestone D is implemented, `provider.app` and leaves such as `provider.app.create_user` participate naturally. Their offline schema supplies documentation, parameters, result types, capability, redaction, defaults, and retry-safety metadata. Canonical syntax is projected from that schema, and bounded examples may come from validated schema documentation. The application does not need to be running for static discovery.
+
+Every description field carries provenance sufficient to distinguish installed core metadata, built-in provider metadata, project configuration, and externally supplied application/provider schemas. Project-supplied summaries, guidance, search terms, and examples are untrusted data: they are length-bounded, stripped of disallowed control characters, emitted as plain strings rather than executable markup, and marked `content_trust: "project_supplied"`. WebTest does not present them as compiler rules or agent instructions. Syntax, parameters, types, capability, redaction, and availability continue to come from validated schema fields rather than prose. A project-supplied example appears in canonical `examples` only after parsing and static validation against its declared schema/context; rejected examples produce schema/configuration diagnostics and are not quietly presented as valid source.
+
+Availability is separate from existence. A construct can be statically known while requiring native execution, configuration, a provider connection, or a host capability that is unavailable in the current environment. Structured `availability`, `runtime_requires`, configuration prerequisites, schema identity, and provider provenance prevent a client from treating “described” as “ready to execute.” `describe` remains static and may report requirements; it does not probe the network or start the provider merely to claim live availability.
+
+### 7.5 One reference, shared by every adapter
+
+`describe` must not maintain a CLI-owned grammar table or a handwritten duplicate provider registry. Protocol-neutral description services compose:
+
+* stable author-facing grammar metadata owned beside the one parser and typed AST;
+* construct identities and syntax-independent semantics used by HIR and analysis;
+* capability/context rules used by analysis;
+* locator, browser-operation, assertion, and state registries used by plan lowering and runtime;
+* configured provider schemas and project inputs.
+
+Some summaries, syntax templates, guidance, and examples are necessarily authored documentation. They live in one shared Rust reference model, are versioned with the language, and are consumed by CLI, editor, DAP, and WASM adapters. They never become adapter-local semantic tables.
+
+Every canonical example is tested through the ordinary lexer, lossless parser, typed AST, HIR, and analysis path in an appropriate enclosing source context. Every advertised context/capability restriction has a matching analysis test. Index entries, category children, construct identities, plan-lowerable operations, provider schemas, and leaf descriptions are checked for bidirectional completeness so an implemented public construct cannot silently disappear from discovery and an unavailable roadmap construct cannot be advertised.
+
+### 7.6 Versioning, bounds, and query failures
+
+Every response includes `description_schema_version` and `language_version`. Project-sensitive responses also identify the configuration/schema revision from which they were derived. Semantic schema changes follow the machine-output compatibility policy; documentation-only wording may change without pretending that the installed language changed, while syntax, parameter, result, constraint, capability, or context changes participate in language/reference compatibility.
+
+Responses are deterministically ordered and bounded. Top-level and category responses provide child query identifiers instead of recursively embedding the entire manual. Leaf descriptions are self-contained. Truncation is explicit, including which collection was truncated and which narrower query retrieves the omitted details.
+
+Unknown and ambiguous queries return the shared machine-diagnostic envelope with stable `description_unknown_query` and `description_ambiguous_query` codes, the requested query, and bounded exact/prefix/edit-distance candidates. These command diagnostics have no invented source range. Human output renders the same reference data concisely; clients using JSON never parse terminal prose.
+
+### 7.7 Limits of description
+
+`describe` explains what the installed language can express; it does not prove that a construct is appropriate for a particular behavioral requirement, that a copied example is safe to execute in the caller's environment, or that an inspected page will remain unchanged. Search relevance is advisory, canonical examples demonstrate language use rather than project intent, and static availability requirements are not live health checks.
+
+The closed loop remains essential: `describe` supports a good first attempt, `check` validates the actual source and returns structured diagnostics/reference queries, and `test` validates runtime behavior. A valid program can still assert the wrong business behavior. C.5 does not claim that reference completeness makes autonomous synthesis infallible.
 
 ## 8. Machine-readable diagnostics
 
@@ -501,10 +994,11 @@ MachineDiagnostic {
     code,
     severity,
     message,
-    source,
+    source?,
     related,
     semantic_details,
     repair_hints,
+    reference_queries,
 }
 
 SourceIdentity {
@@ -536,6 +1030,8 @@ matcher
 ```
 
 Clients must not have to parse these facts back out of an English message.
+
+When a diagnostic concerns a describable construct, type, provider operation, grammar rule, or legal-context rule, `reference_queries` contains bounded canonical `describe` identifiers such as `browser.click`, `locator.role`, or `provider.http.get`. A client can therefore move from a failed first attempt directly to the authoritative installed reference instead of guessing which help topic applies. References are advisory links, not source edits, and use the same identities returned by the description index.
 
 ### 8.2 Stable diagnostic codes
 
@@ -835,6 +1331,7 @@ The following rules are mandatory:
 * text, accessible names, labels, placeholders, URLs, candidate sets, and collections are bounded;
 * URL query parameters configured as sensitive are redacted;
 * generated repair hints never reintroduce a value already classified as secret;
+* description summaries, guidance, defaults, and examples pass through the same schema-aware redaction before emission; a redacted example is revalidated or omitted rather than labeled canonical when redaction makes it invalid;
 * raw DOM is not emitted as part of the semantic inspection DTO;
 * screenshots remain separately controlled artifacts;
 * machine reporters cannot bypass normal evidence limits.
@@ -858,6 +1355,20 @@ max_text_bytes = 256
 include_hidden = false
 ```
 
+Description limits are separate from inspection limits so a configured provider cannot turn a leaf query or search into an accidental full manual or prompt-sized payload:
+
+```toml
+[description]
+max_category_children = 200
+max_search_results = 20
+max_summary_bytes = 1024
+max_guidance_entries = 16
+max_examples = 4
+max_example_bytes = 4096
+```
+
+The implementation enforces documented hard ceilings above project configuration. The minimum permitted `max_examples` still allows the two required canonical examples for a public leaf. Search applies bounds per provenance class before the aggregate limit so project-supplied entries cannot crowd out installed-language matches.
+
 If a limit is reached, output contains structured truncation metadata. It must not silently appear complete.
 
 ## 14. Editor, DAP, and WASM behavior
@@ -871,7 +1382,7 @@ DAP continues to use the ordinary runtime. Failure stops may display structured 
 WASM can:
 
 * produce static machine diagnostics;
-* expose static language/provider description DTOs available from its supplied project inputs;
+* expose the same index, category, leaf, and deterministic search description DTOs available from its supplied project inputs;
 * serialize repair hints for static errors.
 
 WASM cannot execute `webtest inspect` because it has no native Chrome capability. It returns the same explicit unsupported/native-capability result used for other host-only behavior.
@@ -880,15 +1391,15 @@ No TypeScript extension code implements inspection, locator ranking, or repair s
 
 ## 15. Architecture and crate responsibilities
 
-* `syntax` is unchanged by this milestone. No new `.webtest` syntax is required.
-* `hir` is unchanged except where existing semantic metadata must become externally representable.
-* `analysis` exposes structured semantic diagnostic details and deterministic correction candidates from existing symbol/type/provider information.
-* `provider` exposes project-visible schemas through a protocol-neutral description DTO rather than a second CLI-specific registry.
+* `syntax` gains no new `.webtest` syntax, but exposes the canonical author-facing grammar, lexical forms, syntax forms, and validated source examples needed by the shared reference model.
+* `hir` is unchanged except where existing construct identity and semantic metadata must become externally representable.
+* `analysis` composes protocol-neutral description queries from syntax/HIR registries, capability/context rules, provider schemas, and explicit project inputs; it also exposes structured diagnostic details, reference queries, and deterministic correction candidates.
+* `provider` exposes project-visible schemas, provenance, availability requirements, and bounded untrusted documentation through the shared description DTO rather than a second CLI-specific registry.
 * `browser` owns `PageInspection`, `InspectableElement`, semantic element state, and locator-candidate contracts independent of CDP.
 * `browser-cdp` implements semantic inspection using the same accessibility/DOM/actionability primitives as normal locator execution.
 * `runtime` owns browser inspection lifecycle, bounded secondary inspection on failure, cancellation, and conversion into revision-aware observations.
 * `reporter` owns human/JSON/JSONL projections of shared DTOs but does not derive semantic candidates itself.
-* `app` composes `inspect` and `describe` CLI commands using shared services.
+* `app` composes `inspect` and hierarchical/queryable `describe` CLI commands using shared services.
 * `editor`, `lsp`, `dap`, and `wasm` transport shared DTOs only.
 
 The browser abstraction evolves conceptually to include:
@@ -933,11 +1444,14 @@ The normative acceptance harness does not call an LLM.
 
 It proves mechanically that:
 
-1. `webtest inspect /login --reporter json` exposes enough semantic information to identify valid unique locators for the login controls;
-2. those emitted locator expressions parse, analyze, and execute using the normal WebTest pipeline;
-3. a deliberately incorrect button name produces `locator_not_found`;
-4. the structured failure identifies the actual semantic button as a bounded repair candidate;
-5. applying that candidate to the test causes the corrected flow to pass.
+1. `webtest describe --reporter json` exposes the grammar, browser-operation, locator, and provider query identifiers needed for the task without assuming prior WebTest syntax knowledge;
+2. exact lookup and lexical search lead to self-contained `browser.open`, `browser.fill`, `browser.click`, `assertion.locator_state`, `locator.label`, and `locator.role` descriptions with structured syntax, context/capability facts, and canonical examples;
+3. every returned example or syntax form used by the fixture parses and analyzes through its declared enclosing context, while an intentionally illegal server-side browser action produces a diagnostic linked back to its canonical reference query;
+4. `webtest inspect /login --reporter json` exposes enough semantic information to identify valid unique locators for the login controls;
+5. those emitted locator expressions parse, analyze, and execute using the normal WebTest pipeline;
+6. a deliberately incorrect button name produces `locator_not_found`;
+7. the structured failure identifies the actual semantic button as a bounded repair candidate;
+8. applying that candidate to the test causes the corrected flow to pass.
 
 A documented external-agent evaluation may additionally give a fresh agent only:
 
@@ -963,13 +1477,13 @@ The evaluation should prohibit direct Playwright/CDP/browser-MCP use so that it 
 
 ## 17. Delivery slices
 
-1. Define versioned `PageInspection`, `InspectableElement`, locator-candidate, diagnostic-detail, and repair-hint DTOs with golden serialization tests.
+1. Define versioned language index/category/construct/search, syntax-form, provenance/availability, `PageInspection`, `InspectableElement`, locator-candidate, diagnostic-detail, and repair-hint DTOs with golden serialization tests.
 2. Add protocol-neutral browser inspection traits and fake-browser fixtures.
 3. Implement semantic element inspection in `browser-cdp` using existing locator/actionability primitives.
 4. Implement deterministic preferred/alternate locator generation and verify every emitted locator by normal resolution.
 5. Add `webtest inspect` with human and JSON reporters, isolated lifecycle, limits, and redaction.
-6. Add `webtest describe` from shared language/provider metadata without introducing a duplicate semantic registry.
-7. Normalize machine-readable static diagnostic details and stable diagnostic codes.
+6. Add hierarchical `webtest describe`, deterministic lexical search, author-facing grammar, typed construct descriptions, and validated examples from shared language/provider metadata without introducing a duplicate semantic registry.
+7. Normalize machine-readable static diagnostic details, stable diagnostic codes, and canonical description-reference queries.
 8. Add runtime locator/actionability/option repair hints and bounded secondary semantic inspection on failure.
 9. Surface shared details through JSON/JSONL reporters, editor services, LSP, DAP, and WASM where their capabilities permit.
 10. Add the semantic-discovery acceptance fixture, deterministic client harness, documentation, and optional external-agent evaluation instructions.
@@ -981,6 +1495,12 @@ Every slice uses shared semantic DTOs. No slice may implement an agent-specific 
 Required coverage includes:
 
 * deterministic serialization and compatibility golden tests for every new machine schema;
+* top-level index, category-prefix, exact-leaf, unique-alias, ambiguous-alias, unknown-query, and lexical-search golden tests;
+* completeness tests proving every public grammar/locator/browser/assertion/provider construct is indexed and described exactly once, and no unavailable roadmap construct is advertised;
+* tests composing every structured syntax form and parsing/analyzing every canonical example in its declared enclosing context;
+* tests proving described parameter types, result behavior, capabilities, contexts, constraints, availability, and provider schema identity agree with analysis and plan lowering;
+* tests proving static diagnostics include valid bounded `reference_queries` where an authoritative description exists;
+* bounds, sanitization, provenance, and instruction-like-content tests for untrusted project/provider documentation and examples;
 * fake-browser inspection tests for element roles, names, states, supported actions, ordering, truncation, and absence;
 * real-Chrome inspection tests for accessibility roles/names, labels, placeholders, test IDs, IDs, exact text, shadow/iframe limitations, hidden elements, disabled elements, checked controls, and Unicode;
 * tests proving every emitted locator candidate parses and resolves through the ordinary locator implementation;
@@ -1010,13 +1530,14 @@ Milestone C.5 is complete only when:
 
 1. `webtest inspect /login --reporter json` returns a bounded semantic snapshot containing valid, unique WebTest locator expressions for the reference login form without requiring raw DOM, CSS, XPath, screenshots, or application source inspection.
 2. Every emitted preferred locator is validated through the same locator resolver used by ordinary tests and produces deterministic canonical source for an equivalent page state.
-3. `webtest describe --reporter json` exposes the project-visible WebTest locator, operation, type, capability, and provider surface from shared semantic metadata rather than a CLI-only registry.
+3. `webtest describe --reporter json` returns a compact installed-language/project index, and exact, category, alias, and lexical-search queries return bounded self-contained grammar or construct references with structured syntax forms, typed parameters/results, contexts, capabilities, coded constraints/guidance, provenance/availability, and validated canonical examples from shared semantic metadata rather than a CLI-only registry.
 4. `check` and `test` expose stable source revision/range, diagnostic codes, semantic details, and repair hints in versioned machine-readable form without requiring clients to parse human messages.
 5. A deliberately incorrect semantic locator produces a structured runtime failure containing a valid nearby locator candidate when one can be determined, while WebTest never silently changes or heals the authored test.
 6. Ambiguous, disabled, obscured, missing-option, type, member, and provider failures preserve distinct structured semantics rather than collapsing into generic repair text.
 7. Inspection and repair output obey deterministic bounds and redaction rules and never expose password values, cookies, browser storage, configured secrets, or raw privileged browser identifiers.
-8. The deterministic semantic-discovery fixture proves that a client using only `describe`, `inspect`, `check`, `test`, and ordinary file editing has enough information to author and repair the reference login test.
-9. No LLM SDK, agent protocol, second parser, second locator implementation, CDP-specific public DTO, new DSL syntax, or automatic source mutation is introduced.
-10. Existing Milestone B and C behavior, plan serialization, editor/DAP behavior, and the future Milestone D provider architecture remain compatible, and the complete workspace/browser/editor/WASM quality gates pass.
+8. The deterministic semantic-discovery fixture proves that a client with no prior WebTest syntax knowledge, using only `describe`, `inspect`, `check`, `test`, and ordinary file editing, has enough information to discover the relevant vocabulary, author the reference login test, follow diagnostic reference queries, and repair it.
+9. Project/provider-authored description content is explicitly untrusted, bounded, sanitized, provenance-marked, and unable to override compiler-derived syntax, types, contexts, capabilities, availability, or redaction semantics.
+10. No LLM SDK, agent protocol, second parser, second locator implementation, CDP-specific public DTO, new DSL syntax, or automatic source mutation is introduced.
+11. Existing Milestone B and C behavior, plan serialization, editor/DAP behavior, and the future Milestone D provider architecture remain compatible, and the complete workspace/browser/editor/WASM quality gates pass.
 
 The inserted roadmap acceptance statement is thereby satisfied: an external tool can discover a running page, understand the WebTest surface available to it, author and statically validate a semantic WebTest, execute it, and repair a representative failure using only WebTest's versioned machine-readable interfaces.
