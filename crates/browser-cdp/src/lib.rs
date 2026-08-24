@@ -121,6 +121,11 @@ impl ChromeProcess {
             .arg(format!("--user-data-dir={}", profile.path().display()))
             .arg("--no-first-run")
             .arg("--no-default-browser-check")
+            // Debug sessions intentionally keep editor focus. Chrome must still run the owned
+            // test page at foreground speed while its window is unfocused or occluded.
+            .arg("--disable-background-timer-throttling")
+            .arg("--disable-backgrounding-occluded-windows")
+            .arg("--disable-renderer-backgrounding")
             .arg("--no-startup-window")
             .stdin(Stdio::null())
             .stdout(Stdio::null())

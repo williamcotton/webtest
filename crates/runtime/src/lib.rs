@@ -262,6 +262,14 @@ pub trait RunControl: Send + Sync {
 
     async fn before_step(&self, test: &webtest_plan::PlannedTest, step: &PlannedStep);
 
+    fn should_capture_bindings(
+        &self,
+        _test: &webtest_plan::PlannedTest,
+        _step: &PlannedStep,
+    ) -> bool {
+        true
+    }
+
     async fn after_step_failure(
         &self,
         _test: &webtest_plan::PlannedTest,
@@ -275,7 +283,7 @@ pub trait RunControl: Send + Sync {
         &self,
         test: &webtest_plan::PlannedTest,
         step: &PlannedStep,
-        _bindings: &BTreeMap<String, Value>,
+        _bindings: BTreeMap<String, Value>,
     ) {
         self.before_step(test, step).await;
     }
@@ -398,16 +406,20 @@ impl Runner {
                 collect_provider_secrets(call, &environment, &redacted_fields, &mut secrets);
             }
             if let Some(control) = control {
-                let bindings = visible_step_bindings(
-                    step,
-                    &environment,
-                    &binding_names,
-                    &redacted_fields,
-                    &secrets,
-                );
-                control
-                    .before_step_with_bindings(test, step, &bindings)
-                    .await;
+                if control.should_capture_bindings(test, step) {
+                    let bindings = visible_step_bindings(
+                        step,
+                        &environment,
+                        &binding_names,
+                        &redacted_fields,
+                        &secrets,
+                    );
+                    control
+                        .before_step_with_bindings(test, step, bindings)
+                        .await;
+                } else {
+                    control.before_step(test, step).await;
+                }
                 if control.is_cancelled() {
                     break;
                 }
@@ -1766,11 +1778,105 @@ fn visible_bindings(
             environment.get(id).map(|value| {
                 (
                     name.clone(),
-                    value.redacted_with_secrets(redacted_fields, secrets),
+                    debugger_value(value, redacted_fields, secrets),
                 )
             })
         })
         .collect()
+}
+
+const DEBUGGER_SNAPSHOT_BYTES: usize = 16 * 1024;
+const DEBUGGER_SNAPSHOT_ITEMS: usize = 256;
+
+struct DebuggerSnapshotBudget {
+    bytes: usize,
+    items: usize,
+}
+
+fn debugger_value(value: &Value, redacted_fields: &[String], secrets: &[String]) -> Value {
+    // Keep enough overlap to redact a secret crossing the final snapshot boundary, then apply the
+    // hard bound a second time. Debugger presentation must never copy an unbounded response body.
+    let overlap = secrets.iter().map(String::len).max().unwrap_or_default();
+    let mut before_redaction = DebuggerSnapshotBudget {
+        bytes: DEBUGGER_SNAPSHOT_BYTES.saturating_add(overlap),
+        items: DEBUGGER_SNAPSHOT_ITEMS,
+    };
+    let value = debugger_snapshot(value, &mut before_redaction)
+        .redacted_with_secrets(redacted_fields, secrets);
+    let mut final_budget = DebuggerSnapshotBudget {
+        bytes: DEBUGGER_SNAPSHOT_BYTES,
+        items: DEBUGGER_SNAPSHOT_ITEMS,
+    };
+    debugger_snapshot(&value, &mut final_budget)
+}
+
+fn debugger_snapshot(value: &Value, budget: &mut DebuggerSnapshotBudget) -> Value {
+    if budget.items == 0 {
+        return Value::String("<debugger value truncated>".into());
+    }
+    budget.items -= 1;
+    match value {
+        Value::String(value) => Value::String(debugger_text(value, budget)),
+        Value::Bytes(value) => Value::Bytes(debugger_bytes(value, budget)),
+        Value::List(values) => Value::List(
+            values
+                .iter()
+                .take(budget.items)
+                .map(|value| debugger_snapshot(value, budget))
+                .collect(),
+        ),
+        Value::Record(values) => Value::Record(
+            values
+                .iter()
+                .take(budget.items)
+                .map(|(name, value)| (name.clone(), debugger_snapshot(value, budget)))
+                .collect(),
+        ),
+        Value::Headers(values) => Value::Headers(
+            values
+                .iter()
+                .take(budget.items)
+                .map(|(name, value)| (name.clone(), debugger_text(value, budget)))
+                .collect(),
+        ),
+        Value::Response(value) => Value::Response(webtest_provider::ResponseValue {
+            status: value.status,
+            headers: value
+                .headers
+                .iter()
+                .take(budget.items)
+                .map(|(name, value)| (name.clone(), debugger_text(value, budget)))
+                .collect(),
+            body: debugger_bytes(&value.body, budget),
+            json: value
+                .json
+                .as_deref()
+                .map(|value| Box::new(debugger_snapshot(value, budget))),
+        }),
+        Value::ProcessResult(value) => Value::ProcessResult(webtest_provider::ProcessResultValue {
+            exit_code: value.exit_code,
+            stdout: debugger_text(&value.stdout, budget),
+            stderr: debugger_text(&value.stderr, budget),
+            stdout_bytes: debugger_bytes(&value.stdout_bytes, budget),
+            stderr_bytes: debugger_bytes(&value.stderr_bytes, budget),
+        }),
+        value => value.clone(),
+    }
+}
+
+fn debugger_text(value: &str, budget: &mut DebuggerSnapshotBudget) -> String {
+    let mut end = value.len().min(budget.bytes);
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    budget.bytes -= end;
+    value[..end].to_owned()
+}
+
+fn debugger_bytes(value: &[u8], budget: &mut DebuggerSnapshotBudget) -> Vec<u8> {
+    let end = value.len().min(budget.bytes);
+    budget.bytes -= end;
+    value[..end].to_vec()
 }
 
 fn collect_provider_secrets(
@@ -1859,7 +1965,7 @@ fn visible_step_bindings(
             Value::String("[redacted]".into())
         } else {
             evaluate(expression, environment)
-                .map(|value| value.redacted_with_secrets(redacted_fields, secrets))
+                .map(|value| debugger_value(&value, redacted_fields, secrets))
                 .unwrap_or_else(|_| Value::String("<unavailable>".into()))
         };
         visible.insert(format!("argument.{name}"), value);

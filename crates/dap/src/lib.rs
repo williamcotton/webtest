@@ -201,14 +201,13 @@ impl StepLocation {
     }
 }
 
-#[derive(Clone)]
 struct PausedFrame {
     test_name: String,
     operation: String,
     source_line: String,
     path: PathBuf,
     location: StepLocation,
-    bindings: BTreeMap<String, webtest_provider::Value>,
+    variables: DapVariableStore,
 }
 
 #[derive(Clone, Copy)]
@@ -487,12 +486,11 @@ impl DebugState {
     }
 
     async fn stack_trace(&self, request: &Request) -> Result<(), DapError> {
-        let frame = lock(&self.paused).clone();
-        let frames = frame.map_or_else(Vec::new, |frame| {
+        let frames = lock(&self.paused).as_ref().map_or_else(Vec::new, |frame| {
             vec![json!({
                 "id": 1,
-                "name": frame.operation,
-                "source": { "name": source_name(&frame.path), "path": frame.path },
+                "name": &frame.operation,
+                "source": { "name": source_name(&frame.path), "path": &frame.path },
                 "line": frame.location.line,
                 "column": frame.location.column,
                 "endLine": frame.location.end_line,
@@ -512,29 +510,48 @@ impl DebugState {
             .arguments
             .get("variablesReference")
             .and_then(Value::as_i64);
-        let frame = lock(&self.paused).clone();
-        let variables = match (reference, frame) {
-            (Some(reference), Some(frame)) => DapVariableStore::for_frame(&frame)
-                .variables
-                .remove(&reference)
-                .unwrap_or_default(),
-            _ => Vec::new(),
-        };
+        let variables = reference
+            .and_then(|reference| {
+                lock(&self.paused).as_mut().map(|frame| {
+                    let mut variables = if reference == VARIABLES_REFERENCE {
+                        vec![
+                            dap_leaf_variable("test", &format!("{:?}", frame.test_name), "string"),
+                            dap_leaf_variable(
+                                "operation",
+                                &format!("{:?}", frame.operation),
+                                "string",
+                            ),
+                            dap_leaf_variable(
+                                "source",
+                                &format!("{:?}", frame.source_line),
+                                "string",
+                            ),
+                            dap_leaf_variable("line", &frame.location.line.to_string(), "number"),
+                        ]
+                    } else {
+                        Vec::new()
+                    };
+                    variables.extend(frame.variables.variables(reference));
+                    variables
+                })
+            })
+            .unwrap_or_default();
         self.writer
             .response(request, json!({ "variables": variables }))
             .await
     }
 
     async fn resume(&self, request: &Request, command: ResumeCommand) -> Result<(), DapError> {
+        *lock(&self.pending_pause) = match command {
+            ResumeCommand::Continue => None,
+            ResumeCommand::Step => Some("step"),
+        };
         let body = if matches!(command, ResumeCommand::Continue) {
             json!({ "allThreadsContinued": true })
         } else {
             json!({})
         };
         self.writer.response(request, body).await?;
-        if matches!(command, ResumeCommand::Step) {
-            *lock(&self.pending_pause) = Some("step");
-        }
         let _ = self.resume_sender.send(command);
         self.writer
             .event(
@@ -717,7 +734,7 @@ impl DebugState {
             source_line,
             path: program.path,
             location,
-            bindings,
+            variables: DapVariableStore::new(bindings),
         });
         let _ = self
             .writer
@@ -782,15 +799,17 @@ impl DebugState {
             source_line,
             path: program.path,
             location,
-            bindings: bindings
-                .into_iter()
-                .map(|(name, value)| {
-                    (
-                        name,
-                        value.redacted(&self.runner_options.redacted_json_fields),
-                    )
-                })
-                .collect(),
+            variables: DapVariableStore::new(
+                bindings
+                    .into_iter()
+                    .map(|(name, value)| {
+                        (
+                            name,
+                            value.redacted(&self.runner_options.redacted_json_fields),
+                        )
+                    })
+                    .collect(),
+            ),
         });
         let _ = self
             .writer
@@ -820,13 +839,32 @@ impl RunControl for DebugState {
         self.pause_before_step(test, step, BTreeMap::new()).await;
     }
 
+    fn should_capture_bindings(&self, _test: &PlannedTest, step: &PlannedStep) -> bool {
+        if lock(&self.pending_pause).is_some() {
+            return true;
+        }
+        let (path, line) = {
+            let program = lock(&self.program);
+            let Some(program) = program.as_ref() else {
+                return false;
+            };
+            (
+                program.path.clone(),
+                StepLocation::new(&program.source, step.origin.range).line,
+            )
+        };
+        lock(&self.breakpoints)
+            .get(&path)
+            .is_some_and(|lines| lines.contains(&line))
+    }
+
     async fn before_step_with_bindings(
         &self,
         test: &PlannedTest,
         step: &PlannedStep,
-        bindings: &BTreeMap<String, webtest_provider::Value>,
+        bindings: BTreeMap<String, webtest_provider::Value>,
     ) {
-        self.pause_before_step(test, step, bindings.clone()).await;
+        self.pause_before_step(test, step, bindings).await;
     }
 
     async fn after_step_failure(
@@ -962,60 +1000,85 @@ fn unverified_breakpoints(requested: &[SourceBreakpoint], message: &str) -> Vec<
 
 struct DapVariableStore {
     variables: HashMap<i64, Vec<Value>>,
+    targets: HashMap<i64, Arc<webtest_provider::Value>>,
+    root: Vec<(String, Arc<webtest_provider::Value>)>,
     next_reference: i64,
 }
 
 impl DapVariableStore {
-    fn new() -> Self {
+    fn new(bindings: BTreeMap<String, webtest_provider::Value>) -> Self {
         Self {
             variables: HashMap::new(),
+            targets: HashMap::new(),
+            root: bindings
+                .into_iter()
+                .map(|(name, value)| (name, Arc::new(value)))
+                .collect(),
             next_reference: VARIABLES_REFERENCE + 1,
         }
     }
 
-    fn for_frame(frame: &PausedFrame) -> Self {
-        let mut store = Self::new();
-        let mut root = vec![
-            dap_leaf_variable("test", &format!("{:?}", frame.test_name), "string"),
-            dap_leaf_variable("operation", &format!("{:?}", frame.operation), "string"),
-            dap_leaf_variable("source", &format!("{:?}", frame.source_line), "string"),
-            dap_leaf_variable("line", &frame.location.line.to_string(), "number"),
-        ];
-        root.extend(
-            frame
-                .bindings
-                .iter()
-                .map(|(name, value)| store.provider_variable(name, value)),
-        );
-        store.variables.insert(VARIABLES_REFERENCE, root);
-        store
+    fn variables(&mut self, reference: i64) -> Vec<Value> {
+        if let Some(variables) = self.variables.get(&reference) {
+            return variables.clone();
+        }
+        let values = if reference == VARIABLES_REFERENCE {
+            self.root.clone()
+        } else {
+            let Some(value) = self.targets.get(&reference).cloned() else {
+                return Vec::new();
+            };
+            dap_children(&value)
+        };
+        let variables = values
+            .into_iter()
+            .map(|(name, value)| self.provider_variable(&name, value))
+            .collect::<Vec<_>>();
+        self.variables.insert(reference, variables.clone());
+        variables
     }
 
-    fn provider_variable(&mut self, name: &str, value: &webtest_provider::Value) -> Value {
-        let (children, indexed) = dap_children(value);
-        let (reference, child_count) = if children.is_empty() {
-            (0, 0)
-        } else {
+    fn provider_variable(&mut self, name: &str, value: Arc<webtest_provider::Value>) -> Value {
+        let child_shape = dap_child_shape(&value);
+        let reference = if child_shape.is_some() {
             let reference = self.next_reference;
             self.next_reference += 1;
-            let child_count = children.len();
-            let variables = children
-                .into_iter()
-                .map(|(name, value)| self.provider_variable(&name, &value))
-                .collect();
-            self.variables.insert(reference, variables);
-            (reference, child_count)
+            self.targets.insert(reference, Arc::clone(&value));
+            reference
+        } else {
+            0
         };
-        let mut variable = dap_variable(name, &dap_value(value), value.type_name(), reference);
-        if reference != 0 {
-            let count_name = if indexed {
-                "indexedVariables"
-            } else {
-                "namedVariables"
-            };
+        let mut variable = dap_variable(name, &dap_value(&value), value.type_name(), reference);
+        if let Some((count_name, child_count)) = child_shape.and_then(|shape| shape.count) {
             variable[count_name] = child_count.into();
         }
         variable
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DapChildShape {
+    count: Option<(&'static str, usize)>,
+}
+
+fn dap_child_shape(value: &webtest_provider::Value) -> Option<DapChildShape> {
+    use webtest_provider::Value as ProviderValue;
+
+    match value {
+        ProviderValue::List(values) if !values.is_empty() => Some(DapChildShape {
+            count: Some(("indexedVariables", values.len())),
+        }),
+        ProviderValue::Record(values) if !values.is_empty() => Some(DapChildShape {
+            count: Some(("namedVariables", values.len())),
+        }),
+        ProviderValue::Headers(values) if !values.is_empty() => Some(DapChildShape {
+            count: Some(("namedVariables", values.len())),
+        }),
+        ProviderValue::Response(_) => Some(DapChildShape { count: None }),
+        ProviderValue::ProcessResult(_) => Some(DapChildShape {
+            count: Some(("namedVariables", 5)),
+        }),
+        _ => None,
     }
 }
 
@@ -1032,75 +1095,75 @@ fn dap_variable(name: &str, value: &str, kind: &str, variables_reference: i64) -
     })
 }
 
-fn dap_children(value: &webtest_provider::Value) -> (Vec<(String, webtest_provider::Value)>, bool) {
+fn dap_children(value: &webtest_provider::Value) -> Vec<(String, Arc<webtest_provider::Value>)> {
     use webtest_provider::Value as ProviderValue;
 
-    let named = |values| (values, false);
     match value {
-        ProviderValue::List(values) => (
-            values
-                .iter()
-                .enumerate()
-                .map(|(index, value)| (format!("[{index}]"), value.clone()))
-                .collect(),
-            true,
-        ),
-        ProviderValue::Record(values) => named(
-            values
-                .iter()
-                .map(|(name, value)| (name.clone(), value.clone()))
-                .collect(),
-        ),
-        ProviderValue::Headers(values) => named(
-            values
-                .iter()
-                .map(|(name, value)| (name.clone(), ProviderValue::String(value.clone())))
-                .collect(),
-        ),
+        ProviderValue::List(values) => values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| (format!("[{index}]"), Arc::new(value.clone())))
+            .collect(),
+        ProviderValue::Record(values) => values
+            .iter()
+            .map(|(name, value)| (name.clone(), Arc::new(value.clone())))
+            .collect(),
+        ProviderValue::Headers(values) => values
+            .iter()
+            .map(|(name, value)| (name.clone(), Arc::new(ProviderValue::String(value.clone()))))
+            .collect(),
         ProviderValue::Response(response) => {
             let mut values = vec![
                 (
                     "status".into(),
-                    ProviderValue::Int(i64::from(response.status)),
+                    Arc::new(ProviderValue::Int(i64::from(response.status))),
                 ),
                 (
                     "headers".into(),
-                    ProviderValue::Headers(response.headers.clone()),
+                    Arc::new(ProviderValue::Headers(response.headers.clone())),
                 ),
-                ("body".into(), ProviderValue::Bytes(response.body.clone())),
+                ("body".into(), Arc::new(debug_bytes_value(&response.body))),
             ];
             if let Ok(text) = std::str::from_utf8(&response.body) {
-                values.push(("text".into(), ProviderValue::String(text.to_owned())));
+                values.push((
+                    "text".into(),
+                    Arc::new(ProviderValue::String(bounded_debug_text(text))),
+                ));
             }
             values.push((
                 "json".into(),
-                response
-                    .json
-                    .as_deref()
-                    .cloned()
-                    .unwrap_or(ProviderValue::Null),
+                Arc::new(
+                    response
+                        .json
+                        .as_deref()
+                        .cloned()
+                        .unwrap_or(ProviderValue::Null),
+                ),
             ));
-            named(values)
+            values
         }
-        ProviderValue::ProcessResult(result) => named(vec![
+        ProviderValue::ProcessResult(result) => vec![
             ("exit_code".into(), ProviderValue::Int(result.exit_code)),
             (
                 "stdout".into(),
-                ProviderValue::String(result.stdout.clone()),
+                ProviderValue::String(bounded_debug_text(&result.stdout)),
             ),
             (
                 "stderr".into(),
-                ProviderValue::String(result.stderr.clone()),
+                ProviderValue::String(bounded_debug_text(&result.stderr)),
             ),
             (
                 "stdout_bytes".into(),
-                ProviderValue::Bytes(result.stdout_bytes.clone()),
+                debug_bytes_value(&result.stdout_bytes),
             ),
             (
                 "stderr_bytes".into(),
-                ProviderValue::Bytes(result.stderr_bytes.clone()),
+                debug_bytes_value(&result.stderr_bytes),
             ),
-        ]),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name, Arc::new(value)))
+        .collect(),
         ProviderValue::Null
         | ProviderValue::Bool(_)
         | ProviderValue::Int(_)
@@ -1109,62 +1172,195 @@ fn dap_children(value: &webtest_provider::Value) -> (Vec<(String, webtest_provid
         | ProviderValue::DurationMillis(_)
         | ProviderValue::Bytes(_)
         | ProviderValue::FilePath(_)
-        | ProviderValue::TempDirectory(_) => (Vec::new(), false),
+        | ProviderValue::TempDirectory(_) => Vec::new(),
     }
 }
 
 fn dap_value(value: &webtest_provider::Value) -> String {
-    let mut rendered = serde_json::to_string(&dap_json_value(value))
-        .unwrap_or_else(|_| format!("<{}>", value.type_name()));
-    if rendered.len() > 1024 {
-        let mut end = 1024;
-        while !rendered.is_char_boundary(end) {
+    let mut preview = DapValuePreview::new();
+    preview.value(value);
+    preview.finish()
+}
+
+const DAP_VALUE_PREVIEW_BYTES: usize = 1024;
+
+struct DapValuePreview {
+    rendered: String,
+    truncated: bool,
+}
+
+impl DapValuePreview {
+    fn new() -> Self {
+        Self {
+            rendered: String::with_capacity(DAP_VALUE_PREVIEW_BYTES),
+            truncated: false,
+        }
+    }
+
+    fn finish(mut self) -> String {
+        if self.truncated {
+            let limit = DAP_VALUE_PREVIEW_BYTES.saturating_sub(3);
+            while self.rendered.len() > limit {
+                self.rendered.pop();
+            }
+            self.rendered.push_str("...");
+        }
+        self.rendered
+    }
+
+    fn push(&mut self, value: &str) {
+        let remaining = DAP_VALUE_PREVIEW_BYTES.saturating_sub(self.rendered.len());
+        if value.len() <= remaining {
+            self.rendered.push_str(value);
+            return;
+        }
+        let mut end = remaining;
+        while end > 0 && !value.is_char_boundary(end) {
             end -= 1;
         }
-        rendered.truncate(end);
-        rendered.push_str("...");
+        self.rendered.push_str(&value[..end]);
+        self.truncated = true;
     }
-    rendered
-}
 
-fn dap_json_value(value: &webtest_provider::Value) -> Value {
-    use webtest_provider::Value as ProviderValue;
+    fn quoted(&mut self, value: &str) {
+        let bounded = bounded_debug_text(value);
+        let rendered = serde_json::to_string(&bounded).unwrap_or_else(|_| "\"<string>\"".into());
+        self.push(&rendered);
+        if bounded.len() < value.len() {
+            self.truncated = true;
+        }
+    }
 
-    match value {
-        ProviderValue::Null
-        | ProviderValue::Bool(_)
-        | ProviderValue::Int(_)
-        | ProviderValue::Float(_)
-        | ProviderValue::String(_)
-        | ProviderValue::DurationMillis(_)
-        | ProviderValue::List(_)
-        | ProviderValue::Record(_) => webtest_provider::value_to_json(value).unwrap_or(Value::Null),
-        ProviderValue::Headers(headers) => json!(headers),
-        ProviderValue::Bytes(bytes) => debug_bytes(bytes),
-        ProviderValue::Response(response) => json!({
-            "status": response.status,
-            "headers": response.headers,
-            "body": debug_bytes(&response.body),
-            "json": response.json.as_deref().map(dap_json_value),
-        }),
-        ProviderValue::ProcessResult(result) => json!({
-            "exit_code": result.exit_code,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "stdout_bytes": debug_bytes(&result.stdout_bytes),
-            "stderr_bytes": debug_bytes(&result.stderr_bytes),
-        }),
-        ProviderValue::FilePath(path) | ProviderValue::TempDirectory(path) => {
-            Value::String(path.display().to_string())
+    fn fields<'a>(
+        &mut self,
+        values: impl IntoIterator<Item = (&'a str, &'a webtest_provider::Value)>,
+    ) {
+        self.push("{");
+        for (index, (name, value)) in values.into_iter().enumerate() {
+            if self.truncated {
+                break;
+            }
+            if index > 0 {
+                self.push(",");
+            }
+            self.quoted(name);
+            self.push(":");
+            self.value(value);
+        }
+        self.push("}");
+    }
+
+    fn string_fields<'a>(&mut self, values: impl IntoIterator<Item = (&'a str, &'a str)>) {
+        self.push("{");
+        for (index, (name, value)) in values.into_iter().enumerate() {
+            if self.truncated {
+                break;
+            }
+            if index > 0 {
+                self.push(",");
+            }
+            self.quoted(name);
+            self.push(":");
+            self.quoted(value);
+        }
+        self.push("}");
+    }
+
+    fn value(&mut self, value: &webtest_provider::Value) {
+        use webtest_provider::Value as ProviderValue;
+
+        match value {
+            ProviderValue::Null => self.push("null"),
+            ProviderValue::Bool(value) => self.push(if *value { "true" } else { "false" }),
+            ProviderValue::Int(value) => self.push(&value.to_string()),
+            ProviderValue::Float(value) => self.push(&value.to_string()),
+            ProviderValue::String(value) => self.quoted(value),
+            ProviderValue::DurationMillis(value) => self.push(&value.to_string()),
+            ProviderValue::List(values) => {
+                self.push("[");
+                for (index, value) in values.iter().enumerate() {
+                    if self.truncated {
+                        break;
+                    }
+                    if index > 0 {
+                        self.push(",");
+                    }
+                    self.value(value);
+                }
+                self.push("]");
+            }
+            ProviderValue::Record(values) => {
+                self.fields(values.iter().map(|(name, value)| (name.as_str(), value)));
+            }
+            ProviderValue::Headers(values) => {
+                self.string_fields(
+                    values
+                        .iter()
+                        .map(|(name, value)| (name.as_str(), value.as_str())),
+                );
+            }
+            ProviderValue::Bytes(bytes) => self.value(&debug_bytes_value(bytes)),
+            ProviderValue::Response(response) => {
+                self.push("{");
+                self.quoted("status");
+                self.push(":");
+                self.push(&response.status.to_string());
+                self.push(",");
+                self.quoted("headers");
+                self.push(":");
+                self.string_fields(
+                    response
+                        .headers
+                        .iter()
+                        .map(|(name, value)| (name.as_str(), value.as_str())),
+                );
+                self.push(",");
+                self.quoted("body");
+                self.push(":");
+                self.value(&debug_bytes_value(&response.body));
+                self.push(",");
+                self.quoted("json");
+                self.push(":");
+                self.value(response.json.as_deref().unwrap_or(&ProviderValue::Null));
+                self.push("}");
+            }
+            ProviderValue::ProcessResult(result) => {
+                let exit_code = ProviderValue::Int(result.exit_code);
+                let stdout = ProviderValue::String(bounded_debug_text(&result.stdout));
+                let stderr = ProviderValue::String(bounded_debug_text(&result.stderr));
+                self.fields([
+                    ("exit_code", &exit_code),
+                    ("stdout", &stdout),
+                    ("stderr", &stderr),
+                ]);
+            }
+            ProviderValue::FilePath(path) | ProviderValue::TempDirectory(path) => {
+                self.quoted(&path.display().to_string());
+            }
         }
     }
 }
 
-fn debug_bytes(bytes: &[u8]) -> Value {
-    std::str::from_utf8(bytes).map_or_else(
-        |_| Value::String(format!("<{} bytes>", bytes.len())),
-        |text| Value::String(text.to_owned()),
-    )
+fn bounded_debug_text(value: &str) -> String {
+    let mut end = value.len().min(DAP_VALUE_PREVIEW_BYTES);
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
+}
+
+fn debug_bytes_value(bytes: &[u8]) -> webtest_provider::Value {
+    let sample = &bytes[..bytes.len().min(DAP_VALUE_PREVIEW_BYTES)];
+    match std::str::from_utf8(sample) {
+        Ok(text) => webtest_provider::Value::String(text.to_owned()),
+        Err(error) if error.error_len().is_none() && error.valid_up_to() > 0 => {
+            let text = std::str::from_utf8(&sample[..error.valid_up_to()])
+                .unwrap_or_default()
+                .to_owned();
+            webtest_provider::Value::String(text)
+        }
+        Err(_) => webtest_provider::Value::String(format!("<{} bytes>", bytes.len())),
+    }
 }
 
 fn operation_name(operation: &TestOperation) -> String {
@@ -1473,13 +1669,18 @@ mod tests {
         assert!(rendered.contains("alice@example.test"));
         assert_ne!(rendered, "<response>");
 
-        let mut store = DapVariableStore::new();
-        let variable = store.provider_variable("response", &value);
+        let mut store = DapVariableStore::new(BTreeMap::from([("response".into(), value)]));
+        let root = store.variables(VARIABLES_REFERENCE);
+        let variable = root
+            .iter()
+            .find(|variable| variable["name"] == "response")
+            .expect("response variable");
         let response_reference = variable["variablesReference"]
             .as_i64()
             .expect("response reference");
         assert!(response_reference > VARIABLES_REFERENCE);
-        let response_children = &store.variables[&response_reference];
+        assert_eq!(store.variables.len(), 1, "only the root is materialized");
+        let response_children = store.variables(response_reference);
         assert!(
             response_children
                 .iter()
@@ -1490,7 +1691,11 @@ mod tests {
             .find(|child| child["name"] == "json")
             .expect("response JSON child");
         let json_reference = json["variablesReference"].as_i64().expect("JSON reference");
-        let json_children = &store.variables[&json_reference];
+        assert!(
+            !store.variables.contains_key(&json_reference),
+            "nested children stay lazy until the debugger expands them"
+        );
+        let json_children = store.variables(json_reference);
         assert!(json_children.iter().any(|child| {
             child["name"] == "email" && child["value"] == "\"alice@example.test\""
         }));
@@ -1509,8 +1714,14 @@ mod tests {
             Arc::new(UnusedBrowserHost),
             RunnerOptions::default(),
         );
+        *lock(&state.program) = Some(program.clone());
+        assert!(
+            !state.should_capture_bindings(&test, &step),
+            "uninterrupted steps must not build debugger variable snapshots"
+        );
         lock(&state.breakpoints).insert(program.path.clone(), HashSet::from([4]));
         *lock(&state.program) = Some(program);
+        assert!(state.should_capture_bindings(&test, &step));
 
         let bindings = BTreeMap::from([(
             "user".into(),
@@ -1532,7 +1743,7 @@ mod tests {
         let paused_state = Arc::clone(&state);
         let task = tokio::spawn(async move {
             paused_state
-                .before_step_with_bindings(&test, &step, &bindings)
+                .before_step_with_bindings(&test, &step, bindings)
                 .await;
         });
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -1543,18 +1754,38 @@ mod tests {
         .await
         .expect("breakpoint pause");
 
-        let frame = lock(&state.paused).clone().expect("paused frame");
-        assert_eq!(frame.location.line, 4);
-        assert_eq!(frame.operation, "click id(\"submit\")");
-        assert_eq!(
-            frame.bindings["user"].member("token"),
-            Some(webtest_provider::Value::String("[redacted]".into()))
-        );
+        {
+            let mut paused = lock(&state.paused);
+            let frame = paused.as_mut().expect("paused frame");
+            assert_eq!(frame.location.line, 4);
+            assert_eq!(frame.operation, "click id(\"submit\")");
+            let variables = frame.variables.variables(VARIABLES_REFERENCE);
+            let user = variables
+                .iter()
+                .find(|variable| variable["name"] == "user")
+                .expect("user variable");
+            assert!(user["value"].as_str().is_some_and(|value| {
+                value.contains("[redacted]") && !value.contains("private")
+            }));
+        }
+        *lock(&state.pending_pause) = Some("step");
         state
-            .resume_sender
-            .send(ResumeCommand::Continue)
+            .resume(
+                &Request {
+                    seq: 1,
+                    message_type: "request".into(),
+                    command: "continue".into(),
+                    arguments: json!({ "threadId": THREAD_ID }),
+                },
+                ResumeCommand::Continue,
+            )
+            .await
             .expect("continue");
         task.await.expect("control task");
         assert!(lock(&state.paused).is_none());
+        assert!(
+            lock(&state.pending_pause).is_none(),
+            "continue must cancel queued step mode"
+        );
     }
 }
