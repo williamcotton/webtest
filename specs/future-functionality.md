@@ -12,6 +12,8 @@ The purpose of the next stages is to turn the proven architecture into a useful 
 - execution through a source-mapped `TestPlan`;
 - browser semantics independent of CDP;
 - structured runtime events and revision-bound observations;
+- statically discoverable declaration and test-variant identity;
+- bounded, protocol-neutral browser-event observation owned by structured runtime scopes;
 - Tower LSP, Cursor/VS Code, Monaco, CLI, and terminal output as adapters;
 - one native `webtest` executable.
 
@@ -49,9 +51,11 @@ The native executable should grow toward:
 ```text
 webtest check [paths...]
 webtest fmt [paths...] [--check|--stdout]
-webtest test [paths...] [--filter PATTERN] [--tag TAG] [--jobs N] [--headed]
-webtest run <file> [--test NAME]
+webtest test [paths...] [--filter PATTERN] [--tag TAG] [--test NAME] [--variant LABEL] [--jobs N] [--headed]
+webtest run <file> [--test NAME] [--variant LABEL]
 webtest build [paths...] [--emit plan.json]
+webtest describe [paths...] [--reporter human|json]
+webtest inspect [url] [--headed] [--reporter human|json]
 webtest lsp
 webtest dap [--headless]
 webtest repl
@@ -61,7 +65,7 @@ webtest browser install|list|path|clean
 
 `test` is the test-suite command. `run` executes an explicitly selected file or test and may favor interactive output. `build` performs analysis and emits a versioned, serializable `TestPlan` without executing it. All commands must call the same analysis, formatting, planning, and runtime APIs used by editor services.
 
-A project-level `webtest.toml` should eventually define source roots, default timeouts, browser selection, tags, environment profiles, artifact paths, managed-browser policy, application lifecycle, server providers, and bridge schemas. Configuration inputs must participate in query invalidation and plan identity.
+A project-level `webtest.toml` should eventually define source roots, default timeouts, browser selection, tags, environment profiles, artifact paths, managed-browser policy, application lifecycle, server providers, bridge schemas, bounded reactive-event limits, and semantic-verdict policy. Configuration inputs must participate in query invalidation and plan identity.
 
 ---
 
@@ -83,7 +87,7 @@ named arguments
 unary and binary operators
 ```
 
-Required statements:
+Required statement/control forms:
 
 ```text
 let binding
@@ -91,8 +95,17 @@ expression/action statement
 assertion
 server block
 browser block
-sequence, parallel, race, retry, and timeout blocks
+parallel, race, retry, and timeout blocks
+accumulated check block
+semantic verdict and assumption
+actor-scoped browser block
+bounded reactive select
+scoped guard activation
 ```
+
+All ordinary bodies lower to explicit `Sequence { children }` plan nodes. A dedicated `sequence {}` spelling is optional rather than foundational; it should be added only if grammar work demonstrates a distinct authoring need inside concurrent constructs.
+
+The declaration model also grows explicit, statically analyzable forms for labeled test cases, reusable typed patterns, and reusable event guards. Cases expand a test declaration into independently discoverable variants during analysis; they are not runtime loops. Patterns are serializable match descriptions rather than value constructors or callbacks. Guards are constrained scoped invariants rather than detached event handlers.
 
 Illustrative syntax:
 
@@ -127,6 +140,9 @@ List<T>, Option<T>, records
 StatusCode, Headers, Request, Response<T>
 Locator, Element
 Browser, BrowserContext, Page
+BrowserActor, EventCursor<Actor>
+ConsoleEvent, NetworkRequestEvent, NetworkResponseEvent
+WebSocketFrameEvent, WebSocketJsonEvent, NavigationEvent
 ProcessResult, FilePath
 ```
 
@@ -136,7 +152,7 @@ Operations also have an execution capability:
 Pure | Server | Browser | Test
 ```
 
-Analysis must reject operations used in the wrong domain before planning. Values crossing between server and browser blocks must be serializable and explicitly transferable. Strings, numbers, booleans, URLs, and JSON-like records are transferable; pages, sockets, database connections, browser element handles, and file handles are not.
+Analysis must reject operations used in the wrong domain before planning. Values crossing between server and browser blocks must be serializable and explicitly transferable. Strings, numbers, booleans, URLs, and JSON-like records are transferable; actors, event cursors, pages, sockets, database connections, browser element handles, and file handles are not. `BrowserActor` and its cursor are resource-owned identities whose lifetime and actor association are checked statically.
 
 Diagnostics should explain both the expected type/capability and the actual one, point to the smallest useful source range, and offer fixes through protocol-neutral code actions where possible.
 
@@ -144,11 +160,11 @@ Diagnostics should explain both the expected type/capability and the actual one,
 
 Bindings are lexically scoped. Names must resolve to stable semantic IDs rather than strings. Shadowing policy must be explicit and diagnosed consistently. HIR should move toward arena-backed IDs or another compact representation suitable for incremental queries.
 
-Test identity must remain stable enough for filtering, observations, traces, and editor decorations. A test's display name is not its only identity; project, module path, declaration origin, and an internal ID should form the durable identity.
+Test identity must remain stable enough for filtering, observations, traces, editor decorations, reruns, and debugging. Distinguish `TestDeclarationId` from executable `TestVariantId`. Explicitly labeled, statically evaluable cases expand one declaration into independently runnable variants before execution; a declaration without cases has one implicit default variant. Project/module/declaration identity plus the explicit case label—not display formatting, case order, runtime values, or attempt number—forms durable execution identity. Retry attempts retain the same `TestVariantId` and use a separate `AttemptId`.
 
 ### 3.4 Modules, packages, and fixtures
 
-Add a module graph only after single-file expressions and types are stable. Projects should support imports, reusable fixture declarations, helper functions, and project configuration without executing arbitrary code during analysis.
+Add a module graph only after single-file expressions and types are stable. Projects should support imports, reusable fixture declarations, helper functions, typed pattern declarations, event-guard declarations, and project configuration without executing arbitrary code during analysis.
 
 Fixture lifetimes should be explicit:
 
@@ -156,7 +172,9 @@ Fixture lifetimes should be explicit:
 test | file | worker | suite
 ```
 
-Setup and teardown must be represented in the plan and event stream so cancellation and failure cannot silently skip cleanup.
+Setup and teardown must be represented in the plan and event stream so cancellation and failure cannot silently skip cleanup. A test-scoped fixture is acquired per executable variant, while retries follow the resource ownership boundary expressed by the plan.
+
+The dependency-tracked semantic database should also expose bounded project descriptions of helpers, fixtures, tests, parameters, types, capabilities, documentation, and fixture lifetimes. CLI, editor, WASM, and machine clients consume this one query rather than scanning declarations independently.
 
 ---
 
@@ -210,11 +228,37 @@ Timeouts, retries, and polling intervals must be configurable and observable. Fa
 
 ### 4.4 Browser contexts and state
 
-Support isolated contexts, pages, cookies, local/session storage, permissions, geolocation, viewport, user agent, locale, timezone, downloads, dialogs, console events, and network events. Tests should default to isolation. Reuse a browser process for performance without reusing test state unless explicitly requested.
+Support isolated contexts, pages, cookies, local/session storage, permissions, geolocation, viewport, user agent, locale, timezone, downloads, and dialogs. Tests should default to isolation. Reuse a browser process for performance without reusing test state unless explicitly requested.
 
-### 4.5 Network control
+Each test variant has an implicit default browser actor for compatibility with `browser {}`. Explicit `actor name browser` declarations create first-class `BrowserActor` resources, each owning an isolated browser context, default page, event journal, identity, and structured lifetime. Independent actors may run concurrently; analysis rejects conflicting concurrent use of the same exclusively owned actor.
+
+### 4.5 Browser events and reactive observation
+
+Normalize console, network request/response, WebSocket frame/JSON, and navigation events in the protocol-neutral browser layer. Raw CDP event shapes and identifiers never enter the DSL or portable plan.
+
+Each actor owns a bounded, ordered event journal. `checkpoint(actor)` establishes a backend ordering barrier and an actor-bound cursor before a stimulus; `select actor since cursor within duration` scans events in actor order, evaluates eligible alternatives in source order for each event, and executes only the selected branch. An omitted cursor means selection starts at an implicit entry checkpoint, not at arbitrary prior history. Buffer overflow, unavailable event sources, cancellation, and selection timeout remain distinct structured outcomes.
+
+Reusable guards subscribe before their guarded body starts and enforce constrained event invariants until the lexical scope exits. A terminating guard cancels and cleans up the guarded body. Guards may inspect events and emit bounded semantic failure/inconclusive evidence, but they cannot become effectful background browser automation.
+
+### 4.6 Network control
 
 After passive network events are reliable, add request routing, aborting, modification, and deterministic response fulfillment. Matchers should operate on structured URL, method, headers, and resource type rather than raw CDP events. Mocks and their invocation counts must appear in the plan, event stream, assertions, and trace.
+
+### 4.7 Semantic inspection and machine feedback
+
+Before the application bridge, expose existing WebTest semantics directly through the interfaces specified by [`milestone-c-5.md`](./milestone-c-5.md):
+
+```text
+webtest inspect   bounded live-page semantics and validated locator candidates
+webtest describe  static language/project/provider capability description
+check/test JSON   stable diagnostic codes, semantic details, source identity, repair hints
+```
+
+Inspection uses the same accessibility, locator, actionability, browser-lifecycle, and redaction implementations as ordinary execution. It returns useful semantic elements and canonical WebTest locator expressions rather than raw DOM/CDP identifiers. Every suggested locator must already be valid and unique in the observed snapshot; WebTest never silently heals source.
+
+Static description is projected from the same language tables, provider schemas, configuration inputs, and later workspace indexes used by analysis and editor services. Machine output is versioned, bounded, deterministic, and safe to consume without parsing human messages. Humans, scripts, editors, and agents are consumers of these shared DTOs; none receive a second parser, locator evaluator, browser driver, or privileged protocol.
+
+As the language grows, that same description exposes variant syntax and identity, pattern forms and signatures, semantic verdicts, `BrowserActor` capabilities, event-source payload schemas, guard restrictions, and `select`/`check` control semantics. A machine consumer must not need prose documentation or an adapter-owned table to discover them.
 
 ---
 
@@ -406,7 +450,7 @@ Do not transmit language stack traces or secrets by default. A debug configurati
 
 ### 5.4 Schema-first functions and editor intelligence
 
-Schema is part of the integration contract, not optional RPC documentation. Every function declares parameter and result types. A `describe` request returns a canonical schema such as:
+Schema is part of the integration contract, not optional RPC documentation. Every function declares bounded human documentation, parameter and result types, capability/redaction semantics, and operation-level retry safety. Parameters distinguish required/optional status, typed defaults, and secrets. A bridge `describe` request returns a canonical schema such as:
 
 ```json
 {
@@ -414,13 +458,23 @@ Schema is part of the integration contract, not optional RPC documentation. Ever
   "protocol": 1,
   "functions": {
     "create_user": {
+      "documentation": "Create a user directly in the test database.",
+      "retry_safe": false,
       "params": {
         "type": "object",
         "fields": {
-          "email": { "type": "string" },
-          "admin": { "type": "boolean" }
-        },
-        "required": ["email"]
+          "email": {
+            "type": "string",
+            "documentation": "Unique sign-in email.",
+            "secret": false
+          },
+          "admin": {
+            "type": "boolean",
+            "optional": true,
+            "default": false,
+            "secret": false
+          }
+        }
       },
       "returns": {
         "type": "object",
@@ -440,7 +494,9 @@ SDKs also generate a deterministic offline manifest, by default:
 .webtest/app-schema.json
 ```
 
-The LSP, WASM editor service, `check`, and `build` load this file without starting the application. It enables function completion, named-argument validation, result-member completion, and static errors such as passing a string to a Boolean field. The runtime obtains the live schema during handshake and detects incompatible drift from the schema hash embedded in the plan. Drift is a configuration/infrastructure failure, not an untyped runtime surprise.
+The LSP, WASM editor service, `webtest describe`, `check`, and `build` load this file without starting the application. It enables function discovery, documentation, completion, named-argument validation, result-member completion, retry analysis, redaction, and static errors such as passing a string to a Boolean field. Static failures use C.5 diagnostic codes, semantic details, and bounded schema-derived repair candidates. The runtime obtains the live schema during handshake and detects incompatible drift from the schema hash embedded in the plan. Drift is a configuration/infrastructure failure, not an untyped runtime surprise.
+
+The bridge protocol's `describe` message and the CLI's `webtest describe` command are different projections of the same schema values: one verifies a live application bridge, while the other statically describes project-visible semantics. Neither is an agent protocol.
 
 The initial schema value model is intentionally small:
 
@@ -743,7 +799,11 @@ Potential providers include `app`, `http`, `postgres`, `redis`, `mail`, `queue`,
 
 ## 6. Assertions and diagnostics
 
-Expand the existing `expect <locator>.visible` assertion into typed matchers for equality, inequality, containment, patterns, status codes, JSON structures, additional locator states, URLs, and eventually visual snapshots. Preserve the current behavior in which an assertion is a distinct plan operation with the locator/expression's precise source origin.
+Expand the existing `expect <locator>.visible` assertion into typed matchers for equality, inequality, containment, reusable patterns, status codes, JSON structures, additional locator states, URLs, and eventually visual snapshots. Preserve the current behavior in which an assertion is a distinct plan operation with the locator/expression's precise source origin.
+
+Typed `pattern` declarations describe acceptable values through a bounded algebra: literals and types, exact/subset records, exact lists, `each`, `contains`, optional/absent fields, regular expressions, ranges, alternatives, conjunction, negation, and statically resolved pattern references. Patterns are pure, acyclic in their initial form, serializable into plans, usable both by `matches` expressions and assertions, and produce bounded path-aware structured diffs.
+
+`check {}` remains sequential but accumulates only assertion-class failures in stable child order; provider, browser action, infrastructure, internal, timeout, and cancellation failures still terminate it. Semantic `pass`, `fail`, `skip`, and `inconclusive` verdicts and `assume ... else skip|inconclusive` remain distinct from execution errors through runtime results, reporters, JUnit, traces, observations, and DAP.
 
 Snapshot storage must use deterministic project-relative names. Creating or updating snapshots requires an explicit CLI/editor action; ordinary test execution must never silently accept a new result.
 
@@ -754,6 +814,8 @@ Assertion failures must preserve:
 - a structured diff when applicable;
 - relevant page/request/process context;
 - source revision, execution, test, and step identity.
+
+Static diagnostics and runtime failures also expose stable machine codes, typed semantic details, bounded repair hints, and canonical byte ranges/source revisions as defined by C.5. Locator candidates, name/member/argument candidates, option lists, and actionability facts are advisory evidence; adapters never infer them from prose or apply them silently.
 
 Avoid compiling assertions into opaque callbacks. They must remain visible in HIR, `TestPlan`, events, traces, and editor observations.
 
@@ -767,9 +829,13 @@ Grow `TestOperation` into a versioned IR containing:
 Browser, ServerProviderCall, Assertion
 Sequence, Parallel, Race, Retry, Timeout
 Acquire, Setup, Teardown
+Check, Assume, Verdict
+ActorScope, EventCheckpoint, Select, GuardScope
 ```
 
-`ServerProviderCall` contains the provider namespace, operation name, typed arguments/result, provider capability requirements, offline schema identity, and redaction metadata. Built-in `http`, `process`, and `fs` calls and external `app` calls use the same explicit plan shape even though their runtime adapters differ.
+The versioned plan also preserves declaration-level data for `TestDeclarationPlan`, `TestVariantPlan`, serializable `PatternDefinition` matchers, and statically resolved `GuardDefinition`s. A variant records its declaration/variant identities, case label/value/binding, origins, and independently executable child plan.
+
+`ServerProviderCall` contains the provider namespace, operation name, typed arguments/result, provider capability requirements, offline schema identity, retry-safety policy, and redaction metadata. Built-in `http`, `process`, and `fs` calls and external `app` calls use the same explicit plan shape even though their runtime adapters differ.
 
 Plans must be deterministic, serializable, and independent of syntax nodes. Every executable or controlling node carries a stable plan ID, source origin, capability requirements, timeout policy, and source revision. Bridge connections, live browser objects, closures, and application SDK objects never appear in a plan.
 
@@ -782,6 +848,18 @@ The runtime scheduler must provide structured concurrency:
 - `timeout` distinguishes timeout from cancellation and underlying failure;
 - teardown executes once when its resource was acquired.
 
+`Sequence` remains explicit in the IR even if ordinary source blocks provide all necessary sequential syntax. `Race` has one precise meaning: start child computations, let the first successful child win, cancel and clean up losers, and retain an ordered aggregate if every child fails. A failed child does not win while another can still succeed.
+
+Reactive event selection is a separate semantic concept, not another spelling of `Race`:
+
+```text
+Select { actor, cursor, deadline, alternatives, timeout_branch, result_type }
+```
+
+`Select` scans one actor's normalized journal from an explicit or implicit checkpoint, evaluates same-event alternatives in source order with pure filters, and executes only the selected branch. It does not start alternatives speculatively. `GuardScope` installs all subscriptions before its child begins and owns them until deterministic deactivation. `EventCheckpoint`, active selects, guards, and their subscriptions reuse the scheduler's deadlines, cancellation, task paths, and resource ownership without turning reporter events into a reactive source.
+
+`Check` has an explicit versioned continuation policy rather than recognizing recoverable failures from strings. Verdict nodes terminate the current variant while preserving teardown. Plans and results distinguish semantic `Pass`, `Fail`, `Skipped`, and `Inconclusive` from static, infrastructure, and internal errors.
+
 Parallel test execution should be added only after resource isolation and deterministic event ordering are defined. `--jobs` controls test-level concurrency; concurrency inside a test is expressed by the plan.
 
 ---
@@ -790,13 +868,13 @@ Parallel test execution should be added only after resource isolation and determ
 
 ### 8.1 Event schema
 
-Extend the existing event stream with timestamps, parent operation IDs, attempt numbers, durations, captured output, attachments, provider-call identity, and explicit cancellation/infrastructure events. The event schema should be serializable and versioned so terminal reporters, traces, editor observations, DAP, and future remote runners consume the same facts. Bridge arguments/results must be summarized and redacted according to their schemas before entering events.
+Extend the existing event stream with timestamps, parent operation IDs, attempt numbers, durations, captured output, attachments, provider-call identity, declaration/variant/case identity, actor and reactive-operation identity, verdicts, and explicit cancellation/infrastructure events. Variant, actor, checkpoint, select/match/timeout, guard activation/trigger/deactivation, check accumulation, and verdict lifecycle events use the same serializable versioned envelope consumed by terminal reporters, traces, editor observations, DAP, machine clients, and future remote runners. C.5 diagnostic codes, semantic details, repair hints, and source identities remain typed fields rather than formatted strings. Bridge arguments/results and reactive browser payloads must be bounded and redacted according to their schemas before entering events.
 
 Reporters subscribe to events. The runner must not print directly.
 
 ### 8.2 Observation lifecycle
 
-Add observation kinds for ambiguous locators, assertion mismatches, navigation failures, HTTP failures, console errors, network failures, observed values, timings, and retries.
+Add observation kinds for ambiguous locators, assertion and pattern mismatches, accumulated checks, navigation failures, HTTP failures, console errors, network failures, select timeouts/overflow, guard failures, semantic verdicts, observed values, timings, and retries.
 
 The store must atomically replace observations for a completed file/revision execution. New runs clear prior current observations; successful reruns remove prior failures. No adapter may publish an observation when its `SourceRevision` differs from the current document revision.
 
@@ -823,13 +901,15 @@ DOM or accessibility snapshots
 
 `webtest trace` should open or serve an HTML viewer. Trace capture levels must be configurable to control size and sensitive data.
 
+The trace timeline must reconstruct declaration-to-variant identity, separate actor lanes, checkpoints, select waiting intervals and matched events, guard activation intervals and triggers, accumulated checks, semantic verdicts, retries, cancellations, and their source origins without rerunning match logic or project code.
+
 ---
 
 ## 9. CDP and managed browsers
 
 Replace the hand-written CDP subset incrementally with generated typed bindings from a pinned Chrome DevTools Protocol schema. Keep a generic command path for protocol evolution and debugging, but normal browser behavior should use generated request/response/event types.
 
-The connection layer must handle target discovery, flattened sessions, events, request cancellation, disconnects, browser crashes, protocol timeouts, and graceful shutdown. Add bounded queues and prevent a slow observer from blocking CDP reads.
+The connection layer must handle target discovery, flattened sessions, events, request cancellation, disconnects, browser crashes, protocol timeouts, and graceful shutdown. Add bounded queues and prevent a slow observer from blocking CDP reads. Browser contexts back first-class actors, while CDP-specific console/network/WebSocket/navigation events are normalized behind browser traits. Actor checkpoints require a tested bounded protocol barrier; an unavailable ordering guarantee fails explicitly.
 
 Introduce a `BrowserManager` and commands:
 
@@ -852,7 +932,9 @@ Never use the user's browser profile or add `--no-sandbox` by default.
 
 The current database uses revision-keyed memoization suitable for one-file analysis. Before modules and large workspaces, move to a formal incremental query model, preferably Salsa, or document an equivalent dependency-tracked design.
 
-Required inputs include file text, paths/URIs, configuration, environment profile metadata, provider schema manifests and hashes, and module/package graph. Required queries include parse, HIR, name resolution, types/effects, provider/function resolution, static diagnostics, plan construction, symbols, and editor features.
+Required inputs include file text, paths/URIs, configuration, environment profile metadata, provider schema manifests and hashes, event-source schemas, and module/package graph. Required queries include parse, HIR, name resolution, types/effects, provider/function resolution, static case expansion, pattern and guard resolution, actor lifetime/exclusivity checks, select result typing, static diagnostics/repair details, plan construction, symbols, `TestDeclarationId`/`TestVariantId` indexes, project semantic description, and editor features.
+
+The database is the shared answer surface for human and machine questions such as which fixtures/helpers/patterns/guards/tests and variants exist, what a declaration accepts and returns, which actors and event payloads are in scope, where a symbol is defined, and which provider/schema it uses. `webtest describe`, LSP, DAP, and WASM project these query results through protocol-neutral bounded DTOs instead of maintaining separate indexes.
 
 Full-file reparsing remains acceptable until profiling proves it problematic. Query reuse must prevent independent reparses by formatting, diagnostics, semantic tokens, planning, and editor requests.
 
@@ -870,7 +952,9 @@ Add protocol-neutral services in this order:
 4. definition, references, and rename;
 5. code actions for syntax/type/runtime failures;
 6. inlay hints and richer semantic tokens;
-7. workspace symbols and test discovery.
+7. workspace symbols and declaration/variant test discovery.
+
+The same services provide completion, signature help, hover, definition/references/rename, and code actions for cases, patterns, actors, event sources and payloads, guards, selections, checks, and verdicts. Test explorers represent declaration nodes with independently runnable/debuggable variant children while allowing the implicit default variant to be visually collapsed.
 
 Runtime-aware features may show match counts, observed values, timings, or candidate locators, but only for the current source revision.
 
@@ -886,10 +970,11 @@ The shipped DAP foundation remains an adapter over `TestPlan`, `Runner`, and `Ru
 
 Extend debugging with:
 
-- variables for lexical bindings, typed provider results, assertion values, and bounded/redacted evidence;
-- source-mapped frames for nested sequence/retry/fixture scopes;
+- variables for lexical bindings, typed provider results, assertion values, selected event bindings, and bounded/redacted evidence;
+- source-mapped frames for nested sequence/retry/fixture, actor, select, guard, and check scopes;
 - pause, continue, step in/over/out, restart, and cancellation semantics aligned with structured concurrency;
-- exception breakpoints for assertion, infrastructure, provider, and internal failures;
+- concrete `TestVariantId` targeting plus actor/cursor/deadline metadata while a select is waiting;
+- exception/verdict breakpoints for assertion, guard, semantic verdict, infrastructure, provider, and internal failures;
 - optional browser inspection links or metadata without pretending remote DOM nodes are transferable DSL values;
 - deterministic behavior when a breakpoint is placed on a non-executable line or a plan no longer matches the source revision.
 
@@ -905,6 +990,8 @@ Expand `webtest-wasm` from diagnostics/formatting into stable DTO-based APIs:
 openDocument(uri, text)
 updateDocument(uri, text)
 closeDocument(uri)
+analyze(uri)
+describeWorkspace()
 diagnostics(uri)
 format(uri)
 semanticTokens(uri)
@@ -913,11 +1000,13 @@ hover(uri, offset)
 compileTestPlan(uri)
 ```
 
+Every operation that depends only on host-supplied source, configuration, and schemas remains portable: parse/analyze, static description, structured diagnostics/repair hints, formatting, completion/hover/navigation, static case expansion and variant identity, pattern/actor/select/guard type checking, test discovery, and plan generation. Live semantic page inspection and execution of actors, checkpoints, selects, and guards remain native because WASM cannot launch Chrome; the facade reports that capability boundary explicitly while still compiling plans with native host requirements.
+
 Run the WASM module in a Web Worker and communicate with Monaco through messages. Monaco should call editor services directly; it should not require an in-browser LSP server.
 
 Publish `@webtest/editor` containing WASM, worker glue, TypeScript declarations, and a Monaco adapter. Native-only plan operations should still compile in WASM and be marked as requiring host capabilities; the browser build does not launch Chrome or native processes.
 
-Parity tests must run the same syntax, diagnostics, formatting, semantic-token, and plan fixtures against native and WASM builds.
+Parity tests must run the same syntax, static-description, diagnostic-detail/repair-hint, formatting, semantic-token, declaration/variant discovery and identity, pattern plan, event-source resolution, and portable plan fixtures against native and WASM builds.
 
 ---
 
@@ -925,7 +1014,7 @@ Parity tests must run the same syntax, diagnostics, formatting, semantic-token, 
 
 Add human, concise, JSON, JUnit, and event-stream reporters. Color must be disabled when output is not a terminal or when requested. Machine-readable output schemas must be versioned.
 
-CLI diagnostics should show source snippets, labels, related ranges, and suggested fixes. Test output should distinguish assertion/test failure from browser/process infrastructure failure and internal bugs through stable exit codes.
+CLI diagnostics should show source snippets, labels, related ranges, and suggested fixes. `describe`, `inspect`, `check`, and `test` machine reporters expose versioned, bounded semantic DTOs rather than requiring clients to parse that human presentation. Test filtering and reporting distinguish a declaration from each labeled variant. Test results preserve Pass, Fail, Skipped, Inconclusive, browser/process infrastructure failure, and internal bugs as separate structured outcomes with stable aggregate exit behavior.
 
 Support directory discovery, ignore rules, test/tag filtering, fail-fast, deterministic seeds, default/configurable timeouts, artifact directories, application lifecycle, and provider configuration. Watch mode may be added after incremental workspace invalidation is reliable.
 
@@ -940,12 +1029,14 @@ The product intentionally drives browsers, networks, files, and processes, but i
 - safely serialize values crossing into JavaScript or protocols;
 - avoid implicit shell interpretation;
 - redact configured secrets from logs, diagnostics, IPC, and traces;
+- redact and bound case summaries, pattern diffs, console/network/WebSocket event evidence, guard evidence, DAP values, and machine output without changing the unredacted values used for runtime matching;
 - bind CDP and local IPC only to local/private endpoints;
 - authenticate app bridges with per-run secrets, restrict local endpoint permissions, and reject schema/protocol drift;
 - reserve stdio bridge stdout for protocol frames and bound every bridge message;
 - use isolated temporary browser profiles;
 - validate downloaded browser checksums;
 - bound captured body, DOM, console, and process output sizes;
+- bound actor event journals, fail active semantic consumers explicitly on overflow, and require finite reactive selection deadlines;
 - make destructive file/process operations explicit;
 - document that arbitrary test projects should be treated as executable code.
 
@@ -966,6 +1057,14 @@ Every language feature needs:
 - LSP UTF-16 and protocol tests;
 - DAP framing, source-to-step breakpoint, pause/continue, and revision tests;
 - provider-schema type/completion tests and bridge protocol conformance tests;
+- deterministic C.5 description/inspection/diagnostic/repair serialization, redaction, and candidate-validation tests;
+- declaration/variant identity tests across discovery, filtering, reporting, traces, reruns, and DAP;
+- case type/static-evaluation tests and stable variant identity under reorder;
+- serializable pattern analysis/runtime tests with exact/subset and path-aware bounded diffs;
+- accumulated-check and semantic-verdict aggregation/exit/JUnit tests;
+- actor isolation, ownership, conflicting-use, and cleanup tests;
+- normalized event, checkpoint barrier, select ordering/timeout/overflow, and guard subscription/cancellation tests;
+- deterministic reactive stress tests proving bounded memory and non-blocking browser-protocol reads;
 - native/WASM parity coverage where portable.
 
 Use real Chrome tests for navigation, locators, actionability, input, contexts, events, and evidence. Serve fixture pages from random loopback ports and skip only when the environment truly lacks Chrome or socket capability. Add parser fuzzing and property tests for losslessness and non-panicking malformed input.
@@ -1041,50 +1140,78 @@ Acceptance: common form and navigation flows are reliable without manual sleeps 
 
 Acceptance: one test can prepare state through black-box HTTP, use the typed result in a browser, and receive static errors for invalid domain/type transfers. `server {}` is demonstrably a runner capability scope rather than an application-process boundary.
 
+### [Milestone C.5 — Semantic inspection and machine feedback](./milestone-c-5.md)
+
+- semantic live-page inspection through the shared browser/locator abstraction;
+- static language/project/provider description from shared semantic metadata;
+- stable machine diagnostic codes, semantic details, source identity, and bounded repair hints;
+- deterministic locator candidates, redaction, output limits, and schema versioning;
+- a non-LLM acceptance harness proving the WebTest-only authoring/repair loop.
+
+Acceptance: an external client using only `webtest describe`, `inspect`, `check`, `test`, and ordinary file editing can discover valid semantic locators, author the reference login flow, diagnose an intentional locator failure, and repair it from structured WebTest evidence without raw DOM/CDP/browser automation or a second language implementation.
+
 ### [Milestone D — Language-neutral application bridge](./milestone-d.md)
 
 - canonical versioned protocol schemas, documentation, generated Rust DTOs, and conformance corpus;
-- typed `app.*` provider calls and deterministic `.webtest/app-schema.json` loading;
+- typed, documented `app.*` provider calls and deterministic `.webtest/app-schema.json` loading;
+- optional/default/secret/retry-safety metadata projected through the C.5 static description and repair interfaces;
 - local socket/named-pipe discovery, per-run authentication, loopback fallback, and persistent stdio executable mode;
 - runner-managed application lifecycle and health checks, separate from `server {}` execution;
 - reference SDKs in enough distinct ecosystems to prove language neutrality, with optional framework lifecycle helpers;
 - offline LSP completion/type checking and runtime schema-drift validation.
 
-Acceptance: the same WebTest source calls `app.create_user` against applications in at least two different host languages and against a no-SDK executable. All three pass one protocol conformance suite, return the same typed DSL record, and provide editor completion while the applications are stopped.
+Acceptance: the same WebTest source calls `app.create_user` against applications in at least two different host languages and against a no-SDK executable. All three pass one protocol conformance suite, return the same typed DSL record, and provide `describe`, diagnostics/repair details, and editor completion from one offline schema while the applications are stopped.
 
 ### [Milestone E — Structured execution and observability](./milestone-e.md)
 
-- parallel/race/retry/timeout plan nodes;
+- sequence/parallel/race/retry/timeout plan nodes;
 - cancellation-safe resource lifecycles;
+- deadline/wait registration substrate compatible with Milestone H reactive event selection;
 - expanded event and observation schemas;
 - CLI-to-LSP observation IPC;
 - trace artifact and viewer;
 - richer DAP scopes, failure breakpoints, and structured-concurrency stepping.
 
-Acceptance: concurrent/retried tests remain deterministic, diagnosable, and source-mapped in terminal, trace, and editor.
+Acceptance: concurrent/retried tests remain deterministic, diagnosable, and source-mapped in terminal, trace, and editor; `race` remains first-success structured concurrency, and Milestone H reactive event selection can be added without redefining it.
 
 ### [Milestone F — Workspace and editor intelligence](./milestone-f.md)
 
 - incremental query database and module graph;
 - completion, hover, navigation, rename, symbols, actions, and test discovery;
 - incremental LSP synchronization;
-- modules and reusable fixtures.
+- modules and reusable fixtures;
+- shared project description for helpers, fixtures, and tests;
+- declaration/variant-ready test discovery and execution identity.
 
-Acceptance: multi-file projects remain responsive, provider schemas invalidate correctly, and every editor feature derives from shared Rust semantics.
+Acceptance: multi-file projects remain responsive, provider schemas invalidate correctly, every editor/machine query derives from shared Rust semantics, and test APIs never assume one declaration can only have one execution variant.
 
 ### [Milestone G — Portable editor and distribution](./milestone-g.md)
 
 - complete WASM editor-service facade and worker;
+- static description, diagnostic semantic details, repair hints, and test identities in portable DTOs;
 - Monaco adapter and `@webtest/editor`;
 - native release automation, VSIX publishing, and CI container;
 - native/WASM parity suite.
 
-Acceptance: native, Cursor/VS Code, and Monaco experiences agree on syntax, formatting, diagnostics, semantic tokens, and compiled plans.
+Acceptance: native, Cursor/VS Code, and Monaco experiences agree on syntax, static description, formatting, structured diagnostics/repair hints, semantic tokens, test identities, and compiled plans; live browser inspection remains an explicit native capability.
+
+### [Milestone H — Test Modeling and Reactive Workflows](./milestone-h.md)
+
+- statically expanded, explicitly labeled test cases with stable independently runnable/debuggable `TestVariantId`s;
+- reusable typed pattern declarations with a deterministic serializable matcher algebra and path-aware structured diffs;
+- accumulated `check` scopes plus distinct `pass`, `fail`, `skip`, `inconclusive`, and `assume` semantics;
+- first-class isolated `BrowserActor` resources with actor-aware ownership, events, traces, and static parallel-use checks;
+- normalized console, network, WebSocket, and navigation event schemas with bounded actor journals and checkpoint barriers;
+- finite actor-bound reactive `select`, pure source-ordered event alternatives, and explicit timeout/overflow/source-failure behavior distinct from computation `race`;
+- reusable lexically scoped event guards installed before their body and constrained to observational invariant enforcement;
+- end-to-end plan, runtime event, trace, reporter, editor, DAP, C.5 description, and native/WASM static support for all Milestone H concepts.
+
+Acceptance: WebTest can model independently reportable test data, reusable acceptable-value structures, multiple isolated browser participants, accumulated assertions, explicit semantic outcomes, persistent scoped invariants, and bounded asynchronous browser-event behavior while preserving deterministic plans, lost-event prevention, structured ownership/cancellation, source mapping, redaction, and one shared Rust semantic implementation. Existing `race` behavior remains unchanged and no raw CDP events, arbitrary callbacks, or detached tasks enter the language.
 
 ---
 
 ## 18. Definition of long-term success
 
-WebTest is successful when a user can install one native product, author statically checked tests spanning server and browser domains, run them reliably with managed Chrome and structured concurrency, inspect rich traces, and receive current runtime facts directly in their editor.
+WebTest is successful when a user or external tool can discover the available language/project/page semantics through WebTest itself, author statically checked tests spanning server and browser domains, expand explicit test data into stable variants, model multiple isolated browser participants, and state acceptable structures, scoped invariants, asynchronous event outcomes, and semantic verdicts directly. Those tests run reliably with managed Chrome and structured concurrency, produce rich actor-aware traces, and expose current runtime facts through editors and versioned machine output.
 
-The same Rust language implementation must power CLI, runtime planning, Cursor/VS Code, and Monaco. Applications in any host language can expose typed fixtures through one small bridge contract, and SDKs remain ergonomic protocol bindings rather than alternate WebTest implementations. Adding functionality must deepen the shared compiler/runtime/provider architecture rather than creating adapter-, framework-, or language-specific parsers, semantics, or diagnostics.
+The same Rust language implementation must power CLI, runtime planning, machine descriptions/diagnostics, Cursor/VS Code, and Monaco. Applications in any host language can expose typed fixtures through one small bridge contract, and SDKs remain ergonomic protocol bindings rather than alternate WebTest implementations. Cases, patterns, actors, checks, verdicts, guards, and reactive selection are first-class semantic concepts in HIR, serializable plans, runtime events, traces, editor services, DAP, and portable static APIs—not conveniences reconstructed by adapters. `race`, `select`, retry, timeout, guards, checks, and resource lifetimes each encode one distinct semantic concept so generated or handwritten tests do not reinvent orchestration. Adding functionality must deepen the shared compiler/runtime/provider/reactive architecture rather than creating adapter-, agent-, framework-, or language-specific parsers, semantics, diagnostics, locator evaluators, or event models.

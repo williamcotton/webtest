@@ -2,7 +2,7 @@
 
 ## 0. Status and dependencies
 
-This specification expands Milestone D in [`future-functionality.md`](./future-functionality.md). It depends on the typed values, provider schemas, capability analysis, `ServerProviderCall` IR, and built-in providers from [`milestone-c.md`](./milestone-c.md).
+This specification expands Milestone D in [`future-functionality.md`](./future-functionality.md). It depends on the typed values, provider schemas, capability analysis, `ServerProviderCall` IR, and built-in providers from [`milestone-c.md`](./milestone-c.md), plus the static description, machine-diagnostic, and repair-hint contracts from [`milestone-c-5.md`](./milestone-c-5.md).
 
 Milestone D adds one stable application-fixture integration contract. Node, Ruby, Go, Python, Elixir, Java, .NET, Rust, PHP, and unofficial tools do not implement WebTest; they implement or bind the same small bridge protocol.
 
@@ -25,7 +25,7 @@ test "created user can sign in" {
 }
 ```
 
-The `app.create_user` signature is available to `check`, LSP, DAP, WASM analysis, and plan compilation while the application is stopped. At runtime, the call is transported to an application bridge and returns a validated transferable record.
+The `app.create_user` signature is available to `webtest describe`, `check`, LSP, DAP, WASM analysis, and plan compilation while the application is stopped. Its bounded documentation, parameter semantics, result type, capability, redaction, and retry-safety metadata come from the same provider schema used by analysis. At runtime, the call is transported to an application bridge and returns a validated transferable record.
 
 ## 2. Architectural rule
 
@@ -52,7 +52,7 @@ App Bridge Protocol
   Node       Ruby        Go       Python    any executable
 ```
 
-No SDK parses `.webtest`, constructs `TestPlan`, drives Chrome, publishes editor diagnostics, or changes provider semantics.
+No SDK parses `.webtest`, constructs `TestPlan`, drives Chrome, publishes editor diagnostics, or changes provider semantics. The bridge is an application-integration protocol, not an agent protocol; external tools discover `app.*` through the ordinary C.5 description and diagnostic interfaces.
 
 ## 3. Scope
 
@@ -61,6 +61,8 @@ Milestone D includes:
 - a canonical, versioned App Bridge Protocol and schema;
 - generated Rust protocol DTOs plus generators/templates for SDK wire types;
 - typed `app.*` resolution from `.webtest/app-schema.json`;
+- bounded operation/parameter/result documentation plus optional/default/secret/retry-safety metadata;
+- participation in `webtest describe` and shared machine-readable diagnostic/repair DTOs;
 - runtime schema verification and drift errors;
 - Unix-domain-socket, Windows named-pipe, loopback TCP fallback, and stdio transports;
 - per-run authentication and local endpoint discovery;
@@ -72,7 +74,7 @@ Milestone D includes:
 
 ## 4. Non-goals
 
-This milestone does not execute arbitrary source code named in the DSL, expose a privileged public HTTP endpoint by default, transmit live ORM/browser/process objects, define framework-specific DSL syntax, load arbitrary native plugins into the `webtest` process, provide remote/cloud bridges, or implement mail/database/queue providers. Structured concurrency beyond lifecycle-safe cleanup remains Milestone E.
+This milestone does not execute arbitrary source code named in the DSL, expose a privileged public HTTP endpoint by default, transmit live ORM/browser/process objects, define framework-specific DSL syntax, load arbitrary native plugins into the `webtest` process, provide remote/cloud bridges, implement an agent-specific protocol, or implement mail/database/queue providers. Structured concurrency beyond lifecycle-safe cleanup remains Milestone E.
 
 ## 5. Protocol package and compatibility
 
@@ -184,11 +186,23 @@ Authentication or negotiation failure returns `hello_error` with a stable code a
   "schema_hash": "blake3:<hex>",
   "functions": {
     "create_user": {
+      "documentation": "Create a user directly in the test database.",
+      "retry_safe": false,
       "params": {
         "type": "object",
         "fields": {
-          "email": { "type": "string", "secret": false },
-          "admin": { "type": "boolean", "optional": true }
+          "email": {
+            "type": "string",
+            "documentation": "Unique sign-in email.",
+            "secret": false
+          },
+          "admin": {
+            "type": "boolean",
+            "documentation": "Grant administrative access.",
+            "optional": true,
+            "default": false,
+            "secret": false
+          }
         }
       },
       "returns": {
@@ -203,7 +217,7 @@ Authentication or negotiation failure returns `hello_error` with a stable code a
 }
 ```
 
-The hash is computed from one specified canonical JSON encoding of semantic schema content. Documentation-only changes may be excluded only if the canonicalization rules say so.
+The hash is computed from one specified canonical JSON encoding of semantic schema content. Documentation-only changes may be excluded only if the canonicalization rules say so. Type, required/optional/default, secret, capability, and retry-safety changes are semantic and participate in compatibility/hash decisions.
 
 ### 7.3 Calls and results
 
@@ -271,6 +285,10 @@ array<T>, optional<T>, object fields
 
 Semantic aliases such as `Url`, `Email`, `DateTime`, and `UserId` declare a wire base type plus validation/display metadata. Schema recursion, arbitrary unions, executable validators, host-language class names, and object identity are not included in protocol version 1.
 
+Every function schema also carries bounded human documentation and explicit execution metadata. Parameter schemas distinguish required parameters from optional parameters, encode any typed default, and mark secret values before diagnostics/events are constructed. Retry safety is operation-level metadata because it describes whether repeating the call is semantically permitted; a particular application error's `retryable` field remains the runtime fact describing whether that failure may be retried. Milestone E requires both the enclosing retry policy and the operation metadata to permit repetition.
+
+Documentation is plain bounded text, not executable markup or an alternate semantics channel. Analysis, editor services, `webtest describe`, and SDK schema export all consume the same `ProviderSchema`, `OperationSchema`, `ParameterSchema`, and `TypeSchema` representation.
+
 These values cannot cross the bridge:
 
 ```text
@@ -308,7 +326,9 @@ transport = "auto"
 schema = ".webtest/app-schema.json"
 ```
 
-Analysis treats the manifest as a revision-keyed input. It resolves `app.create_user`, validates arguments, infers the result record, powers completion/hover/signature help, and embeds the schema hash in every related plan call.
+Analysis treats the manifest as a revision-keyed input. It resolves `app.create_user`, validates arguments, infers the result record, powers completion/hover/signature help, contributes the `app` provider to the static C.5 description DTO, and embeds the schema hash in every related plan call.
+
+Unknown functions/arguments/members, missing arguments, invalid defaults, and type/capability mismatches use the stable machine diagnostic codes and semantic-detail fields established in C.5. Bounded name/member/argument repair candidates come from the same resolved schema; the CLI, LSP, DAP, and WASM adapters do not infer them from formatted messages or maintain a second app-function registry.
 
 At runtime, the live `describe` schema must match the planned hash. Mismatch stops affected tests before the first app call with a schema-drift infrastructure diagnostic showing expected/live hashes and regeneration instructions. WebTest does not silently fall back to dynamic calls.
 
@@ -446,6 +466,7 @@ ServerProviderCall {
     result_type,
     schema_hash,
     timeout,
+    retry_safety,
     redaction,
     origin,
 }
@@ -459,13 +480,14 @@ Events include provider/function, duration, execution/test/step identity, transp
 
 Offline schema powers:
 
+- `webtest describe` entries for `app.*` operations and their metadata;
 - completion for `app.` functions;
 - signature help and named-argument completion;
 - hover documentation and result types;
 - member completion on returned records;
 - diagnostics for unknown calls/fields, missing arguments, and type mismatch.
 
-These work while the app is stopped in native LSP and WASM analysis. The extension contains no schema parser; it displays Rust editor-service results.
+These work while the app is stopped in the native CLI/LSP and WASM analysis. Description, diagnostics, semantic details, and repair hints use the versioned C.5 DTOs. The extension contains no schema parser; it displays Rust editor-service results.
 
 DAP pauses before an app call. Scopes show already evaluated arguments and, after stepping, the redacted result. Bridge/app lifecycle failures can participate in infrastructure exception breakpoints, while application `error` messages participate in provider-failure breakpoints.
 
@@ -487,6 +509,7 @@ One black-box suite runs against every SDK/executable. It covers:
 
 - successful/failed version negotiation and authentication;
 - deterministic schema generation/hash and `describe`;
+- bounded documentation plus required/optional/default/secret/retry-safety metadata and compatibility behavior;
 - all primitive/nested/optional value forms;
 - valid calls, application errors, validation errors, and Unicode;
 - concurrent calls, out-of-order results, duplicate/unknown IDs;
@@ -500,14 +523,14 @@ The corpus consists of transport-independent input/output fixtures plus an execu
 ## 17. Delivery slices
 
 1. Publish normative protocol/schema documents and generate Rust DTOs/codecs.
-2. Add offline app-schema loading, hashing, diagnostics, and plan integration.
+2. Add offline app-schema loading, hashing, shared `describe` projection, machine diagnostics/repair details, and plan integration.
 3. Implement `AppProvider` correlation/state machine against an in-memory transport.
 4. Add local socket/named-pipe/TCP discovery and authentication.
 5. Add persistent stdio, command, and declarative HTTP adapters.
 6. Add application process/health/bridge lifecycle orchestration.
 7. Build the conformance harness and no-SDK reference executable.
 8. Implement and package the first language SDK, then a structurally different second SDK.
-9. Add editor completion/hover/signature behavior, DAP values/failures, examples, and documentation.
+9. Add editor completion/hover/signature behavior, C.5 description/repair parity, DAP values/failures, examples, and documentation.
 
 Do not begin framework helper packages until their generic language SDK passes conformance independently.
 
@@ -518,7 +541,7 @@ Milestone D is complete only when:
 1. One unchanged `.webtest` file calls `app.create_user` successfully against applications using two different official language SDKs.
 2. The same call succeeds against an independently implemented stdio executable with no SDK.
 3. All three implementations pass the same protocol conformance suite.
-4. `check`, LSP, and WASM provide call/member diagnostics and completion from `.webtest/app-schema.json` with the applications stopped.
+4. `webtest describe`, `check`, LSP, and WASM expose the same documented `app.*` signatures, call/member diagnostics, semantic details, repair hints, and completion from `.webtest/app-schema.json` with the applications stopped.
 5. Runtime rejects schema drift, bad authentication, invalid values, malformed frames, and oversized messages with distinct structured failures.
 6. Owned app/bridge processes and endpoints are cleaned after success, timeout, test failure, and DAP termination.
 7. No framework-specific parser, plan operation, runtime branch, or editor semantic model is introduced.

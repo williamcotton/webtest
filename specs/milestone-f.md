@@ -2,9 +2,9 @@
 
 ## 0. Status and dependencies
 
-This specification expands Milestone F in [`future-functionality.md`](./future-functionality.md). It depends on typed HIR/provider schemas from [`milestone-c.md`](./milestone-c.md), bridge schema inputs from [`milestone-d.md`](./milestone-d.md), and stable plan/event/source identities from [`milestone-e.md`](./milestone-e.md).
+This specification expands Milestone F in [`future-functionality.md`](./future-functionality.md). It depends on typed HIR/provider schemas from [`milestone-c.md`](./milestone-c.md), static description and machine-feedback DTOs from [`milestone-c-5.md`](./milestone-c-5.md), bridge schema inputs from [`milestone-d.md`](./milestone-d.md), and stable plan/event/source identities from [`milestone-e.md`](./milestone-e.md).
 
-Milestone F turns the one-file analysis cache into a dependency-tracked workspace and adds modules, reusable declarations, fixtures, and full protocol-neutral editor intelligence. The native LSP remains an adapter over Rust editor services.
+Milestone F turns the one-file analysis cache into a dependency-tracked workspace and adds modules, reusable declarations, fixtures, and full protocol-neutral editor intelligence. The same semantic database answers editor, CLI, and machine-description queries; the native LSP remains an adapter over Rust editor services.
 
 ## 1. Outcome
 
@@ -37,13 +37,15 @@ Milestone F includes:
 - declarative helper functions and reusable fixtures;
 - explicit `test`, `file`, `worker`, and `suite` fixture lifetimes;
 - document/workspace symbols, folding, selection, completion, signature help, hover, definition, references, rename, code actions, inlay hints, and richer semantic tokens;
+- project-visible helper/fixture/test metadata through the shared static description DTO;
+- `TestDeclarationId`/`TestVariantId`-ready discovery and execution identity;
 - workspace test discovery and Cursor/VS Code test-explorer integration;
 - incremental LSP document synchronization, request cancellation, and progress;
 - cross-file source mapping for plan/runtime/DAP frames.
 
 ## 3. Non-goals
 
-This milestone does not add an online package registry, remote imports, arbitrary build scripts, macro expansion, dynamic code loading during analysis, higher-order functions, unrestricted recursion, language-specific app introspection, collaborative editing, or the browser/Monaco package. Portable delivery is Milestone G.
+This milestone does not add an online package registry, remote imports, arbitrary build scripts, macro expansion, dynamic code loading during analysis, higher-order functions, unrestricted recursion, language-specific app introspection, data-driven `cases` syntax, patterns, actors, reactive event selection, collaborative editing, or the browser/Monaco package. Portable delivery is Milestone G. Variant-ready identity is included; expansion of one declaration into authored data variants is deferred.
 
 ## 4. Workspace model
 
@@ -74,13 +76,14 @@ typed AST -> HIR lowering per declaration
 export table and name resolution
 type/capability/provider resolution
 static diagnostics
-test/fixture/helper indexes
+test-declaration/test-variant/fixture/helper indexes
 TestPlan construction
 symbols, folding, selection, semantic tokens
 completion, signature, hover
 definition, references, rename
 code actions and inlay hints
 test discovery
+project semantic description
 ```
 
 Use Salsa unless an alternative dependency-tracked design is documented and demonstrates equivalent invalidation, parallel snapshot, cycle, and memory behavior before implementation. Full-file reparsing is acceptable; recomputing unrelated files/features is not.
@@ -133,7 +136,7 @@ The module graph is deterministic and independent of filesystem enumeration orde
 
 ## 6. Helper functions
 
-Helper functions are declarative WebTest functions compiled through HIR/plan; they are not host-language callbacks. Parameters and return types are required on exported functions and may be inferred for private expression-local values.
+Helper functions are declarative WebTest functions compiled through HIR/plan; they are not host-language callbacks. Parameters and return types are required on exported functions and may be inferred for private expression-local values. Exported helpers may carry bounded human documentation exposed through the same semantic query used by hover, completion, and static description.
 
 Milestone F supports:
 
@@ -151,7 +154,7 @@ Definition, references, rename, hover, and signature help operate on stable `Fun
 
 ### 7.1 Fixture model
 
-A fixture declares parameters, result type, capability, dependencies, lifetime, setup, provided value, and teardown. It lowers to explicit resource/plan scopes from Milestone E; teardown is never hidden in an SDK callback.
+A fixture declares parameters, result type, capability, dependencies, lifetime, setup, provided value, teardown, and optional bounded human documentation. It lowers to explicit resource/plan scopes from Milestone E; teardown is never hidden in an SDK callback.
 
 Fixture dependencies form an acyclic graph. Acquisition follows dependency order; teardown runs in reverse successful-acquisition order exactly once.
 
@@ -213,9 +216,29 @@ Signature help reports resolved overload/signature, active parameter, types, opt
 
 Hover can show resolved type, declaration signature, capability, fixture lifetime, provider/schema source, and current-revision runtime evidence summary. Secret values and stale observations never appear.
 
+### 9.4 Static project description
+
+Milestone F extends the C.5 `webtest describe` query with project semantic declarations. Bounded machine DTOs can report exported helpers, fixtures, and tests, including their documentation, parameters, result type, capability, fixture lifetime, module, stable declaration identity, and default variant identity where applicable. For example:
+
+```json
+{
+  "fixtures": {
+    "user_fixture": {
+      "parameters": {
+        "email": "String"
+      },
+      "returns": "User",
+      "lifetime": "test"
+    }
+  }
+}
+```
+
+The description is produced from workspace indexes and resolved HIR, not from a CLI-only symbol scan. Native CLI, editor/LSP, and WASM hosts project the same query subject to supplied workspace inputs and DTO limits. This is semantic discovery for any client; it does not define an agent protocol.
+
 ## 10. Code actions, inlay hints, and tokens
 
-Code actions are protocol-neutral edits tied to diagnostic codes. Initial actions include importing a uniquely resolvable symbol, adding a missing required named argument, replacing an unknown record field when one close match exists, qualifying a provider call, and applying canonical formatting. No action executes application code or mutates snapshots implicitly.
+Code actions are protocol-neutral edits tied to diagnostic codes and C.5 repair-hint kinds. Initial actions include importing a uniquely resolvable symbol, adding a missing required named argument, replacing an unknown record field when one close match exists, qualifying a provider call, and applying canonical formatting. No action executes application code or mutates snapshots implicitly.
 
 Inlay hints may show inferred local types, provider result types, fixture lifetimes, and parameter names where useful. They are configurable and derived from typed HIR.
 
@@ -229,10 +252,19 @@ Editor services expose a test tree with stable IDs:
 workspace
   -> module/file
       -> test declaration
-          -> optional data/variant nodes later
+          -> test variant
 ```
 
-Each test item includes label, URI/range, tags, static status, and runnable/debuggable identity. IDs derive from project/module/declaration semantic identity rather than display name alone.
+The identity model distinguishes:
+
+```text
+TestDeclarationId    one authored test declaration
+TestVariantId        one executable variant of that declaration
+```
+
+Milestone F does not add data-driven syntax, so an ordinary declaration initially has one default variant. Discovery, filtering, plan compilation, execution events, reruns, traces, observations, and DAP nevertheless address the executable item by `TestVariantId`. The default variant ID derives from `TestDeclarationId` plus a stable variant key, not from its display label or discovery order. A later cases feature can add variant keys without changing the meaning of declaration identity or assuming one declaration always equals one execution.
+
+Each declaration/variant item includes label, URI/range, tags, static status, and runnable/debuggable identity. Declaration IDs derive from project/module/declaration semantic identity rather than display name alone; variant IDs additionally include their stable variant key.
 
 The LSP may expose custom requests/notifications for discovery/run/debug routing until a suitable standard protocol exists. The Cursor/VS Code extension maps DTOs to the Testing API, run profiles, debug profiles, result messages, and trace links. It does not discover tests by scanning text.
 
@@ -248,7 +280,7 @@ Protocol tests cover concurrent edits/requests, cancellation, shutdown, malforme
 
 ## 13. Cross-file runtime and DAP mapping
 
-Plans retain origin chains from expanded helper/fixture operations back to declaration and call sites. Runtime observations choose the actionable user range while preserving related locations for the declaration/provider schema.
+Plans retain origin chains from expanded helper/fixture operations back to declaration and call sites. Plans, runtime observations, events, reports, traces, and rerun filters preserve both `TestDeclarationId` and `TestVariantId`. Runtime observations choose the actionable user range while preserving related locations for the declaration/provider schema.
 
 DAP stack frames show test, helper, fixture setup/body/teardown, control scope, and operation frames across files. Breakpoints in helper/fixture declarations resolve to all executable plan instances for the selected tests. Source revisions are verified before pause; stale generated plan mappings are rejected.
 
@@ -267,7 +299,7 @@ Before implementation, record numeric budgets from the delivered baseline/protot
 ## 15. Architecture and crate responsibilities
 
 - `syntax` remains the only lossless parser and adds module/import/export/helper/fixture AST views.
-- `hir` owns stable declaration/reference IDs and semantic origin chains, not database implementation details.
+- `hir` owns stable declaration/reference IDs, `TestDeclarationId`/variant-key semantics, and semantic origin chains, not database implementation details.
 - `analysis` owns workspace inputs, module graph, queries, name/type/capability resolution, indexes, and editor-ready semantic facts.
 - `plan` owns expanded helper/fixture/resource scopes with cross-file origins.
 - `runtime` consumes plans and fixture scopes without resolving imports or reading source.
@@ -286,7 +318,7 @@ Before implementation, record numeric budgets from the delivered baseline/protot
 5. Add fixtures/lifetimes/dependencies and explicit setup/provide/teardown planning.
 6. Add completion/signature/hover, then references/rename/code actions/inlay hints/tokens.
 7. Add incremental LSP sync, progress/cancellation, and protocol integration tests.
-8. Add test discovery, Cursor Testing API, and cross-file DAP behavior.
+8. Add declaration/variant-ready test discovery, Cursor Testing API, and cross-file DAP behavior.
 9. Add benchmark workspace, invalidation assertions, performance dashboards, examples, and docs.
 
 ## 17. Testing requirements
@@ -302,7 +334,8 @@ Required coverage includes:
 - definition/reference/rename collision and versioned-edit tests;
 - code-action idempotence and semantic-token stability tests;
 - incremental UTF-16 edit, cancellation, progress, stale-result, and workspace protocol tests;
-- test-discovery stable-ID and synchronized-buffer run/debug tests;
+- test-discovery declaration/variant stable-ID and synchronized-buffer run/debug tests;
+- tests proving default `TestVariantId`s remain stable across unrelated edits and that reporting, filtering, reruns, traces, and DAP never infer execution identity from display names;
 - cross-file runtime observation and DAP breakpoint/frame tests;
 - native/WASM query parity for portable inputs in preparation for Milestone G;
 - benchmark/invalidation/memory regression tests.
@@ -313,10 +346,10 @@ Milestone F is complete only when:
 
 1. A representative multi-file project imports typed helpers/fixtures and compiles deterministic source-mapped plans.
 2. Changing one file or `.webtest/app-schema.json` invalidates all and only semantic dependents under automated assertions.
-3. Completion, hover, navigation, references, rename, actions, hints, symbols, and test discovery derive from shared Rust services and behave on half-typed Unicode source.
+3. Completion, hover, navigation, references, rename, actions, hints, symbols, static project description, and test discovery derive from shared Rust services and behave on half-typed Unicode source.
 4. Fixture lifetimes acquire/share/teardown exactly as specified under parallel tests, retries, cancellation, and failure.
 5. Incremental LSP sync never corrupts UTF-8 ranges or publishes stale diagnostics/tokens/runtime facts.
-6. Cursor's test explorer discovers/runs/debugs tests without scanning source in TypeScript.
+6. Cursor's test explorer discovers/runs/debugs tests without scanning source in TypeScript, and every executable item has distinct declaration and variant identity even before data-driven syntax exists.
 7. The benchmark workspace meets recorded responsiveness and bounded-memory gates.
 
-The roadmap acceptance statement is thereby satisfied: multi-file projects remain responsive, provider schemas invalidate correctly, and every editor feature derives from shared Rust semantics.
+The roadmap acceptance statement is thereby satisfied: multi-file projects remain responsive, provider schemas invalidate correctly, and every editor or machine-facing workspace feature derives from shared Rust semantics.

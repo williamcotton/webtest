@@ -2,13 +2,13 @@
 
 ## 0. Status and dependencies
 
-This specification expands Milestone E in [`future-functionality.md`](./future-functionality.md). It depends on the typed plan/provider model in [`milestone-c.md`](./milestone-c.md), the application lifecycle/bridge in [`milestone-d.md`](./milestone-d.md), and the existing revision-safe observations and DAP `RunControl` hook.
+This specification expands Milestone E in [`future-functionality.md`](./future-functionality.md). It depends on the typed plan/provider model in [`milestone-c.md`](./milestone-c.md), the structured machine-feedback contracts in [`milestone-c-5.md`](./milestone-c-5.md), the application lifecycle/bridge in [`milestone-d.md`](./milestone-d.md), and the existing revision-safe observations and DAP `RunControl` hook.
 
-Milestone E changes how operations are scheduled and observed. It must preserve the same compiler, plan, runner, provider, browser, editor, and debugger paths used by sequential execution.
+Milestone E changes how operations are scheduled, owned, cancelled, and observed. It must preserve the same compiler, plan, runner, provider, browser, editor, and debugger paths used by sequential execution, while establishing cancellation/deadline/wait abstractions that later reactive execution can reuse.
 
 ## 1. Outcome
 
-Tests can express bounded parallelism, races, retries, and timeouts without leaking child work or losing cleanup. Every attempt and cancellation remains source-mapped in terminal output, traces, editor observations, and DAP.
+Tests can express bounded parallelism, races, retries, and timeouts without leaking child work or losing cleanup. Every attempt and cancellation remains source-mapped in terminal output, traces, editor observations, DAP, and versioned machine output.
 
 ```webtest
 test "notifications arrive" {
@@ -37,6 +37,7 @@ Milestone E includes:
 - explicit `Sequence`, `Parallel`, `Race`, `Retry`, and `Timeout` plan nodes;
 - `Acquire`/body/`Teardown` resource scopes;
 - cancellation propagation and bounded cleanup;
+- scheduler-owned deadline and wait registrations suitable for later event-source waits;
 - `--jobs N` test-level concurrency with isolation;
 - versioned, serializable execution events and attachments;
 - atomic observation replacement and expanded runtime evidence;
@@ -47,29 +48,24 @@ Milestone E includes:
 
 ## 3. Non-goals
 
-This milestone does not add distributed/remote execution, cross-machine scheduling, shared mutable DSL state, unbounded background tasks, arbitrary user-defined async functions, time-travel debugging, browser video recording, visual snapshot approval, or a hosted trace service. `parallel` is structured syntax, not a general task-spawn primitive.
+This milestone does not add distributed/remote execution, cross-machine scheduling, shared mutable DSL state, unbounded background tasks, arbitrary user-defined async functions, reactive event selection, event-pattern matching, time-travel debugging, browser video recording, visual snapshot approval, or a hosted trace service. `parallel` is structured syntax, not a general task-spawn primitive.
+
+`race` is structured concurrency: it runs child computations and chooses the first successful completion. It does not subscribe to event sources or dispatch an event handler. A future event-selection construct may reuse E's cancellation, deadline, and wait infrastructure, but it has distinct syntax, plan semantics, and failure behavior.
 
 ## 4. Language semantics
 
 ### 4.1 Sequence
 
-Test and ordinary block bodies remain ordered sequences. A child begins only after the previous child completes. Failure skips remaining ordinary children and enters enclosing teardown.
+Test, capability, fixture, and ordinary control-branch bodies remain ordered sequences and lower to explicit `Sequence { children }` plan nodes. A child begins only after the previous child completes. Failure skips remaining ordinary children and enters enclosing teardown.
 
-```webtest
-sequence {
-    server { let user = app.create_user(email: "a@example.com") }
-    browser { open "/users" }
-}
-```
-
-Explicit `sequence` is primarily useful inside `parallel`, `race`, `retry`, and reusable fixtures; normal blocks already have sequence semantics.
+A dedicated `sequence {}` surface form is not required for this milestone because ordinary blocks already have sequence semantics. Concurrent constructs treat each direct child block as one branch; that branch's body lowers to `Sequence` when it contains multiple statements. Grammar work may add named or explicit branch syntax later only if it represents a distinct authoring need. The plan node is normative regardless of surface spelling.
 
 ### 4.2 Parallel
 
 ```webtest
 parallel {
-    sequence { /* branch 0 */ }
-    sequence { /* branch 1 */ }
+    browser { /* sequential branch 0 */ }
+    browser { /* sequential branch 1 */ }
 }
 ```
 
@@ -79,9 +75,25 @@ The result is successful only if every child succeeds. Multiple failures are pre
 
 ### 4.3 Race
 
+```webtest
+race {
+    browser {
+        expect text("Dashboard").visible
+        provide "dashboard"
+    }
+
+    browser {
+        expect text("Verify your email").visible
+        provide "verification"
+    }
+}
+```
+
 All children start together. The first child to complete successfully wins. The parent cancels losers and awaits their teardown before completing. A failed child does not win while another child can still succeed. If every child fails, return an ordered aggregate of their failures. A non-recoverable infrastructure/internal failure cancels the race immediately.
 
 Race results may be bound only when all branches have a statically compatible result type. Values from losing/cancelled branches never enter the parent environment.
+
+A race child is a computation that may itself perform waits, actions, assertions, or provider calls. This remains different from a future reactive selection node that registers event sources and dispatches one matching alternative. The two concepts may share cancellation machinery but are never represented by the same plan variant.
 
 ### 4.4 Retry
 
@@ -149,21 +161,35 @@ effective timeout policy
 
 Plans are deterministic and serializable. Runtime task handles, cancellation tokens, clocks, providers, bridge connections, and browser contexts are injected at execution and never serialized.
 
+Plan evolution must leave room for a distinct future reactive node, conceptually:
+
+```text
+Select { event_sources, alternatives, deadline }
+```
+
+Milestone E does not serialize or execute `Select`; this shape records the compatibility constraint that event selection must not be encoded as `Race` or as an opaque callback.
+
 ## 7. Scheduler and cancellation model
 
-### 7.1 Task tree
+### 7.1 Ownership tree and wait substrate
 
-Execution forms a tree mirroring plan ownership:
+Execution forms a tree mirroring plan ownership. The scheduler distinguishes child computations, deadlines, and registered waits:
 
 ```text
 Execution
   -> Test task
-      -> control-node task
-          -> child operation tasks
-              -> owned resource scopes
+      -> Control node
+          -> child computation tasks       Parallel / Race
+          -> deadline registration          Timeout / Retry backoff
+          -> wait-source registration       future reactive nodes
+          -> owned resource scopes
 ```
 
-Every task has one parent, cancellation token, effective deadline, stable task path, and event channel. A parent cannot complete until all children and child teardowns complete or are recorded as cleanup failures.
+Every child computation has one parent, cancellation token, effective deadline, stable task path, and event channel. A parent cannot complete until all children and child teardowns complete or are recorded as cleanup failures.
+
+Deadlines and waits are scheduler-owned registrations, not necessarily spawned tasks. Registration, readiness, cancellation, and cleanup use a bounded protocol so a control node can suspend on time or a future event source without leaking a detached future. E implements deadlines and proves the generic wait contract with fake sources; browser/console/network/WebSocket event semantics and public event-selection syntax remain deferred.
+
+The serialized execution-event stream in section 9 records facts after they occur. It is distinct from an event source on which a future reactive control node may wait.
 
 ### 7.2 Cancellation
 
@@ -247,7 +273,7 @@ Events are immutable facts. Reporters subscribe through bounded channels or read
 
 ## 10. Observations
 
-Observation kinds expand to include assertion diffs, ambiguous/actionability locators, HTTP/provider failures, console/network errors, attempts, timings, timeout/cancellation, and evidence links.
+Observation kinds expand to include assertion diffs, ambiguous/actionability locators, HTTP/provider failures, console/network errors, attempts, timings, timeout/cancellation, and evidence links. Existing C.5 diagnostic codes, semantic details, bounded repair hints, source identity, and redaction remain typed fields as observations flow into events, traces, editor services, and DAP; the scheduler does not flatten them into strings.
 
 The runtime accumulates observations per file/revision/execution. Completion atomically replaces the current observation set for that file/revision. Starting a new run marks previous observations stale/cleared immediately; a successful run leaves no old failures.
 
@@ -342,7 +368,7 @@ Stepping never bypasses `Runner`; it changes `RunControl` scheduling decisions. 
 
 - `syntax`/`hir`/`analysis` add explicit control constructs, scope/type rules, and diagnostics.
 - `plan` owns serializable control/resource nodes and deterministic task paths.
-- `runtime` owns the scheduler, task tree, cancellation, deadlines, environments, resource scopes, and event collector.
+- `runtime` owns the scheduler, ownership tree, cancellation, deadlines/wait registrations, environments, resource scopes, and event collector.
 - `browser`, provider traits, and bridge transport accept cancellation/deadline context but do not schedule DSL nodes.
 - `observation` owns atomic revision-bound batches and evidence references.
 - A trace component owns artifact writing/reading schemas; reporters/viewers consume events rather than runtime internals.
@@ -353,7 +379,7 @@ Stepping never bypasses `Runner`; it changes `RunControl` scheduling decisions. 
 ## 15. Delivery slices
 
 1. Version the event envelope and introduce stable plan/task paths under sequential execution.
-2. Add cancellation/deadline context to browser/provider/bridge operations and explicit resource scopes.
+2. Add cancellation/deadline context to browser/provider/bridge operations, the scheduler wait-registration contract, and explicit resource scopes.
 3. Implement `Timeout`, then `Retry`, with deterministic fake-clock tests.
 4. Implement `Parallel` and `Race` plus immutable branch environments and failure aggregation.
 5. Add isolated test scheduling and `--jobs`.
@@ -366,9 +392,10 @@ Stepping never bypasses `Runner`; it changes `RunControl` scheduling decisions. 
 
 Required coverage includes:
 
-- syntax/HIR/type/plan tests for every control construct and invalid scope transfer;
+- syntax/HIR/type/plan tests for every public control construct, implicit `Sequence` lowering, and invalid scope transfer;
 - deterministic plan/task/attempt identity snapshots;
 - model/fake-clock scheduler tests for success, aggregate failure, timeout races, retry policy, cancellation, and cleanup exactly once;
+- fake wait-source tests for registration, readiness, cancellation, and cleanup without introducing public reactive syntax;
 - property tests ensuring no child outlives a completed parent;
 - provider/process/browser/bridge cancellation and leaked-resource tests;
 - test-level isolation and deterministic final ordering under `--jobs`;
@@ -384,12 +411,13 @@ Stress tests use deterministic seeds and print the seed on failure.
 
 Milestone E is complete only when:
 
-1. Parallel/race/retry/timeout semantics match this specification under deterministic scheduler tests.
+1. Parallel/race/retry/timeout semantics match this specification under deterministic scheduler tests; `race` selects the first successful child computation and does not act as reactive event selection.
 2. No child process, bridge call, browser context, temporary resource, or runtime task survives parent completion/cancellation in integration tests.
 3. `--jobs` preserves per-test isolation and deterministic aggregate output.
 4. CLI test runs publish only current-revision observations to a running LSP and a later successful run removes prior diagnostics.
 5. A trace reconstructs parallel branches, attempts, failures, cleanup, sources, and evidence without project execution.
 6. DAP can pause, inspect, step, continue, and disconnect safely during concurrent/retried execution.
-7. Full workspace, browser, bridge-conformance, LSP/DAP, trace, and extension gates pass.
+7. Scheduler wait registrations pass deterministic readiness/cancellation/cleanup tests, leaving a future event-selection plan node additive rather than requiring `Race` to change meaning.
+8. Full workspace, browser, bridge-conformance, LSP/DAP, trace, and extension gates pass.
 
 The roadmap acceptance statement is thereby satisfied: concurrent and retried tests remain deterministic, diagnosable, and source-mapped in terminal, trace, and editor.

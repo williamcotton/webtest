@@ -2,7 +2,7 @@
 
 ## 0. Status and dependencies
 
-This specification expands Milestone G in [`future-functionality.md`](./future-functionality.md). It depends on the shared workspace/editor services from [`milestone-f.md`](./milestone-f.md) and the stable plan/event/protocol formats established by earlier milestones.
+This specification expands Milestone G in [`future-functionality.md`](./future-functionality.md). It depends on the C.5 static description, diagnostic-detail, and repair-hint DTOs, the shared workspace/editor services from [`milestone-f.md`](./milestone-f.md), and the stable plan/event/protocol formats established by earlier milestones.
 
 Milestone G makes the same Rust language intelligence available in Monaco/browser hosts and turns all native/editor components into reproducible release artifacts. It does not fork language semantics for the web.
 
@@ -12,7 +12,7 @@ Users can:
 
 - install signed/checksummed native `webtest` builds on supported macOS, Linux, and Windows systems;
 - install the Cursor/VS Code extension from a compatible marketplace or VSIX;
-- embed `@webtest/editor` in a browser application and receive the same diagnostics, formatting, semantic tokens, completion, hover, symbols, and plan output as native analysis;
+- embed `@webtest/editor` in a browser application and receive the same static description, diagnostics/repair hints, formatting, semantic tokens, completion, hover, symbols, test identities, and plan output as native analysis;
 - run the official CI container with a matching managed Chrome;
 - verify artifact versions, checksums, provenance, and protocol compatibility.
 
@@ -23,17 +23,18 @@ Native, Cursor/VS Code, and Monaco agree on source interpretation because they c
 Milestone G includes:
 
 - a complete WASM facade over portable workspace/editor services;
+- portable C.5 language/project description and machine-diagnostic/repair DTOs;
 - a versioned request/response DTO protocol for a Web Worker;
 - an `@webtest/editor` npm package with WASM, worker, declarations, and Monaco adapter;
 - native/WASM parity fixtures and browser-package integration tests;
 - release automation for native binaries, checksums, signatures/provenance, and installers;
 - VSIX/marketplace publishing and verified native-binary discovery/installation;
 - an official container with `webtest` and matching Chrome for Testing;
-- compatibility manifests across CLI, plan, events/traces, bridge protocol, WASM API, and extension.
+- compatibility manifests across CLI machine DTOs, plan, events/traces, bridge protocol, WASM API, and extension.
 
 ## 3. Non-goals
 
-This milestone does not run Chrome, processes, filesystem providers, application bridges, or arbitrary network requests inside browser WASM. It does not host a browser LSP server, add a JavaScript parser/type checker, embed Chromium in the Rust executable, implement remote workers, provide a cloud editor, or guarantee offline execution of native test plans in a webpage.
+This milestone does not run Chrome, `webtest inspect`, processes, filesystem providers, application bridges, or arbitrary network requests inside browser WASM. It does not host a browser LSP server, add a JavaScript parser/type checker, embed Chromium in the Rust executable, implement remote workers, provide a cloud editor, or guarantee offline execution of native test plans in a webpage.
 
 ## 4. Portable capability boundary
 
@@ -47,6 +48,8 @@ text -> syntax -> hir -> analysis -> format -> plan DTOs -> editor DTOs
 ```
 
 Native filesystem discovery, process launch, sockets, CDP, browser management, app-bridge transport, trace serving, and terminal reporting remain outside the WASM dependency graph.
+
+Every operation that depends only on supplied source/configuration/schema inputs remains portable: parsing, analysis, static description, structured diagnostics and repair hints, formatting, semantic queries, test discovery, and plan generation. These are projections of the same Rust services used by native CLI/LSP adapters. `webtest inspect` remains native because semantic page inspection requires a live browser; WASM reports that capability boundary explicitly rather than approximating the page in TypeScript.
 
 WASM may compile operations requiring native capabilities. The resulting plan/summary marks requirements such as:
 
@@ -78,6 +81,8 @@ interface WebTestEditor {
   closeDocument(uri: string): Promise<void>;
   removeFile(uri: string): Promise<void>;
 
+  analyze(uri: string): Promise<AnalysisResult>;
+  describeWorkspace(): Promise<ProjectDescription>;
   diagnostics(uri: string): Promise<Diagnostic[]>;
   format(uri: string): Promise<TextEdit[]>;
   semanticTokens(uri: string): Promise<SemanticToken[]>;
@@ -91,13 +96,13 @@ interface WebTestEditor {
   codeActions(uri: string, range: Range): Promise<CodeAction[]>;
   inlayHints(uri: string, range: Range): Promise<InlayHint[]>;
   discoverTests(): Promise<TestItem[]>;
-  compileTestPlan(testId: string): Promise<CompiledPlan>;
+  compileTestPlan(testVariantId: string): Promise<CompiledPlan>;
 
   dispose(): Promise<void>;
 }
 ```
 
-The actual API can batch related calls, but every operation maps to the same protocol-neutral Rust editor/query service used by native adapters.
+The actual API can batch related calls, but every operation maps to the same protocol-neutral Rust editor/query service used by native adapters. `AnalysisResult` is a stable semantic DTO, not a Rowan tree or serialized Rust implementation detail. `Diagnostic` preserves the C.5 stable code, source revision/range, semantic details, and bounded repair hints; `ProjectDescription` is the same bounded description query projected by `webtest describe` from the inputs available to the host.
 
 ### 5.2 Positions and revisions
 
@@ -107,7 +112,7 @@ Invalid/out-of-order edits return typed errors without mutating document state. 
 
 ### 5.3 Serialization
 
-DTOs are versioned, plain structured-clone-safe values. Do not expose `wasm_bindgen` internals, Rust pointers, Rowan nodes, or mutable analysis objects. Large token/plan payloads may use typed arrays where measured, but their encoding is documented and versioned.
+DTOs are versioned, plain structured-clone-safe values. C.5 description/diagnostic/repair versions and F declaration/variant identities retain the same meaning across native and WASM adapters. Do not expose `wasm_bindgen` internals, Rust pointers, Rowan nodes, or mutable analysis objects. Large token/plan payloads may use typed arrays where measured, but their encoding is documented and versioned.
 
 Panics are caught at the facade where possible and returned as `internal_error` with a correlation ID; production payloads do not contain Rust backtraces unless explicitly enabled.
 
@@ -185,12 +190,14 @@ One fixture corpus runs through native editor services and the WASM worker. Comp
 
 ```text
 parse/static diagnostics and exact ranges
+static language/provider/project description
+diagnostic semantic details and repair hints
 format edits/result
 semantic tokens
 completion/signature/hover
 symbols/folding/selection
 definition/references/rename/code actions/inlay hints
-test discovery
+test declaration/variant discovery and identities
 compiled plan structure, IDs, source revisions, provider schema hashes, and required host capabilities
 ```
 
@@ -236,7 +243,7 @@ Provide release archives first, then shell/PowerShell installers, Homebrew, and 
 - never alter shell startup files without explicit consent;
 - do not install Chrome silently.
 
-`webtest --version --json` reports product, target, plan/event/trace/bridge versions, and build commit for support tooling.
+`webtest --version --json` reports product, target, inspection/description/diagnostic/repair, plan/event/trace/bridge versions, and build commit for support tooling.
 
 ## 11. Cursor/VS Code distribution
 
@@ -281,6 +288,10 @@ Publish a machine-readable release compatibility manifest:
   "event_schema": 1,
   "trace_format": 1,
   "observation_ipc": 1,
+  "inspection_schema": 1,
+  "description_schema": 1,
+  "diagnostic_schema": 1,
+  "repair_hint_schema": 1,
   "app_bridge_protocol": [1],
   "wasm_editor_api": 1,
   "worker_protocol": 1,
@@ -306,7 +317,7 @@ Readers reject unsupported major formats with actionable errors. Migration tools
 ## 15. Architecture and ownership
 
 - `wasm` is a DTO/lifecycle facade over `analysis`, `format`, `plan`, and `editor`; it contains no parallel semantics.
-- Shared editor DTO definitions should live where native/WASM adapters can serialize them consistently without pulling in LSP/Monaco types.
+- Shared semantic/editor DTO definitions, including C.5 description/diagnostic/repair shapes and F test identities, should live where native/WASM adapters can serialize them consistently without pulling in LSP/Monaco types.
 - Worker and Monaco TypeScript are transport/host adapters only.
 - Release tooling consumes locked Cargo/npm outputs and canonical compatibility manifests.
 - The VSIX locates/manages a verified native product but never implements syntax/runtime behavior.
@@ -314,7 +325,7 @@ Readers reject unsupported major formats with actionable errors. Migration tools
 
 ## 16. Delivery slices
 
-1. Stabilize/version shared editor DTOs and complete the WASM facade method surface.
+1. Stabilize/version shared semantic/editor DTOs, including static description and repair details, and complete the WASM facade method surface.
 2. Implement UTF-16/revision-safe worker protocol, cancellation, limits, and typed errors.
 3. Package core `@webtest/editor` assets/declarations and bundler/CSP examples.
 4. Implement Monaco providers and browser integration tests.
@@ -330,7 +341,7 @@ Required coverage includes:
 
 - WASM facade DTO/version/error and lifecycle tests;
 - UTF-16 edit/position, stale response, cancellation, multi-document/workspace, size-limit, and worker-crash recovery tests;
-- native/WASM parity for every portable editor/query result;
+- native/WASM parity for every portable semantic/editor/query result, including static description, diagnostic details, repair hints, and declaration/variant identities;
 - real-browser Monaco adapter tests for changes, diagnostics, completion, formatting, rename, symbols, and plan compilation;
 - npm package export/type/bundler/CSP/install smoke tests;
 - clean cross-platform native archive execution and `--version --json` tests;
@@ -347,10 +358,10 @@ Milestone G is complete only when:
 
 1. Native release artifacts install and run on every tier-1 platform with verified integrity/provenance.
 2. `@webtest/editor` works in a real browser/Monaco host without a browser LSP server or JavaScript language implementation.
-3. Native and WASM fixture results agree for every portable diagnostic, edit, token, editor feature, test item, and compiled plan field.
+3. Native and WASM fixture results agree for every portable static description, diagnostic/repair detail, edit, token, editor feature, test declaration/variant item, and compiled plan field.
 4. Native-only operations compile in WASM with explicit capability requirements and cannot execute there.
 5. A clean Cursor/VS Code installation can acquire or locate a verified compatible server, activate, run, and debug without bundled multi-platform binaries.
 6. The official non-root CI container runs the example browser suite using the release-matched Chrome.
 7. Compatibility metadata and rejection behavior prevent silent protocol/format skew.
 
-The roadmap acceptance statement is thereby satisfied: native, Cursor/VS Code, and Monaco experiences agree on syntax, formatting, diagnostics, semantic tokens, editor intelligence, and compiled plans.
+The roadmap acceptance statement is thereby satisfied: native, Cursor/VS Code, and Monaco experiences agree on syntax, static description, formatting, structured diagnostics/repair hints, semantic tokens, editor intelligence, test identities, and compiled plans.

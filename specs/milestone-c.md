@@ -4,7 +4,7 @@
 
 This specification expands Milestone C in [`future-functionality.md`](./future-functionality.md). It depends on the product/configuration foundation in [`milestone-a.md`](./milestone-a.md) and reliable browser semantics in [`milestone-b.md`](./milestone-b.md).
 
-Milestone C introduces the expression, type, capability, provider, and value-transfer foundations required by the language-neutral application bridge in [`milestone-d.md`](./milestone-d.md). It proves those foundations first with built-in HTTP, process, and filesystem providers.
+Milestone C introduces the expression, type, capability, provider, and value-transfer foundations consumed next by semantic inspection and machine feedback in [`milestone-c-5.md`](./milestone-c-5.md) and required by the language-neutral application bridge in [`milestone-d.md`](./milestone-d.md). It proves those foundations first with built-in HTTP, process, and filesystem providers.
 
 **Implementation status (2026-08-22): complete.** The shared Rust pipeline now implements the syntax, typed HIR, static analysis, provider schemas, serializable plan, native providers, typed runtime, revision-bound observations, editor/LSP/DAP services, and WASM compilation DTOs described here. Compiler, runtime, editor, and protocol tests cover the typed server-to-browser workflow.
 
@@ -53,7 +53,7 @@ Milestone C includes:
 
 ## 3. Non-goals
 
-This milestone does not implement `app.*`, bridge protocols/SDKs, application startup, modules/imports, user-defined function declarations, reusable fixtures, parallel/race/retry blocks, remote workers, database-specific syntax, or arbitrary plugin loading. Function **calls** and typed provider signatures are included; multi-file helper/fixture declarations belong to Milestone F.
+This milestone does not implement semantic page inspection, `webtest describe`, machine repair hints, `app.*`, bridge protocols/SDKs, application startup, modules/imports, user-defined function declarations, reusable fixtures, parallel/race/retry blocks, remote workers, database-specific syntax, or arbitrary plugin loading. Function **calls** and typed provider signatures are included; Milestone C.5 exposes them for machine discovery, and multi-file helper/fixture declarations belong to Milestone F.
 
 ## 4. Language surface
 
