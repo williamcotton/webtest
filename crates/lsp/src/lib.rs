@@ -2,6 +2,7 @@
 
 use std::{
     collections::HashMap,
+    path::Path,
     sync::{Arc, Mutex},
 };
 
@@ -25,6 +26,7 @@ struct Document {
     file: FileId,
     uri: Uri,
     version: i32,
+    editor: Arc<EditorService>,
 }
 
 #[derive(Default)]
@@ -55,16 +57,26 @@ impl DocumentStore {
 
 struct Backend {
     client: Client,
-    editor: Arc<EditorService>,
+    default_editor: Arc<EditorService>,
+    editor_for_path: Arc<DocumentEditorResolver>,
     documents: Arc<DocumentStore>,
     browser: Arc<dyn BrowserHost>,
 }
 
+pub type DocumentEditorResolver =
+    dyn Fn(&Path) -> std::result::Result<Arc<EditorService>, String> + Send + Sync;
+
 impl Backend {
-    fn new(client: Client, browser: Arc<dyn BrowserHost>, editor: Arc<EditorService>) -> Self {
+    fn new(
+        client: Client,
+        browser: Arc<dyn BrowserHost>,
+        default_editor: Arc<EditorService>,
+        editor_for_path: Arc<DocumentEditorResolver>,
+    ) -> Self {
         Self {
             client,
-            editor,
+            default_editor,
+            editor_for_path,
             documents: Arc::new(DocumentStore::default()),
             browser,
         }
@@ -74,7 +86,7 @@ impl Backend {
         let Some(document) = self.documents.get(uri) else {
             return;
         };
-        let source = match self.editor.source(document.file) {
+        let source = match document.editor.source(document.file) {
             Ok(source) => source,
             Err(error) => {
                 self.client
@@ -83,7 +95,7 @@ impl Backend {
                 return;
             }
         };
-        let diagnostics = match self.editor.diagnostics(document.file) {
+        let diagnostics = match document.editor.diagnostics(document.file) {
             Ok(diagnostics) => diagnostics
                 .into_iter()
                 .map(|diagnostic| diagnostic_to_lsp(&source, diagnostic))
@@ -166,13 +178,34 @@ impl LanguageServer for Backend {
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let document = params.text_document;
-        let file = self
-            .editor
-            .open_document(document.uri.as_str(), document.text);
+        let editor = if document.uri.scheme().as_str() == "file" {
+            match document.uri.to_file_path() {
+                Some(path) => match (self.editor_for_path)(&path) {
+                    Ok(editor) => editor,
+                    Err(error) => {
+                        self.client
+                            .log_message(
+                                MessageType::ERROR,
+                                format!(
+                                    "could not resolve WebTest project for {}: {error}",
+                                    path.display()
+                                ),
+                            )
+                            .await;
+                        Arc::clone(&self.default_editor)
+                    }
+                },
+                None => Arc::clone(&self.default_editor),
+            }
+        } else {
+            Arc::clone(&self.default_editor)
+        };
+        let file = editor.open_document(document.uri.as_str(), document.text);
         self.documents.insert(Document {
             file,
             uri: document.uri.clone(),
             version: document.version,
+            editor,
         });
         self.publish(&document.uri).await;
     }
@@ -183,7 +216,7 @@ impl LanguageServer for Backend {
             return;
         };
         if let Some(change) = params.content_changes.into_iter().last() {
-            self.editor.update_document(document.file, change.text);
+            document.editor.update_document(document.file, change.text);
         }
         document.version = params.text_document.version;
         self.documents.insert(document);
@@ -192,7 +225,7 @@ impl LanguageServer for Backend {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         if let Some(document) = self.documents.remove(&params.text_document.uri) {
-            self.editor.close_document(document.file);
+            document.editor.close_document(document.file);
             self.client
                 .publish_diagnostics(document.uri, Vec::new(), None)
                 .await;
@@ -203,11 +236,11 @@ impl LanguageServer for Backend {
         let Some(document) = self.documents.get(&params.text_document.uri) else {
             return Ok(None);
         };
-        let source = self
+        let source = document
             .editor
             .source(document.file)
             .map_err(|error| Error::invalid_params(error.to_string()))?;
-        let formatted = self
+        let formatted = document
             .editor
             .format(document.file)
             .map_err(|error| Error::invalid_params(error.to_string()))?;
@@ -225,11 +258,11 @@ impl LanguageServer for Backend {
         let Some(document) = self.documents.get(&params.text_document.uri) else {
             return Ok(None);
         };
-        let source = self
+        let source = document
             .editor
             .source(document.file)
             .map_err(|error| Error::invalid_params(error.to_string()))?;
-        let tokens = self
+        let tokens = document
             .editor
             .semantic_tokens(document.file)
             .map_err(|error| Error::invalid_params(error.to_string()))?;
@@ -246,12 +279,12 @@ impl LanguageServer for Backend {
         else {
             return Ok(None);
         };
-        let source = self
+        let source = document
             .editor
             .source(document.file)
             .map_err(|error| Error::invalid_params(error.to_string()))?;
         let offset = position_to_offset(&source, params.text_document_position_params.position);
-        let hover = self
+        let hover = document
             .editor
             .hover(document.file, TextSize::from(offset as u32))
             .map_err(|error| Error::invalid_params(error.to_string()))?;
@@ -266,12 +299,12 @@ impl LanguageServer for Backend {
         let Some(document) = self.documents.get(&position.text_document.uri) else {
             return Ok(None);
         };
-        let source = self
+        let source = document
             .editor
             .source(document.file)
             .map_err(|error| Error::invalid_params(error.to_string()))?;
         let offset = position_to_offset(&source, position.position);
-        let completions = self
+        let completions = document
             .editor
             .completions(document.file, TextSize::from(offset as u32))
             .map_err(|error| Error::invalid_params(error.to_string()))?
@@ -298,12 +331,12 @@ impl LanguageServer for Backend {
         let Some(document) = self.documents.get(&position.text_document.uri) else {
             return Ok(None);
         };
-        let source = self
+        let source = document
             .editor
             .source(document.file)
             .map_err(|error| Error::invalid_params(error.to_string()))?;
         let offset = position_to_offset(&source, position.position);
-        let signature = self
+        let signature = document
             .editor
             .signature_help(document.file, TextSize::from(offset as u32))
             .map_err(|error| Error::invalid_params(error.to_string()))?;
@@ -347,7 +380,7 @@ impl LanguageServer for Backend {
             .get(&uri)
             .ok_or_else(|| Error::invalid_params("document is not open"))?;
 
-        if let Err(error) = self
+        if let Err(error) = document
             .editor
             .run_file(document.file, self.browser.as_ref())
             .await
@@ -366,9 +399,24 @@ pub async fn serve(browser: Arc<dyn BrowserHost>) {
 }
 
 pub async fn serve_with_editor(browser: Arc<dyn BrowserHost>, editor: Arc<EditorService>) {
+    let resolved_editor = Arc::clone(&editor);
+    serve_with_document_editors(
+        browser,
+        editor,
+        Arc::new(move |_| Ok(Arc::clone(&resolved_editor))),
+    )
+    .await;
+}
+
+pub async fn serve_with_document_editors(
+    browser: Arc<dyn BrowserHost>,
+    default_editor: Arc<EditorService>,
+    editor_for_path: Arc<DocumentEditorResolver>,
+) {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
-    let (service, socket) = LspService::new(|client| Backend::new(client, browser, editor));
+    let (service, socket) =
+        LspService::new(|client| Backend::new(client, browser, default_editor, editor_for_path));
     Server::new(stdin, stdout, socket).serve(service).await;
 }
 

@@ -5,7 +5,7 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     process::ExitCode,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Instant,
 };
 
@@ -297,18 +297,20 @@ async fn run(cli: Cli) -> Result<ExitClass, AppError> {
                 project.config.timeouts.browser_command,
                 project.config.timeouts.navigation,
             );
-            let options = runner_options(&project);
-            let (providers, app_provider) = runtime_provider_registry(&project, &options)?;
-            let editor = Arc::new(webtest_editor::EditorService::with_provider_registry(
-                options, providers,
-            ));
-            webtest_lsp::serve_with_editor(Arc::new(browser), editor).await;
-            if let Some(provider) = app_provider {
-                provider
-                    .shutdown()
-                    .await
-                    .map_err(AppError::infrastructure)?;
-            }
+            let project_editors = Arc::new(LspProjectEditors::default());
+            let editor = project_editors.editor_for_project(&project)?;
+            let document_projects = Arc::clone(&project_editors);
+            webtest_lsp::serve_with_document_editors(
+                Arc::new(browser),
+                editor,
+                Arc::new(move |path| {
+                    document_projects
+                        .editor_for_path(path)
+                        .map_err(|error| error.to_string())
+                }),
+            )
+            .await;
+            project_editors.shutdown().await?;
             Ok(ExitClass::Success)
         }
         Command::Dap {
@@ -347,6 +349,77 @@ async fn run(cli: Cli) -> Result<ExitClass, AppError> {
 
 fn project(paths: &[PathBuf]) -> Result<Project, AppError> {
     webtest_project::discover(paths).map_err(AppError::usage)
+}
+
+#[derive(Clone)]
+struct LspProjectEditor {
+    editor: Arc<webtest_editor::EditorService>,
+    app_provider: Option<Arc<AppProvider>>,
+}
+
+#[derive(Default)]
+struct LspProjectEditors {
+    projects: Mutex<std::collections::HashMap<PathBuf, LspProjectEditor>>,
+}
+
+impl LspProjectEditors {
+    fn editor_for_path(&self, path: &Path) -> Result<Arc<webtest_editor::EditorService>, AppError> {
+        let input = if path.exists() {
+            path.to_path_buf()
+        } else {
+            path.parent().unwrap_or(path).to_path_buf()
+        };
+        self.editor_for_project(&project(&[input])?)
+    }
+
+    fn editor_for_project(
+        &self,
+        project: &Project,
+    ) -> Result<Arc<webtest_editor::EditorService>, AppError> {
+        if let Some(project) = self.lock().get(&project.root) {
+            return Ok(Arc::clone(&project.editor));
+        }
+
+        let options = runner_options(project);
+        let (providers, app_provider) = runtime_provider_registry(project, &options)?;
+        let candidate = LspProjectEditor {
+            editor: Arc::new(webtest_editor::EditorService::with_provider_registry(
+                options, providers,
+            )),
+            app_provider,
+        };
+        let mut projects = self.lock();
+        let project = projects.entry(project.root.clone()).or_insert(candidate);
+        Ok(Arc::clone(&project.editor))
+    }
+
+    async fn shutdown(&self) -> Result<(), AppError> {
+        let providers = self
+            .lock()
+            .values()
+            .filter_map(|project| project.app_provider.clone())
+            .collect::<Vec<_>>();
+        let mut first_error = None;
+        for provider in providers {
+            if let Err(error) = provider.shutdown().await
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(AppError::infrastructure(error)),
+            None => Ok(()),
+        }
+    }
+
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<PathBuf, LspProjectEditor>> {
+        self.projects
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 async fn inspect_page(

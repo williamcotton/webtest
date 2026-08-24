@@ -12,6 +12,7 @@ use std::{
 };
 
 use serde_json::{Value, json};
+use webtest_app_bridge::{AppManifest, FieldSchema, FunctionSchema, TypeSchema};
 
 struct ProtocolProcess {
     child: Child,
@@ -306,6 +307,136 @@ fn lsp_stdio_covers_document_features_and_shutdown() {
             .get("result")
             .is_some()
     );
+    lsp.send(json!({"jsonrpc":"2.0","method":"exit","params":null}));
+    lsp.wait_for_exit();
+}
+
+#[test]
+fn lsp_resolves_app_provider_from_the_open_documents_nearest_project() {
+    let directory = tempfile::tempdir().expect("temp directory");
+    let project = directory.path().join("nested-app-project");
+    let schema_directory = project.join(".webtest");
+    std::fs::create_dir_all(&schema_directory).expect("create schema directory");
+    let manifest = AppManifest {
+        manifest_version: 1,
+        protocol: 1,
+        provider: "app".into(),
+        sdk: "protocol-test".into(),
+        sdk_version: "1.0.0".into(),
+        schema_hash: String::new(),
+        functions: [(
+            "create_user".into(),
+            FunctionSchema {
+                documentation: "Create a user for a test.".into(),
+                retry_safe: false,
+                params: TypeSchema::Object {
+                    fields: [(
+                        "email".into(),
+                        FieldSchema {
+                            ty: TypeSchema::String,
+                            documentation: "Unique email address.".into(),
+                            optional: false,
+                            secret: false,
+                            default: None,
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
+                },
+                returns: TypeSchema::Object {
+                    fields: [(
+                        "email".into(),
+                        FieldSchema {
+                            ty: TypeSchema::String,
+                            documentation: String::new(),
+                            optional: false,
+                            secret: false,
+                            default: None,
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
+                },
+            },
+        )]
+        .into_iter()
+        .collect(),
+    }
+    .with_computed_hash()
+    .expect("compute manifest hash");
+    std::fs::write(
+        schema_directory.join("app-schema.json"),
+        serde_json::to_vec_pretty(&manifest).expect("serialize manifest"),
+    )
+    .expect("write manifest");
+    std::fs::write(
+        project.join("webtest.toml"),
+        "[project]\ntest_roots = [\"case.webtest\"]\n\n[server.app]\nschema = \".webtest/app-schema.json\"\n",
+    )
+    .expect("write project configuration");
+
+    let source = "test \"app\" { server { let user = app.create_user(email: \"a@example.test\") expect user.email == \"a@example.test\" } }";
+    let path = project.join("case.webtest");
+    std::fs::write(&path, source).expect("write source");
+    let uri = format!("file://{}", path.display());
+    let mut lsp = ProtocolProcess::spawn(&["lsp"], directory.path());
+    lsp.send(json!({
+        "jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}
+    }));
+    lsp.receive(|message| message["id"] == 1);
+    lsp.send(json!({"jsonrpc":"2.0","method":"initialized","params":{}}));
+    lsp.send(json!({
+        "jsonrpc":"2.0","method":"textDocument/didOpen",
+        "params":{"textDocument":{"uri":uri,"languageId":"webtest","version":1,"text":source}}
+    }));
+    let diagnostics = lsp.receive(|message| {
+        message["method"] == "textDocument/publishDiagnostics" && message["params"]["version"] == 1
+    });
+    assert!(
+        diagnostics["params"]["diagnostics"]
+            .as_array()
+            .expect("diagnostics")
+            .is_empty(),
+        "{diagnostics:#?}"
+    );
+
+    let partial = "test \"app\" { server { let user = app. } }";
+    lsp.send(json!({
+        "jsonrpc":"2.0","method":"textDocument/didChange",
+        "params":{"textDocument":{"uri":uri,"version":2},"contentChanges":[{"text":partial}]}
+    }));
+    let partial_diagnostics = lsp.receive(|message| {
+        message["method"] == "textDocument/publishDiagnostics" && message["params"]["version"] == 2
+    });
+    assert!(
+        partial_diagnostics["params"]["diagnostics"]
+            .as_array()
+            .expect("partial diagnostics")
+            .iter()
+            .all(|diagnostic| {
+                diagnostic["code"] != "semantic.reserved_provider"
+                    && diagnostic["code"] != "semantic.unknown_provider"
+            }),
+        "{partial_diagnostics:#?}"
+    );
+
+    let completion_character = partial.find("app.").expect("app call") + "app.".len();
+    lsp.send(json!({
+        "jsonrpc":"2.0","id":2,"method":"textDocument/completion",
+        "params":{"textDocument":{"uri":uri},"position":{"line":0,"character":completion_character}}
+    }));
+    let completions = lsp.receive(|message| message["id"] == 2);
+    assert!(
+        completions["result"]
+            .as_array()
+            .expect("completion items")
+            .iter()
+            .any(|completion| completion["label"] == "create_user"),
+        "{completions:#?}"
+    );
+
+    lsp.send(json!({"jsonrpc":"2.0","id":3,"method":"shutdown","params":null}));
+    lsp.receive(|message| message["id"] == 3);
     lsp.send(json!({"jsonrpc":"2.0","method":"exit","params":null}));
     lsp.wait_for_exit();
 }
