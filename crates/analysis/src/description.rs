@@ -39,8 +39,8 @@ impl Default for DescriptionLimits {
             max_search_results: 20,
             max_summary_bytes: 1_024,
             max_guidance_entries: 16,
-            max_examples: 4,
-            max_example_bytes: 4_096,
+            max_examples: 10,
+            max_example_bytes: 8_192,
         }
     }
 }
@@ -353,20 +353,70 @@ fn query_description(
     if let Some(construct) = registry.get(query) {
         return DescriptionResponse::Construct(Box::new(apply_limits(construct.clone(), limits)));
     }
-    let prefix = format!("{query}.");
+    if query == "app_bridge"
+        || query == "app.protocol"
+        || query == "app.schema"
+        || query == "app_schema"
+        || query == "app-schema"
+        || query == "app-schema.json"
+        || query == "app.manifest"
+        || query == "app.pseudocode"
+        || query == "app_pseudocode"
+        || query == "app.implementation"
+        || query == "app_implementation"
+        || query == "bridge.pseudocode"
+    {
+        if let Some(construct) = registry.get("provider.app") {
+            return DescriptionResponse::Construct(Box::new(apply_limits(construct.clone(), limits)));
+        }
+    }
+    if query == "app" {
+        if let Some(construct) = registry.get("provider.app") {
+            let children = registry
+                .keys()
+                .filter(|candidate| candidate.starts_with("provider.app.") || candidate.starts_with("app."))
+                .cloned()
+                .collect::<Vec<_>>();
+            if children.is_empty() {
+                return DescriptionResponse::Construct(Box::new(apply_limits(construct.clone(), limits)));
+            }
+        }
+    }
+    let prefixes = if query == "app" || query == "provider.app" {
+        vec!["provider.app.".to_string(), "app.".to_string()]
+    } else if query == "http" || query == "provider.http" {
+        vec!["provider.http.".to_string(), "http.".to_string()]
+    } else if query == "fs" || query == "provider.fs" {
+        vec!["provider.fs.".to_string(), "fs.".to_string()]
+    } else if query == "process" || query == "provider.process" {
+        vec!["provider.process.".to_string(), "process.".to_string()]
+    } else {
+        vec![format!("{query}.")]
+    };
     let children = registry
         .keys()
-        .filter(|candidate| candidate.starts_with(&prefix))
+        .filter(|candidate| prefixes.iter().any(|prefix| candidate.starts_with(prefix)))
         .cloned()
         .collect::<Vec<_>>();
     if !children.is_empty() || category_exists(query) {
         let omitted = children.len().saturating_sub(limits.max_category_children);
+        let id_str = if query == "app" {
+            "provider.app"
+        } else if query == "http" {
+            "provider.http"
+        } else if query == "fs" {
+            "provider.fs"
+        } else if query == "process" {
+            "provider.process"
+        } else {
+            query
+        };
         return DescriptionResponse::Category(CategoryDescription {
             kind: "category_description".into(),
             description_schema_version: DESCRIPTION_SCHEMA_VERSION,
             language_version: language_version(),
-            id: query.into(),
-            summary: category_summary(query),
+            id: id_str.into(),
+            summary: category_summary(id_str),
             children: children
                 .into_iter()
                 .take(limits.max_category_children)
@@ -374,7 +424,7 @@ fn query_description(
             truncation: (omitted > 0).then(|| Truncation {
                 collection: "children".into(),
                 omitted,
-                narrower_query: Some(format!("{query}.<name>")),
+                narrower_query: Some(format!("{id_str}.<name>")),
             }),
         });
     }
@@ -439,11 +489,16 @@ fn index(
         ("declarations", "declaration."),
         ("scopes", "scope."),
         ("statements", "statement."),
+        ("expressions", "expression."),
+        ("operators", "operator."),
         ("browser_operations", "browser."),
         ("assertions", "assertion."),
+        ("locator_states", "locator_state."),
         ("locators", "locator."),
         ("types", "type."),
         ("capabilities", "capability."),
+        ("cli_commands", "cli."),
+        ("configuration", "configuration."),
     ] {
         categories.insert(
             key.into(),
@@ -454,12 +509,27 @@ fn index(
                 .collect(),
         );
     }
+    let mut provider_list: Vec<String> = providers
+        .schemas()
+        .flat_map(|schema| {
+            let mut ops: Vec<String> = schema
+                .operations
+                .keys()
+                .map(|op| format!("{}.{}", schema.name.0, op))
+                .collect();
+            ops.push(format!("provider.{}", schema.name.0));
+            ops
+        })
+        .collect();
+    for item in ["app", "app-schema.json", "app.pseudocode", "provider.app"] {
+        if !provider_list.contains(&item.to_string()) {
+            provider_list.push(item.to_string());
+        }
+    }
+    categories.insert("providers".into(), provider_list);
     categories.insert(
-        "providers".into(),
-        providers
-            .schemas()
-            .map(|schema| format!("provider.{}", schema.name.0))
-            .collect(),
+        "app_bridge".into(),
+        vec!["app".into(), "app-schema.json".into(), "app.pseudocode".into(), "provider.app".into()],
     );
     let mut truncation = Vec::new();
     for (category, children) in &mut categories {
@@ -660,26 +730,58 @@ fn category_exists(query: &str) -> bool {
         "declaration"
             | "scope"
             | "statement"
+            | "expression"
+            | "operator"
             | "locator"
+            | "locator_state"
             | "browser"
             | "assertion"
             | "type"
             | "capability"
             | "provider"
+            | "cli"
+            | "cli_command"
+            | "config"
+            | "configuration"
+            | "app"
+            | "app_bridge"
+            | "provider.app"
+            | "declarations"
+            | "scopes"
+            | "statements"
+            | "expressions"
+            | "operators"
+            | "locators"
+            | "locator_states"
+            | "browser_operations"
+            | "assertions"
+            | "types"
+            | "capabilities"
+            | "cli_commands"
+            | "providers"
     )
 }
 
 fn category_summary(query: &str) -> String {
-    match query.split('.').next().unwrap_or(query) {
-        "declaration" => "Top-level WebTest declarations.",
-        "scope" => "Sequential capability scopes.",
-        "statement" => "Statements shared by WebTest flows.",
-        "locator" => "Semantic and escape-hatch browser locators.",
-        "browser" => "Browser operations executed through the browser abstraction.",
-        "assertion" => "Structured test assertions.",
-        "type" => "Types recognized by static analysis.",
-        "capability" => "Static capability domains.",
-        "provider" => "Project-visible typed server providers.",
+    let key = query.split('.').next().unwrap_or(query);
+    match key {
+        "declaration" | "declarations" => "Top-level WebTest declarations.",
+        "scope" | "scopes" => "Sequential capability scopes.",
+        "statement" | "statements" => "Statements shared by WebTest flows.",
+        "expression" | "expressions" => "Value-producing language expressions.",
+        "operator" | "operators" => "Binary and unary syntax operators.",
+        "locator" | "locators" => "Semantic and escape-hatch browser locators.",
+        "locator_state" | "locator_states" => "Browser element interaction and assertion states.",
+        "browser" | "browser_operations" => "Browser operations executed through the browser abstraction.",
+        "assertion" | "assertions" => "Structured test assertions.",
+        "type" | "types" => "Types recognized by static analysis.",
+        "capability" | "capabilities" => "Static capability domains.",
+        "cli" | "cli_command" | "cli_commands" => "WebTest command line executable subcommands.",
+        "config" | "configuration" => "Project webtest.toml configuration settings.",
+        "app_bridge" => "Application Bridge provider surface (app.*) and offline schema manifest specification.",
+        "provider" if query == "provider.app" => "Language-neutral application bridge provider surface (app.*) powering live/offline application integration.",
+        "provider" | "providers" => "Project-visible typed server providers.",
+        "app" => "Language-neutral application bridge provider surface (app.*) powering live/offline application integration.",
         _ => "WebTest reference category.",
     }
     .into()
@@ -758,12 +860,33 @@ fn core_constructs() -> BTreeMap<String, ConstructDescription> {
     ] {
         constructs.insert(construct.id.clone(), construct);
     }
+    let app_construct = provider_app_construct();
+    let mut app_alias = app_construct.clone();
+    app_alias.id = "app".into();
+    let mut schema_alias = app_construct.clone();
+    schema_alias.id = "app-schema.json".into();
+    schema_alias.name = "app-schema.json".into();
+    schema_alias.construct_kind = "schema".into();
+    schema_alias.syntax = ".webtest/app-schema.json".into();
+    let mut pseudocode_alias = app_construct.clone();
+    pseudocode_alias.id = "app.pseudocode".into();
+    pseudocode_alias.name = "app.pseudocode".into();
+    pseudocode_alias.construct_kind = "implementation".into();
+    pseudocode_alias.syntax = "Native Web App Bridge Socket/IPC Loop Pseudocode".into();
+
     for construct in locator_constructs()
         .into_iter()
         .chain(browser_constructs())
         .chain(assertion_constructs())
         .chain(type_constructs())
         .chain(capability_constructs())
+        .chain(statement_constructs())
+        .chain(expression_constructs())
+        .chain(operator_constructs())
+        .chain(locator_state_constructs())
+        .chain(cli_constructs())
+        .chain(configuration_constructs())
+        .chain([app_construct, app_alias, schema_alias, pseudocode_alias])
     {
         constructs.insert(construct.id.clone(), construct);
     }
@@ -1266,6 +1389,43 @@ fn locator_constructs() -> Vec<ConstructDescription> {
     role.related = vec!["browser.click".into(), "assertion.locator_state".into()];
     role.availability.runtime_requires = vec!["native_browser".into()];
     values.insert(1, role);
+    let mut within = base_construct(
+        "locator.within",
+        "within",
+        "locator",
+        "<locator>.<state> within <duration>",
+        "Specify an explicit timeout duration for locator state assertions and waits.",
+    );
+    within.parameters = vec![
+        parameter("state", Type::Bool, true, Some(0), false, "expression", "locator_state_expression"),
+        parameter("timeout", Type::Duration, true, Some(1), false, "clause", "duration_expression"),
+    ];
+    within.return_type = Some(Type::Bool);
+    within.requires_capabilities = vec![Capability::Browser];
+    within.allowed_contexts = vec!["scope.browser".into()];
+    within.search_terms = vec!["timeout".into(), "deadline".into(), "duration".into()];
+    within.guidance = vec![
+        GuidanceDescription {
+            code: "within_timeout_clause".into(),
+            summary: "Within Timeout Clause: `within` specifies an explicit timeout duration for locator state assertions and waits, e.g. `expect role(\"button\").visible within 5s`. It modifies state assertions or wait operations.".into(),
+        },
+    ];
+    within.examples = vec![
+        example(
+            "locator state assertion within timeout",
+            "expect role(\"button\").visible within 5s",
+            "statement_fragment",
+            "scope.browser",
+        ),
+        example(
+            "locator state wait within timeout",
+            "wait role(\"button\").visible within 10s",
+            "statement_fragment",
+            "scope.browser",
+        ),
+    ];
+    within.availability.runtime_requires = vec!["native_browser".into()];
+    values.push(within);
     values
 }
 
@@ -2042,6 +2202,28 @@ fn type_constructs() -> Vec<ConstructDescription> {
                     "flow_block",
                 ),
             ];
+            if name == "Record" {
+                value.guidance = vec![
+                    GuidanceDescription {
+                        code: "record_member_access".into(),
+                        summary: "Record Member Access: Accessing an unknown or misspelled field on a record (e.g. `user.emai` on `user: { email: String, id: Int }`) produces error code `semantic.unknown_member`: 'type { email: String, id: Int } has no member `emai`'.".into(),
+                    },
+                ];
+            }
+            if name == "Json" {
+                value.guidance = vec![
+                    GuidanceDescription {
+                        code: "json_decode_pattern".into(),
+                        summary: "JSON Response Decoding: `response.json` on an HTTP response must be assigned to a typed Record variable (e.g. `let user: { id: Int, email: String } = response.json`). Attempting to access member fields directly on `response.json` (e.g. `response.json.id`) produces `type Json has no member <name>` (error code `semantic.unknown_member`).".into(),
+                    },
+                ];
+                value.examples.push(example(
+                    "JSON response decoding into typed record",
+                    "let response = http.post(\"/api/users\", json: { email: \"alice@example.com\" })\nexpect response.status == 201\nlet user: { id: Int, email: String } = response.json\nexpect user.id > 0",
+                    "statement_fragment",
+                    "scope.server",
+                ));
+            }
             value.search_terms = vec![ty.to_string(), "static type".into()];
             value
         })
@@ -2135,6 +2317,344 @@ fn capability_constructs() -> Vec<ConstructDescription> {
         value
     })
     .collect()
+}
+
+fn statement_constructs() -> Vec<ConstructDescription> {
+    vec![
+        {
+            let mut value = base_construct(
+                "statement.expect",
+                "expect",
+                "statement",
+                "expect <expression>",
+                "Assert a value condition or locator element state.",
+            );
+            value.allowed_contexts = vec!["scope.server".into(), "scope.browser".into(), "scope.test".into()];
+            value.requires_capabilities = vec![Capability::Test];
+            value.examples = vec![
+                example("value assertion", "expect 1 == 1", "statement_fragment", "scope.server"),
+                example("locator state assertion", "expect text(\"Welcome\").visible", "statement_fragment", "scope.browser"),
+            ];
+            value
+        },
+        {
+            let mut value = base_construct(
+                "statement.expr",
+                "expression_statement",
+                "statement",
+                "<expression>",
+                "Execute an effectful browser action or provider operation statement.",
+            );
+            value.allowed_contexts = vec!["scope.server".into(), "scope.browser".into()];
+            value.examples = vec![
+                example("browser action statement", "click role(\"button\", name: \"Sign in\")", "statement_fragment", "scope.browser"),
+                example("provider call statement", "http.get(\"http://127.0.0.1\")", "statement_fragment", "scope.server"),
+            ];
+            value
+        },
+    ]
+}
+
+fn expression_constructs() -> Vec<ConstructDescription> {
+    vec![
+        {
+            let mut value = base_construct(
+                "expression.literal",
+                "literal",
+                "expression",
+                "<string> | <int> | <float> | <bool> | <duration> | null",
+                "Primitive literal value expression.",
+            );
+            value.allowed_contexts = vec!["expression".into()];
+            value.examples = vec![
+                example("string literal", "\"alice@example.com\"", "expression_fragment", "scope.pure"),
+                example("integer literal", "42", "expression_fragment", "scope.pure"),
+            ];
+            value
+        },
+        {
+            let mut value = base_construct(
+                "expression.name",
+                "name",
+                "expression",
+                "<identifier>",
+                "Reference a bound identifier or variable name.",
+            );
+            value.allowed_contexts = vec!["expression".into()];
+            value.examples = vec![
+                example("boolean literal reference", "true", "expression_fragment", "scope.pure"),
+                example("null literal reference", "null", "expression_fragment", "scope.pure"),
+            ];
+            value
+        },
+        {
+            let mut value = base_construct(
+                "expression.binary",
+                "binary_expression",
+                "expression",
+                "<left> <operator> <right>",
+                "Binary operation expression for arithmetic, comparison, logical, or membership operations.",
+            );
+            value.allowed_contexts = vec!["expression".into()];
+            value.examples = vec![
+                example("comparison expression", "1 == 1", "expression_fragment", "scope.pure"),
+                example("membership expression", "\"hello world\" contains \"hello\"", "expression_fragment", "scope.pure"),
+            ];
+            value
+        },
+        {
+            let mut value = base_construct(
+                "expression.unary",
+                "unary_expression",
+                "expression",
+                "!<expression> | -<expression>",
+                "Unary logical negation or arithmetic negation operation.",
+            );
+            value.allowed_contexts = vec!["expression".into()];
+            value.examples = vec![
+                example("logical negation", "!false", "expression_fragment", "scope.pure"),
+                example("arithmetic negation", "-1", "expression_fragment", "scope.pure"),
+            ];
+            value
+        },
+        {
+            let mut value = base_construct(
+                "expression.member",
+                "member_access",
+                "expression",
+                "<expression>.<field>",
+                "Access a named field on a record or structured provider response.",
+            );
+            value.allowed_contexts = vec!["expression".into()];
+            value.examples = vec![
+                example("record field access", "{ email: \"alice@example.com\" }.email", "expression_fragment", "scope.pure"),
+                example("nested record field access", "{ user: { id: 1 } }.user.id", "expression_fragment", "scope.pure"),
+            ];
+            value
+        },
+        {
+            let mut value = base_construct(
+                "expression.call",
+                "call_expression",
+                "expression",
+                "<function>(<arguments>?)",
+                "Invoke a provider operation, locator, or builtin function.",
+            );
+            value.allowed_contexts = vec!["expression".into()];
+            value.examples = vec![
+                example("locator function call", "label(\"Email\")", "expression_fragment", "scope.browser"),
+                example("provider operation call", "http.get(\"http://127.0.0.1\")", "expression_fragment", "scope.server"),
+            ];
+            value
+        },
+        {
+            let mut value = base_construct(
+                "expression.record",
+                "record_literal",
+                "expression",
+                "{ <name>: <expression> (, <name>: <expression>)* }",
+                "Construct an anonymous record literal.",
+            );
+            value.allowed_contexts = vec!["expression".into()];
+            value.examples = vec![
+                example("record literal", "{ email: \"alice@example.com\" }", "expression_fragment", "scope.pure"),
+                example("nested record literal", "{ user: { id: 1 } }", "expression_fragment", "scope.pure"),
+            ];
+            value
+        },
+        {
+            let mut value = base_construct(
+                "expression.list",
+                "list_literal",
+                "expression",
+                "[ <expression> (, <expression>)* ]",
+                "Construct a typed list literal.",
+            );
+            value.allowed_contexts = vec!["expression".into()];
+            value.examples = vec![
+                example("integer list", "[1, 2, 3]", "expression_fragment", "scope.pure"),
+                example("string list", "[\"alice\", \"bob\"]", "expression_fragment", "scope.pure"),
+            ];
+            value
+        },
+        {
+            let mut value = base_construct(
+                "expression.parenthesized",
+                "parenthesized_expression",
+                "expression",
+                "( <expression> )",
+                "Group expressions to override precedence.",
+            );
+            value.allowed_contexts = vec!["expression".into()];
+            value.examples = vec![
+                example("grouped arithmetic", "(1 + 2) * 3", "expression_fragment", "scope.pure"),
+                example("grouped logic", "(true || false) && true", "expression_fragment", "scope.pure"),
+            ];
+            value
+        },
+    ]
+}
+
+fn operator_constructs() -> Vec<ConstructDescription> {
+    [
+        ("operator.eq", "==", "a == b", "Equality comparison operator.", "1 == 1", "2 == 2"),
+        ("operator.neq", "!=", "a != b", "Inequality comparison operator.", "1 != 2", "2 != 3"),
+        ("operator.lt", "<", "a < b", "Less-than comparison operator.", "1 < 2", "2 < 3"),
+        ("operator.lte", "<=", "a <= b", "Less-than-or-equal comparison operator.", "1 <= 2", "2 <= 2"),
+        ("operator.gt", ">", "a > b", "Greater-than comparison operator.", "2 > 1", "3 > 2"),
+        ("operator.gte", ">=", "a >= b", "Greater-than-or-equal comparison operator.", "2 >= 1", "2 >= 2"),
+        ("operator.add", "+", "a + b", "Addition or string concatenation operator.", "1 + 2", "3 + 4"),
+        ("operator.sub", "-", "a - b", "Arithmetic subtraction operator.", "5 - 2", "10 - 3"),
+        ("operator.mul", "*", "a * b", "Arithmetic multiplication operator.", "2 * 3", "4 * 5"),
+        ("operator.div", "/", "a / b", "Arithmetic division operator.", "6 / 2", "10 / 5"),
+        ("operator.and", "&&", "a && b", "Logical AND conjunction operator.", "true && true", "true && false"),
+        ("operator.or", "||", "a || b", "Logical OR disjunction operator.", "true || false", "false || true"),
+        ("operator.not", "!", "!a", "Logical NOT negation operator.", "!false", "!true"),
+        ("operator.contains", "contains", "a contains b", "Membership containment check operator.", "\"hello\" contains \"ell\"", "[1, 2] contains 1"),
+        ("operator.matches", "matches", "a matches \"pattern\"", "Regular expression pattern matching operator.", "\"hello\" matches \"^h.*o$\"", "\"test 123\" matches \"\\\\d+\""),
+    ]
+    .into_iter()
+    .map(|(id, name, syntax, summary, ex1, ex2)| {
+        let mut value = base_construct(id, name, "operator", syntax, summary);
+        value.allowed_contexts = vec!["expression".into()];
+        value.examples = vec![
+            example("operator usage 1", ex1, "expression_fragment", "scope.pure"),
+            example("operator usage 2", ex2, "expression_fragment", "scope.pure"),
+        ];
+        value
+    })
+    .collect()
+}
+
+fn locator_state_constructs() -> Vec<ConstructDescription> {
+    [
+        ("locator_state.visible", "visible", "<locator>.visible", "Assert or wait for browser element visibility in viewport."),
+        ("locator_state.hidden", "hidden", "<locator>.hidden", "Assert or wait for browser element to be hidden or absent."),
+        ("locator_state.attached", "attached", "<locator>.attached", "Assert or wait for browser element attachment in DOM tree."),
+        ("locator_state.detached", "detached", "<locator>.detached", "Assert or wait for browser element detachment from DOM tree."),
+        ("locator_state.enabled", "enabled", "<locator>.enabled", "Assert or wait for form control to be enabled."),
+        ("locator_state.disabled", "disabled", "<locator>.disabled", "Assert or wait for form control to be disabled."),
+        ("locator_state.checked", "checked", "<locator>.checked", "Assert or wait for checkbox/radio to be checked."),
+        ("locator_state.unchecked", "unchecked", "<locator>.unchecked", "Assert or wait for checkbox/radio to be unchecked."),
+    ]
+    .into_iter()
+    .map(|(id, name, syntax, summary)| {
+        let mut value = base_construct(id, name, "locator_state", syntax, summary);
+        value.allowed_contexts = vec!["scope.browser".into()];
+        value.requires_capabilities = vec![Capability::Browser];
+        value.examples = vec![
+            example("locator state assertion", &format!("expect text(\"Welcome\").{name}"), "statement_fragment", "scope.browser"),
+            example("locator state wait", &format!("wait role(\"button\").{name}"), "statement_fragment", "scope.browser"),
+        ];
+        value
+    })
+    .collect()
+}
+
+fn cli_constructs() -> Vec<ConstructDescription> {
+    vec![
+        {
+            let mut value = base_construct("cli.check", "check", "cli_command", "webtest check <path> [--reporter human|concise|json|junit]", "Statically check WebTest files without running tests.");
+            value.examples = vec![
+                example("check single file", "webtest check tests/auth.webtest", "cli", "cli"),
+                example("check machine json", "webtest check tests/auth.webtest --reporter json", "cli", "cli"),
+            ];
+            value
+        },
+        {
+            let mut value = base_construct("cli.fmt", "fmt", "cli_command", "webtest fmt <path>", "Format WebTest files using the canonical CST formatter.");
+            value.examples = vec![
+                example("format single file", "webtest fmt tests/auth.webtest", "cli", "cli"),
+                example("format workspace", "webtest fmt .", "cli", "cli"),
+            ];
+            value
+        },
+        {
+            let mut value = base_construct("cli.test", "test", "cli_command", "webtest test <path> [--headed] [--chrome-path <path>]", "Execute WebTest files in headless or headed Chrome.");
+            value.examples = vec![
+                example("run headless test", "webtest test tests/auth.webtest", "cli", "cli"),
+                example("run headed test", "webtest test tests/auth.webtest --headed", "cli", "cli"),
+            ];
+            value
+        },
+        {
+            let mut value = base_construct("cli.describe", "describe", "cli_command", "webtest describe [<query>] [--reporter human|json]", "Surgically describe WebTest language constructs, providers, and application bridge specs.");
+            value.examples = vec![
+                example("describe locator topic", "webtest describe locator.role", "cli", "cli"),
+                example("describe app bridge", "webtest describe app", "cli", "cli"),
+            ];
+            value
+        },
+        {
+            let mut value = base_construct("cli.inspect", "inspect", "cli_command", "webtest inspect <url> [--reporter human|json]", "Inspect live web pages and generate validated semantic locators.");
+            value.examples = vec![
+                example("inspect login page", "webtest inspect http://127.0.0.1:3000/login", "cli", "cli"),
+                example("inspect page json", "webtest inspect http://127.0.0.1:3000/login --reporter json", "cli", "cli"),
+            ];
+            value
+        },
+        {
+            let mut value = base_construct("cli.lsp", "lsp", "cli_command", "webtest lsp", "Run Language Server Protocol server over stdio.");
+            value.examples = vec![
+                example("run lsp server", "webtest lsp", "cli", "cli"),
+                example("lsp stdio launch", "webtest lsp --stdio", "cli", "cli"),
+            ];
+            value
+        },
+        {
+            let mut value = base_construct("cli.dap", "dap", "cli_command", "webtest dap", "Run Debug Adapter Protocol server over stdio for Cursor/VS Code step debugging.");
+            value.examples = vec![
+                example("run dap server", "webtest dap", "cli", "cli"),
+                example("dap launch", "webtest dap --stdio", "cli", "cli"),
+            ];
+            value
+        },
+    ]
+}
+
+fn configuration_constructs() -> Vec<ConstructDescription> {
+    vec![
+        {
+            let mut value = base_construct("configuration.webtest_toml", "webtest.toml", "configuration", "webtest.toml", "Typed project configuration manifest placed at the project root.");
+            value.examples = vec![
+                example("canonical webtest.toml boilerplate", "[browser]\nbase_url = \"http://127.0.0.1:3000\"\nheadless = true\n\n[server]\nbase_url = \"http://127.0.0.1:3000\"\n\n[server.app]\nschema = \".webtest/app-schema.json\"\n\n[app]\ncommand = \"mix\"\nargs = [\"phx.server\"]\nport = 3000\n", "config", "config"),
+                example("browser options", "[browser]\nbase_url = \"http://127.0.0.1:3000\"\nheadless = false\ntimeout = \"10s\"\n", "config", "config"),
+            ];
+            value
+        },
+        {
+            let mut value = base_construct("configuration.app", "app", "configuration", "[app] section in webtest.toml", "Application bridge connection, command lifecycle, and transport settings.");
+            value.examples = vec![
+                example("managed app command", "[app]\ncommand = \"node\"\nargs = [\"server.js\"]\n", "config", "config"),
+                example("managed command with args", "[app]\ncommand = \"mix\"\nargs = [\"phx.server\"]\n", "config", "config"),
+            ];
+            value
+        },
+        {
+            let mut value = base_construct("configuration.server", "server", "configuration", "[server] section in webtest.toml", "Server provider settings, server.base_url for relative HTTP URLs, and [server.app] schema linkage.");
+            value.examples = vec![
+                example("server base_url for relative HTTP requests", "[server]\nbase_url = \"http://127.0.0.1:3000\"\n", "config", "config"),
+                example("server app schema linkage", "[server.app]\nschema = \".webtest/app-schema.json\"\n", "config", "config"),
+            ];
+            value
+        },
+        {
+            let mut value = base_construct("configuration.browser", "browser", "configuration", "[browser] section in webtest.toml", "Browser launcher, browser.base_url for relative page navigation, viewport size, and default timeout settings.");
+            value.examples = vec![
+                example("browser options", "[browser]\nbase_url = \"http://127.0.0.1:3000\"\nheadless = false\ntimeout = \"10s\"\n", "config", "config"),
+                example("browser chrome path", "[browser]\nchrome_path = \"/usr/bin/google-chrome\"\n", "config", "config"),
+            ];
+            value
+        },
+        {
+            let mut value = base_construct("configuration.providers", "providers", "configuration", "[providers] section in webtest.toml", "Built-in server provider timeouts and security permissions.");
+            value.examples = vec![
+                example("http provider config", "[providers.http]\ntimeout = \"5s\"\n", "config", "config"),
+                example("fs provider config", "[providers.fs]\nallowed_paths = [\"fixtures/\"]\n", "config", "config"),
+            ];
+            value
+        },
+    ]
 }
 
 fn add_provider_constructs(
@@ -2403,6 +2923,288 @@ fn sanitize_documentation(value: &str) -> String {
         .collect()
 }
 
+fn provider_app_construct() -> ConstructDescription {
+    let mut value = base_construct(
+        "provider.app",
+        "app",
+        "provider",
+        "app.<function>(...)",
+        "Application Bridge provider surface (app.*) for executing typed server operations against your target web application.",
+    );
+    value.syntax_forms = vec![SyntaxForm {
+        id: "app_call".into(),
+        elements: vec![
+            SyntaxElement::Literal {
+                value: "app.".into(),
+            },
+            SyntaxElement::Slot {
+                parameter: Some("function_name".into()),
+                parameter_group: None,
+            },
+            SyntaxElement::Literal { value: "(".into() },
+            SyntaxElement::Repeat {
+                separator: ", ".into(),
+                elements: vec![SyntaxElement::Slot {
+                    parameter: None,
+                    parameter_group: Some("arguments".into()),
+                }],
+            },
+            SyntaxElement::Literal { value: ")".into() },
+        ],
+    }];
+    value.allowed_contexts = vec!["scope.server".into()];
+    value.requires_capabilities = vec![Capability::Server];
+    value.effects = vec!["application_bridge".into(), "provider_call".into()];
+    value.failure_modes = provider_failures("app");
+    value.search_terms = vec![
+        "app".into(),
+        "application bridge".into(),
+        "app bridge".into(),
+        "app.some_func".into(),
+        "bridge protocol".into(),
+        "schema".into(),
+        "app-schema.json".into(),
+        "hello".into(),
+        "describe".into(),
+        "call".into(),
+        "result".into(),
+        "wire spec".into(),
+        "pseudocode".into(),
+        "offline manifest".into(),
+    ];
+    value.constraints = vec![
+        constraint(
+            "app_schema_validation",
+            "analysis",
+            "app.some_func",
+            "Function names, required/optional parameters, explicit types, and default values are statically checked against the application schema (.webtest/app-schema.json or bridge manifest).",
+        ),
+        constraint(
+            "app_bridge_protocol_v1",
+            "runtime",
+            "IPC/TCP Transport",
+            "Application Bridge Protocol 1 uses line-delimited UTF-8 JSON frames over loopback TCP, Unix socket, named pipe, or stdio. Handshake exchanges hello, verifies schema digest via describe, and executes typed call requests.",
+        ),
+        constraint(
+            "app_offline_manifest",
+            "analysis",
+            ".webtest/app-schema.json",
+            "Offline schema manifests allow webtest check and webtest describe to statically validate app.some_func calls and parameter types while the web application is stopped.",
+        ),
+    ];
+    value.guidance = vec![
+        GuidanceDescription {
+            code: "app_schema_declaration".into(),
+            summary: "Declare application bridge functions in .webtest/app-schema.json or export them directly from your web application's bridge SDK / handler.".into(),
+        },
+        GuidanceDescription {
+            code: "app_schema_json_syntax_rules".into(),
+            summary: "Normative .webtest/app-schema.json Rules: 1) Top-level fields: manifest_version=1, protocol=1, provider=\"app\", sdk, sdk_version, schema_hash, functions. 2) 'functions' MUST be a JSON object mapping function names to schemas (NOT a JSON array). 3) Valid JSON schema type strings: 'string', 'integer', 'float', 'boolean', 'array' (with 'items'), 'object' (with 'fields'), 'null'. Note: Use 'array' in app-schema.json (NOT 'list' or 'List'). 4) 'params' MUST be {\"type\": \"object\", \"fields\": { \"<param_name>\": { \"type\": \"<lower_type>\", \"optional\": bool, \"secret\": bool, \"default\": val } } }. 5) 'returns' MUST be {\"type\": \"object\", \"fields\": { \"<field_name>\": { \"type\": \"<lower_type>\" } } } or {\"type\": \"null\"}.".into(),
+        },
+        GuidanceDescription {
+            code: "app_single_source_of_truth".into(),
+            summary: "Single Source of Truth Pattern: To avoid duplicating function schemas in host code, read .webtest/app-schema.json directly when handling {\"type\": \"describe\"}. Return the loaded 'schema_hash' and 'functions' object in the {\"type\": \"schema\"} response.".into(),
+        },
+        GuidanceDescription {
+            code: "app_execution_context".into(),
+            summary: "Application bridge calls execute strictly within `server` capability blocks before or between browser steps.".into(),
+        },
+        GuidanceDescription {
+            code: "app_protocol_sequence".into(),
+            summary: "Protocol 1 Frame Sequence: 1) App connects to WEBTEST_BRIDGE and sends `hello`, 2) Runner returns `hello_ok`, 3) Runner sends `describe`, 4) App returns `schema` with function manifest loaded from .webtest/app-schema.json, 5) Runner sends `call` with ID and typed arguments, 6) App returns `result` or `error`.".into(),
+        },
+        GuidanceDescription {
+            code: "app_env_vars".into(),
+            summary: "Environment variables: WEBTEST=1 (signaling test mode), WEBTEST_BRIDGE (transport URI e.g. unix:/path/to/sock or tcp://127.0.0.1:port), WEBTEST_TOKEN (auth token), WEBTEST_PROTOCOL=1. Check for WEBTEST_BRIDGE presence to activate the bridge.".into(),
+        },
+        GuidanceDescription {
+            code: "app_transport_and_retries".into(),
+            summary: "Transport URI & Connection Retries: WEBTEST_BRIDGE starts with unix: or tcp://. Strip scheme prefix before opening socket. The host bridge MUST retry connecting in a loop (e.g. every 50–100ms for up to 5s) until the runner socket accepts the connection.".into(),
+        },
+        GuidanceDescription {
+            code: "app_managed_command_args".into(),
+            summary: "webtest.toml [app] Command Syntax: Use `command = 'mix'` and `args = ['phx.server']` (or `command = 'npm'`, `args = ['start']`) rather than passing spaces in `command` because WebTest executes binary directly without shell wrapping.".into(),
+        },
+        GuidanceDescription {
+            code: "app_schema_closed_returns".into(),
+            summary: "Strict Closed Return Validation: Response payload dictionaries returned by bridge calls are strictly schema-validated against 'returns.fields' in .webtest/app-schema.json. Returning extra undeclared keys in JSON result values triggers a runtime app_bridge_validation error.".into(),
+        },
+        GuidanceDescription {
+            code: "app_schema_hash_workflow".into(),
+            summary: "BLAKE3 Schema Hash Generation Workflow: To compute or update 'schema_hash' in .webtest/app-schema.json, set \"schema_hash\": \"blake3:placeholder\" and run 'webtest check'. The static diagnostic will output the exact canonical BLAKE3 hash string.".into(),
+        },
+        GuidanceDescription {
+            code: "app_http_readiness_probe".into(),
+            summary: "HTTP Port Readiness Probe: If the web application requires boot/compilation time before accepting HTTP connections, probe the HTTP port (or wait for app readiness) in your bridge before completing the 'hello' handshake to prevent premature runner requests.".into(),
+        },
+    ];
+    value.examples = vec![
+        example(
+            "application bridge function call",
+            "let user = app.create_user(email: \"alice@example.com\", admin: true)",
+            "statement_fragment",
+            "scope.server",
+        ),
+        example(
+            "application bridge complete scenario",
+            "test \"create user scenario\" {\n    server {\n        let user = app.create_user(email: \"alice@example.com\")\n    }\n}",
+            "declaration_fragment",
+            "scope.server",
+        ),
+        example(
+            "Application Bridge Protocol 1 Wire Spec & JSON framing",
+            r#"// Environment: WEBTEST=1, WEBTEST_BRIDGE=tcp://127.0.0.1:<port> or unix:<path>, WEBTEST_TOKEN=<token>
+// Framing: Line-delimited UTF-8 JSON (\n LF)
+// 1. Handshake
+// WebApp -> WebTest: {"type":"hello","protocol_versions":[1],"token":"<token>","sdk":"custom","sdk_version":"0.1.0"}
+// WebTest -> WebApp: {"type":"hello_ok","version":1,"max_frame_bytes":1048576}
+// 2. Schema Discovery (Reading .webtest/app-schema.json as Single Source of Truth)
+// WebTest -> WebApp: {"type":"describe","id":1}
+// WebApp -> WebTest: {"type":"schema","id":1,"protocol":1,"schema_hash":"blake3:...","functions":{"create_user":{"documentation":"...","params":{"type":"object","fields":{"email":{"type":"string"}}},"returns":{"type":"object","fields":{"id":{"type":"integer"}}}}}}
+// 3. Execution
+// WebTest -> WebApp: {"type":"call","id":2,"function":"create_user","arguments":{"email":"alice@example.com"}}
+// WebApp -> WebTest: {"type":"result","id":2,"value":{"id":101,"email":"alice@example.com"}}"#,
+            "source_file",
+            "protocol_spec",
+        ),
+        example(
+            "Offline Schema Manifest (.webtest/app-schema.json)",
+            r#"{
+  "manifest_version": 1,
+  "protocol": 1,
+  "provider": "app",
+  "sdk": "custom-sdk",
+  "sdk_version": "0.1.0",
+  "schema_hash": "blake3:b1254e79ab8984797e49f26190f9fa181239cb0d4c0d279f4d627b7d101e1e2a",
+  "functions": {
+    "create_user": {
+      "documentation": "Create a user directly in the test application's store.",
+      "retry_safe": false,
+      "params": {
+        "type": "object",
+        "fields": {
+          "email": {
+            "type": "string",
+            "documentation": "Unique sign-in email.",
+            "optional": false,
+            "secret": false
+          },
+          "admin": {
+            "type": "boolean",
+            "documentation": "Grant administrative access.",
+            "optional": true,
+            "secret": false,
+            "default": false
+          }
+        }
+      },
+      "returns": {
+        "type": "object",
+        "fields": {
+          "id": {
+            "type": "integer",
+            "optional": false,
+            "secret": false
+          },
+          "email": {
+            "type": "string",
+            "optional": false,
+            "secret": false
+          },
+          "admin": {
+            "type": "boolean",
+            "optional": false,
+            "secret": false
+          }
+        }
+      }
+    }
+  }
+}"#,
+            "source_file",
+            "app_schema_json",
+        ),
+        example(
+            "Web App Native Bridge Implementation Pseudocode",
+            r#"# Native Web App Bridge Implementation Loop (Python/Node/Ruby/Go/Java/Elixir/etc.)
+import os, json, socket, time
+
+def run_bridge(db):
+    endpoint_uri = os.environ.get("WEBTEST_BRIDGE")
+    if not endpoint_uri: return  # Activate when WEBTEST_BRIDGE is present
+    token = os.environ.get("WEBTEST_TOKEN", "")
+    
+    # Parse scheme (unix: or tcp://)
+    if endpoint_uri.startswith("unix:"):
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        connect_addr = endpoint_uri[5:]
+    elif endpoint_uri.startswith("tcp://"):
+        host, port = endpoint_uri[6:].split(":")
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        connect_addr = (host, int(port))
+        
+    # Retry loop until runner socket accepts connection
+    for _ in range(100):
+        try:
+            sock.connect(connect_addr)
+            break
+        except Exception:
+            time.sleep(0.05)
+            
+    # Probe HTTP server readiness before completing handshake if server needs boot time
+    while not is_http_listening(port=3000):
+        time.sleep(0.05)
+        
+    # Handshake & Single Source of Truth describe handler
+    send(sock, {"type": "hello", "protocol_versions": [1], "token": token, "sdk": "my-bridge", "sdk_version": "0.1.0"})
+    assert read(sock)["type"] == "hello_ok"
+    
+    while True:
+        msg = read(sock)
+        if not msg: break
+        kind, msg_id = msg.get("type"), msg.get("id")
+        
+        if kind == "describe":
+            # Load .webtest/app-schema.json directly as Single Source of Truth
+            manifest = json.load(open(".webtest/app-schema.json"))
+            send(sock, {
+                "type": "schema",
+                "id": msg_id,
+                "protocol": 1,
+                "schema_hash": manifest.get("schema_hash", ""),
+                "functions": manifest.get("functions", {})
+            })
+        elif kind == "call":
+            fn, args = msg["function"], msg["arguments"]
+            try:
+                res = db.execute(fn, args)
+                send(sock, {"type": "result", "id": msg_id, "value": res})
+            except Exception as e:
+                send(sock, {"type": "error", "id": msg_id, "code": "app.error", "message": str(e)})
+        elif kind == "ping":
+            send(sock, {"type": "pong", "id": msg_id})
+        elif kind == "shutdown":
+            send(sock, {"type": "shutdown_ok", "id": msg_id})
+            break"#,
+            "source_file",
+            "implementation_pseudocode",
+        ),
+    ];
+    value.related = vec![
+        "scope.server".into(),
+        "provider.http".into(),
+        "type.Record".into(),
+    ];
+    value.availability = Availability {
+        analysis: true,
+        runtime_requires: vec!["native_app_bridge".into()],
+        configuration_prerequisites: vec![
+            "app.command or server.app configuration in webtest.toml".into(),
+        ],
+    };
+    value
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2511,10 +3313,15 @@ mod tests {
             );
         }
         let registry = core_constructs();
-        for construct in registry
-            .values()
-            .filter(|construct| construct.construct_kind != "type")
-        {
+        for construct in registry.values().filter(|construct| {
+            construct.construct_kind != "type"
+                && construct.construct_kind != "cli_command"
+                && construct.construct_kind != "configuration"
+                && construct.id != "provider.app"
+                && construct.id != "app"
+                && construct.id != "app-schema.json"
+                && construct.id != "app.pseudocode"
+        }) {
             for example in &construct.examples {
                 let source = wrap_example(example);
                 let parsed = webtest_syntax::parse(&source);
@@ -2579,6 +3386,7 @@ mod tests {
             "locator.test_id",
             "locator.css",
             "locator.xpath",
+            "locator.within",
             "browser.open",
             "browser.evaluate",
             "browser.click",
@@ -2618,6 +3426,57 @@ mod tests {
             "capability.Server",
             "capability.Browser",
             "capability.Test",
+            "app",
+            "app-schema.json",
+            "app.pseudocode",
+            "provider.app",
+            "statement.expect",
+            "statement.expr",
+            "expression.literal",
+            "expression.name",
+            "expression.binary",
+            "expression.unary",
+            "expression.member",
+            "expression.call",
+            "expression.record",
+            "expression.list",
+            "expression.parenthesized",
+            "operator.eq",
+            "operator.neq",
+            "operator.lt",
+            "operator.lte",
+            "operator.gt",
+            "operator.gte",
+            "operator.add",
+            "operator.sub",
+            "operator.mul",
+            "operator.div",
+            "operator.and",
+            "operator.or",
+            "operator.not",
+            "operator.contains",
+            "operator.matches",
+            "locator_state.visible",
+            "locator_state.hidden",
+            "locator_state.attached",
+            "locator_state.detached",
+            "locator_state.enabled",
+            "locator_state.disabled",
+            "locator_state.checked",
+            "locator_state.unchecked",
+            "locator.within",
+            "cli.check",
+            "cli.fmt",
+            "cli.test",
+            "cli.describe",
+            "cli.inspect",
+            "cli.lsp",
+            "cli.dap",
+            "configuration.webtest_toml",
+            "configuration.app",
+            "configuration.server",
+            "configuration.browser",
+            "configuration.providers",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -2762,6 +3621,13 @@ mod tests {
             }
             "statement_fragment" => {
                 format!("test \"example\" {{ {} }}", example.source)
+            }
+            "cli" | "config" => example.source.clone(),
+            "expression_fragment" if example.enclosing_context == "scope.browser" => {
+                format!("test \"example\" {{ browser {{ click {} }} }}", example.source)
+            }
+            "expression_fragment" => {
+                format!("test \"example\" {{ server {{ let res = {} }} }}", example.source)
             }
             other => panic!("unsupported example kind {other}"),
         }

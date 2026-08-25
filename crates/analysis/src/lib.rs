@@ -1533,10 +1533,15 @@ impl<'a> Compiler<'a> {
                     if receiver.ty != Type::Unknown {
                         let known = known_members(&receiver.ty);
                         let candidates = nearest_strings(&known, member, 5);
+                        let message = if let Some(best) = candidates.first() {
+                            format!("type {} has no member `{member}`; did you mean `{best}`?", receiver.ty)
+                        } else {
+                            format!("type {} has no member `{member}`", receiver.ty)
+                        };
                         self.error_with_details(
                             member_origin.range,
                             "semantic.unknown_member",
-                            format!("type {} has no member `{member}`", receiver.ty),
+                            message,
                             serde_json::json!({
                                 "requested": member,
                                 "receiver_type": receiver.ty.to_string(),

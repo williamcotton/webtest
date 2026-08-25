@@ -9,3 +9,4 @@ examples/application-bridge/*/.webtest/*
 editors/vscode/*.vsix
 .DS_Store
 **/obj
+*.dump

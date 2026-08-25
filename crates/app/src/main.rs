@@ -694,6 +694,12 @@ fn write_description_human(
             if let Some(retry_safe) = construct.retry_safe {
                 writeln!(output, "retry safe: {retry_safe}").map_err(AppError::infrastructure)?;
             }
+            if !construct.guidance.is_empty() {
+                writeln!(output, "\nguidance:").map_err(AppError::infrastructure)?;
+                for entry in &construct.guidance {
+                    writeln!(output, "  - {}", entry.summary).map_err(AppError::infrastructure)?;
+                }
+            }
             for example in &construct.examples {
                 writeln!(
                     output,

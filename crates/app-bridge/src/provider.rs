@@ -493,7 +493,7 @@ impl AppProvider {
             tokio::select! {
                 accepted = tokio::time::timeout(self.config.startup_timeout, listener.accept()) => accepted,
                 status = child.wait() => {
-                    let error = bridge_process_error(status);
+                    let error = bridge_process_error(child, status).await;
                     terminate_process(&mut resources, self.config.shutdown_timeout).await;
                     return Err(error);
                 }
@@ -565,7 +565,7 @@ impl AppProvider {
             tokio::select! {
                 accepted = tokio::time::timeout(self.config.startup_timeout, listener.accept()) => accepted,
                 status = child.wait() => {
-                    let error = bridge_process_error(status);
+                    let error = bridge_process_error(child, status).await;
                     terminate_process(&mut resources, self.config.shutdown_timeout).await;
                     return Err(error);
                 }
@@ -632,7 +632,7 @@ impl AppProvider {
             tokio::select! {
                 connected = tokio::time::timeout(self.config.startup_timeout, server.connect()) => connected,
                 status = child.wait() => {
-                    let error = bridge_process_error(status);
+                    let error = bridge_process_error(child, status).await;
                     terminate_process(&mut resources, self.config.shutdown_timeout).await;
                     return Err(error);
                 }
@@ -1610,7 +1610,7 @@ fn spawn_application(
         .current_dir(&working_directory)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .kill_on_drop(application.owned)
         .envs(&application.environment);
     for (name, value) in bridge_environment {
@@ -1806,13 +1806,29 @@ fn is_local_ipc_unavailable(error: &ProviderError) -> bool {
     )
 }
 
-fn bridge_process_error(status: std::io::Result<std::process::ExitStatus>) -> ProviderError {
-    ProviderError::BridgeProcess {
-        message: match status {
-            Ok(status) => format!("owned application exited with {status}"),
-            Err(error) => format!("could not observe owned application status: {error}"),
-        },
+async fn bridge_process_error(
+    child: &mut Child,
+    status: std::io::Result<std::process::ExitStatus>,
+) -> ProviderError {
+    let mut message = match status {
+        Ok(status) => format!("owned application exited with {status}"),
+        Err(error) => format!("could not observe owned application status: {error}"),
+    };
+    if let Some(mut stderr) = child.stderr.take() {
+        use tokio::io::AsyncReadExt;
+        let mut buffer = Vec::new();
+        if stderr.read_to_end(&mut buffer).await.is_ok() {
+            if let Ok(text) = String::from_utf8(buffer) {
+                let lines = text.trim().lines().rev().take(10).collect::<Vec<_>>();
+                if !lines.is_empty() {
+                    let summary = lines.into_iter().rev().collect::<Vec<_>>().join("\n  ");
+                    message.push_str("\nstderr:\n  ");
+                    message.push_str(&summary);
+                }
+            }
+        }
     }
+    ProviderError::BridgeProcess { message }
 }
 
 fn duration_millis(duration: Duration) -> u64 {
@@ -2276,6 +2292,42 @@ mod tests {
             Err(ProviderError::BridgeProcess { ref message }) if message.contains("23")
         ));
         assert!(started.elapsed() < Duration::from_secs(2));
+        provider.shutdown().await.expect("shutdown");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn owned_process_death_captures_and_surfaces_stderr() {
+        let project = tempfile::tempdir().expect("project");
+        let provider = AppProvider::new(
+            manifest(),
+            AppProviderConfig {
+                transport: AppTransport::Auto,
+                application: Some(AppProcessConfig {
+                    command: "/bin/sh".into(),
+                    args: vec![
+                        "-c".into(),
+                        "echo 'Error: listen EADDRINUSE :::3000' >&2; exit 1".into(),
+                    ],
+                    working_directory: PathBuf::from("."),
+                    environment: BTreeMap::new(),
+                    owned: true,
+                    health: None,
+                }),
+                startup_timeout: Duration::from_secs(5),
+                ..AppProviderConfig::default()
+            },
+        )
+        .expect("provider");
+        let result = provider.start(project.path()).await;
+        match result {
+            Err(ProviderError::BridgeProcess { message }) => {
+                assert!(message.contains("owned application exited with exit status: 1"));
+                assert!(message.contains("stderr:"));
+                assert!(message.contains("Error: listen EADDRINUSE :::3000"));
+            }
+            res => panic!("expected BridgeProcess error with stderr, got {res:?}"),
+        }
         provider.shutdown().await.expect("shutdown");
     }
 
