@@ -1,44 +1,71 @@
 ---
 name: webtest
-description: Discover, inspect, author, validate, and run WebTest web-system tests using native CLI capabilities (`describe`, `inspect`, `check`, `test`, `fmt`).
+description: Bootstrap, discover, author, inspect, validate, format, and run WebTest web-system tests with the installed CLI and its machine-readable language, provider, diagnostic, and page-inspection surfaces.
 ---
 
-# WebTest Authoring & Discovery
+# WebTest
 
-WebTest is a statically analyzable language for web-system tests. The language is **self-describing** and **live-inspectable**. To avoid wasting context tokens, perform targeted, surgical CLI queries for specific constructs rather than dumping the full language surface.
+Use WebTest as a statically analyzed test language, not as an ad hoc browser-automation wrapper. Use the installed `webtest` binary and let the resolved project supply current syntax and provider facts.
 
-## 1. Surgical Discovery (`webtest describe`)
+## Bootstrap the project
 
-Perform targeted queries for specific constructs, providers, or application bridge specifications:
+Confirm the CLI is installed, then initialize WebTest before creating configuration, schemas, or tests by hand:
 
-- **Targeted Construct Query** (returns exact syntax, parameter types, legal contexts, and canonical examples):
-  `webtest describe locator.role`
-  `webtest describe browser.click`
-  `webtest describe provider.http.post`
-- **Application Bridge & Protocol Query** (returns full Protocol 1 wire spec, JSON framing, transport scheme/retries, offline schema manifest, and single-source-of-truth implementation pseudocode):
-  `webtest describe app`
-  `webtest describe app.pseudocode`
-  `webtest describe app.create_user` (in a project with app-schema)
-- **Search Capabilities**:
-  `webtest describe --search "json post"`
-- **Machine Format**:
-  `webtest describe <query> --reporter json`
+```sh
+webtest --version
+webtest init .
+```
 
-## 2. Live Page Inspection (`webtest inspect`)
+`webtest init` creates `webtest.toml`, `.webtest/app-schema.json`, `tests/example.webtest`, and this skill under `.agents/skills/webtest`. It also creates a `.claude/skills/webtest` compatibility link. It never overwrites conflicting files.
 
-Discover validated semantic locators on live web pages without raw DOM scraping:
+The generated application schema declares `app.echo(message: String) -> String`, giving any host language a small Protocol 1 implementation target. Static checking works immediately. Before executing the generated test, configure the application command and implement that bridge operation.
 
-- **Inspect page**:
-  `webtest inspect http://127.0.0.1:3000/login --reporter json`
+The canonical starter configuration is:
 
-## 3. Test Structure Anatomy
+```toml
+[project]
+test_roots = ["tests"]
+
+[server.app]
+adapter = "bridge"
+transport = "auto"
+schema = ".webtest/app-schema.json"
+
+# Configure these sections before running application and browser tests.
+#
+# [app]
+# command = "your-application-command"
+# args = []
+# working_directory = "."
+#
+# [browser]
+# base_url = "http://127.0.0.1:3000"
+#
+# [server]
+# base_url = "http://127.0.0.1:3000"
+```
+
+The generated bridge smoke test is:
 
 ```webtest
-test "user authentication flow" {
+test "application bridge responds" {
+    server {
+        let echoed = app.echo(message: "hello from WebTest")
+        expect echoed == "hello from WebTest"
+    }
+}
+```
+
+## Test anatomy
+
+A complete system test may create application state on the server, pass transferable typed values into the browser flow, and use semantic locators:
+
+```webtest
+test "created user can sign in" {
     server {
         let user = app.create_user(email: "alice@example.com", admin: false)
-        let res = http.post("/api/login", json: { email: user.email })
-        expect res.status == 200
+        let response = http.post("/api/login", json: { email: user.email })
+        expect response.status == 200
     }
 
     browser {
@@ -50,28 +77,42 @@ test "user authentication flow" {
 }
 ```
 
-## 4. Closed-Loop Authoring Workflow
+This example requires `server.base_url` and `browser.base_url`, plus an offline application manifest declaring `app.create_user` with the shown parameters and a transferable result containing `email`.
 
-1. **Inspect Target Page**: Run `webtest inspect <url>` for canonical locators.
-2. **Surgically Discover Vocabulary**: Run `webtest describe <query>` (e.g. `webtest describe app` or `webtest describe app.pseudocode`) for specific parameter signatures, wire protocol specs, or examples.
-3. **Format Code**: Run `webtest fmt <path>` to canonicalize formatting.
-4. **Statically Check**: Run `webtest check <path> --reporter json`. Diagnostics contain `reference_queries` (e.g. `locator.role`) pointing to the exact `webtest describe` topic needed for repair.
-5. **Execute Test**: Run `webtest test <path> [--headed]`. Structured failure outputs provide `repair_hints` with replacement candidates.
+## Discover before authoring
 
-## 5. Canonical `webtest.toml` Configuration
+Start with a narrow query and use JSON when consuming results programmatically:
 
-```toml
-[browser]
-base_url = "http://127.0.0.1:3000"
-headless = true
-
-[server]
-base_url = "http://127.0.0.1:3000"
-
-[server.app]
-schema = ".webtest/app-schema.json"
-
-[app]
-command = "npm"
-args = ["run", "dev"]
+```sh
+webtest describe locator.role --reporter json
+webtest describe browser.click --reporter json
+webtest describe http.post --reporter json
+webtest describe --search "json post" --reporter json
 ```
+
+The no-query index contains canonical topic IDs. A construct response supplies syntax forms, typed parameters/results, legal contexts, constraints, and availability. Installed language and provider leaves include canonical examples whose prerequisites are part of the contract. A project-supplied provider operation may have no examples because the current Protocol 1 manifest does not declare them; do not invent application-specific values.
+
+For a configured application provider, query a concrete project operation such as `webtest describe app.echo --reporter json`. Use these focused built-in topics when implementing the provider itself:
+
+- `provider.app`: provider semantics and project requirements.
+- `app.schema`: offline Protocol 1 manifest shape and hashing rules.
+- `app.protocol`: framing, handshake, correlation, transports, and required wire fields.
+- `app.pseudocode`: a non-normative implementation outline that points back to the protocol contract.
+
+Use `webtest <command> --help` for CLI flags and reporters. `describe` documents the language and project-visible provider surface; it is not a duplicate CLI manual.
+
+## Inspect a live page
+
+Run `webtest inspect [<url>] --reporter json` to obtain bounded semantic elements and validated locator candidates. When the URL is omitted, the project must provide `browser.base_url`. Inspection describes the current page state; candidates are evidence, not a guarantee against later page changes.
+
+## Close the loop
+
+1. Query the smallest relevant `describe` topic or inspect the target page.
+2. Author the test using returned syntax, contexts, types, and prerequisites.
+3. Run `webtest fmt <path>` to apply the canonical formatter, or `webtest fmt --check <path>` for a non-mutating check.
+4. Run `webtest check <path> --reporter json` and fix every static error before execution.
+5. Run `webtest test <path> --reporter json`; add `--headed` only when visible Chrome is useful.
+
+Diagnostics may contain canonical `reference_queries` and bounded `repair_hints`. Runtime failures may contain locator replacement candidates when WebTest has safe evidence. Treat both as advisory, preserve their source ranges, and rerun `check` or `test` after any edit; WebTest does not apply repairs automatically.
+
+Do not infer unavailable roadmap syntax from prose or model memory. If a query is unknown, search the installed reference or inspect `webtest describe language --reporter json` rather than inventing a construct.

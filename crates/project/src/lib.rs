@@ -275,8 +275,8 @@ impl Default for ProjectConfig {
                 max_search_results: 20,
                 max_summary_bytes: 1_024,
                 max_guidance_entries: 16,
-                max_examples: 10,
-                max_example_bytes: 8_192,
+                max_examples: 4,
+                max_example_bytes: 4_096,
             },
         }
     }

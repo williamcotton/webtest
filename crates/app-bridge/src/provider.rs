@@ -5,7 +5,7 @@ use std::{
     pin::Pin,
     process::Stdio,
     sync::{
-        Arc, RwLock as StdRwLock,
+        Arc, Mutex as StdMutex, RwLock as StdRwLock,
         atomic::{AtomicU64, Ordering},
     },
     task::{Context, Poll},
@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncRead, AsyncWrite, BufReader, ReadBuf, ReadHalf, WriteHalf},
     process::{Child, ChildStdin, ChildStdout, Command},
-    sync::{Mutex, oneshot},
+    sync::{Mutex, Notify, oneshot},
 };
 use tracing::{info, warn};
 use webtest_provider::{
@@ -143,8 +143,25 @@ struct ActiveBridge {
 
 #[derive(Default)]
 struct ProcessResources {
-    children: Vec<Child>,
+    children: Vec<ManagedProcess>,
     endpoint_directory: Option<tempfile::TempDir>,
+}
+
+struct ManagedProcess {
+    child: Child,
+    stderr: Option<StderrCapture>,
+}
+
+struct StderrCapture {
+    state: Arc<StdMutex<CapturedStderr>>,
+    finished: Arc<Notify>,
+}
+
+#[derive(Default)]
+struct CapturedStderr {
+    bytes: Vec<u8>,
+    total: usize,
+    done: bool,
 }
 
 impl AppProvider {
@@ -367,12 +384,20 @@ impl AppProvider {
             drain_stderr(stderr, self.config.max_stderr_bytes);
         }
         let mut resources = ProcessResources {
-            children: vec![child],
+            children: vec![ManagedProcess {
+                child,
+                stderr: None,
+            }],
             endpoint_directory: None,
         };
         if let Some(application) = &self.config.application {
             if application.owned {
-                match spawn_application(application, project_root, &[]) {
+                match spawn_application(
+                    application,
+                    project_root,
+                    &[],
+                    self.config.max_stderr_bytes,
+                ) {
                     Ok(application) => resources.children.push(application),
                     Err(error) => {
                         terminate_process(&mut resources, self.config.shutdown_timeout).await;
@@ -406,7 +431,8 @@ impl AppProvider {
             wait_for_health(application.health.as_ref()).await?;
             return Ok(ProcessResources::default());
         }
-        let child = spawn_application(application, project_root, &[])?;
+        let child =
+            spawn_application(application, project_root, &[], self.config.max_stderr_bytes)?;
         let mut resources = ProcessResources {
             children: vec![child],
             endpoint_directory: None,
@@ -489,11 +515,11 @@ impl AppProvider {
                 .collect(),
             endpoint_directory: Some(directory),
         };
-        let accepted = if let Some(child) = resources.children.first_mut() {
+        let accepted = if let Some(process) = resources.children.first_mut() {
             tokio::select! {
                 accepted = tokio::time::timeout(self.config.startup_timeout, listener.accept()) => accepted,
-                status = child.wait() => {
-                    let error = bridge_process_error(child, status).await;
+                status = process.child.wait() => {
+                    let error = bridge_process_error(process, status).await;
                     terminate_process(&mut resources, self.config.shutdown_timeout).await;
                     return Err(error);
                 }
@@ -561,11 +587,11 @@ impl AppProvider {
                 .collect(),
             endpoint_directory: None,
         };
-        let accepted = if let Some(child) = resources.children.first_mut() {
+        let accepted = if let Some(process) = resources.children.first_mut() {
             tokio::select! {
                 accepted = tokio::time::timeout(self.config.startup_timeout, listener.accept()) => accepted,
-                status = child.wait() => {
-                    let error = bridge_process_error(child, status).await;
+                status = process.child.wait() => {
+                    let error = bridge_process_error(process, status).await;
                     terminate_process(&mut resources, self.config.shutdown_timeout).await;
                     return Err(error);
                 }
@@ -628,11 +654,11 @@ impl AppProvider {
                 .collect(),
             endpoint_directory: None,
         };
-        let connected = if let Some(child) = resources.children.first_mut() {
+        let connected = if let Some(process) = resources.children.first_mut() {
             tokio::select! {
                 connected = tokio::time::timeout(self.config.startup_timeout, server.connect()) => connected,
-                status = child.wait() => {
-                    let error = bridge_process_error(child, status).await;
+                status = process.child.wait() => {
+                    let error = bridge_process_error(process, status).await;
                     terminate_process(&mut resources, self.config.shutdown_timeout).await;
                     return Err(error);
                 }
@@ -641,19 +667,26 @@ impl AppProvider {
             tokio::time::timeout(self.config.startup_timeout, server.connect()).await
         };
         match connected {
-            Ok(Ok(())) => Ok((Box::new(server), resources, "named_pipe")),
+            Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 terminate_process(&mut resources, self.config.shutdown_timeout).await;
-                Err(transport_error(error))
+                return Err(transport_error(error));
             }
             Err(_) => {
                 terminate_process(&mut resources, self.config.shutdown_timeout).await;
-                Err(ProviderError::BridgeHandshake {
+                return Err(ProviderError::BridgeHandshake {
                     code: "bridge_readiness_timeout".into(),
                     message: "application did not connect to the named pipe".into(),
-                })
+                });
             }
         }
+        if let Some(application) = &self.config.application
+            && let Err(error) = wait_for_health(application.health.as_ref()).await
+        {
+            terminate_process(&mut resources, self.config.shutdown_timeout).await;
+            return Err(error);
+        }
+        Ok((Box::new(server), resources, "named_pipe"))
     }
 
     #[cfg(not(windows))]
@@ -672,7 +705,7 @@ impl AppProvider {
         project_root: &std::path::Path,
         endpoint: &str,
         token: &str,
-    ) -> Result<Option<Child>, ProviderError> {
+    ) -> Result<Option<ManagedProcess>, ProviderError> {
         let application =
             self.config
                 .application
@@ -691,6 +724,7 @@ impl AppProvider {
                 ("WEBTEST_TOKEN", token),
                 ("WEBTEST_PROTOCOL", "1"),
             ],
+            self.config.max_stderr_bytes,
         )
         .map(Some)
     }
@@ -1598,7 +1632,8 @@ fn spawn_application(
     application: &AppProcessConfig,
     project_root: &std::path::Path,
     bridge_environment: &[(&str, &str)],
-) -> Result<Child, ProviderError> {
+    max_stderr_bytes: usize,
+) -> Result<ManagedProcess, ProviderError> {
     let working_directory = if application.working_directory.is_absolute() {
         application.working_directory.clone()
     } else {
@@ -1621,14 +1656,67 @@ fn spawn_application(
         working_directory = %working_directory.display(),
         "spawning configured application"
     );
-    command
+    let mut child = command
         .spawn()
         .map_err(|error| ProviderError::BridgeTransport {
             message: format!(
                 "could not start application executable `{}`: {error}",
                 application.command
             ),
-        })
+        })?;
+    let stderr = child
+        .stderr
+        .take()
+        .map(|stderr| capture_stderr(stderr, max_stderr_bytes));
+    Ok(ManagedProcess { child, stderr })
+}
+
+fn capture_stderr(mut stderr: tokio::process::ChildStderr, limit: usize) -> StderrCapture {
+    let state = Arc::new(StdMutex::new(CapturedStderr::default()));
+    let output = Arc::clone(&state);
+    let finished = Arc::new(Notify::new());
+    let completion = Arc::clone(&finished);
+    tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+
+        let mut buffer = [0u8; 8_192];
+        loop {
+            let read = match stderr.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(error) => {
+                    warn!(%error, "could not read runner-owned application stderr");
+                    break;
+                }
+            };
+            let mut captured = output
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            captured.total = captured.total.saturating_add(read);
+            if read >= limit {
+                captured.bytes.clear();
+                captured
+                    .bytes
+                    .extend_from_slice(&buffer[read.saturating_sub(limit)..read]);
+            } else {
+                let overflow = captured
+                    .bytes
+                    .len()
+                    .saturating_add(read)
+                    .saturating_sub(limit);
+                if overflow > 0 {
+                    captured.bytes.drain(..overflow);
+                }
+                captured.bytes.extend_from_slice(&buffer[..read]);
+            }
+        }
+        output
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .done = true;
+        completion.notify_one();
+    });
+    StderrCapture { state, finished }
 }
 
 async fn wait_for_health(health: Option<&HealthCheck>) -> Result<(), ProviderError> {
@@ -1663,13 +1751,16 @@ async fn wait_for_health(health: Option<&HealthCheck>) -> Result<(), ProviderErr
 }
 
 async fn terminate_process(resources: &mut ProcessResources, timeout: Duration) {
-    for child in &mut resources.children {
-        if let Ok(Some(_)) = child.try_wait() {
+    for process in &mut resources.children {
+        if let Ok(Some(_)) = process.child.try_wait() {
             continue;
         }
-        let _ = child.start_kill();
+        let _ = process.child.start_kill();
         info!("terminating runner-owned application process");
-        if tokio::time::timeout(timeout, child.wait()).await.is_err() {
+        if tokio::time::timeout(timeout, process.child.wait())
+            .await
+            .is_err()
+        {
             warn!("application process did not exit before the teardown deadline");
         }
     }
@@ -1807,25 +1898,39 @@ fn is_local_ipc_unavailable(error: &ProviderError) -> bool {
 }
 
 async fn bridge_process_error(
-    child: &mut Child,
+    process: &ManagedProcess,
     status: std::io::Result<std::process::ExitStatus>,
 ) -> ProviderError {
     let mut message = match status {
         Ok(status) => format!("owned application exited with {status}"),
         Err(error) => format!("could not observe owned application status: {error}"),
     };
-    if let Some(mut stderr) = child.stderr.take() {
-        use tokio::io::AsyncReadExt;
-        let mut buffer = Vec::new();
-        if stderr.read_to_end(&mut buffer).await.is_ok() {
-            if let Ok(text) = String::from_utf8(buffer) {
-                let lines = text.trim().lines().rev().take(10).collect::<Vec<_>>();
-                if !lines.is_empty() {
-                    let summary = lines.into_iter().rev().collect::<Vec<_>>().join("\n  ");
-                    message.push_str("\nstderr:\n  ");
-                    message.push_str(&summary);
-                }
-            }
+    if let Some(stderr) = &process.stderr {
+        let finished = stderr.finished.notified();
+        let done = stderr
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .done;
+        if !done {
+            let _ = tokio::time::timeout(Duration::from_millis(100), finished).await;
+        }
+        let captured = stderr
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let text = String::from_utf8_lossy(&captured.bytes);
+        let lines = text.trim().lines().rev().take(10).collect::<Vec<_>>();
+        if !lines.is_empty() {
+            let summary = lines.into_iter().rev().collect::<Vec<_>>().join("\n  ");
+            message.push_str("\nstderr:\n  ");
+            message.push_str(&summary);
+        }
+        if captured.total > captured.bytes.len() {
+            message.push_str(&format!(
+                "\n  … {} additional stderr byte(s) omitted",
+                captured.total - captured.bytes.len()
+            ));
         }
     }
     ProviderError::BridgeProcess { message }
@@ -2327,6 +2432,40 @@ mod tests {
                 assert!(message.contains("Error: listen EADDRINUSE :::3000"));
             }
             res => panic!("expected BridgeProcess error with stderr, got {res:?}"),
+        }
+        provider.shutdown().await.expect("shutdown");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn owned_process_stderr_capture_is_bounded() {
+        let project = tempfile::tempdir().expect("project");
+        let provider = AppProvider::new(
+            manifest(),
+            AppProviderConfig {
+                transport: AppTransport::Auto,
+                application: Some(AppProcessConfig {
+                    command: "/bin/sh".into(),
+                    args: vec!["-c".into(), "printf 'abcdefghijk\\n' >&2; exit 1".into()],
+                    working_directory: PathBuf::from("."),
+                    environment: BTreeMap::new(),
+                    owned: true,
+                    health: None,
+                }),
+                startup_timeout: Duration::from_secs(5),
+                max_stderr_bytes: 8,
+                ..AppProviderConfig::default()
+            },
+        )
+        .expect("provider");
+        let result = provider.start(project.path()).await;
+        match result {
+            Err(ProviderError::BridgeProcess { message }) => {
+                assert!(message.contains("stderr:\n  efghijk"));
+                assert!(message.contains("additional stderr byte(s) omitted"));
+                assert!(!message.contains("abcdefghijk"));
+            }
+            res => panic!("expected BridgeProcess error with bounded stderr, got {res:?}"),
         }
         provider.shutdown().await.expect("shutdown");
     }

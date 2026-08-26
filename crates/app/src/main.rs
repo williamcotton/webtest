@@ -1,3 +1,4 @@
+mod init;
 mod report;
 
 use std::{
@@ -53,6 +54,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Create a minimal WebTest project, application schema, example, and agent skill.
+    Init {
+        /// Directory to initialize.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
     /// Parse and statically check WebTest files.
     Check {
         paths: Vec<PathBuf>,
@@ -256,6 +263,7 @@ async fn main() -> ExitCode {
 
 async fn run(cli: Cli) -> Result<ExitClass, AppError> {
     match cli.command {
+        Command::Init { path } => init_project(&path),
         Command::Check { paths, reporter } => {
             let project = project(&paths)?;
             let report = check_project(&project)?;
@@ -345,6 +353,35 @@ async fn run(cli: Cli) -> Result<ExitClass, AppError> {
             Ok(ExitClass::Success)
         }
     }
+}
+
+fn init_project(path: &Path) -> Result<ExitClass, AppError> {
+    let outcome = init::initialize(path).map_err(|error| match error.class() {
+        init::ErrorClass::Usage => AppError::usage(error),
+        init::ErrorClass::Infrastructure => AppError::infrastructure(error),
+        init::ErrorClass::Internal => AppError::internal(error),
+    })?;
+    let action = if outcome.created.is_empty() {
+        "WebTest project is already initialized at"
+    } else {
+        "initialized WebTest project at"
+    };
+    println!("{action} {}", outcome.root.display());
+    for path in &outcome.created {
+        println!("  created {path}");
+    }
+    for path in &outcome.unchanged {
+        println!("  unchanged {path}");
+    }
+    for warning in &outcome.warnings {
+        eprintln!("warning[init.skill_link]: {warning}");
+    }
+    println!("next:");
+    println!("  configure [app] in webtest.toml");
+    println!("  implement app.echo using `webtest describe app.protocol`");
+    println!("  webtest check");
+    println!("  webtest test");
+    Ok(ExitClass::Success)
 }
 
 fn project(paths: &[PathBuf]) -> Result<Project, AppError> {
@@ -663,6 +700,19 @@ fn write_description_human(
                 )
                 .map_err(AppError::infrastructure)?;
             }
+            if !construct.requires_capabilities.is_empty() {
+                writeln!(
+                    output,
+                    "capabilities: {}",
+                    construct
+                        .requires_capabilities
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+                .map_err(AppError::infrastructure)?;
+            }
             if !construct.parameters.is_empty() {
                 writeln!(output, "parameters:").map_err(AppError::infrastructure)?;
                 for parameter in &construct.parameters {
@@ -694,10 +744,50 @@ fn write_description_human(
             if let Some(retry_safe) = construct.retry_safe {
                 writeln!(output, "retry safe: {retry_safe}").map_err(AppError::infrastructure)?;
             }
+            if !construct.effects.is_empty() {
+                writeln!(output, "effects: {}", construct.effects.join(", "))
+                    .map_err(AppError::infrastructure)?;
+            }
+            if !construct.failure_modes.is_empty() {
+                writeln!(
+                    output,
+                    "failure modes: {}",
+                    construct.failure_modes.join(", ")
+                )
+                .map_err(AppError::infrastructure)?;
+            }
+            if !construct.constraints.is_empty() {
+                writeln!(output, "\nconstraints:").map_err(AppError::infrastructure)?;
+                for entry in &construct.constraints {
+                    writeln!(output, "  - {}: {}", entry.code, entry.summary)
+                        .map_err(AppError::infrastructure)?;
+                }
+            }
             if !construct.guidance.is_empty() {
                 writeln!(output, "\nguidance:").map_err(AppError::infrastructure)?;
                 for entry in &construct.guidance {
-                    writeln!(output, "  - {}", entry.summary).map_err(AppError::infrastructure)?;
+                    writeln!(output, "  - {}: {}", entry.code, entry.summary)
+                        .map_err(AppError::infrastructure)?;
+                }
+            }
+            if !construct.availability.runtime_requires.is_empty()
+                || !construct
+                    .availability
+                    .configuration_prerequisites
+                    .is_empty()
+            {
+                writeln!(output, "\navailability:").map_err(AppError::infrastructure)?;
+                if !construct.availability.runtime_requires.is_empty() {
+                    writeln!(
+                        output,
+                        "  runtime: {}",
+                        construct.availability.runtime_requires.join(", ")
+                    )
+                    .map_err(AppError::infrastructure)?;
+                }
+                for prerequisite in &construct.availability.configuration_prerequisites {
+                    writeln!(output, "  configuration: {prerequisite}")
+                        .map_err(AppError::infrastructure)?;
                 }
             }
             for example in &construct.examples {
@@ -708,6 +798,10 @@ fn write_description_human(
                     example.source.replace('\n', "\n  ")
                 )
                 .map_err(AppError::infrastructure)?;
+                for prerequisite in &example.prerequisites {
+                    writeln!(output, "  requires: {prerequisite}")
+                        .map_err(AppError::infrastructure)?;
+                }
             }
         }
         DescriptionResponse::Search(search) => {
@@ -723,6 +817,22 @@ fn write_description_human(
         DescriptionResponse::Diagnostic(diagnostic) => {
             writeln!(output, "error[{}]: {}", diagnostic.code, diagnostic.message)
                 .map_err(AppError::infrastructure)?;
+            for hint in &diagnostic.repair_hints {
+                let replacement = match &hint.replacement {
+                    webtest_feedback::RepairReplacement::Locator { source } => source,
+                    webtest_feedback::RepairReplacement::Text(value) => value,
+                };
+                writeln!(output, "  suggestion: {replacement}")
+                    .map_err(AppError::infrastructure)?;
+            }
+            if !diagnostic.reference_queries.is_empty() {
+                writeln!(
+                    output,
+                    "  reference: {}",
+                    diagnostic.reference_queries.join(", ")
+                )
+                .map_err(AppError::infrastructure)?;
+            }
         }
     }
     Ok(())

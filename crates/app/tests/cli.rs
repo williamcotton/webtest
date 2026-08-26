@@ -34,6 +34,17 @@ fn describe_bootstraps_exact_alias_category_and_search_without_source_files() {
             .expect("locators")
             .contains(&serde_json::json!("locator.role"))
     );
+    assert_eq!(
+        index["categories"]["app_bridge"],
+        serde_json::json!([
+            "provider.app",
+            "app.schema",
+            "app.protocol",
+            "app.pseudocode"
+        ])
+    );
+    assert!(index["categories"].get("cli_commands").is_none());
+    assert!(index["categories"].get("configuration").is_none());
 
     let role = webtest(directory.path())
         .args(["describe", "role", "--reporter", "json"])
@@ -45,6 +56,15 @@ fn describe_bootstraps_exact_alias_category_and_search_without_source_files() {
     assert_eq!(role["syntax_forms"][0]["elements"][1]["parameter"], "role");
     assert_eq!(role["allowed_contexts"][0], "scope.browser");
     assert_eq!(role["examples"].as_array().expect("examples").len(), 2);
+
+    let short_provider_operation = webtest(directory.path())
+        .args(["describe", "http.post", "--reporter", "json"])
+        .output()
+        .expect("describe short provider operation");
+    assert!(short_provider_operation.status.success());
+    let short_provider_operation: serde_json::Value =
+        serde_json::from_slice(&short_provider_operation.stdout).expect("provider operation JSON");
+    assert_eq!(short_provider_operation["id"], "provider.http.post");
 
     let category = webtest(directory.path())
         .args(["describe", "provider.http", "--reporter", "json"])
@@ -58,6 +78,24 @@ fn describe_bootstraps_exact_alias_category_and_search_without_source_files() {
             .expect("children")
             .contains(&serde_json::json!("provider.http.get"))
     );
+
+    let plural_category = webtest(directory.path())
+        .args(["describe", "locators", "--reporter", "json"])
+        .output()
+        .expect("plural category alias");
+    assert!(plural_category.status.success());
+    let plural_category: serde_json::Value =
+        serde_json::from_slice(&plural_category.stdout).expect("plural category JSON");
+    assert_eq!(plural_category["id"], "locator");
+
+    let app_schema = webtest(directory.path())
+        .args(["describe", "app-schema.json", "--reporter", "json"])
+        .output()
+        .expect("app manifest alias");
+    assert!(app_schema.status.success());
+    let app_schema: serde_json::Value =
+        serde_json::from_slice(&app_schema.stdout).expect("app schema JSON");
+    assert_eq!(app_schema["id"], "app.schema");
 
     let search = webtest(directory.path())
         .args([
@@ -80,6 +118,180 @@ fn describe_bootstraps_exact_alias_category_and_search_without_source_files() {
     let unknown: serde_json::Value = serde_json::from_slice(&unknown.stdout).expect("unknown JSON");
     assert_eq!(unknown["code"], "description_unknown_query");
     assert_eq!(unknown["repair_hints"][0]["kind"], "name_candidate");
+
+    let human_unknown = webtest(directory.path())
+        .args(["describe", "locator.rol"])
+        .output()
+        .expect("human unknown description");
+    assert_eq!(human_unknown.status.code(), Some(2));
+    let human_unknown = String::from_utf8(human_unknown.stdout).expect("human output");
+    assert!(human_unknown.contains("suggestion: locator.role"));
+    assert!(human_unknown.contains("reference: locator.role"));
+
+    write(
+        &directory.path().join("webtest.toml"),
+        "[server.app]\nschema = \"app-schema.json\"\n",
+    );
+    write(
+        &directory.path().join("app-schema.json"),
+        include_str!("../../../protocol/examples/app-schema.json"),
+    );
+    let project_operation = webtest(directory.path())
+        .args(["describe", "app.create_user", "--reporter", "json"])
+        .output()
+        .expect("project app operation");
+    assert!(
+        project_operation.status.success(),
+        "{}",
+        String::from_utf8_lossy(&project_operation.stderr)
+    );
+    let project_operation: serde_json::Value =
+        serde_json::from_slice(&project_operation.stdout).expect("project operation JSON");
+    assert_eq!(project_operation["id"], "provider.app.create_user");
+    assert_eq!(project_operation["examples"], serde_json::json!([]));
+    assert!(
+        project_operation["guidance"]
+            .as_array()
+            .expect("guidance")
+            .iter()
+            .any(|guidance| guidance["code"] == "project_examples_not_declared")
+    );
+}
+
+#[test]
+fn init_creates_a_checkable_idempotent_application_bridge_scaffold() {
+    let directory = tempfile::tempdir().expect("temp directory");
+    let project = directory.path().join("demo");
+    let initialized = webtest(directory.path())
+        .args(["init", "demo"])
+        .output()
+        .expect("initialize project");
+    assert!(
+        initialized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initialized.stderr)
+    );
+    let initialized_output = String::from_utf8(initialized.stdout).expect("init output");
+    assert!(initialized_output.contains("created webtest.toml"));
+    assert!(initialized_output.contains("webtest describe app.protocol"));
+
+    assert!(project.join("webtest.toml").is_file());
+    assert!(project.join(".webtest/app-schema.json").is_file());
+    assert!(project.join("tests/example.webtest").is_file());
+    let skill_path = project.join(".agents/skills/webtest/SKILL.md");
+    let skill = fs::read_to_string(&skill_path).expect("installed skill");
+    assert_eq!(
+        skill,
+        include_str!("../../../.agents/skills/webtest/SKILL.md")
+    );
+    assert!(skill.contains("webtest init ."));
+    assert!(skill.contains("test \"application bridge responds\""));
+    assert!(skill.contains("[server.app]"));
+    assert!(!skill.contains("target/debug/webtest"));
+    assert!(!skill.contains("cargo run"));
+
+    let manifest = webtest_app_bridge::AppManifest::read(&project.join(".webtest/app-schema.json"))
+        .expect("valid generated manifest");
+    assert!(manifest.functions.contains_key("echo"));
+    assert_eq!(manifest.sdk, "webtest-init");
+
+    #[cfg(unix)]
+    assert_eq!(
+        fs::read_link(project.join(".claude/skills/webtest")).expect("Claude skill link"),
+        Path::new("../../.agents/skills/webtest")
+    );
+    #[cfg(not(unix))]
+    assert!(project.join(".claude/skills/webtest/SKILL.md").is_file());
+
+    let check = webtest(&project)
+        .args(["check", "--reporter", "json"])
+        .output()
+        .expect("check generated project");
+    assert!(
+        check.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+
+    let formatted = webtest(&project)
+        .args(["fmt", "--check"])
+        .output()
+        .expect("check generated formatting");
+    assert!(
+        formatted.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&formatted.stdout),
+        String::from_utf8_lossy(&formatted.stderr)
+    );
+
+    let described = webtest(&project)
+        .args(["describe", "app.echo", "--reporter", "json"])
+        .output()
+        .expect("describe generated operation");
+    assert!(
+        described.status.success(),
+        "{}",
+        String::from_utf8_lossy(&described.stderr)
+    );
+    let described: serde_json::Value =
+        serde_json::from_slice(&described.stdout).expect("description JSON");
+    assert_eq!(described["id"], "provider.app.echo");
+
+    let repeated = webtest(&project)
+        .args(["init"])
+        .output()
+        .expect("repeat initialization");
+    assert!(repeated.status.success());
+    let repeated = String::from_utf8(repeated.stdout).expect("repeated output");
+    assert!(repeated.contains("already initialized"));
+    assert!(repeated.contains("unchanged webtest.toml"));
+}
+
+#[test]
+fn init_refuses_conflicts_without_creating_partial_scaffolding() {
+    let directory = tempfile::tempdir().expect("temp directory");
+    let configuration = directory.path().join("webtest.toml");
+    write(&configuration, "# application-owned configuration\n");
+
+    let initialized = webtest(directory.path())
+        .args(["init"])
+        .output()
+        .expect("initialize conflicting project");
+    assert_eq!(initialized.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&initialized.stderr).contains("webtest.toml"));
+    assert_eq!(
+        fs::read_to_string(configuration).expect("preserved configuration"),
+        "# application-owned configuration\n"
+    );
+    assert!(!directory.path().join(".webtest/app-schema.json").exists());
+    assert!(!directory.path().join("tests/example.webtest").exists());
+    assert!(
+        !directory
+            .path()
+            .join(".agents/skills/webtest/SKILL.md")
+            .exists()
+    );
+    assert!(fs::symlink_metadata(directory.path().join(".claude/skills/webtest")).is_err());
+}
+
+#[test]
+fn init_preflights_agent_directory_conflicts_before_writing_project_files() {
+    let directory = tempfile::tempdir().expect("temp directory");
+    write(
+        &directory.path().join(".claude"),
+        "application-owned file\n",
+    );
+
+    let initialized = webtest(directory.path())
+        .args(["init"])
+        .output()
+        .expect("initialize with conflicting agent directory");
+    assert_eq!(initialized.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&initialized.stderr).contains(".claude/skills/webtest"));
+    assert!(!directory.path().join("webtest.toml").exists());
+    assert!(!directory.path().join(".webtest/app-schema.json").exists());
+    assert!(!directory.path().join("tests/example.webtest").exists());
 }
 
 #[test]

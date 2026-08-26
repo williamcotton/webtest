@@ -30,6 +30,19 @@ cargo install --path crates/app --locked
 webtest --version
 ```
 
+Bootstrap a new or existing application directory before authoring tests:
+
+```sh
+webtest init path/to/application
+```
+
+Initialization creates a non-overwriting, language-neutral starter project with
+`webtest.toml`, `.webtest/app-schema.json`, `tests/example.webtest`, and the
+WebTest agent skill. The generated `app.echo` test statically checks immediately;
+configure `[app]` and implement the Protocol 1 echo operation before executing it.
+The canonical skill lives at `.agents/skills/webtest`, with a relative
+`.claude/skills/webtest` compatibility link.
+
 For development, `cargo build` keeps the executable at `target/debug/webtest`. Install the tested Chrome for Testing release into WebTest's versioned cache after either setup. Ordinary test runs never download a browser.
 
 ```sh

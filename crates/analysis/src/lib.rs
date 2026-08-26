@@ -1534,7 +1534,10 @@ impl<'a> Compiler<'a> {
                         let known = known_members(&receiver.ty);
                         let candidates = nearest_strings(&known, member, 5);
                         let message = if let Some(best) = candidates.first() {
-                            format!("type {} has no member `{member}`; did you mean `{best}`?", receiver.ty)
+                            format!(
+                                "type {} has no member `{member}`; did you mean `{best}`?",
+                                receiver.ty
+                            )
                         } else {
                             format!("type {} has no member `{member}`", receiver.ty)
                         };

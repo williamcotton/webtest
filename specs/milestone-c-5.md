@@ -8,7 +8,7 @@ Milestone C.5 makes WebTest's existing semantics directly discoverable and consu
 
 It does not depend on the application bridge in Milestone D. When Milestone D later adds statically known `app.*` functions, those functions participate in the same discovery interfaces introduced here.
 
-**Implementation status (2026-08-23): implemented.** The shared Rust implementation now exposes versioned description/search, semantic page inspection, deterministic validated locator candidates, structured static/runtime details and repair hints, bounded/redacted CLI and event output, editor/LSP/DAP transport, WASM static parity, and the deterministic `examples/semantic-discovery` acceptance fixture. `inspect` remains an explicitly unsupported native capability in WASM.
+**Implementation status (2026-08-26): implemented for the installed language, built-in providers, inspection, machine feedback, and project bootstrapping.** The shared Rust implementation exposes versioned description/search, semantic page inspection, deterministic validated locator candidates, structured static/runtime details and repair hints, bounded/redacted CLI and event output, editor/LSP/DAP transport, WASM static parity, and the deterministic `examples/semantic-discovery` acceptance fixture. `webtest init` creates a non-overwriting, statically checkable Protocol 1 starter project and installs the canonical agent skill plus its Claude compatibility link. `inspect` remains an explicitly unsupported native capability in WASM. Protocol 1 project-provider schemas do not currently carry source examples, so project operation leaves explicitly omit examples instead of fabricating application-specific values; validated schema-supplied examples remain future work.
 
 [`future-functionality.md`](./future-functionality.md) places this milestone after C and before D.
 
@@ -17,6 +17,7 @@ It does not depend on the application bridge in Milestone D. When Milestone D la
 An external client with no private knowledge of WebTest internals can discover the semantic surface of a running page and use ordinary WebTest commands as a closed authoring and repair loop:
 
 ```sh
+webtest init .
 webtest describe --reporter json
 webtest describe locator.role --reporter json
 webtest inspect /login --reporter json
@@ -657,7 +658,7 @@ Every leaf description includes at least:
 * semantic constraints, effects, and failure behavior relevant to correct use;
 * canonical source examples.
 
-Every public leaf description provides at least two canonical examples: a minimal fragment and a composed use in its legal context. Additional examples are required when they communicate optional forms, temporal ordering, ownership, result unification, or other behavior not apparent from the syntax form. Configured external schemas must supply examples that pass WebTest's validation; the description service does not fabricate plausible application values or present an invalid example as canonical.
+Every installed public leaf description provides at least two canonical examples: a minimal fragment and a composed use in its legal context. Additional examples are required when they communicate optional forms, temporal ordering, ownership, result unification, or other behavior not apparent from the syntax form. The current Protocol 1 manifest and shared `OperationSchema` do not define source examples, so configured project-provider leaves return no examples and a coded guidance entry explains why. A future external example field must pass WebTest's parser and static validation before it can appear here; the description service never fabricates plausible application values or presents an invalid example as canonical.
 
 For example, `webtest describe locator.role --reporter json` returns a leaf shaped like:
 
@@ -711,15 +712,9 @@ For example, `webtest describe locator.role --reporter json` returns a leaf shap
   "returns": "Locator",
   "requires_capabilities": ["Browser"],
   "allowed_contexts": ["scope.browser"],
-  "effects": ["browser_pointer_input", "page_may_navigate"],
   "failure_modes": [
     "locator_not_found",
-    "locator_ambiguous",
-    "element_not_visible",
-    "element_disabled",
-    "element_obscured",
-    "action_timeout",
-    "browser_disconnected"
+    "locator_ambiguous"
   ],
   "constraints": [
     {
@@ -732,7 +727,7 @@ For example, `webtest describe locator.role --reporter json` returns a leaf shap
       "code": "singular_consumer_requires_unique_match",
       "phase": "runtime",
       "subject": "locator result",
-      "summary": "An action or singular assertion requires exactly one matching element."
+      "summary": "An operation that requires a present target rejects multiple matches; hidden and detached state checks may succeed with no match."
     }
   ],
   "examples": [
@@ -775,7 +770,7 @@ Statement-like constructs use the same schema. `webtest describe browser.click -
       ]
     }
   ],
-  "summary": "Wait for one actionable element and activate it with pointer input.",
+  "summary": "Wait for one visible, enabled, stable, unobscured element and activate it with pointer input.",
   "search_terms": ["activate", "button", "pointer", "press control"],
   "parameters": [
     {
@@ -791,18 +786,25 @@ Statement-like constructs use the same schema. `webtest describe browser.click -
   "produces_value": false,
   "requires_capabilities": ["Browser"],
   "allowed_contexts": ["scope.browser"],
+  "effects": ["browser_pointer_input", "page_may_navigate"],
+  "failure_modes": [
+    "locator_not_found",
+    "locator_ambiguous",
+    "locator_invalid",
+    "element_detached",
+    "element_not_visible",
+    "element_unstable",
+    "element_disabled",
+    "element_obscured",
+    "action_timeout",
+    "browser_disconnected"
+  ],
   "constraints": [
     {
       "code": "unique_target_before_deadline",
       "phase": "runtime",
       "subject": "target",
-      "summary": "The locator must resolve to exactly one element before the action deadline."
-    },
-    {
-      "code": "pointer_actionability",
-      "phase": "runtime",
-      "subject": "target",
-      "summary": "The element must be attached, visible, stable, enabled, and able to receive pointer input."
+      "summary": "The locator must resolve to exactly one visible, enabled, stable target before the operation deadline."
     }
   ],
   "examples": [
@@ -913,7 +915,7 @@ Provider operation details are emitted from the same `ProviderSchema`, `Operatio
   "constraints": [
     {
       "code": "relative_url_requires_base_url",
-      "phase": "analysis",
+      "phase": "configuration",
       "subject": "url",
       "summary": "A relative URL requires the applicable configured base URL."
     },
@@ -947,9 +949,9 @@ Provider operation details are emitted from the same `ProviderSchema`, `Operatio
 
 The concrete operation description includes every registered parameter, including secret/redaction metadata and supported bodies such as `json`, `text`, `bytes`, or `form`; the shortened example above demonstrates the shape rather than replacing the provider schema.
 
-When Milestone D is implemented, `provider.app` and leaves such as `provider.app.create_user` participate naturally. Their offline schema supplies documentation, parameters, result types, capability, redaction, defaults, and retry-safety metadata. Canonical syntax is projected from that schema, and bounded examples may come from validated schema documentation. The application does not need to be running for static discovery.
+`provider.app` and leaves such as `provider.app.create_user` participate through Milestone D's implemented offline manifest. Their offline schema supplies documentation, parameters, result types, capability, redaction, defaults, and retry-safety metadata, and canonical syntax is projected from that schema. The current manifest has no source-example field, so these project leaves omit examples rather than inventing values. The application does not need to be running for static discovery.
 
-Every description field carries provenance sufficient to distinguish installed core metadata, built-in provider metadata, project configuration, and externally supplied application/provider schemas. Project-supplied summaries, guidance, search terms, and examples are untrusted data: they are length-bounded, stripped of disallowed control characters, emitted as plain strings rather than executable markup, and marked `content_trust: "project_supplied"`. WebTest does not present them as compiler rules or agent instructions. Syntax, parameters, types, capability, redaction, and availability continue to come from validated schema fields rather than prose. A project-supplied example appears in canonical `examples` only after parsing and static validation against its declared schema/context; rejected examples produce schema/configuration diagnostics and are not quietly presented as valid source.
+Every description field carries provenance sufficient to distinguish installed core metadata, built-in provider metadata, project configuration, and externally supplied application/provider schemas. Project-supplied summaries and parameter documentation are untrusted data: they are length-bounded, stripped of disallowed control characters, emitted as plain strings rather than executable markup, and marked `content_trust: "project_supplied"`. WebTest does not present them as compiler rules or agent instructions. Syntax, parameters, types, capability, redaction, and availability continue to come from validated schema fields rather than prose. If a future provider schema supplies examples, each example must be parsed and statically validated against its declared schema/context before appearing in canonical `examples`; rejected content must produce schema/configuration diagnostics rather than being quietly presented as valid source.
 
 Availability is separate from existence. A construct can be statically known while requiring native execution, configuration, a provider connection, or a host capability that is unavailable in the current environment. Structured `availability`, `runtime_requires`, configuration prerequisites, schema identity, and provider provenance prevent a client from treating “described” as “ready to execute.” `describe` remains static and may report requirements; it does not probe the network or start the provider merely to claim live availability.
 
@@ -1367,7 +1369,7 @@ max_examples = 4
 max_example_bytes = 4096
 ```
 
-The implementation enforces documented hard ceilings above project configuration. The minimum permitted `max_examples` still allows the two required canonical examples for a public leaf. Search applies bounds per provenance class before the aggregate limit so project-supplied entries cannot crowd out installed-language matches.
+The implementation enforces documented hard ceilings above project configuration. The minimum permitted `max_examples` still allows the two required canonical examples for an installed public leaf. Search applies bounds per provenance class before the aggregate limit so project-supplied entries cannot crowd out installed-language matches.
 
 If a limit is reached, output contains structured truncation metadata. It must not silently appear complete.
 
@@ -1465,6 +1467,7 @@ permission to edit .webtest files
 and allow it to use:
 
 ```text
+webtest init
 webtest describe
 webtest inspect
 webtest check
@@ -1530,7 +1533,7 @@ Milestone C.5 is complete only when:
 
 1. `webtest inspect /login --reporter json` returns a bounded semantic snapshot containing valid, unique WebTest locator expressions for the reference login form without requiring raw DOM, CSS, XPath, screenshots, or application source inspection.
 2. Every emitted preferred locator is validated through the same locator resolver used by ordinary tests and produces deterministic canonical source for an equivalent page state.
-3. `webtest describe --reporter json` returns a compact installed-language/project index, and exact, category, alias, and lexical-search queries return bounded self-contained grammar or construct references with structured syntax forms, typed parameters/results, contexts, capabilities, coded constraints/guidance, provenance/availability, and validated canonical examples from shared semantic metadata rather than a CLI-only registry.
+3. `webtest describe --reporter json` returns a compact installed-language/project index, and exact, category, alias, and lexical-search queries return bounded self-contained grammar or construct references with structured syntax forms, typed parameters/results, contexts, capabilities, coded constraints/guidance, and provenance/availability from shared semantic metadata rather than a CLI-only registry. Installed leaves include validated canonical examples; current project-provider leaves explicitly omit them because their schema has no example field.
 4. `check` and `test` expose stable source revision/range, diagnostic codes, semantic details, and repair hints in versioned machine-readable form without requiring clients to parse human messages.
 5. A deliberately incorrect semantic locator produces a structured runtime failure containing a valid nearby locator candidate when one can be determined, while WebTest never silently changes or heals the authored test.
 6. Ambiguous, disabled, obscured, missing-option, type, member, and provider failures preserve distinct structured semantics rather than collapsing into generic repair text.
