@@ -74,6 +74,10 @@ fn provider_overview() -> ConstructDescription {
     ];
     value.guidance = vec![
         guidance(
+            "app_bridge_discovery",
+            "For a new or custom bridge, inspect `app.schema`, then `app.protocol`, then `app.pseudocode`; inspect the exact project operation separately after loading its manifest.",
+        ),
+        guidance(
             "app_operation_lookup",
             "With a project manifest loaded, query an exact operation such as `webtest describe app.create_user`; the canonical result ID is `provider.app.create_user`.",
         ),
@@ -187,13 +191,15 @@ fn protocol_reference() -> ConstructDescription {
         "describe".into(),
         "schema drift".into(),
         "call deadline".into(),
+        "loopback TCP".into(),
+        "WEBTEST_BRIDGE".into(),
     ];
     value.constraints = vec![
         constraint(
             "protocol_framing",
             "transport",
             "frame",
-            "Each bounded frame is one UTF-8 JSON object followed by LF; protocol stdout contains frames only and logs use stderr.",
+            "Each bounded frame is one UTF-8 JSON object followed by LF. Protocol streams carry frames only; with stdio, stdout carries frames and logs use stderr.",
         ),
         constraint(
             "protocol_authentication",
@@ -218,6 +224,14 @@ fn protocol_reference() -> ConstructDescription {
             "Runner-managed socket bridges receive WEBTEST_BRIDGE, WEBTEST_TOKEN, and WEBTEST_PROTOCOL=1. Persistent stdio bridges receive the token and protocol variables and use stdin/stdout; WEBTEST=1 is not injected unless the project adds it under app.environment.",
         ),
         guidance(
+            "protocol_transport_selection",
+            "The `webtest init` scaffold selects `transport = \"auto\"`: Unix-domain sockets on Unix, named pipes on Windows, and loopback TCP when local IPC is unavailable. A custom bridge may explicitly select `tcp` for a portable `tcp://127.0.0.1:<random-port>` endpoint. WebTest creates the listener before spawning the configured application command.",
+        ),
+        guidance(
+            "protocol_managed_command",
+            "Configure `[app].command` as one executable and `[app].args` as separate arguments. WebTest launches it directly without a shell, sets the bridge environment, and owns bounded shutdown and child reaping.",
+        ),
+        guidance(
             "protocol_transports",
             "The runner supports Unix sockets, Windows named pipes, loopback TCP, and persistent stdio. Custom bridges should prefer an SDK and must reject non-local socket endpoints.",
         ),
@@ -231,7 +245,8 @@ fn protocol_reference() -> ConstructDescription {
             "valid handshake frames",
             r#"{"type":"hello","protocol_versions":[1],"sdk":"custom","sdk_version":"0.1.0","token":"<per-run token>","capabilities":{"cancel":false,"events":false}}
 {"type":"hello_ok","protocol":1,"run_id":"<run id>","max_message_bytes":1048576}
-{"type":"describe","id":1}"#,
+{"type":"describe","id":1}
+{"type":"schema","id":1,"protocol":1,"schema_hash":"blake3:b1254e79ab8984797e49f26190f9fa181239cb0d4c0d279f4d627b7d101e1e2a","functions":{"create_user":{"documentation":"Create a user directly in the test application's in-memory store.","retry_safe":false,"params":{"type":"object","fields":{"admin":{"type":"boolean","documentation":"Grant administrative access.","optional":true,"secret":false,"default":false},"email":{"type":"string","documentation":"Unique sign-in email.","optional":false,"secret":false}}},"returns":{"type":"object","fields":{"admin":{"type":"boolean","optional":false,"secret":false},"email":{"type":"string","optional":false,"secret":false},"id":{"type":"integer","optional":false,"secret":false}}}}}}"#,
             "jsonl",
             "protocol_stream",
         ),
@@ -294,10 +309,23 @@ if explicit_test_boot_mode:
             "application_test_boot",
         ),
         example(
+            "webtest init echo handler",
+            r#"call(id, "echo", arguments, deadline_ms) =>
+    require(arguments.message is a string)
+    send({type: result, id, value: arguments.message})"#,
+            "pseudocode",
+            "protocol_state_machine",
+        ),
+        example(
             "no-SDK Protocol 1 loop",
             r#"endpoint = WEBTEST_BRIDGE if present else stdio
 token = require(WEBTEST_TOKEN)
-io = connect_local_endpoint(endpoint)
+if endpoint starts with "tcp://":
+    host, port = parse_uri(endpoint)
+    require(host is loopback)
+    io = connect_tcp(host, port)
+else:
+    io = connect_supported_local_endpoint_or_stdio(endpoint)
 send({type: hello, protocol_versions: [1], sdk, sdk_version, token,
       capabilities: {cancel: false, events: false}})
 hello_ok = receive_bounded_frame()
@@ -311,9 +339,10 @@ loop:
                           functions: manifest.functions})
     call(id, function, arguments, deadline_ms) =>
         validate arguments against manifest
-        run the registered handler within deadline_ms
+        result = run the registered handler within deadline_ms
         validate result against manifest
-        send result, or error with code, message, retryable, and data
+        send({type: result, id, value: result}),
+        or send({type: error, id, code, message, retryable, data})
     ping(id) => send({type: pong, id})
     shutdown(id) => drain bounded work; send({type: shutdown_ok, id}); close"#,
             "pseudocode",

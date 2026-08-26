@@ -173,6 +173,7 @@ fn init_creates_a_checkable_idempotent_application_bridge_scaffold() {
     );
     let initialized_output = String::from_utf8(initialized.stdout).expect("init output");
     assert!(initialized_output.contains("created webtest.toml"));
+    assert!(initialized_output.contains(".agents/skills/webtest/SKILL.md"));
     assert!(initialized_output.contains("webtest describe app.protocol"));
 
     assert!(project.join("webtest.toml").is_file());
@@ -187,6 +188,10 @@ fn init_creates_a_checkable_idempotent_application_bridge_scaffold() {
     assert!(skill.contains("webtest init ."));
     assert!(skill.contains("test \"application bridge responds\""));
     assert!(skill.contains("[server.app]"));
+    assert!(skill.contains("webtest describe app.schema"));
+    assert!(skill.contains("webtest describe app.protocol"));
+    assert!(skill.contains("webtest describe app.pseudocode"));
+    assert!(skill.contains("webtest describe app.echo"));
     assert!(!skill.contains("target/debug/webtest"));
     assert!(!skill.contains("cargo run"));
 

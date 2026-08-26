@@ -41,7 +41,10 @@ Initialization creates a non-overwriting, language-neutral starter project with
 WebTest agent skill. The generated `app.echo` test statically checks immediately;
 configure `[app]` and implement the Protocol 1 echo operation before executing it.
 The canonical skill lives at `.agents/skills/webtest`, with a relative
-`.claude/skills/webtest` compatibility link.
+`.claude/skills/webtest` compatibility link. Its application-bridge section routes
+agents through `webtest describe app`, `app.schema`, `app.protocol`,
+`app.pseudocode`, and the generated `app.echo` operation instead of duplicating the
+wire contract in prompt text.
 
 For development, `cargo build` keeps the executable at `target/debug/webtest`. Install the tested Chrome for Testing release into WebTest's versioned cache after either setup. Ordinary test runs never download a browser.
 

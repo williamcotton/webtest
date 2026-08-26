@@ -610,6 +610,10 @@ mod tests {
         assert!(WEBTEST_SKILL.contains(EXAMPLE_TEST));
         assert!(WEBTEST_SKILL.contains(FULL_FLOW_EXAMPLE));
         assert!(WEBTEST_SKILL.contains("webtest init ."));
+        assert!(WEBTEST_SKILL.contains("webtest describe app.schema"));
+        assert!(WEBTEST_SKILL.contains("webtest describe app.protocol"));
+        assert!(WEBTEST_SKILL.contains("webtest describe app.pseudocode"));
+        assert!(WEBTEST_SKILL.contains("webtest describe app.echo"));
         assert!(!WEBTEST_SKILL.contains("target/debug/webtest"));
         assert!(!WEBTEST_SKILL.contains("cargo run"));
     }

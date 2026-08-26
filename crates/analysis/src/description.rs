@@ -1282,6 +1282,12 @@ mod tests {
     #[test]
     fn app_reference_examples_match_the_manifest_and_wire_contracts() {
         let core = core_constructs();
+        assert!(
+            core["provider.app"]
+                .guidance
+                .iter()
+                .any(|guidance| guidance.code == "app_bridge_discovery")
+        );
         let schema = &core["app.schema"];
         let manifest = schema
             .examples
@@ -1314,6 +1320,13 @@ mod tests {
         assert_eq!(hello_ok["protocol"], 1);
         assert!(hello_ok["run_id"].is_string());
         assert!(hello_ok["max_message_bytes"].is_number());
+        let live_schema = frames
+            .iter()
+            .find(|frame| frame["type"] == "schema")
+            .expect("schema");
+        assert_eq!(live_schema["protocol"], manifest["protocol"]);
+        assert_eq!(live_schema["schema_hash"], manifest["schema_hash"]);
+        assert_eq!(live_schema["functions"], manifest["functions"]);
         let call = frames
             .iter()
             .find(|frame| frame["type"] == "call")
@@ -1325,6 +1338,20 @@ mod tests {
             .expect("error");
         assert!(error["retryable"].is_boolean());
         assert!(error.get("data").is_some());
+
+        let protocol_guidance = protocol
+            .guidance
+            .iter()
+            .map(|guidance| guidance.code.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(protocol_guidance.contains("protocol_transport_selection"));
+        assert!(protocol_guidance.contains("protocol_managed_command"));
+        assert!(
+            core["app.pseudocode"]
+                .examples
+                .iter()
+                .any(|example| example.source.contains("arguments.message"))
+        );
 
         let providers = {
             let mut providers = ProviderRegistry::built_in_schemas();

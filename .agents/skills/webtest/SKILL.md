@@ -18,7 +18,7 @@ webtest init .
 
 `webtest init` creates `webtest.toml`, `.webtest/app-schema.json`, `tests/example.webtest`, and this skill under `.agents/skills/webtest`. It also creates a `.claude/skills/webtest` compatibility link. It never overwrites conflicting files.
 
-The generated application schema declares `app.echo(message: String) -> String`, giving any host language a small Protocol 1 implementation target. Static checking works immediately. Before executing the generated test, configure the application command and implement that bridge operation.
+Initialization makes the generated test statically checkable, not yet executable. The generated application schema declares `app.echo(message: String) -> String`; before running the test, configure `[app]` and use the application-bridge discovery sequence below. Do not replace the bridge call with a public test-only HTTP route.
 
 The canonical starter configuration is:
 
@@ -56,6 +56,22 @@ test "application bridge responds" {
 }
 ```
 
+## Discover the application bridge
+
+Do not infer or invent the application bridge from this skill. From the initialized project, run these focused queries in order before editing the application:
+
+```sh
+webtest describe app
+webtest describe app.schema
+webtest describe app.protocol
+webtest describe app.pseudocode
+webtest describe app.echo
+```
+
+The results respectively establish the provider boundary, offline manifest/configuration contract, exact Protocol 1 transport and frames, host-language implementation outline, and generated operation signature. Use the default human output while learning; add `--reporter json` only when consuming the response programmatically. Follow the returned configuration prerequisites and related topics, prefer a maintained SDK when one is available, and keep the bridge behind an explicit test-only application boot path.
+
+After configuring `[app]` and implementing `app.echo`, run `webtest check` and then `webtest test tests/example.webtest --reporter json`. Use any structured failure's code and reference queries to return to the narrowest relevant `describe` topic.
+
 ## Test anatomy
 
 A complete system test may create application state on the server, pass transferable typed values into the browser flow, and use semantic locators:
@@ -92,7 +108,7 @@ webtest describe --search "json post" --reporter json
 
 The no-query index contains canonical topic IDs. A construct response supplies syntax forms, typed parameters/results, legal contexts, constraints, and availability. Installed language and provider leaves include canonical examples whose prerequisites are part of the contract. A project-supplied provider operation may have no examples because the current Protocol 1 manifest does not declare them; do not invent application-specific values.
 
-For a configured application provider, query a concrete project operation such as `webtest describe app.echo --reporter json`. Use these focused built-in topics when implementing the provider itself:
+For a configured application provider, query a concrete project operation such as `webtest describe app.echo`. Use human output while learning and `--reporter json` when consuming the result programmatically. These focused built-in topics provide the deeper provider contract:
 
 - `provider.app`: provider semantics and project requirements.
 - `app.schema`: offline Protocol 1 manifest shape and hashing rules.

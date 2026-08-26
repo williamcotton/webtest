@@ -378,7 +378,8 @@ fn init_project(path: &Path) -> Result<ExitClass, AppError> {
     }
     println!("next:");
     println!("  configure [app] in webtest.toml");
-    println!("  implement app.echo using `webtest describe app.protocol`");
+    println!("  implement the app.echo bridge using .agents/skills/webtest/SKILL.md");
+    println!("  use `webtest describe app.protocol` for the complete protocol reference");
     println!("  webtest check");
     println!("  webtest test");
     Ok(ExitClass::Success)
