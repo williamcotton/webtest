@@ -308,12 +308,18 @@ async fn run(cli: Cli) -> Result<ExitClass, AppError> {
             let project_editors = Arc::new(LspProjectEditors::default());
             let editor = project_editors.editor_for_project(&project)?;
             let document_projects = Arc::clone(&project_editors);
-            webtest_lsp::serve_with_document_editors(
+            let changed_projects = Arc::clone(&project_editors);
+            webtest_lsp::serve_with_document_editors_and_project_changes(
                 Arc::new(browser),
                 editor,
                 Arc::new(move |path| {
                     document_projects
                         .editor_for_path(path)
+                        .map_err(|error| error.to_string())
+                }),
+                Arc::new(move |path| {
+                    changed_projects
+                        .reload_for_changed_path(path)
                         .map_err(|error| error.to_string())
                 }),
             )
@@ -393,6 +399,7 @@ fn project(paths: &[PathBuf]) -> Result<Project, AppError> {
 struct LspProjectEditor {
     editor: Arc<webtest_editor::EditorService>,
     app_provider: Option<Arc<AppProvider>>,
+    schema_path: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -425,10 +432,53 @@ impl LspProjectEditors {
                 options, providers,
             )),
             app_provider,
+            schema_path: configured_app_schema_path(project),
         };
         let mut projects = self.lock();
         let project = projects.entry(project.root.clone()).or_insert(candidate);
         Ok(Arc::clone(&project.editor))
+    }
+
+    fn reload_for_changed_path(&self, path: &Path) -> Result<bool, AppError> {
+        let path = canonical_event_path(path);
+        let roots = self
+            .lock()
+            .iter()
+            .filter(|(root, project)| {
+                root.join("webtest.toml") == path
+                    || project.schema_path.as_deref() == Some(path.as_path())
+            })
+            .map(|(root, _)| root.clone())
+            .collect::<Vec<_>>();
+        if roots.is_empty() {
+            return Ok(false);
+        }
+
+        for root in roots {
+            let project = project(std::slice::from_ref(&root))?;
+            let options = runner_options(&project);
+            let (providers, app_provider) = runtime_provider_registry(&project, &options)?;
+            let previous_provider = {
+                let mut projects = self.lock();
+                let cached = projects.get_mut(&root).ok_or_else(|| {
+                    AppError::internal(format!(
+                        "cached LSP project `{}` disappeared during reload",
+                        root.display()
+                    ))
+                })?;
+                cached.editor.reconfigure(options, providers);
+                cached.schema_path = configured_app_schema_path(&project);
+                std::mem::replace(&mut cached.app_provider, app_provider)
+            };
+            if let Some(previous_provider) = previous_provider {
+                tokio::spawn(async move {
+                    if let Err(error) = previous_provider.shutdown().await {
+                        tracing::warn!(%error, "could not shut down replaced LSP application provider");
+                    }
+                });
+            }
+        }
+        Ok(true)
     }
 
     async fn shutdown(&self) -> Result<(), AppError> {
@@ -458,6 +508,24 @@ impl LspProjectEditors {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
+
+fn configured_app_schema_path(project: &Project) -> Option<PathBuf> {
+    project
+        .config
+        .server
+        .app
+        .as_ref()
+        .map(|app| project.root.join(&app.schema))
+}
+
+fn canonical_event_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| {
+        path.parent()
+            .and_then(|parent| std::fs::canonicalize(parent).ok())
+            .and_then(|parent| path.file_name().map(|name| parent.join(name)))
+            .unwrap_or_else(|| path.to_path_buf())
+    })
 }
 
 async fn inspect_page(

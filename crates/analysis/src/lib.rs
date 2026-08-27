@@ -262,6 +262,18 @@ impl AnalysisDatabase {
             .collect()
     }
 
+    pub fn set_provider_registry(&mut self, providers: ProviderRegistry) {
+        let current = self.provider_schema_hashes();
+        let incoming = providers
+            .schemas()
+            .map(|schema| (schema.name.0.clone(), schema.hash()))
+            .collect::<BTreeMap<_, _>>();
+        self.providers = providers;
+        if current != incoming {
+            self.cache.clear();
+        }
+    }
+
     pub fn completions(
         &mut self,
         file: FileId,

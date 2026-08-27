@@ -6,7 +6,8 @@
 runtime transports/adapters/lifecycle, Node and Ruby SDKs, the no-SDK executable, native/LSP/DAP/WASM
 editor parity, shared black-box conformance, and all nine web-server examples are present. The
 repository verification commands and CI matrix enforce deterministic schemas, stopped-app analysis,
-end-to-end execution, and owned-process/port cleanup.
+end-to-end execution, owned-process/port cleanup, and LSP invalidation when the resolved offline
+manifest or project configuration changes.
 
 This specification expands Milestone D in [`future-functionality.md`](./future-functionality.md). It depends on the typed values, provider schemas, capability analysis, `ServerProviderCall` IR, and built-in providers from [`milestone-c.md`](./milestone-c.md), plus the static description, machine-diagnostic, and repair-hint contracts from [`milestone-c-5.md`](./milestone-c-5.md).
 

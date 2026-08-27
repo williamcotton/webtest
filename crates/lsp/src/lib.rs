@@ -3,7 +3,10 @@
 use std::{
     collections::HashMap,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use tower_lsp_server::{
@@ -48,6 +51,10 @@ impl DocumentStore {
         self.lock().remove(uri.as_str())
     }
 
+    fn all(&self) -> Vec<Document> {
+        self.lock().values().cloned().collect()
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Document>> {
         self.documents
             .lock()
@@ -61,10 +68,14 @@ struct Backend {
     editor_for_path: Arc<DocumentEditorResolver>,
     documents: Arc<DocumentStore>,
     browser: Arc<dyn BrowserHost>,
+    project_file_changed: Arc<ProjectFileChangeHandler>,
+    supports_dynamic_file_watching: AtomicBool,
 }
 
 pub type DocumentEditorResolver =
     dyn Fn(&Path) -> std::result::Result<Arc<EditorService>, String> + Send + Sync;
+pub type ProjectFileChangeHandler =
+    dyn Fn(&Path) -> std::result::Result<bool, String> + Send + Sync;
 
 impl Backend {
     fn new(
@@ -72,6 +83,7 @@ impl Backend {
         browser: Arc<dyn BrowserHost>,
         default_editor: Arc<EditorService>,
         editor_for_path: Arc<DocumentEditorResolver>,
+        project_file_changed: Arc<ProjectFileChangeHandler>,
     ) -> Self {
         Self {
             client,
@@ -79,6 +91,8 @@ impl Backend {
             editor_for_path,
             documents: Arc::new(DocumentStore::default()),
             browser,
+            project_file_changed,
+            supports_dynamic_file_watching: AtomicBool::new(false),
         }
     }
 
@@ -114,7 +128,16 @@ impl Backend {
 }
 
 impl LanguageServer for Backend {
-    async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        self.supports_dynamic_file_watching.store(
+            params
+                .capabilities
+                .workspace
+                .and_then(|workspace| workspace.did_change_watched_files)
+                .and_then(|watched| watched.dynamic_registration)
+                .unwrap_or(false),
+            Ordering::Relaxed,
+        );
         Ok(InitializeResult {
             server_info: Some(ServerInfo {
                 name: "webtest".into(),
@@ -167,6 +190,33 @@ impl LanguageServer for Backend {
     }
 
     async fn initialized(&self, _: InitializedParams) {
+        if self.supports_dynamic_file_watching.load(Ordering::Relaxed) {
+            let options = DidChangeWatchedFilesRegistrationOptions {
+                watchers: vec![
+                    FileSystemWatcher {
+                        glob_pattern: GlobPattern::String("**/webtest.toml".into()),
+                        kind: None,
+                    },
+                    FileSystemWatcher {
+                        glob_pattern: GlobPattern::String("**/*.json".into()),
+                        kind: None,
+                    },
+                ],
+            };
+            let registration = Registration {
+                id: "webtest-project-inputs".into(),
+                method: "workspace/didChangeWatchedFiles".into(),
+                register_options: serde_json::to_value(options).ok(),
+            };
+            if let Err(error) = self.client.register_capability(vec![registration]).await {
+                self.client
+                    .log_message(
+                        MessageType::WARNING,
+                        format!("could not watch WebTest project inputs: {error}"),
+                    )
+                    .await;
+            }
+        }
         self.client
             .log_message(MessageType::INFO, "WebTest language server initialized")
             .await;
@@ -229,6 +279,37 @@ impl LanguageServer for Backend {
             self.client
                 .publish_diagnostics(document.uri, Vec::new(), None)
                 .await;
+        }
+    }
+
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        let mut reconfigured = false;
+        for change in params.changes {
+            if change.uri.scheme().as_str() != "file" {
+                continue;
+            }
+            let Some(path) = change.uri.to_file_path() else {
+                continue;
+            };
+            match (self.project_file_changed)(&path) {
+                Ok(changed) => reconfigured |= changed,
+                Err(error) => {
+                    self.client
+                        .log_message(
+                            MessageType::ERROR,
+                            format!(
+                                "could not reload WebTest project input {}: {error}",
+                                path.display()
+                            ),
+                        )
+                        .await;
+                }
+            }
+        }
+        if reconfigured {
+            for document in self.documents.all() {
+                self.publish(&document.uri).await;
+            }
         }
     }
 
@@ -413,10 +494,32 @@ pub async fn serve_with_document_editors(
     default_editor: Arc<EditorService>,
     editor_for_path: Arc<DocumentEditorResolver>,
 ) {
+    serve_with_document_editors_and_project_changes(
+        browser,
+        default_editor,
+        editor_for_path,
+        Arc::new(|_| Ok(false)),
+    )
+    .await;
+}
+
+pub async fn serve_with_document_editors_and_project_changes(
+    browser: Arc<dyn BrowserHost>,
+    default_editor: Arc<EditorService>,
+    editor_for_path: Arc<DocumentEditorResolver>,
+    project_file_changed: Arc<ProjectFileChangeHandler>,
+) {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
-    let (service, socket) =
-        LspService::new(|client| Backend::new(client, browser, default_editor, editor_for_path));
+    let (service, socket) = LspService::new(|client| {
+        Backend::new(
+            client,
+            browser,
+            default_editor,
+            editor_for_path,
+            project_file_changed,
+        )
+    });
     Server::new(stdin, stdout, socket).serve(service).await;
 }
 

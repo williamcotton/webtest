@@ -1,6 +1,6 @@
 //! Protocol-independent editor services used by both LSP and future WASM hosts.
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use thiserror::Error;
 use webtest_analysis::{
@@ -52,6 +52,11 @@ pub enum EditorError {
 pub struct EditorService {
     database: RwLock<AnalysisDatabase>,
     observations: Arc<ObservationStore>,
+    runtime: RwLock<RuntimeConfiguration>,
+    configuration: Mutex<()>,
+}
+
+struct RuntimeConfiguration {
     runner_options: RunnerOptions,
     providers: ProviderRegistry,
 }
@@ -79,9 +84,23 @@ impl EditorService {
         Self {
             database: RwLock::new(AnalysisDatabase::with_provider_registry(providers.clone())),
             observations: Arc::new(ObservationStore::default()),
+            runtime: RwLock::new(RuntimeConfiguration {
+                runner_options,
+                providers,
+            }),
+            configuration: Mutex::new(()),
+        }
+    }
+
+    pub fn reconfigure(&self, runner_options: RunnerOptions, providers: ProviderRegistry) {
+        let _configuration = self.lock_configuration();
+        self.write_database()
+            .set_provider_registry(providers.clone());
+        *self.write_runtime() = RuntimeConfiguration {
             runner_options,
             providers,
-        }
+        };
+        self.observations.clear();
     }
 
     pub fn observations(&self) -> Arc<ObservationStore> {
@@ -360,7 +379,8 @@ impl EditorService {
         file: FileId,
         browser: &dyn BrowserHost,
     ) -> Result<RunResult, EditorError> {
-        let plan = {
+        let (plan, runner_options, providers) = {
+            let _configuration = self.lock_configuration();
             let mut database = self.write_database();
             if database
                 .diagnostics(file)?
@@ -369,11 +389,18 @@ impl EditorService {
             {
                 return Err(EditorError::StaticErrors);
             }
-            database.test_plan(file)?
+            let plan = database.test_plan(file)?;
+            drop(database);
+            let runtime = self.read_runtime();
+            (
+                plan,
+                runtime.runner_options.clone(),
+                runtime.providers.clone(),
+            )
         };
         let runner = Runner::new(Arc::clone(&self.observations))
-            .with_options(self.runner_options.clone())
-            .with_provider_registry(self.providers.clone());
+            .with_options(runner_options)
+            .with_provider_registry(providers);
         Ok(runner.run(&plan, browser).await?)
     }
 
@@ -386,6 +413,24 @@ impl EditorService {
     fn write_database(&self) -> std::sync::RwLockWriteGuard<'_, AnalysisDatabase> {
         self.database
             .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn read_runtime(&self) -> std::sync::RwLockReadGuard<'_, RuntimeConfiguration> {
+        self.runtime
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn write_runtime(&self) -> std::sync::RwLockWriteGuard<'_, RuntimeConfiguration> {
+        self.runtime
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn lock_configuration(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.configuration
+            .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
@@ -463,6 +508,9 @@ mod tests {
     use async_trait::async_trait;
     use webtest_browser::{BrowserSession, Page};
     use webtest_browser_cdp::ChromeHost;
+    use webtest_provider::{
+        Capability, OperationName, OperationSchema, ProviderName, ProviderSchema, Type,
+    };
 
     use super::*;
 
@@ -470,6 +518,59 @@ mod tests {
     struct FakeSession(bool);
     struct FakePage(bool);
     struct DisconnectHost;
+
+    fn app_registry(functions: &[&str]) -> ProviderRegistry {
+        let mut providers = ProviderRegistry::built_in_schemas();
+        providers.register_schema(ProviderSchema {
+            name: ProviderName("app".into()),
+            operations: functions
+                .iter()
+                .map(|name| {
+                    (
+                        (*name).into(),
+                        OperationSchema {
+                            name: OperationName((*name).into()),
+                            parameters: Vec::new(),
+                            result: Type::String,
+                            capability: Capability::Server,
+                            documentation: format!("Call {name}."),
+                            retry_safe: false,
+                        },
+                    )
+                })
+                .collect(),
+            schema_identity: Some(functions.join(",")),
+        });
+        providers
+    }
+
+    #[test]
+    fn provider_reconfiguration_invalidates_cached_analysis() {
+        let editor = EditorService::with_provider_registry(
+            RunnerOptions::default(),
+            app_registry(&["existing"]),
+        );
+        let source = "test \"schema\" { server { let value = app.new_function() } }";
+        let file = editor.open_document("file:///schema.webtest", source);
+        assert!(
+            editor
+                .diagnostics(file)
+                .expect("initial diagnostics")
+                .iter()
+                .any(|diagnostic| diagnostic.code == "semantic.unknown_provider_operation")
+        );
+
+        editor.reconfigure(
+            RunnerOptions::default(),
+            app_registry(&["existing", "new_function"]),
+        );
+        assert!(
+            editor
+                .diagnostics(file)
+                .expect("reconfigured diagnostics")
+                .is_empty()
+        );
+    }
 
     #[async_trait]
     impl BrowserHost for FakeHost {

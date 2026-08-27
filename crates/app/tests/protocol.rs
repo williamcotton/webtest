@@ -381,10 +381,23 @@ fn lsp_resolves_app_provider_from_the_open_documents_nearest_project() {
     let uri = format!("file://{}", path.display());
     let mut lsp = ProtocolProcess::spawn(&["lsp"], directory.path());
     lsp.send(json!({
-        "jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}
+        "jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{
+            "workspace":{"didChangeWatchedFiles":{"dynamicRegistration":true}}
+        }}
     }));
     lsp.receive(|message| message["id"] == 1);
     lsp.send(json!({"jsonrpc":"2.0","method":"initialized","params":{}}));
+    let registration = lsp.receive(|message| message["method"] == "client/registerCapability");
+    let watchers = &registration["params"]["registrations"][0]["registerOptions"]["watchers"];
+    assert!(
+        watchers
+            .as_array()
+            .expect("file watchers")
+            .iter()
+            .any(|watcher| watcher["globPattern"] == "**/*.json"),
+        "{registration:#?}"
+    );
+    lsp.send(json!({"jsonrpc":"2.0","id":registration["id"].clone(),"result":null}));
     lsp.send(json!({
         "jsonrpc":"2.0","method":"textDocument/didOpen",
         "params":{"textDocument":{"uri":uri,"languageId":"webtest","version":1,"text":source}}
@@ -433,6 +446,61 @@ fn lsp_resolves_app_provider_from_the_open_documents_nearest_project() {
             .iter()
             .any(|completion| completion["label"] == "create_user"),
         "{completions:#?}"
+    );
+
+    let new_source =
+        "test \"app\" { server { let value = app.new_function() expect value == \"new\" } }";
+    lsp.send(json!({
+        "jsonrpc":"2.0","method":"textDocument/didChange",
+        "params":{"textDocument":{"uri":uri,"version":3},"contentChanges":[{"text":new_source}]}
+    }));
+    let stale_diagnostics = lsp.receive(|message| {
+        message["method"] == "textDocument/publishDiagnostics" && message["params"]["version"] == 3
+    });
+    assert!(
+        stale_diagnostics["params"]["diagnostics"]
+            .as_array()
+            .expect("stale diagnostics")
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "semantic.unknown_provider_operation"),
+        "{stale_diagnostics:#?}"
+    );
+
+    let mut updated_manifest = manifest.clone();
+    updated_manifest.functions.insert(
+        "new_function".into(),
+        FunctionSchema {
+            documentation: "Return a newly added value.".into(),
+            retry_safe: true,
+            params: TypeSchema::Object {
+                fields: std::collections::BTreeMap::new(),
+            },
+            returns: TypeSchema::String,
+        },
+    );
+    updated_manifest.schema_hash = String::new();
+    let updated_manifest = updated_manifest
+        .with_computed_hash()
+        .expect("compute updated manifest hash");
+    let schema_path = schema_directory.join("app-schema.json");
+    std::fs::write(
+        &schema_path,
+        serde_json::to_vec_pretty(&updated_manifest).expect("serialize updated manifest"),
+    )
+    .expect("update manifest");
+    lsp.send(json!({
+        "jsonrpc":"2.0","method":"workspace/didChangeWatchedFiles",
+        "params":{"changes":[{"uri":format!("file://{}", schema_path.display()),"type":2}]}
+    }));
+    let refreshed_diagnostics = lsp.receive(|message| {
+        message["method"] == "textDocument/publishDiagnostics" && message["params"]["version"] == 3
+    });
+    assert!(
+        refreshed_diagnostics["params"]["diagnostics"]
+            .as_array()
+            .expect("refreshed diagnostics")
+            .is_empty(),
+        "{refreshed_diagnostics:#?}"
     );
 
     lsp.send(json!({"jsonrpc":"2.0","id":3,"method":"shutdown","params":null}));

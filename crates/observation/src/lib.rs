@@ -184,6 +184,13 @@ pub struct ObservationStore {
 }
 
 impl ObservationStore {
+    pub fn clear(&self) {
+        self.observations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+
     pub fn clear_for_file(&self, file: FileId) {
         let mut observations = self
             .observations
