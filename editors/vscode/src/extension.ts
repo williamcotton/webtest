@@ -83,8 +83,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         command: serverPath,
         args: ["lsp"],
     };
+    const projectConfigurationWatcher = vscode.workspace.createFileSystemWatcher(
+        "**/webtest.toml",
+    );
+    const projectJsonWatcher = vscode.workspace.createFileSystemWatcher("**/*.json");
+    context.subscriptions.push(projectConfigurationWatcher, projectJsonWatcher);
     const clientOptions: LanguageClientOptions = {
         documentSelector: [{ scheme: "file", language: "webtest" }],
+        initializationOptions: { projectFileEvents: true },
+        synchronize: {
+            fileEvents: [projectConfigurationWatcher, projectJsonWatcher],
+        },
     };
 
     client = new LanguageClient(

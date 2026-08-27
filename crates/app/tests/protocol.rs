@@ -503,6 +503,60 @@ fn lsp_resolves_app_provider_from_the_open_documents_nearest_project() {
         "{refreshed_diagnostics:#?}"
     );
 
+    let mut invalid_manifest = updated_manifest.clone();
+    let renamed = invalid_manifest
+        .functions
+        .remove("new_function")
+        .expect("new function");
+    invalid_manifest
+        .functions
+        .insert("renamed_function".into(), renamed);
+    std::fs::write(
+        &schema_path,
+        serde_json::to_vec_pretty(&invalid_manifest).expect("serialize invalid manifest"),
+    )
+    .expect("write invalid manifest");
+    lsp.send(json!({
+        "jsonrpc":"2.0","method":"workspace/didChangeWatchedFiles",
+        "params":{"changes":[{"uri":format!("file://{}", schema_path.display()),"type":2}]}
+    }));
+    let invalid_manifest_diagnostics = lsp.receive(|message| {
+        message["method"] == "textDocument/publishDiagnostics" && message["params"]["version"] == 3
+    });
+    assert!(
+        invalid_manifest_diagnostics["params"]["diagnostics"]
+            .as_array()
+            .expect("invalid manifest diagnostics")
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "semantic.reserved_provider"),
+        "{invalid_manifest_diagnostics:#?}"
+    );
+
+    invalid_manifest.schema_hash = String::new();
+    let renamed_manifest = invalid_manifest
+        .with_computed_hash()
+        .expect("compute renamed manifest hash");
+    std::fs::write(
+        &schema_path,
+        serde_json::to_vec_pretty(&renamed_manifest).expect("serialize renamed manifest"),
+    )
+    .expect("write renamed manifest");
+    lsp.send(json!({
+        "jsonrpc":"2.0","method":"workspace/didChangeWatchedFiles",
+        "params":{"changes":[{"uri":format!("file://{}", schema_path.display()),"type":2}]}
+    }));
+    let renamed_diagnostics = lsp.receive(|message| {
+        message["method"] == "textDocument/publishDiagnostics" && message["params"]["version"] == 3
+    });
+    assert!(
+        renamed_diagnostics["params"]["diagnostics"]
+            .as_array()
+            .expect("renamed diagnostics")
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "semantic.unknown_provider_operation"),
+        "{renamed_diagnostics:#?}"
+    );
+
     lsp.send(json!({"jsonrpc":"2.0","id":3,"method":"shutdown","params":null}));
     lsp.receive(|message| message["id"] == 3);
     lsp.send(json!({"jsonrpc":"2.0","method":"exit","params":null}));

@@ -44,7 +44,7 @@ Do not claim unimplemented roadmap features—such as modules, user-defined func
 - `crates/dap`: stdio DAP framing, launch/breakpoint state, source-to-step mapping, stack/scopes/variables, and pause/continue/step control. The app injects a `BrowserHost`; DAP does not own CDP semantics.
 - `crates/wasm`: stable portable DTO facade over shared diagnostics, formatting, plan compilation, description/search, completion, signature-help, and hover services, with offline application manifests and required host-capability metadata. Native filesystem, process, socket, provider execution, and Chrome capabilities do not belong here.
 - `crates/app`: the composition root and sole native executable: Clap commands including `init`, configuration precedence, reporters/exit classes, filesystem/terminal presentation, tracing setup, and composition of LSP, DAP, runtime, providers, managed Chrome, and `ChromeHost`. It owns bootstrap scaffold installation, including the canonical skill and agent-tool links.
-- `editors/vscode`: Cursor/VS Code manifest and TypeScript adapter. It locates/spawns `webtest lsp` and `webtest dap`; it contains no language intelligence.
+- `editors/vscode`: Cursor/VS Code manifest and TypeScript adapter. It locates/spawns `webtest lsp` and `webtest dap` and forwards project configuration/JSON file events; it contains no language intelligence.
 - `examples`: self-contained manual fixture projects and passing/failing `.webtest` programs. Automated tests should not depend on their fixed ports.
 - `protocol` and `sdks`: normative application-bridge schemas/state semantics, generated projections, black-box conformance, and thin host-language SDKs. They never parse the DSL or construct plans.
 
@@ -56,7 +56,7 @@ Internal ranges are UTF-8 byte offsets. Preserve the smallest useful `SyntaxOrig
 
 Every executable plan carries the source revision from which it was built. Every editor-visible runtime observation carries that revision plus file, test, step, and range identity. `EditorService` may publish an observation only when its revision equals the current document revision. Starting a new run clears prior observations for the file; a successful rerun must remove old runtime diagnostics.
 
-Provider schemas are explicit semantic inputs even when source text is unchanged. Replacing a project provider schema must invalidate cached diagnostics, types, completions, signatures, hovers, and plans and clear runtime observations built against the prior schema. The native LSP watches `webtest.toml` and JSON project inputs, filters events to each cached project's resolved configuration and application-manifest paths, reconfigures the existing editor service, and republishes open-document diagnostics without requiring a server or developer-window restart.
+Provider schemas are explicit semantic inputs even when source text is unchanged. Replacing a project provider schema must invalidate cached diagnostics, types, completions, signatures, hovers, and plans and clear runtime observations built against the prior schema. The native LSP watches `webtest.toml` and JSON project inputs, filters events to each cached project's resolved configuration and application-manifest paths, reconfigures the existing editor service, and republishes open-document diagnostics without requiring a server or developer-window restart. An invalid or half-written replacement must evict the stale project-provider schema and surface an error; never keep accepting operations from the last valid manifest.
 
 Keep these failure classes distinct:
 

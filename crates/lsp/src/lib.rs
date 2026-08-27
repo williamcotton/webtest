@@ -129,13 +129,20 @@ impl Backend {
 
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        let client_supplies_project_file_events = params
+            .initialization_options
+            .as_ref()
+            .and_then(|options| options.get("projectFileEvents"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         self.supports_dynamic_file_watching.store(
             params
                 .capabilities
                 .workspace
                 .and_then(|workspace| workspace.did_change_watched_files)
                 .and_then(|watched| watched.dynamic_registration)
-                .unwrap_or(false),
+                .unwrap_or(false)
+                && !client_supplies_project_file_events,
             Ordering::Relaxed,
         );
         Ok(InitializeResult {
@@ -294,6 +301,7 @@ impl LanguageServer for Backend {
             match (self.project_file_changed)(&path) {
                 Ok(changed) => reconfigured |= changed,
                 Err(error) => {
+                    reconfigured = true;
                     self.client
                         .log_message(
                             MessageType::ERROR,

@@ -400,6 +400,7 @@ struct LspProjectEditor {
     editor: Arc<webtest_editor::EditorService>,
     app_provider: Option<Arc<AppProvider>>,
     schema_path: Option<PathBuf>,
+    runner_options: RunnerOptions,
 }
 
 #[derive(Default)]
@@ -429,10 +430,12 @@ impl LspProjectEditors {
         let (providers, app_provider) = runtime_provider_registry(project, &options)?;
         let candidate = LspProjectEditor {
             editor: Arc::new(webtest_editor::EditorService::with_provider_registry(
-                options, providers,
+                options.clone(),
+                providers,
             )),
             app_provider,
             schema_path: configured_app_schema_path(project),
+            runner_options: options,
         };
         let mut projects = self.lock();
         let project = projects.entry(project.root.clone()).or_insert(candidate);
@@ -455,9 +458,19 @@ impl LspProjectEditors {
         }
 
         for root in roots {
-            let project = project(std::slice::from_ref(&root))?;
-            let options = runner_options(&project);
-            let (providers, app_provider) = runtime_provider_registry(&project, &options)?;
+            let refreshed = (|| {
+                let project = project(std::slice::from_ref(&root))?;
+                let options = runner_options(&project);
+                let (providers, app_provider) = runtime_provider_registry(&project, &options)?;
+                Ok::<_, AppError>((project, options, providers, app_provider))
+            })();
+            let (project, options, providers, app_provider) = match refreshed {
+                Ok(refreshed) => refreshed,
+                Err(error) => {
+                    self.invalidate_cached_project(&root);
+                    return Err(error);
+                }
+            };
             let previous_provider = {
                 let mut projects = self.lock();
                 let cached = projects.get_mut(&root).ok_or_else(|| {
@@ -466,19 +479,30 @@ impl LspProjectEditors {
                         root.display()
                     ))
                 })?;
-                cached.editor.reconfigure(options, providers);
+                cached.editor.reconfigure(options.clone(), providers);
                 cached.schema_path = configured_app_schema_path(&project);
+                cached.runner_options = options;
                 std::mem::replace(&mut cached.app_provider, app_provider)
             };
-            if let Some(previous_provider) = previous_provider {
-                tokio::spawn(async move {
-                    if let Err(error) = previous_provider.shutdown().await {
-                        tracing::warn!(%error, "could not shut down replaced LSP application provider");
-                    }
-                });
-            }
+            shutdown_replaced_provider(previous_provider);
         }
         Ok(true)
+    }
+
+    fn invalidate_cached_project(&self, root: &Path) {
+        let previous_provider = {
+            let mut projects = self.lock();
+            let Some(cached) = projects.get_mut(root) else {
+                return;
+            };
+            let providers =
+                ProviderRegistry::built_in(cached.runner_options.provider_config.clone());
+            cached
+                .editor
+                .reconfigure(cached.runner_options.clone(), providers);
+            cached.app_provider.take()
+        };
+        shutdown_replaced_provider(previous_provider);
     }
 
     async fn shutdown(&self) -> Result<(), AppError> {
@@ -526,6 +550,16 @@ fn canonical_event_path(path: &Path) -> PathBuf {
             .and_then(|parent| path.file_name().map(|name| parent.join(name)))
             .unwrap_or_else(|| path.to_path_buf())
     })
+}
+
+fn shutdown_replaced_provider(provider: Option<Arc<AppProvider>>) {
+    if let Some(provider) = provider {
+        tokio::spawn(async move {
+            if let Err(error) = provider.shutdown().await {
+                tracing::warn!(%error, "could not shut down replaced LSP application provider");
+            }
+        });
+    }
 }
 
 async fn inspect_page(
