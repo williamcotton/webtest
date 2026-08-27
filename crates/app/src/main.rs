@@ -427,7 +427,20 @@ impl LspProjectEditors {
         }
 
         let options = runner_options(project);
-        let (providers, app_provider) = runtime_provider_registry(project, &options)?;
+        let (providers, app_provider) = match runtime_provider_registry(project, &options) {
+            Ok(provider) => provider,
+            Err(error) => {
+                tracing::error!(
+                    project_root = %project.root.display(),
+                    %error,
+                    "could not load WebTest project provider; continuing with built-in providers"
+                );
+                (
+                    ProviderRegistry::built_in(options.provider_config.clone()),
+                    None,
+                )
+            }
+        };
         let candidate = LspProjectEditor {
             editor: Arc::new(webtest_editor::EditorService::with_provider_registry(
                 options.clone(),
@@ -1703,7 +1716,7 @@ fn app_manifest(project: &Project) -> Result<Option<AppManifest>, AppError> {
     let Some(app) = &project.config.server.app else {
         return Ok(None);
     };
-    AppManifest::read(&project.root.join(&app.schema))
+    AppManifest::read_normalized(&project.root.join(&app.schema))
         .map(Some)
         .map_err(AppError::usage)
 }

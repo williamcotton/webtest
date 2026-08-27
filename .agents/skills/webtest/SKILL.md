@@ -56,6 +56,8 @@ test "application bridge responds" {
 }
 ```
 
+The offline `.webtest/app-schema.json` is intentionally author-editable. Add, rename, and refine entries under `functions` directly; WebTest derives the canonical schema identity from those functions, so do not stop to recalculate `schema_hash` after each edit. The field remains in the Protocol 1 file shape for compatibility, and SDK-generated exports should keep it current, but a stale value does not block WebTest analysis or execution. The live bridge must return the same functions as the offline file; WebTest verifies their derived canonical identity rather than trusting the declared hash.
+
 ## Discover the application bridge
 
 Do not infer or invent the application bridge from this skill. From the initialized project, run these focused queries in order before editing the application:

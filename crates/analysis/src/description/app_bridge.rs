@@ -69,7 +69,7 @@ fn provider_overview() -> ConstructDescription {
             "app_live_schema_identity",
             "runtime",
             "live schema",
-            "A persistent bridge must describe the same canonical schema hash that was compiled into the plan.",
+            "A persistent bridge must describe functions whose derived canonical schema hash matches the offline schema compiled into the plan.",
         ),
     ];
     value.guidance = vec![
@@ -141,7 +141,7 @@ fn manifest_reference() -> ConstructDescription {
             "app_schema_hash",
             "configuration",
             "schema_hash",
-            "The hash is BLAKE3 over canonical JSON for functions; documentation and all semantic schema metadata participate.",
+            "The schema identity is BLAKE3 over canonical JSON for functions; documentation and all semantic schema metadata participate.",
         ),
     ];
     value.guidance = vec![
@@ -151,7 +151,7 @@ fn manifest_reference() -> ConstructDescription {
         ),
         guidance(
             "app_manifest_hash_generation",
-            "Generate or export the manifest with an SDK or schema-hash tool. WebTest validates the declared hash and reports the computed canonical hash on mismatch; `webtest check` does not rewrite the manifest.",
+            "The offline schema may be edited directly. WebTest derives its in-memory schema identity from `functions`, so a stale declared `schema_hash` does not block check, editor analysis, planning, or execution, and WebTest does not rewrite the file. SDK exporters should still write the canonical hash for portable Protocol 1 manifests.",
         ),
         guidance(
             "app_manifest_location",
@@ -211,7 +211,7 @@ fn protocol_reference() -> ConstructDescription {
             "protocol_schema_verification",
             "handshake",
             "schema.schema_hash",
-            "After hello_ok, the runner sends describe and rejects a live schema hash that differs from the offline plan.",
+            "After hello_ok, the runner sends describe, derives the canonical hash from the returned functions, and rejects functions whose identity differs from the offline plan. The declared hash is not trusted and may be stale while a manifest is being edited.",
         ),
     ];
     value.guidance = vec![

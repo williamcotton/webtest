@@ -45,9 +45,12 @@ new 256-bit `WEBTEST_TOKEN` for each owned run and a timing-resistant comparison
 the highest common version. Failure sends `hello_error` with `authentication_failed`,
 `unsupported_protocol`, or `expected_hello`, then closes. Tokens never enter diagnostics or logs.
 
-After `hello_ok`, the runner sends `describe` and verifies that the canonical live schema hash equals
-the offline planned hash before dispatching a call. A mismatch is `app_schema_drift`; dynamic fallback
-is forbidden.
+After `hello_ok`, the runner sends `describe`, derives the canonical live schema hash from the returned
+`functions`, and verifies that it equals the offline planned hash before dispatching a call. A mismatch
+is `app_schema_drift`; dynamic fallback is forbidden. The `schema_hash` field remains required for
+Protocol 1 compatibility and producers should keep it canonical, but the runner does not trust it:
+an author-edited manifest may temporarily carry a stale declaration while its functions are already
+the source of truth.
 
 In `Ready`, request IDs are unsigned integers unique among in-flight requests. Results may arrive out
 of order. Duplicate IDs, unknown IDs, multiple terminal responses, or a terminal response of the

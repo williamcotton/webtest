@@ -1094,17 +1094,16 @@ impl BridgeClient {
         }
         let computed = canonical_schema_hash(&functions).map_err(schema_validation_error)?;
         if computed != schema_hash {
-            return Err(ProviderError::BridgeProtocol {
-                code: "invalid_live_schema_hash".into(),
-                message: format!(
-                    "bridge declared {schema_hash}, canonical live schema is {computed}"
-                ),
-            });
+            tracing::debug!(
+                declared = %schema_hash,
+                canonical = %computed,
+                "using canonical live application schema hash"
+            );
         }
-        if schema_hash != manifest.schema_hash {
+        if computed != manifest.schema_hash {
             return Err(ProviderError::BridgeSchemaDrift {
                 expected: manifest.schema_hash.clone(),
-                live: schema_hash,
+                live: computed,
             });
         }
 
@@ -2530,6 +2529,31 @@ mod tests {
                 live: live.schema_hash,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn stale_declared_live_hash_uses_the_canonical_functions_hash() {
+        let expected = manifest();
+        let mut live = expected.clone();
+        live.schema_hash = format!("blake3:{}", "0".repeat(64));
+        let token = "secret".to_owned();
+        let (runner, bridge) = tokio::io::duplex(16_384);
+        let peer = tokio::spawn(fixture_bridge(bridge, token.clone(), live));
+
+        let client = BridgeClient::handshake(
+            Box::new(runner),
+            token,
+            "run".into(),
+            &expected,
+            &AppProviderConfig::default(),
+        )
+        .await
+        .expect("canonical live functions match the offline manifest");
+        client
+            .shutdown(Duration::from_secs(1))
+            .await
+            .expect("shutdown");
+        peer.await.expect("bridge task");
     }
 
     #[test]

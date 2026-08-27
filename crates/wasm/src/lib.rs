@@ -190,7 +190,8 @@ pub fn describe_with_manifest(
 }
 
 fn database_with_manifest(manifest_json: &str) -> Result<AnalysisDatabase, String> {
-    let manifest = AppManifest::from_json(manifest_json).map_err(|error| error.to_string())?;
+    let manifest =
+        AppManifest::from_json_normalized(manifest_json).map_err(|error| error.to_string())?;
     let mut providers = ProviderRegistry::built_in_schemas();
     providers.register_schema(manifest.provider_schema());
     Ok(AnalysisDatabase::with_provider_registry(providers))

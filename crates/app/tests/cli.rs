@@ -254,6 +254,57 @@ fn init_creates_a_checkable_idempotent_application_bridge_scaffold() {
 }
 
 #[test]
+fn check_and_describe_accept_a_directly_edited_manifest_with_a_stale_hash() {
+    let directory = tempfile::tempdir().expect("temp directory");
+    let project = directory.path().join("demo");
+    let initialized = webtest(directory.path())
+        .args(["init", "demo"])
+        .output()
+        .expect("initialize project");
+    assert!(initialized.status.success());
+
+    let schema_path = project.join(".webtest/app-schema.json");
+    let mut manifest =
+        webtest_app_bridge::AppManifest::read(&schema_path).expect("generated manifest is strict");
+    let echo = manifest.functions.remove("echo").expect("echo function");
+    manifest.functions.insert("renamed_echo".into(), echo);
+    fs::write(
+        &schema_path,
+        serde_json::to_vec_pretty(&manifest).expect("edited manifest JSON"),
+    )
+    .expect("write directly edited manifest");
+    assert!(webtest_app_bridge::AppManifest::read(&schema_path).is_err());
+    write(
+        &project.join("tests/example.webtest"),
+        "test \"application bridge responds\" { server { let echoed = app.renamed_echo(message: \"hello\") expect echoed == \"hello\" } }\n",
+    );
+
+    let check = webtest(&project)
+        .args(["check", "--reporter", "json"])
+        .output()
+        .expect("check edited manifest");
+    assert!(
+        check.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+
+    let described = webtest(&project)
+        .args(["describe", "app.renamed_echo", "--reporter", "json"])
+        .output()
+        .expect("describe directly edited operation");
+    assert!(
+        described.status.success(),
+        "{}",
+        String::from_utf8_lossy(&described.stderr)
+    );
+    let described: serde_json::Value =
+        serde_json::from_slice(&described.stdout).expect("description JSON");
+    assert_eq!(described["id"], "provider.app.renamed_echo");
+}
+
+#[test]
 fn init_refuses_conflicts_without_creating_partial_scaffolding() {
     let directory = tempfile::tempdir().expect("temp directory");
     let configuration = directory.path().join("webtest.toml");

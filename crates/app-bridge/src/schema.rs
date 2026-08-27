@@ -109,10 +109,7 @@ pub enum AppSchemaError {
 
 impl AppManifest {
     pub fn read(path: &Path) -> Result<Self, AppSchemaError> {
-        let source = std::fs::read_to_string(path).map_err(|source| AppSchemaError::Read {
-            path: path.display().to_string(),
-            source,
-        })?;
+        let source = read_manifest_source(path)?;
         Self::from_json(&source)
     }
 
@@ -122,7 +119,37 @@ impl AppManifest {
         Ok(manifest)
     }
 
+    /// Reads an author-edited offline manifest and derives its schema identity
+    /// from the canonical `functions` value.
+    ///
+    /// Protocol messages and generated manifests still use [`Self::read`] and
+    /// [`Self::validate`] when the declared hash itself is part of the contract.
+    /// Authoring tools use this path so changing a function does not require a
+    /// second, manual hash edit before analysis can observe the new schema.
+    pub fn read_normalized(path: &Path) -> Result<Self, AppSchemaError> {
+        let source = read_manifest_source(path)?;
+        Self::from_json_normalized(&source)
+    }
+
+    pub fn from_json_normalized(source: &str) -> Result<Self, AppSchemaError> {
+        let manifest: Self = serde_json::from_str(source)?;
+        manifest.validate_structure()?;
+        manifest.with_computed_hash()
+    }
+
     pub fn validate(&self) -> Result<(), AppSchemaError> {
+        self.validate_structure()?;
+        let computed = self.computed_hash()?;
+        if self.schema_hash != computed {
+            return Err(AppSchemaError::HashMismatch {
+                declared: self.schema_hash.clone(),
+                computed,
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_structure(&self) -> Result<(), AppSchemaError> {
         if self.manifest_version != MANIFEST_VERSION {
             return Err(AppSchemaError::Invalid(format!(
                 "manifest_version must be {MANIFEST_VERSION}, got {}",
@@ -190,13 +217,6 @@ impl AppManifest {
                 .returns
                 .reject_defaults(&format!("$.functions.{name}.returns"))?;
         }
-        let computed = self.computed_hash()?;
-        if self.schema_hash != computed {
-            return Err(AppSchemaError::HashMismatch {
-                declared: self.schema_hash.clone(),
-                computed,
-            });
-        }
         Ok(())
     }
 
@@ -256,6 +276,13 @@ impl AppManifest {
         self.schema_hash = self.computed_hash()?;
         Ok(self)
     }
+}
+
+fn read_manifest_source(path: &Path) -> Result<String, AppSchemaError> {
+    std::fs::read_to_string(path).map_err(|source| AppSchemaError::Read {
+        path: path.display().to_string(),
+        source,
+    })
 }
 
 impl TypeSchema {
@@ -706,6 +733,39 @@ mod tests {
             manifest.schema_hash
         );
         manifest.validate().expect("valid manifest");
+    }
+
+    #[test]
+    fn normalized_manifest_replaces_a_stale_declared_hash() {
+        let mut edited = manifest();
+        let old_hash = edited.schema_hash.clone();
+        edited.functions.insert(
+            "new_function".into(),
+            FunctionSchema {
+                documentation: "Newly edited function.".into(),
+                retry_safe: true,
+                params: TypeSchema::Object {
+                    fields: BTreeMap::new(),
+                },
+                returns: TypeSchema::String,
+            },
+        );
+        let source = serde_json::to_string(&edited).expect("manifest JSON");
+
+        let normalized = AppManifest::from_json_normalized(&source).expect("normalized manifest");
+
+        assert_ne!(normalized.schema_hash, old_hash);
+        assert_eq!(
+            normalized.schema_hash,
+            normalized.computed_hash().expect("canonical hash")
+        );
+        normalized
+            .validate()
+            .expect("normalized manifest is strict");
+        assert!(matches!(
+            AppManifest::from_json(&source),
+            Err(AppSchemaError::HashMismatch { .. })
+        ));
     }
 
     #[test]

@@ -503,42 +503,82 @@ fn lsp_resolves_app_provider_from_the_open_documents_nearest_project() {
         "{refreshed_diagnostics:#?}"
     );
 
-    let mut invalid_manifest = updated_manifest.clone();
-    let renamed = invalid_manifest
+    let mut directly_edited_manifest = updated_manifest.clone();
+    let renamed = directly_edited_manifest
         .functions
         .remove("new_function")
         .expect("new function");
-    invalid_manifest
+    directly_edited_manifest
         .functions
         .insert("renamed_function".into(), renamed);
     std::fs::write(
         &schema_path,
-        serde_json::to_vec_pretty(&invalid_manifest).expect("serialize invalid manifest"),
+        serde_json::to_vec_pretty(&directly_edited_manifest)
+            .expect("serialize directly edited manifest"),
     )
-    .expect("write invalid manifest");
+    .expect("write directly edited manifest");
     lsp.send(json!({
         "jsonrpc":"2.0","method":"workspace/didChangeWatchedFiles",
         "params":{"changes":[{"uri":format!("file://{}", schema_path.display()),"type":2}]}
     }));
-    let invalid_manifest_diagnostics = lsp.receive(|message| {
+    let direct_edit_diagnostics = lsp.receive(|message| {
         message["method"] == "textDocument/publishDiagnostics" && message["params"]["version"] == 3
     });
     assert!(
-        invalid_manifest_diagnostics["params"]["diagnostics"]
+        direct_edit_diagnostics["params"]["diagnostics"]
             .as_array()
-            .expect("invalid manifest diagnostics")
+            .expect("direct edit diagnostics")
             .iter()
-            .any(|diagnostic| diagnostic["code"] == "semantic.reserved_provider"),
-        "{invalid_manifest_diagnostics:#?}"
+            .any(|diagnostic| diagnostic["code"] == "semantic.unknown_provider_operation"),
+        "{direct_edit_diagnostics:#?}"
     );
 
-    invalid_manifest.schema_hash = String::new();
-    let renamed_manifest = invalid_manifest
-        .with_computed_hash()
-        .expect("compute renamed manifest hash");
+    let mut restarted_lsp = ProtocolProcess::spawn(&["lsp"], &project);
+    restarted_lsp.send(json!({
+        "jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}
+    }));
+    restarted_lsp.receive(|message| message["id"] == 1);
+    restarted_lsp.send(json!({"jsonrpc":"2.0","method":"initialized","params":{}}));
+    restarted_lsp.send(json!({
+        "jsonrpc":"2.0","method":"textDocument/didOpen",
+        "params":{"textDocument":{"uri":uri,"languageId":"webtest","version":3,"text":new_source}}
+    }));
+    let restarted_diagnostics = restarted_lsp.receive(|message| {
+        message["method"] == "textDocument/publishDiagnostics" && message["params"]["version"] == 3
+    });
+    assert!(
+        restarted_diagnostics["params"]["diagnostics"]
+            .as_array()
+            .expect("restarted diagnostics")
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "semantic.unknown_provider_operation"),
+        "{restarted_diagnostics:#?}"
+    );
+    restarted_lsp.send(json!({"jsonrpc":"2.0","id":2,"method":"shutdown","params":null}));
+    restarted_lsp.receive(|message| message["id"] == 2);
+    restarted_lsp.send(json!({"jsonrpc":"2.0","method":"exit","params":null}));
+    restarted_lsp.wait_for_exit();
+
+    std::fs::write(&schema_path, "{").expect("write half-edited manifest");
+    lsp.send(json!({
+        "jsonrpc":"2.0","method":"workspace/didChangeWatchedFiles",
+        "params":{"changes":[{"uri":format!("file://{}", schema_path.display()),"type":2}]}
+    }));
+    let half_edited_diagnostics = lsp.receive(|message| {
+        message["method"] == "textDocument/publishDiagnostics" && message["params"]["version"] == 3
+    });
+    assert!(
+        half_edited_diagnostics["params"]["diagnostics"]
+            .as_array()
+            .expect("half-edited diagnostics")
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "semantic.reserved_provider"),
+        "{half_edited_diagnostics:#?}"
+    );
+
     std::fs::write(
         &schema_path,
-        serde_json::to_vec_pretty(&renamed_manifest).expect("serialize renamed manifest"),
+        serde_json::to_vec_pretty(&directly_edited_manifest).expect("serialize renamed manifest"),
     )
     .expect("write renamed manifest");
     lsp.send(json!({
@@ -559,6 +599,56 @@ fn lsp_resolves_app_provider_from_the_open_documents_nearest_project() {
 
     lsp.send(json!({"jsonrpc":"2.0","id":3,"method":"shutdown","params":null}));
     lsp.receive(|message| message["id"] == 3);
+    lsp.send(json!({"jsonrpc":"2.0","method":"exit","params":null}));
+    lsp.wait_for_exit();
+}
+
+#[test]
+fn lsp_starts_with_a_half_edited_application_manifest() {
+    let project = tempfile::tempdir().expect("temp project");
+    let schema_directory = project.path().join(".webtest");
+    std::fs::create_dir_all(&schema_directory).expect("create schema directory");
+    std::fs::write(schema_directory.join("app-schema.json"), "{")
+        .expect("write half-edited manifest");
+    std::fs::write(
+        project.path().join("webtest.toml"),
+        "[project]\ntest_roots = [\"case.webtest\"]\n\n[server.app]\nschema = \".webtest/app-schema.json\"\n",
+    )
+    .expect("write project configuration");
+    let source = "test \"app\" { server { let value = app.echo(message: \"hello\") } }";
+    let path = project.path().join("case.webtest");
+    std::fs::write(&path, source).expect("write source");
+    let uri = format!("file://{}", path.display());
+    let mut lsp = ProtocolProcess::spawn(&["lsp"], project.path());
+
+    lsp.send(json!({
+        "jsonrpc":"2.0","id":1,"method":"initialize","params":{
+            "capabilities":{},"initializationOptions":{"projectFileEvents":true}
+        }
+    }));
+    assert_eq!(
+        lsp.receive(|message| message["id"] == 1)["result"]["serverInfo"]["name"],
+        "webtest"
+    );
+    lsp.send(json!({"jsonrpc":"2.0","method":"initialized","params":{}}));
+    lsp.send(json!({
+        "jsonrpc":"2.0","method":"textDocument/didOpen",
+        "params":{"textDocument":{"uri":uri,"languageId":"webtest","version":1,"text":source}}
+    }));
+    let diagnostics = lsp.receive(|message| {
+        message["method"] == "textDocument/publishDiagnostics" && message["params"]["version"] == 1
+    });
+    assert!(
+        diagnostics["params"]["diagnostics"]
+            .as_array()
+            .expect("diagnostics")
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "semantic.reserved_provider"),
+        "{diagnostics:#?}"
+    );
+
+    lsp.send(json!({"jsonrpc":"2.0","id":2,"method":"shutdown","params":null}));
+    lsp.receive(|message| message["id"] == 2);
     lsp.send(json!({"jsonrpc":"2.0","method":"exit","params":null}));
     lsp.wait_for_exit();
 }
