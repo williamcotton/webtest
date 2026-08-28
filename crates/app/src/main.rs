@@ -17,7 +17,7 @@ use report::{
 };
 use webtest_analysis::{
     AnalysisDatabase, DescriptionLimits, DescriptionProject, DescriptionRequest,
-    DescriptionResponse, Diagnostic, DiagnosticSeverity,
+    DescriptionResponse, Diagnostic, DiagnosticSeverity, ResolvedRuntimeConfiguration,
 };
 use webtest_app_bridge::{
     AppAdapter, AppHttpConfig, AppManifest, AppProcessConfig, AppProvider, AppProviderConfig,
@@ -36,7 +36,7 @@ use webtest_plan::{
 use webtest_project::{DiscoveredFile, Project};
 use webtest_provider::{
     Capability, FsProviderConfig, HttpProviderConfig, NativeProviderConfig, ProcessProviderConfig,
-    ProviderRegistry,
+    ProviderError, ProviderRegistry,
 };
 use webtest_runtime::{EvidenceOptions, RunError, Runner, RunnerOptions, StepError, StepFailure};
 use webtest_text::{SourceRevision, TextRange};
@@ -726,6 +726,7 @@ fn describe_reference(
                 Some(DescriptionProject {
                     root: normalized_path(&project.root),
                     configuration_revision: revision_hex(SourceRevision::of(&configuration)),
+                    resolved_runtime_configuration: Some(resolved_runtime_configuration(project)),
                 }),
                 DescriptionLimits {
                     max_category_children: project.config.description.max_category_children,
@@ -768,6 +769,95 @@ fn describe_reference(
     } else {
         ExitClass::Success
     })
+}
+
+fn resolved_runtime_configuration(project: &Project) -> ResolvedRuntimeConfiguration {
+    let provider = project.config.server.app.as_ref();
+    let application = project.config.app.as_ref();
+    let adapter = provider.map(|app| match app.adapter {
+        webtest_project::ServerAppAdapter::Bridge => "bridge",
+        webtest_project::ServerAppAdapter::Command => "command",
+        webtest_project::ServerAppAdapter::Http => "http",
+    });
+    let transport = provider
+        .filter(|app| app.adapter == webtest_project::ServerAppAdapter::Bridge)
+        .map(|app| match app.transport {
+            webtest_project::ServerAppTransport::Auto => "auto",
+            webtest_project::ServerAppTransport::Unix => "unix",
+            webtest_project::ServerAppTransport::NamedPipe => "named_pipe",
+            webtest_project::ServerAppTransport::Tcp => "tcp",
+            webtest_project::ServerAppTransport::Stdio => "stdio",
+        });
+    let uses_provider_command = provider.is_some_and(|app| {
+        app.adapter == webtest_project::ServerAppAdapter::Command
+            || (app.adapter == webtest_project::ServerAppAdapter::Bridge
+                && app.transport == webtest_project::ServerAppTransport::Stdio)
+    });
+    let (command, arguments, working_directory) = if uses_provider_command {
+        let command = provider.and_then(|app| app.command.first()).cloned();
+        let arguments = provider
+            .map(|app| {
+                redact_secret_arguments(&app.command[usize::from(!app.command.is_empty())..])
+            })
+            .unwrap_or_default();
+        (command, arguments, Some(normalized_path(&project.root)))
+    } else {
+        let command = application.and_then(|app| app.command.clone());
+        let arguments = application
+            .map(|app| redact_secret_arguments(&app.args))
+            .unwrap_or_default();
+        let working_directory =
+            application.map(|app| normalized_path(&project.root.join(&app.working_directory)));
+        (command, arguments, working_directory)
+    };
+    ResolvedRuntimeConfiguration {
+        selected_adapter: adapter.map(str::to_owned),
+        selected_transport: transport.map(str::to_owned),
+        resolved_command: command,
+        resolved_arguments: arguments,
+        working_directory,
+        schema_path: provider.map(|app| normalized_path(&project.root.join(&app.schema))),
+        browser_base_url: project.config.browser.base_url.clone(),
+        server_base_url: project.config.server.base_url.clone(),
+    }
+}
+
+fn redact_secret_arguments(arguments: &[String]) -> Vec<String> {
+    let mut redact_next = false;
+    arguments
+        .iter()
+        .map(|argument| {
+            if redact_next {
+                redact_next = false;
+                return "<redacted>".into();
+            }
+            if let Some((key, _)) = argument.split_once('=')
+                && secret_argument_name(key)
+            {
+                return format!("{key}=<redacted>");
+            }
+            if argument.starts_with('-') && secret_argument_name(argument) {
+                redact_next = true;
+            }
+            argument.clone()
+        })
+        .collect()
+}
+
+fn secret_argument_name(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    [
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "api-key",
+        "apikey",
+        "credential",
+        "authorization",
+    ]
+    .iter()
+    .any(|marker| value.contains(marker))
 }
 
 fn write_description_human(
@@ -905,6 +995,42 @@ fn write_description_human(
                     writeln!(output, "  configuration: {prerequisite}")
                         .map_err(AppError::infrastructure)?;
                 }
+            }
+            if let Some(configuration) = &construct.resolved_configuration {
+                writeln!(output, "\nresolved configuration:").map_err(AppError::infrastructure)?;
+                for (name, value) in [
+                    (
+                        "selected adapter",
+                        configuration.selected_adapter.as_deref(),
+                    ),
+                    (
+                        "selected transport",
+                        configuration.selected_transport.as_deref(),
+                    ),
+                    (
+                        "resolved command",
+                        configuration.resolved_command.as_deref(),
+                    ),
+                    (
+                        "working directory",
+                        configuration.working_directory.as_deref(),
+                    ),
+                    ("schema path", configuration.schema_path.as_deref()),
+                    (
+                        "browser base URL",
+                        configuration.browser_base_url.as_deref(),
+                    ),
+                    ("server base URL", configuration.server_base_url.as_deref()),
+                ] {
+                    writeln!(output, "  {name}: {}", value.unwrap_or("<not configured>"))
+                        .map_err(AppError::infrastructure)?;
+                }
+                writeln!(
+                    output,
+                    "  resolved arguments: [{}]",
+                    configuration.resolved_arguments.join(", ")
+                )
+                .map_err(AppError::infrastructure)?;
             }
             for example in &construct.examples {
                 writeln!(
@@ -2150,9 +2276,7 @@ fn step_semantic_details(failure: &StepFailure) -> Option<serde_json::Value> {
                 "nearby_candidates": failure.evidence.candidates,
             }))
         }
-        StepError::Provider(error) => Some(serde_json::json!({
-            "provider_error_code": error.code(),
-        })),
+        StepError::Provider(error) => Some(provider_error_semantic_details(error)),
         StepError::Assertion(error) => Some(serde_json::json!({
             "matcher": format!("{:?}", error.matcher).to_ascii_lowercase(),
             "expected": error.expected,
@@ -2169,6 +2293,42 @@ fn step_semantic_details(failure: &StepFailure) -> Option<serde_json::Value> {
         })),
         StepError::Internal(_) => None,
     }
+}
+
+fn provider_error_semantic_details(error: &ProviderError) -> serde_json::Value {
+    let mut details = serde_json::json!({
+        "provider_error_code": error.code(),
+    });
+    let Some(object) = details.as_object_mut() else {
+        return details;
+    };
+    match error {
+        ProviderError::BridgeHandshake { code, .. }
+        | ProviderError::BridgeProtocol { code, .. } => {
+            object.insert("bridge_code".into(), code.clone().into());
+        }
+        ProviderError::BridgeSchemaDrift { expected, live } => {
+            object.insert("expected_schema_identity".into(), expected.clone().into());
+            object.insert("live_schema_identity".into(), live.clone().into());
+        }
+        _ => {}
+    }
+    if matches!(
+        error,
+        ProviderError::BridgeHandshake { .. }
+            | ProviderError::BridgeProtocol { .. }
+            | ProviderError::BridgeTransport { .. }
+            | ProviderError::BridgeProcess { .. }
+            | ProviderError::BridgeSchemaDrift { .. }
+            | ProviderError::BridgeValidation { .. }
+            | ProviderError::BridgeTimeout { .. }
+    ) {
+        object.insert(
+            "reference_queries".into(),
+            serde_json::json!(["app.diagnostics", "runtime.configuration"]),
+        );
+    }
+    details
 }
 
 fn browser_error_locator(error: &BrowserError) -> Option<&Locator> {
@@ -2489,5 +2649,31 @@ mod tests {
             headless.command,
             Command::Dap { headless: true, .. }
         ));
+    }
+
+    #[test]
+    fn resolved_configuration_redacts_secret_like_arguments() {
+        assert_eq!(
+            redact_secret_arguments(&[
+                "serve".into(),
+                "--token".into(),
+                "secret-value".into(),
+                "--api-key=also-secret".into(),
+            ]),
+            ["serve", "--token", "<redacted>", "--api-key=<redacted>"]
+        );
+    }
+
+    #[test]
+    fn bridge_failures_point_to_targeted_diagnostics() {
+        let details = provider_error_semantic_details(&ProviderError::BridgeProtocol {
+            code: "unknown_response_id".into(),
+            message: "duplicate response".into(),
+        });
+        assert_eq!(details["bridge_code"], "unknown_response_id");
+        assert_eq!(
+            details["reference_queries"],
+            serde_json::json!(["app.diagnostics", "runtime.configuration"])
+        );
     }
 }

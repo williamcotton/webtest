@@ -38,9 +38,13 @@ fn describe_bootstraps_exact_alias_category_and_search_without_source_files() {
         index["categories"]["app_bridge"],
         serde_json::json!([
             "provider.app",
+            "app.configuration",
+            "app.bridge",
+            "app.bridge.example",
             "app.schema",
             "app.protocol",
-            "app.pseudocode"
+            "app.diagnostics",
+            "runtime.configuration"
         ])
     );
     assert!(index["categories"].get("cli_commands").is_none());
@@ -130,7 +134,7 @@ fn describe_bootstraps_exact_alias_category_and_search_without_source_files() {
 
     write(
         &directory.path().join("webtest.toml"),
-        "[server.app]\nschema = \"app-schema.json\"\n",
+        "[app]\ncommand = \"node\"\nargs = [\"server.js\", \"--token\", \"do-not-report\"]\nworking_directory = \".\"\n\n[server.app]\nadapter = \"bridge\"\ntransport = \"tcp\"\nschema = \"app-schema.json\"\n\n[browser]\nbase_url = \"http://127.0.0.1:3000\"\n\n[server]\nbase_url = \"http://127.0.0.1:3001\"\n",
     );
     write(
         &directory.path().join("app-schema.json"),
@@ -156,6 +160,25 @@ fn describe_bootstraps_exact_alias_category_and_search_without_source_files() {
             .iter()
             .any(|guidance| guidance["code"] == "project_examples_not_declared")
     );
+
+    let runtime_configuration = webtest(directory.path())
+        .args(["describe", "runtime.configuration", "--reporter", "json"])
+        .output()
+        .expect("resolved runtime configuration");
+    assert!(runtime_configuration.status.success());
+    let runtime_configuration: serde_json::Value =
+        serde_json::from_slice(&runtime_configuration.stdout).expect("runtime configuration JSON");
+    let resolved = &runtime_configuration["resolved_configuration"];
+    assert_eq!(resolved["selected_adapter"], "bridge");
+    assert_eq!(resolved["selected_transport"], "tcp");
+    assert_eq!(resolved["resolved_command"], "node");
+    assert_eq!(
+        resolved["resolved_arguments"],
+        serde_json::json!(["server.js", "--token", "<redacted>"])
+    );
+    assert_eq!(resolved["browser_base_url"], "http://127.0.0.1:3000");
+    assert_eq!(resolved["server_base_url"], "http://127.0.0.1:3001");
+    assert!(!runtime_configuration.to_string().contains("do-not-report"));
 }
 
 #[test]
@@ -189,8 +212,12 @@ fn init_creates_a_checkable_idempotent_application_bridge_scaffold() {
     assert!(skill.contains("test \"application bridge responds\""));
     assert!(skill.contains("[server.app]"));
     assert!(skill.contains("webtest describe app.schema"));
+    assert!(skill.contains("webtest describe app.configuration"));
+    assert!(skill.contains("webtest describe runtime.configuration"));
+    assert!(skill.contains("webtest describe app.bridge"));
     assert!(skill.contains("webtest describe app.protocol"));
-    assert!(skill.contains("webtest describe app.pseudocode"));
+    assert!(skill.contains("webtest describe app.bridge.example"));
+    assert!(skill.contains("webtest describe app.diagnostics"));
     assert!(skill.contains("webtest describe app.echo"));
     assert!(!skill.contains("target/debug/webtest"));
     assert!(!skill.contains("cargo run"));

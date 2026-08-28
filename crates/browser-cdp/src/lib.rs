@@ -2304,19 +2304,22 @@ mod tests {
             return;
         };
         let address = listener.local_addr().expect("fixture address");
-        tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept fixture request");
-            let mut request = [0u8; 2048];
-            let _ = stream.read(&mut request).await;
-            let body = "<!doctype html><html><body><button id=\"submit\" onclick=\"const result=document.createElement('div');result.textContent='submitted';document.body.append(result)\">Submit</button><div style=\"display:none\">hidden</div></body></html>";
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream
-                .write_all(response.as_bytes())
-                .await
-                .expect("serve fixture");
+        let fixture = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut request = [0u8; 2048];
+                    let _ = stream.read(&mut request).await;
+                    let body = "<!doctype html><html><body><button id=\"submit\" onclick=\"const result=document.createElement('div');result.textContent='submitted';document.body.append(result)\">Submit</button><div style=\"display:none\">hidden</div></body></html>";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream
+                        .write_all(response.as_bytes())
+                        .await
+                        .expect("serve fixture");
+                });
+            }
         });
         let mut browser = host.start().await.expect("start Chrome");
         let mut page = browser.new_page().await.expect("create page");
@@ -2338,6 +2341,7 @@ mod tests {
         assert!(matches!(missing, Err(BrowserError::LocatorNotFound { .. })));
         drop(page);
         browser.close().await.expect("close and reap Chrome");
+        fixture.abort();
     }
 
     #[tokio::test]

@@ -6,8 +6,8 @@ pub use description::{
     Availability, CategoryDescription, ConstraintDescription, ConstructDescription,
     DescriptionDiagnostic, DescriptionIndex, DescriptionLimits, DescriptionProject,
     DescriptionRequest, DescriptionResponse, GuidanceDescription, LanguageDescription,
-    ParameterDescription, Provenance, SearchDescription, SearchResult, SourceExample,
-    SyntaxElement, SyntaxForm, describe,
+    ParameterDescription, Provenance, ResolvedRuntimeConfiguration, SearchDescription,
+    SearchResult, SourceExample, SyntaxElement, SyntaxForm, describe,
 };
 
 use std::{

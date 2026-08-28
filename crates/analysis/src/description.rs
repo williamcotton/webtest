@@ -28,6 +28,20 @@ pub enum DescriptionRequest {
 pub struct DescriptionProject {
     pub root: String,
     pub configuration_revision: String,
+    #[serde(skip)]
+    pub resolved_runtime_configuration: Option<ResolvedRuntimeConfiguration>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedRuntimeConfiguration {
+    pub selected_adapter: Option<String>,
+    pub selected_transport: Option<String>,
+    pub resolved_command: Option<String>,
+    pub resolved_arguments: Vec<String>,
+    pub working_directory: Option<String>,
+    pub schema_path: Option<String>,
+    pub browser_base_url: Option<String>,
+    pub server_base_url: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -166,6 +180,8 @@ pub struct ConstructDescription {
     pub related: Vec<String>,
     pub availability: Availability,
     pub provenance: Provenance,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_configuration: Option<ResolvedRuntimeConfiguration>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub truncation: Vec<Truncation>,
 }
@@ -315,6 +331,13 @@ pub fn describe(
 ) -> DescriptionResponse {
     let limits = limits.bounded();
     let mut registry = core_constructs();
+    if let Some(resolved) = project
+        .as_ref()
+        .and_then(|project| project.resolved_runtime_configuration.clone())
+        && let Some(configuration) = registry.get_mut("runtime.configuration")
+    {
+        configuration.resolved_configuration = Some(resolved);
+    }
     add_provider_constructs(&mut registry, providers);
     match request {
         DescriptionRequest::Index => {
@@ -416,9 +439,13 @@ const CATEGORY_SPECS: &[CategorySpec] = &[
         prefixes: &["provider.app"],
         exact_children: &[
             "provider.app",
+            "app.configuration",
+            "app.bridge",
+            "app.bridge.example",
             "app.schema",
             "app.protocol",
-            "app.pseudocode",
+            "app.diagnostics",
+            "runtime.configuration",
         ],
         summary: "Application Bridge provider, manifest, and Protocol 1 reference topics.",
     },
@@ -436,12 +463,17 @@ fn canonical_construct_query<'a>(
 ) -> Cow<'a, str> {
     let canonical = match query {
         "app" => Some("provider.app"),
+        "app.configuration" | "app_config" | "app-config" => Some("app.configuration"),
+        "app.bridge" | "bridge.lifecycle" => Some("app.bridge"),
+        "app.bridge.example" | "bridge.example" => Some("app.bridge.example"),
         "app.schema" | "app_schema" | "app-schema" | "app-schema.json" | "app.manifest" => {
             Some("app.schema")
         }
         "app.protocol" => Some("app.protocol"),
         "app.pseudocode" | "app_pseudocode" | "app.implementation" | "app_implementation"
-        | "bridge.pseudocode" => Some("app.pseudocode"),
+        | "bridge.pseudocode" => Some("app.bridge.example"),
+        "app.diagnostics" | "bridge.diagnostics" => Some("app.diagnostics"),
+        "runtime.configuration" | "resolved.configuration" => Some("runtime.configuration"),
         _ => None,
     };
     if let Some(canonical) = canonical {
@@ -630,9 +662,13 @@ fn index(
         "app_bridge".into(),
         vec![
             "provider.app".into(),
+            "app.configuration".into(),
+            "app.bridge".into(),
+            "app.bridge.example".into(),
             "app.schema".into(),
             "app.protocol".into(),
-            "app.pseudocode".into(),
+            "app.diagnostics".into(),
+            "runtime.configuration".into(),
         ],
     );
     let mut truncation = Vec::new();
@@ -902,9 +938,13 @@ mod tests {
             index.categories["app_bridge"],
             [
                 "provider.app",
+                "app.configuration",
+                "app.bridge",
+                "app.bridge.example",
                 "app.schema",
                 "app.protocol",
-                "app.pseudocode"
+                "app.diagnostics",
+                "runtime.configuration"
             ]
         );
         assert!(!index.categories.contains_key("cli_commands"));
@@ -952,6 +992,12 @@ mod tests {
             panic!("app schema alias")
         };
         assert_eq!(schema.id, "app.schema");
+        let DescriptionResponse::Construct(bridge_example) =
+            response(DescriptionRequest::Query("app.pseudocode".into()))
+        else {
+            panic!("legacy bridge example alias")
+        };
+        assert_eq!(bridge_example.id, "app.bridge.example");
 
         for children in index.categories.values() {
             for child in children {
@@ -1047,13 +1093,17 @@ mod tests {
             construct.id != "provider.app"
                 && construct.id != "app.schema"
                 && construct.id != "app.protocol"
-                && construct.id != "app.pseudocode"
         }) {
-            for example in construct
-                .examples
-                .iter()
-                .filter(|example| example.source_kind != "type_fragment")
-            {
+            for example in construct.examples.iter().filter(|example| {
+                matches!(
+                    example.source_kind.as_str(),
+                    "source_file"
+                        | "declaration_fragment"
+                        | "block_fragment"
+                        | "locator_fragment"
+                        | "statement_fragment"
+                )
+            }) {
                 let source = wrap_example(example);
                 let parsed = webtest_syntax::parse(&source);
                 assert!(
@@ -1186,14 +1236,19 @@ mod tests {
             "type.TempDirectory",
             "type.Locator",
             "type.BrowserPage",
+            "json.typed_decode",
             "capability.Pure",
             "capability.Server",
             "capability.Browser",
             "capability.Test",
             "provider.app",
+            "app.configuration",
+            "app.bridge",
+            "app.bridge.example",
             "app.schema",
             "app.protocol",
-            "app.pseudocode",
+            "app.diagnostics",
+            "runtime.configuration",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -1346,11 +1401,77 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert!(protocol_guidance.contains("protocol_transport_selection"));
         assert!(protocol_guidance.contains("protocol_managed_command"));
+        let bridge_example = core["app.bridge.example"]
+            .examples
+            .iter()
+            .find(|example| example.name == "complete no-SDK loop")
+            .expect("complete bridge example");
         assert!(
-            core["app.pseudocode"]
+            bridge_example
+                .source
+                .contains("unix:/absolute/path/to/app.sock, not unix:///path")
+        );
+        assert!(
+            bridge_example
+                .source
+                .contains("tcp://127.0.0.1:<random-port>")
+        );
+        assert!(
+            bridge_example
+                .source
+                .contains("unsupported WEBTEST_BRIDGE endpoint format")
+        );
+        assert!(
+            bridge_example
+                .source
+                .contains("shutdown_ok(id = message.id)")
+        );
+        assert!(
+            core["app.configuration"]
                 .examples
                 .iter()
-                .any(|example| example.source.contains("arguments.message"))
+                .any(|example| example.source.contains("transport = \"stdio\"")
+                    && example.source.contains("command = \"node\""))
+        );
+        assert!(
+            core["app.configuration"]
+                .guidance
+                .iter()
+                .any(|guidance| guidance.code == "app_configuration_timeouts"
+                    && guidance.summary.contains("server.app.startup_timeout")
+                    && guidance.summary.contains("[app.health].timeout"))
+        );
+        assert!(core["app.configuration"].examples.iter().any(|example| {
+            example.source.contains("startup_timeout = \"10s\"")
+                && example.source.contains("shutdown_timeout = \"2s\"")
+        }));
+        assert!(
+            core["app.diagnostics"]
+                .guidance
+                .iter()
+                .any(|guidance| guidance.code == "diagnose_unknown_response_id")
+        );
+        assert!(
+            core["app.diagnostics"]
+                .guidance
+                .iter()
+                .any(|guidance| guidance.code == "diagnose_secondary_broken_pipe"
+                    && guidance.summary.contains("earliest reported failure")
+                    && guidance.summary.contains("captured stderr"))
+        );
+        assert!(
+            core["type.Response"]
+                .guidance
+                .iter()
+                .any(|guidance| guidance.code == "response_members"
+                    && guidance.summary.contains("status: StatusCode")
+                    && guidance.summary.contains("json: T"))
+        );
+        assert!(
+            core["json.typed_decode"]
+                .constraints
+                .iter()
+                .any(|constraint| constraint.code == "json_has_no_static_members")
         );
 
         let providers = {
@@ -1372,6 +1493,39 @@ mod tests {
             );
             database.close_file(file);
         }
+    }
+
+    #[test]
+    fn runtime_configuration_attaches_only_to_its_project_query() {
+        let resolved = ResolvedRuntimeConfiguration {
+            selected_adapter: Some("bridge".into()),
+            selected_transport: Some("stdio".into()),
+            resolved_command: Some("node".into()),
+            resolved_arguments: vec!["bridge.js".into()],
+            working_directory: Some("/project".into()),
+            schema_path: Some("/project/.webtest/app-schema.json".into()),
+            browser_base_url: None,
+            server_base_url: None,
+        };
+        let project = DescriptionProject {
+            root: "/project".into(),
+            configuration_revision: "revision".into(),
+            resolved_runtime_configuration: Some(resolved.clone()),
+        };
+        let DescriptionResponse::Construct(configuration) = describe(
+            &ProviderRegistry::built_in_schemas(),
+            DescriptionRequest::Query("runtime.configuration".into()),
+            Some(project),
+            DescriptionLimits::default(),
+        ) else {
+            panic!("runtime configuration")
+        };
+        assert_eq!(configuration.resolved_configuration, Some(resolved));
+        let serialized = serde_json::to_value(configuration).expect("configuration JSON");
+        assert_eq!(
+            serialized["resolved_configuration"]["resolved_command"],
+            "node"
+        );
     }
 
     #[test]

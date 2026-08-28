@@ -167,35 +167,6 @@ fn fixture_server() -> Option<(std::net::SocketAddr, Arc<AtomicBool>)> {
     Some((address, stop))
 }
 
-fn json_fixture_server() -> Option<(std::net::SocketAddr, Arc<AtomicBool>)> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
-    listener.set_nonblocking(true).ok()?;
-    let address = listener.local_addr().ok()?;
-    let stop = Arc::new(AtomicBool::new(false));
-    let server_stop = Arc::clone(&stop);
-    thread::spawn(move || {
-        while !server_stop.load(Ordering::Acquire) {
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    let mut request = [0u8; 2048];
-                    let _ = stream.read(&mut request);
-                    let body = r#"{"id":7,"email":"alice@example.test"}"#;
-                    let response = format!(
-                        "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    let _ = stream.write_all(response.as_bytes());
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(5));
-                }
-                Err(_) => break,
-            }
-        }
-    });
-    Some((address, stop))
-}
-
 impl Drop for ProtocolProcess {
     fn drop(&mut self) {
         let _ = self.child.kill();

@@ -4,10 +4,249 @@ use super::*;
 pub(super) fn constructs() -> Vec<ConstructDescription> {
     vec![
         provider_overview(),
+        configuration_reference(),
+        bridge_lifecycle_reference(),
+        bridge_example_reference(),
         manifest_reference(),
         protocol_reference(),
-        implementation_reference(),
+        diagnostics_reference(),
+        runtime_configuration_reference(),
     ]
+}
+
+fn configuration_reference() -> ConstructDescription {
+    let mut value = base_construct(
+        "app.configuration",
+        "Application provider configuration",
+        "configuration_reference",
+        "[server.app] plus adapter-specific [app] or [server.app.*] settings",
+        "Configure exactly one typed application-provider adapter and keep provider selection separate from runner-owned application lifecycle settings.",
+    );
+    value.search_terms = vec![
+        "webtest.toml app command".into(),
+        "server.app command".into(),
+        "bridge stdio http adapter".into(),
+        "working directory".into(),
+    ];
+    value.constraints = vec![
+        constraint(
+            "app_configuration_ownership",
+            "configuration",
+            "sections",
+            "`[server.app]` owns provider adapter, transport, schema, limits, and compatibility-adapter settings. `[app]` owns an optionally runner-managed application process, its arguments, working directory, environment, ownership, and health check.",
+        ),
+        constraint(
+            "app_configuration_no_duplicate_commands",
+            "configuration",
+            "command",
+            "Socket bridges use `[app].command`; stdio bridges and command adapters use `[server.app].command`. Do not duplicate one process command in both locations unless the adapter intentionally starts two distinct processes.",
+        ),
+        constraint(
+            "app_configuration_adapter_requirements",
+            "configuration",
+            "required settings",
+            "Every adapter requires `server.app.schema`. A runner-managed socket bridge requires `[app].command`; a stdio bridge or command adapter requires `server.app.command`; an HTTP adapter requires `server.app.http.base_url` and at least one explicit operation.",
+        ),
+    ];
+    value.guidance = vec![
+        guidance(
+            "app_configuration_bridge_difference",
+            "For `adapter = \"bridge\"` with `auto`, `unix`, `named_pipe`, or `tcp`, WebTest creates the local endpoint and launches or waits for the application described by `[app]`. With `transport = \"stdio\"`, WebTest launches `server.app.command` as the dedicated protocol peer and reserves its stdout for frames; `[app]`, when present, describes a separate web application process and health check.",
+        ),
+        guidance(
+            "app_configuration_command_vs_stdio",
+            "The `command` compatibility adapter starts `server.app.command` once per `app.*` call, writes one JSON object containing function, arguments, deadline_ms, and schema_hash to stdin, reads one bounded terminal JSON response from stdout, and exits. A stdio bridge is one persistent Protocol 1 process for the run: it performs hello/schema negotiation, handles many correlated calls, and participates in shutdown.",
+        ),
+        guidance(
+            "app_configuration_timeouts",
+            "Configure bridge connection and protocol readiness with `server.app.startup_timeout`, and bounded bridge shutdown and child cleanup with `server.app.shutdown_timeout`; neither key belongs under `[app]`. `[app.health].timeout` is separate and bounds only the configured HTTP health check.",
+        ),
+        guidance(
+            "app_configuration_validation",
+            "Unknown keys are warnings. Invalid adapter/transport combinations, missing adapter-required settings, absolute or parent-traversing project paths, and malformed URLs are configuration errors before analysis or execution.",
+        ),
+    ];
+    value.examples = vec![
+        example(
+            "runner-managed socket bridge",
+            "[app]\ncommand = \"node\"\nargs = [\"server.js\"]\nworking_directory = \".\"\n\n[server.app]\nadapter = \"bridge\"\ntransport = \"auto\"\nschema = \".webtest/app-schema.json\"\nstartup_timeout = \"10s\"\nshutdown_timeout = \"2s\"",
+            "config",
+            "webtest.toml",
+        ),
+        example(
+            "dedicated stdio bridge",
+            "[server.app]\nadapter = \"bridge\"\ntransport = \"stdio\"\nschema = \".webtest/app-schema.json\"\ncommand = \"node\"\nargs = [\"bridge.js\"]",
+            "config",
+            "webtest.toml",
+        ),
+        example(
+            "command compatibility adapter",
+            "[server.app]\nadapter = \"command\"\nschema = \".webtest/app-schema.json\"\ncommand = \"bin/app-provider\"\nargs = []",
+            "config",
+            "webtest.toml",
+        ),
+        example(
+            "HTTP compatibility adapter",
+            "[server.app]\nadapter = \"http\"\nschema = \".webtest/app-schema.json\"\n\n[server.app.http]\nbase_url = \"http://127.0.0.1:3000\"\n\n[server.app.http.operations]\ncreate_user = { method = \"POST\", path = \"/__webtest/create_user\" }",
+            "config",
+            "webtest.toml",
+        ),
+    ];
+    value.related = vec![
+        "app.bridge".into(),
+        "app.schema".into(),
+        "runtime.configuration".into(),
+    ];
+    value
+}
+
+fn bridge_lifecycle_reference() -> ConstructDescription {
+    let mut value = base_construct(
+        "app.bridge",
+        "Application bridge lifecycle",
+        "lifecycle_reference",
+        "runner start → transport connect → hello → describe → calls → shutdown",
+        "Follow the complete runner-owned lifecycle for a Protocol 1 application bridge.",
+    );
+    value.search_terms = vec![
+        "bridge lifecycle".into(),
+        "startup teardown".into(),
+        "hello shutdown".into(),
+    ];
+    value.constraints = vec![
+        constraint(
+            "bridge_lifecycle_order",
+            "runtime",
+            "state machine",
+            "The application sends `hello`; the runner sends `hello_ok` and then `describe`; the application returns a correlated `schema`; calls and shutdown each require a terminal response carrying the request's exact ID.",
+        ),
+        constraint(
+            "bridge_stream_ownership",
+            "transport",
+            "stdout",
+            "For stdio, stdin/stdout are the protocol stream and application logs must use stderr. Socket bridges may log normally, but must send frames only on the selected bridge connection.",
+        ),
+    ];
+    value.guidance = vec![
+        guidance(
+            "bridge_lifecycle_sequence",
+            "WebTest resolves configuration, creates the socket listener or stdio pipes, starts the configured process, and establishes transport. The application sends authenticated `hello`; WebTest verifies it, replies `hello_ok`, requests `describe`, verifies the returned schema, dispatches correlated calls, sends `shutdown`, waits for correlated `shutdown_ok`, then reaps runner-owned children.",
+        ),
+        guidance(
+            "bridge_lifecycle_environment",
+            "Socket bridges receive `WEBTEST_BRIDGE`, `WEBTEST_TOKEN`, and `WEBTEST_PROTOCOL=1`. Stdio bridges receive `WEBTEST_TOKEN` and `WEBTEST_PROTOCOL=1`; their endpoint is stdin/stdout, so `WEBTEST_BRIDGE` is absent.",
+        ),
+    ];
+    value.examples = vec![
+        example(
+            "socket lifecycle",
+            "create local listener\nspawn [app].command with WEBTEST_BRIDGE, WEBTEST_TOKEN, WEBTEST_PROTOCOL=1\naccept connection\nhello → hello_ok → describe → schema\ncall(id) → result(id) or error(id)\nshutdown(id) → shutdown_ok(id)\nreap child",
+            "sequence",
+            "runner_and_application",
+        ),
+        example(
+            "stdio lifecycle",
+            "spawn server.app.command with stdin/stdout pipes and WEBTEST_TOKEN, WEBTEST_PROTOCOL=1\nhello → hello_ok → describe → schema\ncall(id) → result(id) or error(id)\nshutdown(id) → shutdown_ok(id)\nreap bridge process",
+            "sequence",
+            "runner_and_application",
+        ),
+    ];
+    value.related = vec![
+        "app.configuration".into(),
+        "app.protocol".into(),
+        "app.bridge.example".into(),
+        "app.diagnostics".into(),
+    ];
+    value.availability.runtime_requires = vec!["native_app_bridge".into()];
+    value
+}
+
+fn bridge_example_reference() -> ConstructDescription {
+    let mut value = base_construct(
+        "app.bridge.example",
+        "Custom application bridge example",
+        "implementation_reference",
+        "correlated Protocol 1 bridge loop pseudocode",
+        "Implement the smallest custom bridge loop while preserving authentication, bounds, validation, and exact request-ID correlation.",
+    );
+    value.search_terms = vec![
+        "bridge pseudocode".into(),
+        "request id correlation".into(),
+        "shutdown_ok id".into(),
+    ];
+    value.constraints = vec![constraint(
+        "bridge_exact_response_id",
+        "protocol",
+        "response id",
+        "Copy the ID from each `describe`, `call`, `ping`, and `shutdown` request into its corresponding `schema`, `result`/`error`, `pong`, or `shutdown_ok` response. Never hardcode or generate response IDs.",
+    )];
+    value.guidance = vec![guidance(
+        "bridge_example_scope",
+        "This is non-normative pseudocode. `app.protocol` remains authoritative for frame fields, limits, validation, cancellation, events, and state semantics.",
+    )];
+    value.examples = vec![
+        example(
+            "complete no-SDK loop",
+            r#"manifest = load_manifest()
+endpoint = environment.get("WEBTEST_BRIDGE")
+if endpoint is absent:
+    io = stdio  # only for configured transport = "stdio"
+else if endpoint starts with "unix:":
+    # WebTest emits exactly unix:/absolute/path/to/app.sock, not unix:///path.
+    socket_path = endpoint after the "unix:" prefix
+    require(socket_path starts with "/")
+    io = connect_unix_socket(socket_path)
+else if endpoint starts with "tcp://":
+    # WebTest emits tcp://127.0.0.1:<random-port>.
+    host, port = parse_tcp_uri(endpoint)
+    require(host is loopback and port is an integer)
+    io = connect_tcp(host, port)
+else if endpoint starts with "pipe:":
+    # On Windows, everything after "pipe:" is the named-pipe path.
+    io = connect_named_pipe(endpoint after the "pipe:" prefix)
+else:
+    fail("unsupported WEBTEST_BRIDGE endpoint format")
+
+send hello(token = WEBTEST_TOKEN, protocol_versions = [1])
+hello_ok = receive_bounded_frame()
+require(hello_ok.protocol == 1)
+
+message = receive_bounded_frame()
+require(message.type == describe)
+send schema(id = message.id, protocol = 1,
+            schema_hash = canonical_hash(manifest.functions),
+            functions = manifest.functions)
+
+loop:
+    message = receive_bounded_frame()
+    if message.type == call:
+        validate(message.arguments, manifest.functions[message.function].params)
+        outcome = invoke(message.function, message.arguments, message.deadline_ms)
+        validate(outcome, manifest.functions[message.function].returns)
+        send result(id = message.id, value = outcome)
+        # on failure: send error(id = message.id, ...)
+    if message.type == ping:
+        send pong(id = message.id)
+    if message.type == shutdown:
+        send shutdown_ok(id = message.id)
+        close io
+        break"#,
+            "pseudocode",
+            "protocol_state_machine",
+        ),
+        example(
+            "correlation rule",
+            "receive call(id = request_id, ...)\nsend result(id = request_id, ...)\nreceive shutdown(id = shutdown_id)\nsend shutdown_ok(id = shutdown_id)",
+            "pseudocode",
+            "protocol_state_machine",
+        ),
+    ];
+    value.related = vec![
+        "app.bridge".into(),
+        "app.protocol".into(),
+        "app.schema".into(),
+    ];
+    value
 }
 
 fn provider_overview() -> ConstructDescription {
@@ -75,7 +314,7 @@ fn provider_overview() -> ConstructDescription {
     value.guidance = vec![
         guidance(
             "app_bridge_discovery",
-            "For a new or custom bridge, inspect `app.schema`, then `app.protocol`, then `app.pseudocode`; inspect the exact project operation separately after loading its manifest.",
+            "For a new or custom bridge, inspect `app.configuration`, `runtime.configuration`, `app.bridge`, `app.schema`, `app.protocol`, `app.bridge.example`, and `app.diagnostics`; inspect the exact project operation separately after loading its manifest.",
         ),
         guidance(
             "app_operation_lookup",
@@ -97,8 +336,12 @@ fn provider_overview() -> ConstructDescription {
         ),
     ];
     value.related = vec![
+        "app.configuration".into(),
+        "app.bridge".into(),
         "app.schema".into(),
         "app.protocol".into(),
+        "app.bridge.example".into(),
+        "app.diagnostics".into(),
         "scope.server".into(),
     ];
     value.availability.runtime_requires = vec!["configured_app_provider".into()];
@@ -263,93 +506,144 @@ fn protocol_reference() -> ConstructDescription {
     value.related = vec![
         "provider.app".into(),
         "app.schema".into(),
-        "app.pseudocode".into(),
+        "app.bridge".into(),
+        "app.bridge.example".into(),
     ];
     value.availability.runtime_requires = vec!["native_app_bridge".into()];
     value
 }
 
-fn implementation_reference() -> ConstructDescription {
+fn diagnostics_reference() -> ConstructDescription {
     let mut value = base_construct(
-        "app.pseudocode",
-        "Application Bridge implementation outline",
-        "implementation_reference",
-        "Protocol 1 state machine pseudocode",
-        "Outline a custom bridge without replacing the normative Protocol 1 schemas, limits, or state semantics.",
+        "app.diagnostics",
+        "Application bridge diagnostics",
+        "diagnostic_reference",
+        "application bridge failure code → likely cause → next inspection",
+        "Diagnose bridge startup, handshake, correlation, schema, and child-process failures using the structured provider failure and the process state it implies.",
     );
     value.search_terms = vec![
-        "custom bridge".into(),
-        "host implementation".into(),
-        "pseudocode".into(),
-        "SDK".into(),
+        "bridge did not connect".into(),
+        "closed before hello".into(),
+        "unknown response id".into(),
+        "schema mismatch".into(),
+        "child process exited".into(),
+        "broken pipe teardown".into(),
+        "timeout debugging".into(),
     ];
+    value.failure_modes = provider_failures("app");
     value.guidance = vec![
         guidance(
-            "prefer_bridge_sdk",
-            "Prefer a maintained bridge SDK. A custom implementation must still implement bounded framing, authentication, schema verification, correlation, value validation, deadlines, and shutdown.",
+            "diagnose_bridge_readiness_timeout",
+            "`app_bridge_handshake` with `bridge_readiness_timeout` means the runner created a local endpoint but no bridge connected before `server.app.startup_timeout`. Confirm `runtime.configuration`, then inspect whether `[app].command` started, received `WEBTEST_BRIDGE`, and entered its explicit test boot path.",
         ),
         guidance(
-            "implementation_source_of_truth",
-            "Keep one in-process manifest value for SDK export and the live schema response so the checked-in offline manifest and runtime description cannot drift silently.",
+            "diagnose_eof_before_hello",
+            "`app_bridge_handshake` with `eof_before_hello` means transport connected and then closed before the first frame. Inspect child exit status and stderr; for stdio, remove every log or banner from stdout and send one JSON `hello` frame followed by LF.",
         ),
         guidance(
-            "application_readiness",
-            "For a runner-managed web server, configure app.health so WebTest performs bounded HTTP readiness polling after the bridge connects and before the protocol handshake proceeds.",
+            "diagnose_unknown_response_id",
+            "`app_bridge_protocol` with `unknown_response_id` means a terminal response reused, invented, or hardcoded an ID. Log request type and ID on stderr and copy each request ID unchanged into its one terminal response, including `shutdown_ok`.",
+        ),
+        guidance(
+            "diagnose_schema_drift",
+            "`app_schema_drift` means the canonical live `functions` differ from the offline manifest compiled into the plan. Diff the live schema response against `server.app.schema`; generate both from one manifest value and restart the bridge.",
+        ),
+        guidance(
+            "diagnose_bridge_process",
+            "`app_bridge_process` means a runner-owned process exited before readiness. Inspect captured bounded stderr and the exit status, then run the resolved command and arguments in the resolved working directory with the same explicit test boot path.",
+        ),
+        guidance(
+            "diagnose_secondary_broken_pipe",
+            "A broken pipe reported during shutdown or teardown often means the bridge process already crashed or closed its transport. Treat it as a secondary failure: inspect the earliest reported failure, child exit status, and captured stderr before debugging shutdown framing.",
+        ),
+        guidance(
+            "diagnose_hello_or_describe_timeout",
+            "`hello_timeout` means transport exists but the application did not send `hello`; `describe_timeout` means authentication completed but no correlated `schema` arrived. These states distinguish process/transport startup from protocol progress.",
         ),
     ];
     value.examples = vec![
         example(
-            "SDK integration outline",
-            r#"manifest = load_or_define_manifest()
-bridge = sdk_bridge(manifest)
-bridge.register_each_application_handler()
-if explicit_test_boot_mode:
-    bridge.connect_from_environment()  // blocks until bounded shutdown"#,
-            "pseudocode",
-            "application_test_boot",
+            "readiness triage",
+            "failure: app_bridge_handshake / bridge_readiness_timeout\nprocess state: runner listener exists; bridge has not connected\ninspect: runtime.configuration, child stderr, WEBTEST_BRIDGE handling, test boot path",
+            "diagnostic_playbook",
+            "runtime_failure",
         ),
         example(
-            "webtest init echo handler",
-            r#"call(id, "echo", arguments, deadline_ms) =>
-    require(arguments.message is a string)
-    send({type: result, id, value: arguments.message})"#,
-            "pseudocode",
-            "protocol_state_machine",
+            "teardown correlation triage",
+            "failure: app_bridge_protocol / unknown_response_id\nprocess state: protocol loop is active; response ID has no matching request\ninspect: shutdown request ID and shutdown_ok ID; never hardcode either",
+            "diagnostic_playbook",
+            "runtime_failure",
         ),
         example(
-            "no-SDK Protocol 1 loop",
-            r#"endpoint = WEBTEST_BRIDGE if present else stdio
-token = require(WEBTEST_TOKEN)
-if endpoint starts with "tcp://":
-    host, port = parse_uri(endpoint)
-    require(host is loopback)
-    io = connect_tcp(host, port)
-else:
-    io = connect_supported_local_endpoint_or_stdio(endpoint)
-send({type: hello, protocol_versions: [1], sdk, sdk_version, token,
-      capabilities: {cancel: false, events: false}})
-hello_ok = receive_bounded_frame()
-require(hello_ok.protocol == 1)
-limit = min(local_limit, hello_ok.max_message_bytes)
-
-loop:
-    message = receive_bounded_frame(limit)
-    describe(id) => send({type: schema, id, protocol: 1,
-                          schema_hash: manifest.schema_hash,
-                          functions: manifest.functions})
-    call(id, function, arguments, deadline_ms) =>
-        validate arguments against manifest
-        result = run the registered handler within deadline_ms
-        validate result against manifest
-        send({type: result, id, value: result}),
-        or send({type: error, id, code, message, retryable, data})
-    ping(id) => send({type: pong, id})
-    shutdown(id) => drain bounded work; send({type: shutdown_ok, id}); close"#,
-            "pseudocode",
-            "protocol_state_machine",
+            "secondary broken pipe triage",
+            "failure: broken pipe during shutdown or teardown\nprocess state: bridge peer may already have exited or closed transport\ninspect: earliest failure, child exit status, captured stderr; diagnose shutdown framing only if no earlier cause exists",
+            "diagnostic_playbook",
+            "runtime_failure",
         ),
     ];
-    value.related = vec!["app.protocol".into(), "app.schema".into()];
+    value.related = vec![
+        "runtime.configuration".into(),
+        "app.configuration".into(),
+        "app.bridge".into(),
+        "app.bridge.example".into(),
+        "app.protocol".into(),
+    ];
+    value
+}
+
+fn runtime_configuration_reference() -> ConstructDescription {
+    let mut value = base_construct(
+        "runtime.configuration",
+        "Resolved runtime configuration",
+        "runtime_inspection",
+        "webtest describe runtime.configuration [--project <path>] --reporter json",
+        "Inspect the project configuration that WebTest resolved for application-provider and browser/server startup without exposing environment values or unredacted secret-like arguments.",
+    );
+    value.search_terms = vec![
+        "resolved adapter transport command arguments".into(),
+        "working directory schema path".into(),
+        "browser base URL server base URL".into(),
+        "configuration debugging".into(),
+    ];
+    value.constraints = vec![
+        constraint(
+            "runtime_configuration_project",
+            "discovery",
+            "project",
+            "Run from a project or pass the describe command's project path option. Without a discovered `webtest.toml`, the topic explains the fields but has no `resolved_configuration` object.",
+        ),
+        constraint(
+            "runtime_configuration_redaction",
+            "presentation",
+            "secrets",
+            "Environment entries and bridge tokens are never reported. Arguments following secret-like flags and inline secret-like assignments are replaced with `<redacted>`.",
+        ),
+    ];
+    value.guidance = vec![
+        guidance(
+            "runtime_configuration_fields",
+            "The machine-readable `resolved_configuration` object reports selected adapter and transport, resolved command and arguments, working directory, schema path, browser base URL, and server base URL. Absent configuration is represented as null or an empty argument list.",
+        ),
+        guidance(
+            "runtime_configuration_transport",
+            "`selected_transport` is the configured selection. For `auto`, the concrete runtime transport is host-dependent and may fall back from local IPC to loopback TCP.",
+        ),
+    ];
+    value.examples = vec![
+        example(
+            "inspect current project",
+            "webtest describe runtime.configuration --reporter json",
+            "cli_invocation",
+            "project_directory",
+        ),
+        example(
+            "inspect selected project",
+            "webtest describe runtime.configuration --project path/to/project --reporter json",
+            "cli_invocation",
+            "shell",
+        ),
+    ];
+    value.related = vec!["app.configuration".into(), "app.diagnostics".into()];
     value
 }
 

@@ -1108,6 +1108,14 @@ fn resolve_server_app(
     }
     let mut command = raw.command.into_iter().collect::<Vec<_>>();
     command.extend(raw.args);
+    if adapter == ServerAppAdapter::Bridge
+        && transport != ServerAppTransport::Stdio
+        && !command.is_empty()
+    {
+        return Err(invalid(
+            "server.app.command is only valid for command adapters and stdio bridges; use app.command for socket bridges".into(),
+        ));
+    }
     if (adapter == ServerAppAdapter::Command
         || (adapter == ServerAppAdapter::Bridge && transport == ServerAppTransport::Stdio))
         && command.is_empty()
@@ -1663,7 +1671,42 @@ max_pending_calls = 12
         assert_eq!(app.max_message_bytes, 4096);
         assert_eq!(app.max_pending_calls, 12);
 
+        let (stdio, _) = parse_config(
+            path,
+            "[server.app]\nadapter = \"bridge\"\ntransport = \"stdio\"\ncommand = \"node\"\nargs = [\"bridge.js\"]\n",
+        )
+        .expect("stdio bridge configuration");
+        assert_eq!(
+            stdio.server.app.expect("stdio provider").command,
+            ["node", "bridge.js"]
+        );
+        let (command, _) = parse_config(
+            path,
+            "[server.app]\nadapter = \"command\"\ncommand = \"bin/app-provider\"\n",
+        )
+        .expect("command adapter configuration");
+        assert_eq!(
+            command.server.app.expect("command provider").adapter,
+            ServerAppAdapter::Command
+        );
+        let (http, _) = parse_config(
+            path,
+            "[server.app]\nadapter = \"http\"\n[server.app.http]\nbase_url = \"http://127.0.0.1:3000\"\n[server.app.http.operations]\ncreate_user = { method = \"POST\", path = \"/__webtest/create_user\" }\n",
+        )
+        .expect("HTTP adapter configuration");
+        assert_eq!(
+            http.server.app.expect("HTTP provider").adapter,
+            ServerAppAdapter::Http
+        );
+
         assert!(parse_config(path, "[server.app]\ntransport = \"stdio\"\n").is_err());
+        assert!(
+            parse_config(
+                path,
+                "[server.app]\nadapter = \"bridge\"\ntransport = \"tcp\"\ncommand = \"node\"\n",
+            )
+            .is_err()
+        );
         assert!(
             parse_config(
                 path,

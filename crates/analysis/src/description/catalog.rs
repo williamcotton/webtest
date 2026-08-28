@@ -7,6 +7,7 @@ pub(super) fn core_constructs() -> BTreeMap<String, ConstructDescription> {
         scope_construct("server", Capability::Server),
         scope_construct("browser", Capability::Browser),
         let_construct(),
+        typed_json_decode(),
     ] {
         constructs.insert(construct.id.clone(), construct);
     }
@@ -71,6 +72,7 @@ pub(super) fn base_construct(
             content_trust: "installed".into(),
             schema_identity: None,
         },
+        resolved_configuration: None,
         truncation: Vec::new(),
     }
 }
@@ -1473,10 +1475,93 @@ fn type_constructs() -> Vec<ConstructDescription> {
                     "the endpoint returns JSON with integer id and string email fields".into(),
                 ];
             }
+            if name == "Response" {
+                value.guidance = vec![
+                    GuidanceDescription {
+                        code: "response_members".into(),
+                        summary: "`Response<T>` exposes `status: StatusCode`, `headers: Headers`, `body: Bytes`, `text: String` when the body is valid UTF-8, and `json: T`. Built-in `http.*` operations return `Response<Json>`.".into(),
+                    },
+                    GuidanceDescription {
+                        code: "response_json_decode".into(),
+                        summary: "Because `http.*.json` is raw `Json`, assign it to an explicitly typed record before member access; see `json.typed_decode`.".into(),
+                    },
+                ];
+                value.examples.push(example(
+                    "status and typed JSON response",
+                    "let response = http.get(\"http://example.test/api/items\")\nexpect response.status == 200\nlet payload: { items: List<{ id: Int, name: String }> } = response.json\nexpect payload.items contains { id: 1, name: \"Example\" }",
+                    "statement_fragment",
+                    "scope.server",
+                ));
+                value.examples.last_mut().expect("response example").prerequisites = vec![
+                    "the endpoint returns a JSON object with the declared items shape".into(),
+                ];
+            }
             value.search_terms = vec![ty.to_string(), "static type".into()];
             value
         })
         .collect()
+}
+
+fn typed_json_decode() -> ConstructDescription {
+    let mut value = base_construct(
+        "json.typed_decode",
+        "Typed JSON decode",
+        "type_conversion",
+        "let <name>: <Type> = <Json expression>",
+        "Decode dynamically shaped `Json` into a statically known record, list, or primitive shape before accessing members.",
+    );
+    value.allowed_contexts = vec!["scope.server".into(), "scope.browser".into()];
+    value.search_terms = vec![
+        "raw json member access".into(),
+        "explicit type annotation".into(),
+        "response json decode".into(),
+        "semantic unknown member".into(),
+    ];
+    value.constraints = vec![
+        constraint(
+            "json_has_no_static_members",
+            "analysis",
+            "Json member access",
+            "Raw `Json` has no statically known members, so direct access such as `response.json.items` is rejected. The annotation supplies the shape analysis uses for later member access.",
+        ),
+        constraint(
+            "json_decode_runtime_validation",
+            "runtime",
+            "decoded value",
+            "Execution validates the complete annotated shape. A missing field, wrong primitive, or wrong nested list/record member is a structured decode failure with the exact JSON path.",
+        ),
+    ];
+    value.guidance = vec![
+        GuidanceDescription {
+            code: "json_decode_then_access".into(),
+            summary: "Bind the raw JSON expression to an explicitly typed value, then access fields on that binding. Use nested `List<{ ... }>` and record forms to describe the response shape.".into(),
+        },
+    ];
+    value.examples = vec![
+        example(
+            "decode nested response JSON",
+            "let result = http.get(\"http://example.test/api/items\")\nlet payload: { items: List<{ id: Int, name: String }> } = result.json\nexpect payload.items contains { id: 1, name: \"Example\" }",
+            "statement_fragment",
+            "scope.server",
+        ),
+        example(
+            "decode one response object",
+            "let response = http.post(\"http://example.test/api/users\", json: { email: \"alice@example.com\" })\nlet user: { id: Int, email: String } = response.json\nexpect user.email == \"alice@example.com\"",
+            "statement_fragment",
+            "scope.server",
+        ),
+    ];
+    for example in &mut value.examples {
+        example.prerequisites =
+            vec!["the endpoint returns JSON matching the annotated shape".into()];
+    }
+    value.related = vec![
+        "type.Json".into(),
+        "type.Response".into(),
+        "type.Record".into(),
+    ];
+    value.failure_modes = vec!["value_decode_failed".into()];
+    value
 }
 
 fn type_form_example(name: &str) -> &str {

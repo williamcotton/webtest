@@ -45,6 +45,8 @@ schema = ".webtest/app-schema.json"
 # base_url = "http://127.0.0.1:3000"
 ```
 
+`[server.app]` owns the provider adapter, transport, offline schema, limits, and compatibility-adapter command/HTTP settings. For the scaffolded socket bridge, `[app]` owns the runner-managed application command, arguments, working directory, environment, ownership, and health check. A stdio bridge instead puts its dedicated protocol command under `[server.app]`; query `app.configuration` before moving command settings between sections.
+
 The generated bridge smoke test is:
 
 ```webtest
@@ -64,13 +66,17 @@ Do not infer or invent the application bridge from this skill. From the initiali
 
 ```sh
 webtest describe app
+webtest describe app.configuration
+webtest describe runtime.configuration
+webtest describe app.bridge
 webtest describe app.schema
 webtest describe app.protocol
-webtest describe app.pseudocode
+webtest describe app.bridge.example
+webtest describe app.diagnostics
 webtest describe app.echo
 ```
 
-The results respectively establish the provider boundary, offline manifest/configuration contract, exact Protocol 1 transport and frames, host-language implementation outline, and generated operation signature. Use the default human output while learning; add `--reporter json` only when consuming the response programmatically. Follow the returned configuration prerequisites and related topics, prefer a maintained SDK when one is available, and keep the bridge behind an explicit test-only application boot path.
+The results establish the provider boundary, authoritative section ownership and adapter examples, the resolved redacted project values, complete lifecycle, offline manifest, exact Protocol 1 frames, correlation-safe implementation outline, failure triage, and generated operation signature. Use the default human output while learning; add `--reporter json` only when consuming the response programmatically. Follow the returned configuration prerequisites and related topics, prefer a maintained SDK when one is available, and keep the bridge behind an explicit test-only application boot path.
 
 After configuring `[app]` and implementing `app.echo`, run `webtest check` and then `webtest test tests/example.webtest --reporter json`. Use any structured failure's code and reference queries to return to the narrowest relevant `describe` topic.
 
@@ -113,9 +119,15 @@ The no-query index contains canonical topic IDs. A construct response supplies s
 For a configured application provider, query a concrete project operation such as `webtest describe app.echo`. Use human output while learning and `--reporter json` when consuming the result programmatically. These focused built-in topics provide the deeper provider contract:
 
 - `provider.app`: provider semantics and project requirements.
+- `app.configuration`: authoritative section ownership, required settings, validation, and examples for every adapter.
+- `runtime.configuration`: selected adapter/transport and redacted resolved paths, command, arguments, and base URLs for the discovered project.
+- `app.bridge`: runner/process/transport/handshake/call/shutdown lifecycle and environment/stdout rules.
 - `app.schema`: offline Protocol 1 manifest shape and hashing rules.
 - `app.protocol`: framing, handshake, correlation, transports, and required wire fields.
-- `app.pseudocode`: a non-normative implementation outline that points back to the protocol contract.
+- `app.bridge.example`: a correlation-safe non-normative implementation outline that points back to the protocol contract.
+- `app.diagnostics`: failure-code-specific likely causes, process state, and next inspections.
+
+For HTTP responses, query `type.Response` for the `status`, `headers`, `body`, `text`, and `json` members. Query `json.typed_decode` when raw `Json` must become a statically shaped record or list before member access.
 
 Use `webtest <command> --help` for CLI flags and reporters. `describe` documents the language and project-visible provider surface; it is not a duplicate CLI manual.
 
