@@ -23,7 +23,7 @@ use webtest_provider::{
     CallContext, Capability, OperationName, OperationSchema, ProviderCall, ProviderError,
     ProviderName, ProviderRegistry, ProviderResult, ProviderSchema, ServerProvider, Type, Value,
 };
-use webtest_runtime::{RunControl, RunError, Runner, RunnerOptions, StepError};
+use webtest_runtime::{RunControl, RunError, RunEventSink, Runner, RunnerOptions, StepError};
 use webtest_text::{FileId, SourceRevision, SyntaxOrigin, TextRange, TextSize};
 
 #[derive(Default)]
@@ -259,6 +259,40 @@ fn event_names(events: &[ExecutionEvent]) -> Vec<&'static str> {
             ExecutionEvent::RunFinished { .. } => "run_finished",
         })
         .collect()
+}
+
+#[derive(Default)]
+struct RecordingEventSink {
+    events: Mutex<Vec<ExecutionEvent>>,
+}
+
+impl RunEventSink for RecordingEventSink {
+    fn publish(&self, event: &ExecutionEvent) {
+        self.events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(event.clone());
+    }
+}
+
+#[tokio::test]
+async fn event_sink_receives_the_same_ordered_facts_as_the_final_result() {
+    let state = Arc::new(LifecycleState::default());
+    let sink = Arc::new(RecordingEventSink::default());
+    let plan = plan_with_tests(vec![Capability::Pure], vec![vec![pure(Value::Null)]]);
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .with_event_sink(sink.clone())
+        .run(&plan, &LifecycleHost(state))
+        .await
+        .expect("run");
+
+    assert_eq!(
+        *sink
+            .events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        result.events
+    );
 }
 
 #[tokio::test]

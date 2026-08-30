@@ -13,6 +13,7 @@ mod report;
 mod runtime_configuration;
 mod runtime_output;
 mod source_output;
+mod test_progress;
 
 use std::process::ExitCode;
 

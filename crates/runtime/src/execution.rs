@@ -5,7 +5,10 @@ use webtest_observation::{ExecutionEvent, ExecutionId, ObservationStore};
 use webtest_plan::{PlannedTest, TestOperation, TestPlan};
 use webtest_provider::{ProviderError, ProviderRegistry};
 
-use crate::{RunControl, RunError, RunnerOptions, TestResult, redaction::redact_step_error};
+use crate::{
+    RunControl, RunError, RunEventSink, RunnerOptions, TestResult, events::emit_event,
+    redaction::redact_step_error,
+};
 
 use self::{
     failure::{FailureInput, process_failure},
@@ -35,6 +38,7 @@ pub(crate) async fn execute_test(
     test: &PlannedTest,
     execution_id: ExecutionId,
     events: &mut Vec<ExecutionEvent>,
+    event_sink: Option<&dyn RunEventSink>,
     session: &mut Option<Box<dyn BrowserSession>>,
     control: Option<&dyn RunControl>,
     options: &RunnerOptions,
@@ -42,11 +46,15 @@ pub(crate) async fn execute_test(
     observations: &ObservationStore,
 ) -> Result<ExecutedTest, RunError> {
     let test_started = Instant::now();
-    events.push(ExecutionEvent::TestStarted {
-        execution_id,
-        test_id: test.id,
-        name: test.name.clone(),
-    });
+    emit_event(
+        events,
+        event_sink,
+        ExecutionEvent::TestStarted {
+            execution_id,
+            test_id: test.id,
+            name: test.name.clone(),
+        },
+    );
     let mut context = if let Some(session) = session.as_deref_mut() {
         Some(session.new_context(&options.browser_context).await?)
     } else {
@@ -79,43 +87,59 @@ pub(crate) async fn execute_test(
                 break;
             }
         }
-        events.push(ExecutionEvent::StepStarted {
-            execution_id,
-            test_id: test.id,
-            step_id: step.id,
-        });
-        if let TestOperation::ServerProviderCall(call) = &step.operation {
-            events.push(ExecutionEvent::ProviderCallStarted {
+        emit_event(
+            events,
+            event_sink,
+            ExecutionEvent::StepStarted {
                 execution_id,
                 test_id: test.id,
                 step_id: step.id,
-                provider: call.provider.clone(),
-                operation: call.operation.clone(),
-                transport_kind: providers.transport_kind(&call.provider),
-                arguments: state.provider_argument_summaries(call),
-            });
+            },
+        );
+        if let TestOperation::ServerProviderCall(call) = &step.operation {
+            emit_event(
+                events,
+                event_sink,
+                ExecutionEvent::ProviderCallStarted {
+                    execution_id,
+                    test_id: test.id,
+                    step_id: step.id,
+                    provider: call.provider.clone(),
+                    operation: call.operation.clone(),
+                    transport_kind: providers.transport_kind(&call.provider),
+                    arguments: state.provider_argument_summaries(call),
+                },
+            );
         }
         let step_started = Instant::now();
         match execute_step(providers, options, &mut page, step, &mut state).await {
             Ok(()) => {
                 if let TestOperation::ServerProviderCall(call) = &step.operation {
                     state.accept_provider_result_metadata(call);
-                    events.push(ExecutionEvent::ProviderCallFinished {
+                    emit_event(
+                        events,
+                        event_sink,
+                        ExecutionEvent::ProviderCallFinished {
+                            execution_id,
+                            test_id: test.id,
+                            step_id: step.id,
+                            provider: call.provider.clone(),
+                            operation: call.operation.clone(),
+                            elapsed_ms: duration_millis(step_started.elapsed()),
+                            transport_kind: providers.transport_kind(&call.provider),
+                            result: state.provider_result_summary(call),
+                        },
+                    );
+                }
+                emit_event(
+                    events,
+                    event_sink,
+                    ExecutionEvent::StepPassed {
                         execution_id,
                         test_id: test.id,
                         step_id: step.id,
-                        provider: call.provider.clone(),
-                        operation: call.operation.clone(),
-                        elapsed_ms: duration_millis(step_started.elapsed()),
-                        transport_kind: providers.transport_kind(&call.provider),
-                        result: state.provider_result_summary(call),
-                    });
-                }
-                events.push(ExecutionEvent::StepPassed {
-                    execution_id,
-                    test_id: test.id,
-                    step_id: step.id,
-                });
+                    },
+                );
             }
             Err(error) => {
                 let (redacted_fields, secrets) = state.redaction();
@@ -141,6 +165,7 @@ pub(crate) async fn execute_test(
                     providers,
                     observations,
                     events,
+                    event_sink,
                     elapsed_ms: duration_millis(step_started.elapsed()),
                     secrets,
                 })
@@ -169,11 +194,15 @@ pub(crate) async fn execute_test(
         false
     };
     let passed = failure.is_none();
-    events.push(ExecutionEvent::TestFinished {
-        execution_id,
-        test_id: test.id,
-        passed,
-    });
+    emit_event(
+        events,
+        event_sink,
+        ExecutionEvent::TestFinished {
+            execution_id,
+            test_id: test.id,
+            passed,
+        },
+    );
     let bindings = state.final_transferable_bindings(&options.redacted_json_fields);
     for directory in state.temporary_directories() {
         tokio::fs::remove_dir_all(&directory)

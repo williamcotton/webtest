@@ -12,8 +12,8 @@ use webtest_plan::{PlannedStep, ServerProviderCall, TestOperation, TestPlan};
 use webtest_provider::ProviderRegistry;
 
 use crate::{
-    Artifact, RunError, RunnerOptions, StepError, StepFailure, artifacts::write_artifacts,
-    evaluation::display_value,
+    Artifact, RunError, RunEventSink, RunnerOptions, StepError, StepFailure,
+    artifacts::write_artifacts, evaluation::display_value, events::emit_event,
 };
 
 use super::browser::step_browser_locator;
@@ -29,6 +29,7 @@ pub(super) struct FailureInput<'a> {
     pub(super) providers: &'a ProviderRegistry,
     pub(super) observations: &'a ObservationStore,
     pub(super) events: &'a mut Vec<ExecutionEvent>,
+    pub(super) event_sink: Option<&'a dyn RunEventSink>,
     pub(super) elapsed_ms: u64,
     pub(super) secrets: &'a [String],
 }
@@ -45,6 +46,7 @@ pub(super) async fn process_failure(input: FailureInput<'_>) -> Result<StepFailu
         providers,
         observations,
         events,
+        event_sink,
         elapsed_ms,
         secrets,
     } = input;
@@ -99,6 +101,7 @@ pub(super) async fn process_failure(input: FailureInput<'_>) -> Result<StepFailu
         providers,
         observations,
         events,
+        event_sink,
         elapsed_ms,
     })
 }
@@ -116,6 +119,7 @@ struct FinishFailureInput<'a> {
     providers: &'a ProviderRegistry,
     observations: &'a ObservationStore,
     events: &'a mut Vec<ExecutionEvent>,
+    event_sink: Option<&'a dyn RunEventSink>,
     elapsed_ms: u64,
 }
 
@@ -133,6 +137,7 @@ fn finish_failure(input: FinishFailureInput<'_>) -> Result<StepFailure, RunError
         providers,
         observations,
         events,
+        event_sink,
         elapsed_ms,
     } = input;
     let mut repair_hints = inspection
@@ -161,15 +166,19 @@ fn finish_failure(input: FinishFailureInput<'_>) -> Result<StepFailure, RunError
             Vec::new()
         };
     if let TestOperation::ServerProviderCall(call) = &step.operation {
-        events.push(provider_failure_event(
-            call,
-            execution_id,
-            test_id,
-            step,
-            &error,
-            elapsed_ms,
-            providers,
-        ));
+        emit_event(
+            events,
+            event_sink,
+            provider_failure_event(
+                call,
+                execution_id,
+                test_id,
+                step,
+                &error,
+                elapsed_ms,
+                providers,
+            ),
+        );
     }
     if !error.is_infrastructure() {
         record_observation(
@@ -185,16 +194,20 @@ fn finish_failure(input: FinishFailureInput<'_>) -> Result<StepFailure, RunError
             elapsed_ms,
         );
     }
-    events.push(ExecutionEvent::StepFailed {
-        execution_id,
-        test_id,
-        step_id: step.id,
-        failure: runtime_failure(&error),
-        repair_hints: repair_hints.clone(),
-        page: inspection
-            .as_ref()
-            .map(|inspection| inspection.page.clone()),
-    });
+    emit_event(
+        events,
+        event_sink,
+        ExecutionEvent::StepFailed {
+            execution_id,
+            test_id,
+            step_id: step.id,
+            failure: runtime_failure(&error),
+            repair_hints: repair_hints.clone(),
+            page: inspection
+                .as_ref()
+                .map(|inspection| inspection.page.clone()),
+        },
+    );
     if error.is_infrastructure() {
         return Err(match error {
             StepError::Browser(error) => RunError::Browser(error),

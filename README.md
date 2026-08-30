@@ -71,6 +71,8 @@ target/debug/webtest dap
 
 Browser resolution is `--chrome-path`, `WEBTEST_CHROME_PATH`, `browser.path`, managed Chrome, then supported system locations. Set `WEBTEST_CACHE_DIR` to relocate the managed cache. Tests are headless by default; `--headed` shows Chrome.
 
+The default human `test` reporter streams progress while it works: static checking, application and health-check readiness, per-file Chrome startup and shutdown, and each active test. Concise, JSON, events, and JUnit reporters remain free of human progress text.
+
 Exit codes are stable: `0` success, `1` static/test/format failure, `2` CLI/config/input error, `3` browser/CDP/filesystem/reporter infrastructure failure, and `4` internal invariant failure. JSON and JSONL event output use `schema_version: 1`; machine durations are integer nanoseconds. JUnit distinguishes test failures from infrastructure errors.
 
 ## Project configuration

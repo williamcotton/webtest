@@ -7,7 +7,8 @@ use webtest_plan::TestPlan;
 use webtest_provider::{Capability, NativeProviderConfig, ProviderRegistry};
 
 use crate::{
-    RunControl, RunError, RunResult, RunnerOptions,
+    RunControl, RunError, RunEventSink, RunResult, RunnerOptions,
+    events::emit_event,
     execution::{ExecutedTest, execute_test},
 };
 
@@ -15,6 +16,7 @@ pub struct Runner {
     observations: Arc<ObservationStore>,
     options: RunnerOptions,
     providers: ProviderRegistry,
+    event_sink: Option<Arc<dyn RunEventSink>>,
 }
 
 impl Runner {
@@ -23,6 +25,7 @@ impl Runner {
             observations,
             options: RunnerOptions::default(),
             providers: ProviderRegistry::built_in(NativeProviderConfig::default()),
+            event_sink: None,
         }
     }
 
@@ -34,6 +37,11 @@ impl Runner {
 
     pub fn with_provider_registry(mut self, providers: ProviderRegistry) -> Self {
         self.providers = providers;
+        self
+    }
+
+    pub fn with_event_sink(mut self, sink: Arc<dyn RunEventSink>) -> Self {
+        self.event_sink = Some(sink);
         self
     }
 
@@ -56,7 +64,12 @@ impl Runner {
         self.observations.clear_for_file(plan.file);
         let run_started = Instant::now();
         let execution_id = ExecutionId::next();
-        let mut events = vec![ExecutionEvent::RunStarted { execution_id }];
+        let mut events = Vec::new();
+        emit_event(
+            &mut events,
+            self.event_sink.as_deref(),
+            ExecutionEvent::RunStarted { execution_id },
+        );
         let needs_browser = plan
             .required_host_capabilities
             .contains(&Capability::Browser);
@@ -79,6 +92,7 @@ impl Runner {
                 test,
                 execution_id,
                 &mut events,
+                self.event_sink.as_deref(),
                 &mut session,
                 control,
                 &self.options,
@@ -95,7 +109,11 @@ impl Runner {
             }
         }
 
-        events.push(ExecutionEvent::RunFinished { execution_id });
+        emit_event(
+            &mut events,
+            self.event_sink.as_deref(),
+            ExecutionEvent::RunFinished { execution_id },
+        );
         if let Some(mut session) = session {
             session.close().await?;
         }

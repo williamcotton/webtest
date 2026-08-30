@@ -137,6 +137,39 @@ fn check_reporters_preserve_output_and_exit_class() {
 }
 
 #[test]
+fn human_test_reporter_streams_preparation_and_each_test_status_once() {
+    let directory = fixture(
+        "test \"works\" {\n    server {\n        let value = 1\n        expect value == 1\n    }\n}\n",
+    );
+    let output = run(directory.path(), &["test"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("human output"),
+        concat!(
+            "checking 1 test file ... done\n",
+            "running 1 test in 1 file\n",
+            "test \"works\" ... ok\n",
+            "1 passed; 0 failed; 0 infrastructure errors\n",
+        )
+    );
+}
+
+#[test]
+fn human_test_reporter_closes_browser_startup_when_resolution_fails() {
+    let directory = fixture("test \"browser\" { browser { open \"about:blank\" } }\n");
+    let output = run(
+        directory.path(),
+        &["test", "--chrome-path", "missing-chrome"],
+    );
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("human output");
+    assert!(stdout.contains("starting Chrome for tests/example.webtest (headless) ... FAILED\n"));
+    assert!(stdout.contains("infrastructure error[runtime.browser_launch]"));
+}
+
+#[test]
 fn static_errors_suppress_test_execution_without_resolving_chrome() {
     let directory =
         fixture("test \"broken\" {\n    server {\n        expect missing == 1\n    }\n}\n");

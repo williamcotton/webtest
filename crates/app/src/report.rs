@@ -257,10 +257,22 @@ impl CommandReport {
     }
 
     fn write_human(&self, output: &mut dyn Write) -> io::Result<()> {
+        self.write_human_with_status(output, true)
+    }
+
+    pub(crate) fn write_human_after_progress(&self, output: &mut dyn Write) -> io::Result<()> {
+        self.write_human_with_status(output, false)
+    }
+
+    fn write_human_with_status(
+        &self,
+        output: &mut dyn Write,
+        include_test_status: bool,
+    ) -> io::Result<()> {
         for warning in &self.warnings {
             writeln!(output, "warning[{}]: {}", warning.code, warning.message)?;
         }
-        if self.command == "test" {
+        if self.command == "test" && include_test_status {
             writeln!(
                 output,
                 "running {} test{} in {} file{}",
@@ -282,13 +294,18 @@ impl CommandReport {
                 )?;
             }
             for test in &file.tests {
-                writeln!(
-                    output,
-                    "test {:?} ... {}",
-                    test.name,
-                    if test.passed { "ok" } else { "FAILED" }
-                )?;
+                if include_test_status {
+                    writeln!(
+                        output,
+                        "test {:?} ... {}",
+                        test.name,
+                        if test.passed { "ok" } else { "FAILED" }
+                    )?;
+                }
                 if let Some(failure) = &test.failure {
+                    if !include_test_status {
+                        writeln!(output, "failure in test {:?}:", test.name)?;
+                    }
                     if let Some(span) = &failure.span {
                         write_source_diagnostic(
                             output,
@@ -543,6 +560,14 @@ pub(crate) fn write_report(report: &CommandReport, reporter: Reporter) -> Result
         .map_err(AppError::infrastructure)
 }
 
+pub(crate) fn write_human_report_after_progress(report: &CommandReport) -> Result<(), AppError> {
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    report
+        .write_human_after_progress(&mut output)
+        .map_err(AppError::infrastructure)
+}
+
 fn write_source_diagnostic(
     output: &mut dyn Write,
     path: &str,
@@ -644,6 +669,21 @@ mod tests {
         assert!(output.contains("tests/a.webtest:2:7"));
         assert!(output.contains("2 | click id(\"missing\")"));
         assert!(output.contains("      ^^^^^^^^^^^^^"));
+    }
+
+    #[test]
+    fn human_output_after_live_progress_keeps_details_without_repeating_status() {
+        let report = sample();
+        let mut output = Vec::new();
+        report
+            .write_human_after_progress(&mut output)
+            .expect("render");
+        let output = String::from_utf8(output).expect("UTF-8");
+        assert!(!output.contains("running 1 test"));
+        assert!(!output.contains("test \"a < b\" ... FAILED"));
+        assert!(output.contains("failure in test \"a < b\":"));
+        assert!(output.contains("error[runtime.locator_not_found]"));
+        assert!(output.ends_with("0 passed; 1 failed; 0 infrastructure errors\n"));
     }
 
     #[test]

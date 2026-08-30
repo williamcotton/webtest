@@ -7,14 +7,16 @@ use webtest_plan::{PlannedStep, ValueMatcher};
 use webtest_provider::{Type, Value};
 use webtest_runtime::{
     Artifact, ArtifactKind, AssertionFailure, DecodeFailure, EvaluationFailure, EvidenceOptions,
-    RunControl, RunError, RunResult, Runner, RunnerOptions, StepError, StepFailure, TestResult,
-    resolve_browser_url,
+    RunControl, RunError, RunEventSink, RunResult, Runner, RunnerOptions, StepError, StepFailure,
+    TestResult, resolve_browser_url,
 };
 use webtest_text::{FileId, SyntaxOrigin, TextRange};
 
 fn assert_error<T: Error>() {}
 
 fn accepts_control(_: Option<&dyn RunControl>) {}
+
+fn accepts_event_sink(_: Option<&dyn RunEventSink>) {}
 
 fn test_result(passed: bool) -> TestResult {
     TestResult {
@@ -76,6 +78,7 @@ fn root_public_api_remains_importable_and_constructible() {
     assert_error::<StepError>();
     assert_error::<RunError>();
     accepts_control(None);
+    accepts_event_sink(None);
     assert_eq!(StepError::Decode(decode).code(), "json_decode_failed");
     assert_eq!(StepError::Evaluation(evaluation).code(), "division_by_zero");
     assert_eq!(step_failure.error.code(), "assertion_failed");
