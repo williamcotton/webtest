@@ -2,7 +2,16 @@
 
 ## 0. Status and dependencies
 
-**Status: proposed (2026-08-30).**
+**Status: implemented (2026-08-30).**
+
+Implementation decomposes the native CDP adapter behind the unchanged
+`webtest_browser_cdp::{ChromeHost, find_system_chrome}` facade. Process/profile ownership, generic
+wire envelopes, the single bounded correlation actor, session/context/target setup, and the page
+evaluation, navigation, locator, action, evidence, redaction, and inspection responsibilities now
+have the explicit owners defined below. The focused crate suite increased from the original 13
+mixed tests to 36 owner-focused and cross-layer tests, while retaining the available real-Chrome
+startup, context isolation, physical input, inspection, evidence, actionability, disconnect,
+reaping, and profile-cleanup coverage.
 
 This maintenance milestone follows the implemented browser foundations in
 [`milestone-b.md`](./milestone-b.md), the implemented semantic inspection and machine-feedback
