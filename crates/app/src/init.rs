@@ -8,6 +8,8 @@ use std::{
 
 use webtest_app_bridge::{AppManifest, FieldSchema, FunctionSchema, PROTOCOL_VERSION, TypeSchema};
 
+use crate::{error::AppError, report::ExitClass};
+
 pub const PROJECT_CONFIG: &str = r#"[project]
 test_roots = ["tests"]
 
@@ -235,6 +237,36 @@ pub fn initialize(requested_root: &Path) -> Result<InitOutcome, InitError> {
         unchanged,
         warnings,
     })
+}
+
+pub(crate) fn run(path: &Path) -> Result<ExitClass, AppError> {
+    let outcome = initialize(path).map_err(|error| match error.class() {
+        ErrorClass::Usage => AppError::usage(error),
+        ErrorClass::Infrastructure => AppError::infrastructure(error),
+        ErrorClass::Internal => AppError::internal(error),
+    })?;
+    let action = if outcome.created.is_empty() {
+        "WebTest project is already initialized at"
+    } else {
+        "initialized WebTest project at"
+    };
+    println!("{action} {}", outcome.root.display());
+    for path in &outcome.created {
+        println!("  created {path}");
+    }
+    for path in &outcome.unchanged {
+        println!("  unchanged {path}");
+    }
+    for warning in &outcome.warnings {
+        eprintln!("warning[init.skill_link]: {warning}");
+    }
+    println!("next:");
+    println!("  configure [app] in webtest.toml");
+    println!("  implement the app.echo bridge using .agents/skills/webtest/SKILL.md");
+    println!("  use `webtest describe app.protocol` for the complete protocol reference");
+    println!("  webtest check");
+    println!("  webtest test");
+    Ok(ExitClass::Success)
 }
 
 fn scaffold_files() -> Result<Vec<ScaffoldFile>, InitError> {

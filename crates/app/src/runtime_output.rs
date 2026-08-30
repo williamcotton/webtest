@@ -1,0 +1,585 @@
+use webtest_browser::{BrowserError, Locator};
+use webtest_observation::{ExecutionEvent, RuntimeFailure};
+use webtest_provider::ProviderError;
+use webtest_runtime::{RunError, StepError, StepFailure};
+
+use crate::{
+    project_context::normalized_path,
+    report::{EventReport, ExitClass, FailureReport},
+    source_output::source_span,
+};
+
+fn runtime_code(error: &BrowserError) -> &'static str {
+    match error {
+        BrowserError::LocatorNotFound { .. } => "runtime.locator_not_found",
+        BrowserError::LocatorAmbiguous { .. } => "runtime.locator_ambiguous",
+        BrowserError::LocatorInvalid { .. } => "runtime.locator_invalid",
+        BrowserError::ElementDetached { .. } => "runtime.element_detached",
+        BrowserError::LocatorNotVisible { .. } => "runtime.locator_not_visible",
+        BrowserError::ElementUnstable { .. } => "runtime.element_unstable",
+        BrowserError::ElementDisabled { .. } => "runtime.element_disabled",
+        BrowserError::ElementObscured { .. } => "runtime.element_obscured",
+        BrowserError::ElementNotEditable { .. } => "runtime.element_not_editable",
+        BrowserError::OptionNotFound { .. } => "runtime.option_not_found",
+        BrowserError::OptionAmbiguous { .. } => "runtime.option_ambiguous",
+        BrowserError::InvalidKey { .. } => "runtime.invalid_key",
+        BrowserError::ActionTimeout { .. } => "runtime.action_timeout",
+        BrowserError::AssertionFailed { .. } => "runtime.assertion_failed",
+        BrowserError::UrlMismatch { .. } => "runtime.url_mismatch",
+        BrowserError::NavigationFailed { .. } => "runtime.navigation_failed",
+        BrowserError::NavigationTimeout { .. } => "runtime.navigation_timeout",
+        BrowserError::CommandTimeout { .. } => "runtime.browser_command_timeout",
+        BrowserError::BrowserDisconnected => "runtime.browser_disconnected",
+        BrowserError::BrowserCrashed { .. } => "runtime.browser_crashed",
+        BrowserError::MalformedProtocol { .. } => "runtime.browser_malformed_protocol",
+        BrowserError::Protocol { .. } => "runtime.browser_protocol",
+        BrowserError::Launch(_) => "runtime.browser_launch",
+        BrowserError::EvaluationFailed { .. } => "runtime.evaluation_failed",
+        BrowserError::UnsupportedCapability { .. } => "runtime.unsupported_browser_capability",
+    }
+}
+
+fn runtime_message(error: &BrowserError) -> String {
+    match error {
+        BrowserError::LocatorNotFound { locator } => {
+            format!(
+                "No element with {} was found.",
+                locator_description(locator)
+            )
+        }
+        BrowserError::LocatorNotVisible { locator } => format!(
+            "The element with {} was not visible.",
+            locator_description(locator)
+        ),
+        _ => error.to_string(),
+    }
+}
+
+fn infrastructure_message(error: &BrowserError) -> String {
+    match error {
+        BrowserError::Launch(message) if message.contains("Chrome was not found") => format!(
+            "{message}. Install the managed browser with `webtest browser install` or configure an explicit path"
+        ),
+        _ => error.to_string(),
+    }
+}
+
+pub(crate) fn run_error_code(error: &RunError) -> String {
+    match error {
+        RunError::Browser(error) => runtime_code(error).into(),
+        RunError::Provider(error) => format!("runtime.{}", error.code()),
+        RunError::Internal(_) => "runtime.internal_error".into(),
+    }
+}
+
+pub(crate) fn run_error_message(error: &RunError) -> String {
+    match error {
+        RunError::Browser(error) => infrastructure_message(error),
+        _ => error.to_string(),
+    }
+}
+
+fn step_error_code(error: &StepError) -> String {
+    match error {
+        StepError::Browser(error) => runtime_code(error).into(),
+        _ => format!("runtime.{}", error.code()),
+    }
+}
+
+pub(crate) fn step_failure_report(mut failure: StepFailure, source: &str) -> FailureReport {
+    let range = failure.step.origin.range;
+    for hint in &mut failure.repair_hints {
+        if hint.source_range.is_none() {
+            hint.source_range = Some(webtest_feedback::ByteRange {
+                start: range.start().into(),
+                end: range.end().into(),
+            });
+        }
+    }
+    let semantic_details = step_semantic_details(&failure);
+    let page = failure
+        .inspection
+        .as_ref()
+        .map(|inspection| inspection.page.clone())
+        .or_else(|| {
+            failure
+                .evidence
+                .current_url
+                .as_ref()
+                .map(|url| webtest_browser::PageSummary {
+                    url: url.clone(),
+                    title: failure.evidence.title.clone().unwrap_or_default(),
+                })
+        });
+    FailureReport {
+        diagnostic_schema_version: webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
+        repair_hint_schema_version: webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
+        code: step_error_code(&failure.error),
+        message: failure.error.to_string(),
+        span: Some(source_span(source, range)),
+        diff: match &failure.error {
+            StepError::Assertion(error) => Some(error.diff.clone()),
+            _ => None,
+        },
+        artifacts: failure
+            .artifacts
+            .into_iter()
+            .map(|artifact| normalized_path(&artifact.path))
+            .collect(),
+        semantic_details,
+        repair_hints: failure.repair_hints,
+        page,
+        secondary: failure.secondary_failures,
+    }
+}
+
+fn step_semantic_details(failure: &StepFailure) -> Option<serde_json::Value> {
+    match &failure.error {
+        StepError::Browser(error) => {
+            let locator = browser_error_locator(error);
+            let requested = locator.map(ToString::to_string);
+            let target = locator.and_then(|locator| {
+                let source = locator.to_string();
+                failure
+                    .inspection
+                    .as_ref()?
+                    .elements
+                    .iter()
+                    .find(|element| {
+                        element.preferred_locator.source == source
+                            || element
+                                .alternate_locators
+                                .iter()
+                                .any(|candidate| candidate.source == source)
+                    })
+            });
+            Some(serde_json::json!({
+                "code": error.code(),
+                "requested": requested.map(|source| serde_json::json!({"source": source})),
+                "states": target.map(|target| &target.states),
+                "supported_actions": target.map(|target| &target.supported_actions),
+                "available_options": target.map(|target| &target.options),
+                "actionability": failure.evidence.actionability,
+                "nearby_candidates": failure.evidence.candidates,
+            }))
+        }
+        StepError::Provider(error) => Some(provider_error_semantic_details(error)),
+        StepError::Assertion(error) => Some(serde_json::json!({
+            "matcher": format!("{:?}", error.matcher).to_ascii_lowercase(),
+            "expected": error.expected,
+            "actual": error.actual,
+        })),
+        StepError::Decode(error) => Some(serde_json::json!({
+            "path": error.path,
+            "expected_type": error.expected.to_string(),
+            "actual": error.actual,
+            "response_operation": error.response_operation,
+        })),
+        StepError::Evaluation(error) => Some(serde_json::json!({
+            "evaluation_code": error.code,
+        })),
+        StepError::Internal(_) => None,
+    }
+}
+
+fn provider_error_semantic_details(error: &ProviderError) -> serde_json::Value {
+    let mut details = serde_json::json!({
+        "provider_error_code": error.code(),
+    });
+    let Some(object) = details.as_object_mut() else {
+        return details;
+    };
+    match error {
+        ProviderError::BridgeHandshake { code, .. }
+        | ProviderError::BridgeProtocol { code, .. } => {
+            object.insert("bridge_code".into(), code.clone().into());
+        }
+        ProviderError::BridgeSchemaDrift { expected, live } => {
+            object.insert("expected_schema_identity".into(), expected.clone().into());
+            object.insert("live_schema_identity".into(), live.clone().into());
+        }
+        _ => {}
+    }
+    if matches!(
+        error,
+        ProviderError::BridgeHandshake { .. }
+            | ProviderError::BridgeProtocol { .. }
+            | ProviderError::BridgeTransport { .. }
+            | ProviderError::BridgeProcess { .. }
+            | ProviderError::BridgeSchemaDrift { .. }
+            | ProviderError::BridgeValidation { .. }
+            | ProviderError::BridgeTimeout { .. }
+    ) {
+        object.insert(
+            "reference_queries".into(),
+            serde_json::json!(["app.diagnostics", "runtime.configuration"]),
+        );
+    }
+    details
+}
+
+fn browser_error_locator(error: &BrowserError) -> Option<&Locator> {
+    match error {
+        BrowserError::LocatorNotFound { locator }
+        | BrowserError::LocatorAmbiguous { locator, .. }
+        | BrowserError::LocatorInvalid { locator, .. }
+        | BrowserError::ElementDetached { locator }
+        | BrowserError::LocatorNotVisible { locator }
+        | BrowserError::ElementUnstable { locator }
+        | BrowserError::ElementDisabled { locator }
+        | BrowserError::ElementObscured { locator }
+        | BrowserError::ElementNotEditable { locator }
+        | BrowserError::OptionNotFound { locator, .. }
+        | BrowserError::OptionAmbiguous { locator, .. }
+        | BrowserError::ActionTimeout { locator, .. }
+        | BrowserError::AssertionFailed { locator, .. } => Some(locator),
+        _ => None,
+    }
+}
+
+fn locator_description(locator: &Locator) -> String {
+    locator.to_string()
+}
+
+pub(crate) fn event_reports(path: &str, events: &[ExecutionEvent]) -> Vec<EventReport> {
+    events
+        .iter()
+        .map(|event| match event {
+            ExecutionEvent::RunStarted { execution_id } => {
+                event_report(path, "run_started", Some(execution_id.0), None, None)
+            }
+            ExecutionEvent::TestStarted {
+                execution_id,
+                test_id,
+                name,
+            } => {
+                let mut event = event_report(
+                    path,
+                    "test_started",
+                    Some(execution_id.0),
+                    Some(test_id.0),
+                    None,
+                );
+                event.name = Some(name.clone());
+                event
+            }
+            ExecutionEvent::StepStarted {
+                execution_id,
+                test_id,
+                step_id,
+            } => event_report(
+                path,
+                "step_started",
+                Some(execution_id.0),
+                Some(test_id.0),
+                Some(step_id.0),
+            ),
+            ExecutionEvent::StepPassed {
+                execution_id,
+                test_id,
+                step_id,
+            } => event_report(
+                path,
+                "step_passed",
+                Some(execution_id.0),
+                Some(test_id.0),
+                Some(step_id.0),
+            ),
+            ExecutionEvent::ProviderCallStarted {
+                execution_id,
+                test_id,
+                step_id,
+                provider,
+                operation,
+                transport_kind,
+                arguments,
+            } => {
+                let mut event = event_report(
+                    path,
+                    "provider_call_started",
+                    Some(execution_id.0),
+                    Some(test_id.0),
+                    Some(step_id.0),
+                );
+                event.name = Some(format!("{provider}.{operation}"));
+                event.transport_kind = transport_kind.clone();
+                event.arguments = arguments.clone();
+                event
+            }
+            ExecutionEvent::ProviderCallFinished {
+                execution_id,
+                test_id,
+                step_id,
+                provider,
+                operation,
+                elapsed_ms,
+                transport_kind,
+                result,
+            } => {
+                let mut event = event_report(
+                    path,
+                    "provider_call_finished",
+                    Some(execution_id.0),
+                    Some(test_id.0),
+                    Some(step_id.0),
+                );
+                event.name = Some(format!("{provider}.{operation}"));
+                event.message = Some(format!("completed in {elapsed_ms}ms"));
+                event.transport_kind = transport_kind.clone();
+                event.result = result.clone();
+                event
+            }
+            ExecutionEvent::ProviderCallFailed {
+                execution_id,
+                test_id,
+                step_id,
+                provider,
+                operation,
+                code,
+                message,
+                elapsed_ms,
+                transport_kind,
+            } => {
+                let mut event = event_report(
+                    path,
+                    "provider_call_failed",
+                    Some(execution_id.0),
+                    Some(test_id.0),
+                    Some(step_id.0),
+                );
+                event.name = Some(format!("{provider}.{operation}"));
+                event.code = Some(format!("runtime.{code}"));
+                event.message = Some(format!("{message} (failed after {elapsed_ms}ms)"));
+                event.transport_kind = transport_kind.clone();
+                event
+            }
+            ExecutionEvent::StepFailed {
+                execution_id,
+                test_id,
+                step_id,
+                failure,
+                repair_hints,
+                page,
+            } => {
+                let mut event = event_report(
+                    path,
+                    "step_failed",
+                    Some(execution_id.0),
+                    Some(test_id.0),
+                    Some(step_id.0),
+                );
+                let (code, message) = runtime_failure_report(failure);
+                event.code = Some(code);
+                event.message = Some(message);
+                if let RuntimeFailure::Assertion { diff, .. } = failure {
+                    event.diff = Some(diff.clone());
+                }
+                event.repair_hints = repair_hints.clone();
+                event.page = page.clone();
+                event.diagnostic_schema_version = Some(webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION);
+                event.repair_hint_schema_version =
+                    Some(webtest_feedback::REPAIR_HINT_SCHEMA_VERSION);
+                event
+            }
+            ExecutionEvent::TestFinished {
+                execution_id,
+                test_id,
+                passed,
+            } => {
+                let mut event = event_report(
+                    path,
+                    "test_finished",
+                    Some(execution_id.0),
+                    Some(test_id.0),
+                    None,
+                );
+                event.passed = Some(*passed);
+                event.exit_class = Some(if *passed {
+                    ExitClass::Success
+                } else {
+                    ExitClass::TestFailure
+                });
+                event
+            }
+            ExecutionEvent::RunFinished { execution_id } => {
+                event_report(path, "run_finished", Some(execution_id.0), None, None)
+            }
+        })
+        .collect()
+}
+
+fn runtime_failure_report(failure: &RuntimeFailure) -> (String, String) {
+    match failure {
+        RuntimeFailure::Browser(error) => (runtime_code(error).into(), runtime_message(error)),
+        RuntimeFailure::Provider(error) => (format!("runtime.{}", error.code()), error.to_string()),
+        RuntimeFailure::Assertion { message, .. } => {
+            ("runtime.assertion_failed".into(), message.clone())
+        }
+        RuntimeFailure::Decode { message } => {
+            ("runtime.json_decode_failed".into(), message.clone())
+        }
+        RuntimeFailure::Evaluation { code, message } => {
+            (format!("runtime.{code}"), message.clone())
+        }
+        RuntimeFailure::Internal { message } => ("runtime.internal_error".into(), message.clone()),
+    }
+}
+
+fn event_report(
+    path: &str,
+    kind: &str,
+    execution_id: Option<u64>,
+    test_id: Option<u32>,
+    step_id: Option<u32>,
+) -> EventReport {
+    EventReport {
+        schema_version: 1,
+        kind: kind.into(),
+        file: path.into(),
+        execution_id,
+        test_id,
+        step_id,
+        name: None,
+        passed: None,
+        exit_class: None,
+        code: None,
+        message: None,
+        transport_kind: None,
+        arguments: Default::default(),
+        result: None,
+        diagnostic_schema_version: None,
+        repair_hint_schema_version: None,
+        diff: None,
+        repair_hints: Vec::new(),
+        page: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use webtest_hir::{StepId, TestId};
+    use webtest_observation::ExecutionId;
+
+    use super::*;
+
+    #[test]
+    fn bridge_failures_point_to_targeted_diagnostics() {
+        let details = provider_error_semantic_details(&ProviderError::BridgeProtocol {
+            code: "unknown_response_id".into(),
+            message: "duplicate response".into(),
+        });
+        assert_eq!(details["bridge_code"], "unknown_response_id");
+        assert_eq!(
+            details["reference_queries"],
+            serde_json::json!(["app.diagnostics", "runtime.configuration"])
+        );
+    }
+
+    #[test]
+    fn browser_error_codes_remain_stable() {
+        assert_eq!(
+            runtime_code(&BrowserError::BrowserDisconnected),
+            "runtime.browser_disconnected"
+        );
+        assert_eq!(
+            runtime_code(&BrowserError::LocatorNotFound {
+                locator: Locator::Id("missing".into()),
+            }),
+            "runtime.locator_not_found"
+        );
+    }
+
+    #[test]
+    fn every_execution_event_variant_has_a_stable_report_kind() {
+        let execution_id = ExecutionId(7);
+        let test_id = TestId(3);
+        let step_id = StepId(5);
+        let events = vec![
+            ExecutionEvent::RunStarted { execution_id },
+            ExecutionEvent::TestStarted {
+                execution_id,
+                test_id,
+                name: "test".into(),
+            },
+            ExecutionEvent::StepStarted {
+                execution_id,
+                test_id,
+                step_id,
+            },
+            ExecutionEvent::StepPassed {
+                execution_id,
+                test_id,
+                step_id,
+            },
+            ExecutionEvent::ProviderCallStarted {
+                execution_id,
+                test_id,
+                step_id,
+                provider: "app".into(),
+                operation: "echo".into(),
+                transport_kind: Some("stdio".into()),
+                arguments: BTreeMap::from([("message".into(), "<redacted>".into())]),
+            },
+            ExecutionEvent::ProviderCallFinished {
+                execution_id,
+                test_id,
+                step_id,
+                provider: "app".into(),
+                operation: "echo".into(),
+                elapsed_ms: 1,
+                transport_kind: Some("stdio".into()),
+                result: Some("<redacted>".into()),
+            },
+            ExecutionEvent::ProviderCallFailed {
+                execution_id,
+                test_id,
+                step_id,
+                provider: "app".into(),
+                operation: "echo".into(),
+                code: "app_provider_failure".into(),
+                message: "failed".into(),
+                elapsed_ms: 2,
+                transport_kind: Some("stdio".into()),
+            },
+            ExecutionEvent::StepFailed {
+                execution_id,
+                test_id,
+                step_id,
+                failure: RuntimeFailure::Internal {
+                    message: "failed".into(),
+                },
+                repair_hints: Vec::new(),
+                page: None,
+            },
+            ExecutionEvent::TestFinished {
+                execution_id,
+                test_id,
+                passed: false,
+            },
+            ExecutionEvent::RunFinished { execution_id },
+        ];
+        let reports = event_reports("tests/a.webtest", &events);
+        assert_eq!(
+            reports
+                .iter()
+                .map(|report| report.kind.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "run_started",
+                "test_started",
+                "step_started",
+                "step_passed",
+                "provider_call_started",
+                "provider_call_finished",
+                "provider_call_failed",
+                "step_failed",
+                "test_finished",
+                "run_finished",
+            ]
+        );
+        assert_eq!(reports[4].arguments["message"], "<redacted>");
+        assert_eq!(reports[8].exit_class, Some(ExitClass::TestFailure));
+    }
+}

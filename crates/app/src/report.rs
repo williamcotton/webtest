@@ -8,6 +8,9 @@ use serde_json::Value;
 use webtest_browser::PageSummary;
 use webtest_feedback::RepairHint;
 use webtest_observation::ValueDiff;
+use webtest_project::Project;
+
+use crate::{error::AppError, project_context::normalized_path};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -516,6 +519,28 @@ impl CommandReport {
         }
         writeln!(output, "</testsuites>")
     }
+}
+
+pub(crate) fn base_report(command: &str, project: &Project) -> CommandReport {
+    let mut report = CommandReport::new(command, normalized_path(&project.root));
+    report.warnings = project
+        .warnings
+        .iter()
+        .map(|warning| WarningReport {
+            code: "config.unknown".into(),
+            key: warning.key.clone(),
+            message: warning.message.clone(),
+        })
+        .collect();
+    report
+}
+
+pub(crate) fn write_report(report: &CommandReport, reporter: Reporter) -> Result<(), AppError> {
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    report
+        .write(reporter, &mut output)
+        .map_err(AppError::infrastructure)
 }
 
 fn write_source_diagnostic(
