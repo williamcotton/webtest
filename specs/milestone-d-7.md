@@ -6,7 +6,7 @@
 
 This maintenance milestone follows the implemented application bridge in
 [`milestone-d.md`](./milestone-d.md), the application composition-root decomposition in
-[`milestone-d-5.md`](./milestone-d-5.md), and the proposed analysis decomposition in
+[`milestone-d-5.md`](./milestone-d-5.md), and the implemented analysis decomposition in
 [`milestone-d-6.md`](./milestone-d-6.md). It prepares the current sequential runtime for the
 structured execution work specified in [`milestone-e.md`](./milestone-e.md), but it does not
 implement any Milestone E syntax, plan node, scheduler, cancellation, retry, timeout, trace, or

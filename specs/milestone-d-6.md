@@ -2,7 +2,7 @@
 
 ## 0. Status and dependencies
 
-**Status: proposed (2026-08-30).**
+**Status: implemented (2026-08-30).**
 
 This maintenance milestone follows the implemented application-bridge work in
 [`milestone-d.md`](./milestone-d.md) and the application composition-root decomposition in
