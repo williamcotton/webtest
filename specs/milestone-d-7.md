@@ -2,7 +2,15 @@
 
 ## 0. Status and dependencies
 
-**Status: proposed (2026-08-30).**
+**Status: implemented (2026-08-30).**
+
+Implementation characterization confirmed one pre-existing cleanup sharp edge: an infrastructure
+step failure drops the page and best-effort closes its context, then returns before the runner's
+normal explicit session close and before per-test temporary-directory enumeration. Correcting that
+path safely also requires defined dropped-future and structured resource-scope semantics, so it is
+explicitly deferred to Milestone E rather than being silently changed or promoted to a desirable
+D.7 invariant. Normal completion, ordinary test failure, nested temporary-resource cleanup,
+context-close session restart, and session close remain directly covered by D.7 tests.
 
 This maintenance milestone follows the implemented application bridge in
 [`milestone-d.md`](./milestone-d.md), the application composition-root decomposition in
