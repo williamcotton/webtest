@@ -504,10 +504,14 @@ fn static_usage_and_browser_failures_have_distinct_exit_codes() {
         serde_json::from_slice(&infrastructure.stdout).expect("infrastructure JSON");
     assert_eq!(report["exit_class"], "infrastructure");
     assert!(
-        report["files"][0]["infrastructure_error"]["message"]
+        report["files"][0]["execution_error"]["failure"]["message"]
             .as_str()
             .expect("message")
             .contains("does not exist")
+    );
+    assert_eq!(
+        report["files"][0]["execution_error"]["class"],
+        "infrastructure"
     );
 }
 

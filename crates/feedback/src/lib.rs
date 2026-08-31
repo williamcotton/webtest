@@ -9,6 +9,14 @@ pub const REPAIR_HINT_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum FailureClass {
+    Test,
+    Infrastructure,
+    Internal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RepairHintKind {
     LocatorCandidate,
     NameCandidate,
@@ -93,6 +101,22 @@ mod tests {
         assert_eq!(
             value["replacement"]["source"],
             "role(\"button\", name: \"Save\")"
+        );
+    }
+
+    #[test]
+    fn failure_classes_have_stable_machine_names() {
+        assert_eq!(
+            serde_json::to_value(FailureClass::Test).expect("serialize class"),
+            "test"
+        );
+        assert_eq!(
+            serde_json::to_value(FailureClass::Infrastructure).expect("serialize class"),
+            "infrastructure"
+        );
+        assert_eq!(
+            serde_json::to_value(FailureClass::Internal).expect("serialize class"),
+            "internal"
         );
     }
 }

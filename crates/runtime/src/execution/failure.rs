@@ -12,7 +12,7 @@ use webtest_plan::{PlannedStep, ServerProviderCall, TestOperation, TestPlan};
 use webtest_provider::ProviderRegistry;
 
 use crate::{
-    Artifact, RunError, RunEventSink, RunnerOptions, StepError, StepFailure,
+    Artifact, FailureClass, RunError, RunEventSink, RunnerOptions, StepError, StepFailure,
     artifacts::write_artifacts, evaluation::display_value, events::emit_event,
 };
 
@@ -50,7 +50,9 @@ pub(super) async fn process_failure(input: FailureInput<'_>) -> Result<StepFailu
         elapsed_ms,
         secrets,
     } = input;
-    let evidence = if matches!(error, StepError::Browser(_)) && !error.is_infrastructure() {
+    let eligible_browser_failure =
+        matches!(error, StepError::Browser(_)) && error.failure_class() == FailureClass::Test;
+    let evidence = if eligible_browser_failure {
         if let Some(page) = page.as_deref_mut() {
             page.capture_evidence(&EvidenceRequest {
                 locator: step_browser_locator(step),
@@ -67,27 +69,26 @@ pub(super) async fn process_failure(input: FailureInput<'_>) -> Result<StepFailu
     } else {
         PageEvidence::default()
     };
-    let (inspection, secondary_failures) =
-        if matches!(error, StepError::Browser(_)) && !error.is_infrastructure() {
-            if let Some(page) = page.as_deref_mut() {
-                let mut inspection_options = options.inspection.clone();
-                inspection_options.redacted_values.extend(secrets.to_vec());
-                match page.inspect(&inspection_options).await {
-                    Ok(inspection) => (Some(inspection), Vec::new()),
-                    Err(secondary) => (
-                        None,
-                        vec![format!("semantic inspection unavailable: {secondary}")],
-                    ),
-                }
-            } else {
-                (
+    let (inspection, secondary_failures) = if eligible_browser_failure {
+        if let Some(page) = page.as_deref_mut() {
+            let mut inspection_options = options.inspection.clone();
+            inspection_options.redacted_values.extend(secrets.to_vec());
+            match page.inspect(&inspection_options).await {
+                Ok(inspection) => (Some(inspection), Vec::new()),
+                Err(secondary) => (
                     None,
-                    vec!["semantic inspection unavailable: page is closed".into()],
-                )
+                    vec![format!("semantic inspection unavailable: {secondary}")],
+                ),
             }
         } else {
-            (None, Vec::new())
-        };
+            (
+                None,
+                vec!["semantic inspection unavailable: page is closed".into()],
+            )
+        }
+    } else {
+        (None, Vec::new())
+    };
     finish_failure(FinishFailureInput {
         plan,
         test_id,
@@ -140,6 +141,9 @@ fn finish_failure(input: FinishFailureInput<'_>) -> Result<StepFailure, RunError
         event_sink,
         elapsed_ms,
     } = input;
+    let failure_class = error.failure_class();
+    let eligible_browser_failure =
+        matches!(error, StepError::Browser(_)) && failure_class == FailureClass::Test;
     let mut repair_hints = inspection
         .as_ref()
         .map(|inspection| repair_hints_for_error(&error, inspection))
@@ -153,18 +157,19 @@ fn finish_failure(input: FinishFailureInput<'_>) -> Result<StepFailure, RunError
     if !options.evidence.screenshot_on_failure {
         evidence.screenshot_png = None;
     }
-    let artifacts =
-        if options.evidence.screenshot_on_failure || options.evidence.dom_snapshot_on_failure {
-            write_artifacts(
-                &options.evidence.artifact_directory,
-                execution_id,
-                test_id,
-                step.id,
-                &mut evidence,
-            )
-        } else {
-            Vec::new()
-        };
+    let artifacts = if eligible_browser_failure
+        && (options.evidence.screenshot_on_failure || options.evidence.dom_snapshot_on_failure)
+    {
+        write_artifacts(
+            &options.evidence.artifact_directory,
+            execution_id,
+            test_id,
+            step.id,
+            &mut evidence,
+        )
+    } else {
+        Vec::new()
+    };
     if let TestOperation::ServerProviderCall(call) = &step.operation {
         emit_event(
             events,
@@ -180,7 +185,7 @@ fn finish_failure(input: FinishFailureInput<'_>) -> Result<StepFailure, RunError
             ),
         );
     }
-    if !error.is_infrastructure() {
+    if failure_class == FailureClass::Test {
         record_observation(
             observations,
             plan,
@@ -201,6 +206,7 @@ fn finish_failure(input: FinishFailureInput<'_>) -> Result<StepFailure, RunError
             execution_id,
             test_id,
             step_id: step.id,
+            failure_class,
             failure: runtime_failure(&error),
             repair_hints: repair_hints.clone(),
             page: inspection
@@ -208,22 +214,37 @@ fn finish_failure(input: FinishFailureInput<'_>) -> Result<StepFailure, RunError
                 .map(|inspection| inspection.page.clone()),
         },
     );
-    if error.is_infrastructure() {
-        return Err(match error {
-            StepError::Browser(error) => RunError::Browser(error),
-            StepError::Provider(error) => RunError::Provider(error),
-            other => RunError::Internal(other.to_string()),
-        });
+    match failure_class {
+        FailureClass::Test => Ok(StepFailure {
+            step: step.clone(),
+            error,
+            evidence,
+            artifacts,
+            inspection,
+            repair_hints,
+            secondary_failures,
+        }),
+        FailureClass::Infrastructure => match error {
+            StepError::Browser(error) => Err(RunError::Browser(error)),
+            StepError::Provider(error) => Err(RunError::Provider(error)),
+            StepError::Assertion(_)
+            | StepError::Decode(_)
+            | StepError::Evaluation(_)
+            | StepError::Internal(_) => {
+                unreachable!("only browser and provider errors classify as infrastructure")
+            }
+        },
+        FailureClass::Internal => match error {
+            StepError::Internal(message) => Err(RunError::Internal(message)),
+            StepError::Browser(_)
+            | StepError::Provider(_)
+            | StepError::Assertion(_)
+            | StepError::Decode(_)
+            | StepError::Evaluation(_) => {
+                unreachable!("only internal step errors classify as internal")
+            }
+        },
     }
-    Ok(StepFailure {
-        step: step.clone(),
-        error,
-        evidence,
-        artifacts,
-        inspection,
-        repair_hints,
-        secondary_failures,
-    })
 }
 
 fn provider_failure_event(
@@ -243,6 +264,7 @@ fn provider_failure_event(
         operation: call.operation.clone(),
         code: error.code().into(),
         message: error.to_string(),
+        failure_class: error.failure_class(),
         elapsed_ms,
         transport_kind: providers.transport_kind(&call.provider),
     }
@@ -308,14 +330,7 @@ fn record_observation(
             actual: None,
             diff: None,
         },
-        StepError::Internal(message) => RuntimeObservationKind::ValueFailure {
-            code: "internal_error".into(),
-            message: message.clone(),
-            path: None,
-            expected: None,
-            actual: None,
-            diff: None,
-        },
+        StepError::Internal(_) => return,
     };
     observations.record(RuntimeObservation {
         execution_id,

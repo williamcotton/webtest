@@ -41,7 +41,7 @@ fn dynamic_expression_errors_are_test_failures_not_internal_invariants() {
     };
     let error = evaluate(&expression, &HashMap::new()).expect_err("division should fail");
     assert_eq!(error.code(), "division_by_zero");
-    assert!(!error.is_infrastructure());
+    assert_eq!(error.failure_class(), crate::FailureClass::Test);
     assert!(matches!(error, StepError::Evaluation(_)));
 }
 

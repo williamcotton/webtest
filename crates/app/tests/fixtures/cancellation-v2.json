@@ -30,7 +30,7 @@
       ],
       "outcome": "cancelled",
       "reason": "requested",
-      "infrastructure_error": null
+      "execution_error": null
     }
   ],
   "summary": {
@@ -44,6 +44,7 @@
     "skipped": 1,
     "aborted": 0,
     "infrastructure_errors": 0,
+    "internal_errors": 0,
     "duration_nanos": 5
   },
   "exit_class": "test_failure"

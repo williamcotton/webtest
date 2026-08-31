@@ -6,8 +6,8 @@ use webtest_plan::{PlannedTest, TestOperation, TestPlan};
 use webtest_provider::{ProviderError, ProviderRegistry};
 
 use crate::{
-    CancellationReason, RunControl, RunError, RunEventSink, RunnerOptions, TestOutcome, TestResult,
-    events::emit_event, redaction::redact_step_error,
+    CancellationReason, FailureClass, RunControl, RunError, RunEventSink, RunnerOptions,
+    TestOutcome, TestResult, events::emit_event, redaction::redact_step_error,
 };
 
 use self::{
@@ -173,7 +173,9 @@ pub(crate) async fn execute_test(
                     secrets,
                     &options.inspection.redacted_query_parameters,
                 );
-                if let Some(control) = control {
+                if error.failure_class() != FailureClass::Internal
+                    && let Some(control) = control
+                {
                     control
                         .after_step_failure(test, step, &error, &state.visible_step_bindings(step))
                         .await;
@@ -228,6 +230,7 @@ pub(crate) async fn execute_test(
     }
     let outcome = outcome.unwrap_or(TestOutcome::Passed);
     let outcome_kind = outcome.finished_kind();
+    let failure_class = outcome.failure_class();
     emit_event(
         events,
         event_sink,
@@ -235,6 +238,7 @@ pub(crate) async fn execute_test(
             execution_id,
             test_id: test.id,
             outcome: outcome_kind,
+            failure_class,
         },
     );
     ExecutedTest {

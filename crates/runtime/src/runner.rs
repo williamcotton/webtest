@@ -7,8 +7,8 @@ use webtest_plan::{PlannedTest, TestPlan};
 use webtest_provider::{Capability, NativeProviderConfig, ProviderRegistry, Value};
 
 use crate::{
-    CancellationReason, RunControl, RunEventSink, RunOutcome, RunResult, RunnerOptions,
-    TestOutcome, TestResult,
+    CancellationReason, FailureClass, RunControl, RunEventSink, RunOutcome, RunResult,
+    RunnerOptions, TestOutcome, TestResult,
     events::emit_event,
     execution::{ExecutedTest, execute_test},
 };
@@ -76,6 +76,7 @@ impl Runner {
             skip_tests(
                 &plan.tests,
                 SkipReason::RunCancelled,
+                None,
                 execution_id,
                 &mut tests,
                 &mut events,
@@ -103,6 +104,7 @@ impl Runner {
                         skip_tests(
                             &plan.tests,
                             SkipReason::RunAborted,
+                            Some(FailureClass::Infrastructure),
                             execution_id,
                             &mut tests,
                             &mut events,
@@ -130,6 +132,7 @@ impl Runner {
                     skip_tests(
                         &plan.tests[index..],
                         SkipReason::RunCancelled,
+                        None,
                         execution_id,
                         &mut tests,
                         &mut events,
@@ -157,12 +160,14 @@ impl Runner {
                     TestOutcome::Cancelled { reason } => Some((
                         RunOutcome::Cancelled { reason: *reason },
                         SkipReason::RunCancelled,
+                        None,
                     )),
                     TestOutcome::Aborted { failure } => Some((
                         RunOutcome::Aborted {
                             failure: failure.clone(),
                         },
                         SkipReason::RunAborted,
+                        Some(failure.failure_class()),
                     )),
                     TestOutcome::Passed
                     | TestOutcome::Failed(_)
@@ -170,11 +175,12 @@ impl Runner {
                     | TestOutcome::Skipped { .. } => None,
                 };
                 tests.push(result);
-                if let Some((terminal, reason)) = terminal {
+                if let Some((terminal, reason, failure_class)) = terminal {
                     outcome = terminal;
                     skip_tests(
                         &plan.tests[index + 1..],
                         reason,
+                        failure_class,
                         execution_id,
                         &mut tests,
                         &mut events,
@@ -195,6 +201,7 @@ impl Runner {
                             skip_tests(
                                 &plan.tests[index + 1..],
                                 SkipReason::RunAborted,
+                                Some(FailureClass::Infrastructure),
                                 execution_id,
                                 &mut tests,
                                 &mut events,
@@ -229,6 +236,7 @@ impl Runner {
 fn skip_tests(
     planned: &[PlannedTest],
     reason: SkipReason,
+    failure_class: Option<FailureClass>,
     execution_id: ExecutionId,
     results: &mut Vec<TestResult>,
     events: &mut Vec<ExecutionEvent>,
@@ -243,11 +251,15 @@ fn skip_tests(
                 test_id: test.id,
                 name: test.name.clone(),
                 reason,
+                failure_class,
             },
         );
         results.push(TestResult {
             name: test.name.clone(),
-            outcome: TestOutcome::Skipped { reason },
+            outcome: TestOutcome::Skipped {
+                reason,
+                failure_class,
+            },
             duration: std::time::Duration::ZERO,
             bindings: BTreeMap::<String, Value>::new(),
         });
@@ -262,12 +274,14 @@ fn finish_run(
     started: Instant,
     event_sink: Option<&dyn RunEventSink>,
 ) -> RunResult {
+    let failure_class = outcome.failure_class();
     emit_event(
         &mut events,
         event_sink,
         ExecutionEvent::RunFinished {
             execution_id,
             outcome: outcome.kind(),
+            failure_class,
         },
     );
     RunResult {

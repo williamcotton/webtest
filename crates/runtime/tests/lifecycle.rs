@@ -13,7 +13,8 @@ use webtest_browser::{
 };
 use webtest_hir::{BindingId, StepId, TestId};
 use webtest_observation::{
-    ExecutionEvent, ExecutionId, ObservationStore, RuntimeObservation, RuntimeObservationKind,
+    ExecutionEvent, ExecutionId, ObservationStore, RuntimeFailure, RuntimeObservation,
+    RuntimeObservationKind,
 };
 use webtest_plan::{
     BrowserOperation, EvaluatePureOperation, PlanExpr, PlannedStep, PlannedTest,
@@ -24,8 +25,8 @@ use webtest_provider::{
     ProviderName, ProviderRegistry, ProviderResult, ProviderSchema, ServerProvider, Type, Value,
 };
 use webtest_runtime::{
-    CancellationReason, RunControl, RunError, RunEventSink, RunOutcome, Runner, RunnerOptions,
-    SkipReason, StepError, TestOutcome,
+    CancellationReason, FailureClass, RunControl, RunError, RunEventSink, RunOutcome, Runner,
+    RunnerOptions, SkipReason, StepError, TestOutcome,
 };
 use webtest_text::{FileId, SourceRevision, SyntaxOrigin, TextRange, TextSize};
 
@@ -243,6 +244,15 @@ fn pure(value: Value) -> TestOperation {
         result_binding: None,
         result_name: None,
         result_type: Type::Null,
+    })
+}
+
+fn missing_binding() -> TestOperation {
+    TestOperation::EvaluatePure(EvaluatePureOperation {
+        expression: PlanExpr::Binding(BindingId(999)),
+        result_binding: None,
+        result_name: None,
+        result_type: Type::String,
     })
 }
 
@@ -577,6 +587,117 @@ async fn observations_are_cleared_before_browser_start_can_fail() {
     );
 }
 
+#[tokio::test]
+async fn internal_step_failure_aborts_with_typed_events_and_no_user_observation() {
+    let store = Arc::new(ObservationStore::default());
+    let plan = plan_with_tests(
+        vec![Capability::Pure],
+        vec![vec![missing_binding()], vec![pure(Value::Null)]],
+    );
+    store.record(RuntimeObservation {
+        execution_id: ExecutionId::next(),
+        file: plan.file,
+        source_revision: plan.source_revision,
+        test_id: TestId(0),
+        step_id: StepId(0),
+        range: TextRange::default(),
+        kind: RuntimeObservationKind::ValueFailure {
+            code: "stale".into(),
+            message: "stale".into(),
+            path: None,
+            expected: None,
+            actual: None,
+            diff: None,
+        },
+    });
+    let control = RecordingControl::new(false, false, true);
+    let result = Runner::new(Arc::clone(&store))
+        .run_with_control(
+            &plan,
+            &LifecycleHost(Arc::new(LifecycleState::default())),
+            Some(&control),
+        )
+        .await;
+
+    assert!(matches!(
+        result.tests[0].outcome,
+        TestOutcome::Aborted {
+            failure: RunError::Internal(_)
+        }
+    ));
+    assert!(matches!(
+        result.tests[1].outcome,
+        TestOutcome::Skipped {
+            reason: SkipReason::RunAborted,
+            failure_class: Some(FailureClass::Internal),
+        }
+    ));
+    assert!(matches!(
+        result.outcome,
+        RunOutcome::Aborted {
+            failure: RunError::Internal(_)
+        }
+    ));
+    assert!(control.failure.lock().expect("failure hook").is_none());
+    assert!(
+        store
+            .observations_for(plan.file, plan.source_revision)
+            .is_empty()
+    );
+    assert!(result.events.iter().any(|event| matches!(
+        event,
+        ExecutionEvent::StepFailed {
+            failure_class: FailureClass::Internal,
+            failure: RuntimeFailure::Internal { .. },
+            ..
+        }
+    )));
+    assert!(result.events.iter().any(|event| matches!(
+        event,
+        ExecutionEvent::TestFinished {
+            failure_class: Some(FailureClass::Internal),
+            ..
+        }
+    )));
+    assert!(matches!(
+        result.events.last(),
+        Some(ExecutionEvent::RunFinished {
+            failure_class: Some(FailureClass::Internal),
+            ..
+        })
+    ));
+
+    store.record(RuntimeObservation {
+        execution_id: result.execution_id,
+        file: plan.file,
+        source_revision: plan.source_revision,
+        test_id: TestId(0),
+        step_id: StepId(0),
+        range: TextRange::default(),
+        kind: RuntimeObservationKind::ValueFailure {
+            code: "old_internal_run".into(),
+            message: "old".into(),
+            path: None,
+            expected: None,
+            actual: None,
+            diff: None,
+        },
+    });
+    let successful = plan_with_tests(vec![Capability::Pure], vec![vec![pure(Value::Null)]]);
+    let rerun = Runner::new(Arc::clone(&store))
+        .run(
+            &successful,
+            &LifecycleHost(Arc::new(LifecycleState::default())),
+        )
+        .await;
+    assert!(matches!(rerun.tests[0].outcome, TestOutcome::Passed));
+    assert!(
+        store
+            .observations_for(successful.file, successful.source_revision)
+            .is_empty()
+    );
+}
+
 struct RecordingControl {
     cancel: AtomicBool,
     cancel_after_hook: bool,
@@ -790,7 +911,8 @@ async fn cancellation_before_first_step_finishes_active_test_and_skips_later_tes
     assert!(matches!(
         result.tests[1].outcome,
         TestOutcome::Skipped {
-            reason: SkipReason::RunCancelled
+            reason: SkipReason::RunCancelled,
+            ..
         }
     ));
     assert_eq!(
@@ -825,7 +947,8 @@ async fn cancellation_between_tests_preserves_the_completed_result_and_skips_the
     assert!(matches!(
         result.tests[1].outcome,
         TestOutcome::Skipped {
-            reason: SkipReason::RunCancelled
+            reason: SkipReason::RunCancelled,
+            ..
         }
     ));
     assert_eq!((result.passed(), result.skipped()), (1, 1));
@@ -1108,6 +1231,21 @@ async fn provider_failure_is_redacted_before_control_events_and_observation() {
             "run_finished",
         ]
     );
+    assert!(matches!(result.tests[0].outcome, TestOutcome::Failed(_)));
+    assert_eq!(
+        store
+            .observations_for(plan.file, plan.source_revision)
+            .len(),
+        1
+    );
+    assert!(result.events.iter().any(|event| matches!(
+        event,
+        ExecutionEvent::StepFailed {
+            failure_class: FailureClass::Test,
+            failure: RuntimeFailure::Provider(ProviderError::Application { .. }),
+            ..
+        }
+    )));
 }
 
 #[tokio::test]
@@ -1177,6 +1315,21 @@ async fn provider_infrastructure_failure_aborts_without_recording_an_observation
             .observations_for(plan.file, plan.source_revision)
             .is_empty()
     );
+    assert!(result.events.iter().any(|event| matches!(
+        event,
+        ExecutionEvent::StepFailed {
+            failure_class: FailureClass::Infrastructure,
+            failure: RuntimeFailure::Provider(ProviderError::BridgeTransport { .. }),
+            ..
+        }
+    )));
+    assert!(matches!(
+        result.events.last(),
+        Some(ExecutionEvent::RunFinished {
+            failure_class: Some(FailureClass::Infrastructure),
+            ..
+        })
+    ));
 }
 
 #[tokio::test]

@@ -21,6 +21,7 @@ pub use options::{EvidenceOptions, RunnerOptions};
 pub use result::{RunOutcome, RunResult, StepFailure, TestOutcome, TestResult};
 pub use runner::Runner;
 pub use url::resolve_browser_url;
+pub use webtest_feedback::FailureClass;
 pub use webtest_observation::{CancellationReason, SkipReason};
 
 #[cfg(test)]

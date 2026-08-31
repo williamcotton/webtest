@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, time::Duration};
 
 use webtest_browser::{PageEvidence, PageInspection, RepairHint};
+use webtest_feedback::FailureClass;
 use webtest_observation::{
     CancellationReason, ExecutionEvent, ExecutionId, RunOutcomeKind, SkipReason, TestOutcomeKind,
 };
@@ -32,10 +33,19 @@ pub struct TestResult {
 pub enum TestOutcome {
     Passed,
     Failed(Box<StepFailure>),
-    TimedOut { timeout: Duration },
-    Cancelled { reason: CancellationReason },
-    Skipped { reason: SkipReason },
-    Aborted { failure: RunError },
+    TimedOut {
+        timeout: Duration,
+    },
+    Cancelled {
+        reason: CancellationReason,
+    },
+    Skipped {
+        reason: SkipReason,
+        failure_class: Option<FailureClass>,
+    },
+    Aborted {
+        failure: RunError,
+    },
 }
 
 impl TestOutcome {
@@ -47,11 +57,22 @@ impl TestOutcome {
             Self::Cancelled { .. } => TestOutcomeKind::Cancelled,
             Self::Skipped {
                 reason: SkipReason::RunCancelled,
+                ..
             } => TestOutcomeKind::Cancelled,
             Self::Skipped {
                 reason: SkipReason::RunAborted,
+                ..
             }
             | Self::Aborted { .. } => TestOutcomeKind::Aborted,
+        }
+    }
+
+    pub(crate) fn failure_class(&self) -> Option<FailureClass> {
+        match self {
+            Self::Passed | Self::Cancelled { .. } => None,
+            Self::Failed(_) | Self::TimedOut { .. } => Some(FailureClass::Test),
+            Self::Skipped { failure_class, .. } => *failure_class,
+            Self::Aborted { failure } => Some(failure.failure_class()),
         }
     }
 }
@@ -69,6 +90,13 @@ impl RunOutcome {
             Self::Completed => RunOutcomeKind::Completed,
             Self::Cancelled { .. } => RunOutcomeKind::Cancelled,
             Self::Aborted { .. } => RunOutcomeKind::Aborted,
+        }
+    }
+
+    pub const fn failure_class(&self) -> Option<FailureClass> {
+        match self {
+            Self::Completed | Self::Cancelled { .. } => None,
+            Self::Aborted { failure } => Some(failure.failure_class()),
         }
     }
 }

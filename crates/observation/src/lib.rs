@@ -10,7 +10,7 @@ use std::{
 };
 
 use webtest_browser::{CandidateEvidence, Locator, PageSummary};
-use webtest_feedback::RepairHint;
+use webtest_feedback::{FailureClass, RepairHint};
 use webtest_hir::{StepId, TestId};
 use webtest_text::{FileId, SourceRevision, TextRange};
 
@@ -141,6 +141,7 @@ pub enum ExecutionEvent {
         operation: String,
         code: String,
         message: String,
+        failure_class: FailureClass,
         elapsed_ms: u64,
         transport_kind: Option<String>,
     },
@@ -148,6 +149,7 @@ pub enum ExecutionEvent {
         execution_id: ExecutionId,
         test_id: TestId,
         step_id: StepId,
+        failure_class: FailureClass,
         failure: RuntimeFailure,
         repair_hints: Vec<RepairHint>,
         page: Option<PageSummary>,
@@ -156,16 +158,19 @@ pub enum ExecutionEvent {
         execution_id: ExecutionId,
         test_id: TestId,
         outcome: TestOutcomeKind,
+        failure_class: Option<FailureClass>,
     },
     TestSkipped {
         execution_id: ExecutionId,
         test_id: TestId,
         name: String,
         reason: SkipReason,
+        failure_class: Option<FailureClass>,
     },
     RunFinished {
         execution_id: ExecutionId,
         outcome: RunOutcomeKind,
+        failure_class: Option<FailureClass>,
     },
 }
 

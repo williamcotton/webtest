@@ -294,10 +294,12 @@ mod tests {
             execution_id,
             test_id: TestId(3),
             outcome: TestOutcomeKind::Passed,
+            failure_class: None,
         });
         progress.publish(&ExecutionEvent::RunFinished {
             execution_id,
             outcome: webtest_observation::RunOutcomeKind::Completed,
+            failure_class: None,
         });
         progress.browser_run_finished(true).expect("browser done");
         progress.stopping_application().expect("stopping app");

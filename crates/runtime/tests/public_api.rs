@@ -162,6 +162,7 @@ fn defaults_and_result_counts_are_exact() {
             }),
             test_result(TestOutcome::Skipped {
                 reason: SkipReason::RunCancelled,
+                failure_class: None,
             }),
             test_result(TestOutcome::Aborted {
                 failure: RunError::Internal("aborted".into()),
@@ -172,6 +173,7 @@ fn defaults_and_result_counts_are_exact() {
             ExecutionEvent::RunFinished {
                 execution_id,
                 outcome: RunOutcomeKind::Completed,
+                failure_class: None,
             },
         ],
         duration: Duration::ZERO,

@@ -1,6 +1,7 @@
 use std::{io, path::PathBuf, sync::Arc, time::Instant};
 
 use webtest_browser_cdp::ChromeHost;
+use webtest_feedback::FailureClass;
 use webtest_observation::ObservationStore;
 use webtest_provider::Capability;
 use webtest_runtime::{RunError, RunOutcome, Runner, TestOutcome};
@@ -13,8 +14,9 @@ use crate::{
     project_context::{display_path, nanos, project},
     provider_composition::runtime_provider_registry,
     report::{
-        ExitClass, FailureReport, FileReport, RunReportOutcome, TestReport, TestReportOutcome,
-        WarningReport, base_report, write_human_report_after_progress, write_report,
+        ExecutionFailureReport, ExitClass, FailureReport, FileReport, RunReportOutcome, TestReport,
+        TestReportOutcome, WarningReport, base_report, write_human_report_after_progress,
+        write_report,
     },
     runtime_configuration::runner_options,
     runtime_output::{event_reports, run_failure_report, step_failure_report},
@@ -94,7 +96,7 @@ pub(crate) async fn run_test(
                 tests: Vec::new(),
                 outcome: None,
                 reason: None,
-                infrastructure_error: None,
+                execution_error: None,
                 events: Vec::new(),
             });
             continue;
@@ -116,7 +118,7 @@ pub(crate) async fn run_test(
             tests: Vec::new(),
             outcome: None,
             reason: None,
-            infrastructure_error: None,
+            execution_error: None,
             events: Vec::new(),
         };
         if let Some(provider) = &app_provider {
@@ -134,18 +136,21 @@ pub(crate) async fn run_test(
                 if first_attempt && let Some(progress) = &progress {
                     record_progress_error(progress.application_started(false), &mut progress_error);
                 }
-                file_report.infrastructure_error = Some(FailureReport {
-                    diagnostic_schema_version: webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
-                    repair_hint_schema_version: webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
-                    code: format!("runtime.{}", error.code()),
-                    message: error.to_string(),
-                    span: None,
-                    diff: None,
-                    artifacts: Vec::new(),
-                    semantic_details: None,
-                    repair_hints: Vec::new(),
-                    page: None,
-                    secondary: Vec::new(),
+                file_report.execution_error = Some(ExecutionFailureReport {
+                    class: FailureClass::Infrastructure,
+                    failure: FailureReport {
+                        diagnostic_schema_version: webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
+                        repair_hint_schema_version: webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
+                        code: format!("runtime.{}", error.code()),
+                        message: error.to_string(),
+                        span: None,
+                        diff: None,
+                        artifacts: Vec::new(),
+                        semantic_details: None,
+                        repair_hints: Vec::new(),
+                        page: None,
+                        secondary: Vec::new(),
+                    },
                 });
                 file_report.duration_nanos =
                     nanos(analysis_duration.saturating_add(started.elapsed()));
@@ -190,18 +195,22 @@ pub(crate) async fn run_test(
                             &mut progress_error,
                         );
                     }
-                    file_report.infrastructure_error = Some(FailureReport {
-                        diagnostic_schema_version: webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
-                        repair_hint_schema_version: webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
-                        code: "runtime.browser_launch".into(),
-                        message: error.message,
-                        span: None,
-                        diff: None,
-                        artifacts: Vec::new(),
-                        semantic_details: None,
-                        repair_hints: Vec::new(),
-                        page: None,
-                        secondary: Vec::new(),
+                    file_report.execution_error = Some(ExecutionFailureReport {
+                        class: FailureClass::Infrastructure,
+                        failure: FailureReport {
+                            diagnostic_schema_version: webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
+                            repair_hint_schema_version:
+                                webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
+                            code: "runtime.browser_launch".into(),
+                            message: error.message,
+                            span: None,
+                            diff: None,
+                            artifacts: Vec::new(),
+                            semantic_details: None,
+                            repair_hints: Vec::new(),
+                            page: None,
+                            secondary: Vec::new(),
+                        },
                     });
                     file_report.duration_nanos =
                         nanos(analysis_duration.saturating_add(started.elapsed()));
@@ -229,23 +238,26 @@ pub(crate) async fn run_test(
             Err(_) => {
                 file_report.outcome = Some(RunReportOutcome::Aborted);
                 file_report.reason = Some("test file timeout".into());
-                file_report.infrastructure_error = Some(FailureReport {
-                    diagnostic_schema_version: webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
-                    repair_hint_schema_version: webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
-                    code: "runtime.test_timeout".into(),
-                    message: format!(
-                        "test file exceeded its {}ms timeout",
-                        project.config.timeouts.test.as_millis()
-                    ),
-                    span: None,
-                    diff: None,
-                    artifacts: Vec::new(),
-                    semantic_details: Some(serde_json::json!({
-                        "timeout_ms": project.config.timeouts.test.as_millis(),
-                    })),
-                    repair_hints: Vec::new(),
-                    page: None,
-                    secondary: Vec::new(),
+                file_report.execution_error = Some(ExecutionFailureReport {
+                    class: FailureClass::Infrastructure,
+                    failure: FailureReport {
+                        diagnostic_schema_version: webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
+                        repair_hint_schema_version: webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
+                        code: "runtime.test_timeout".into(),
+                        message: format!(
+                            "test file exceeded its {}ms timeout",
+                            project.config.timeouts.test.as_millis()
+                        ),
+                        span: None,
+                        diff: None,
+                        artifacts: Vec::new(),
+                        semantic_details: Some(serde_json::json!({
+                            "timeout_ms": project.config.timeouts.test.as_millis(),
+                        })),
+                        repair_hints: Vec::new(),
+                        page: None,
+                        secondary: Vec::new(),
+                    },
                 });
                 report.exit_class = report.exit_class.combine(ExitClass::Infrastructure);
                 file_report.exit_class = ExitClass::Infrastructure;
@@ -264,7 +276,10 @@ pub(crate) async fn run_test(
                         file_report.outcome = Some(RunReportOutcome::Aborted);
                         file_report.reason = Some(failure.to_string());
                         if result.aborted() == 0 {
-                            file_report.infrastructure_error = Some(run_failure_report(failure));
+                            file_report.execution_error = Some(ExecutionFailureReport {
+                                class: failure.failure_class(),
+                                failure: run_failure_report(failure),
+                            });
                         }
                         run_error_exit_class(failure)
                     }
@@ -276,10 +291,11 @@ pub(crate) async fn run_test(
                     .tests
                     .into_iter()
                     .map(|test| {
-                        let (outcome, reason, timeout_nanos, failure, exit_class) =
+                        let (outcome, failure_class, reason, timeout_nanos, failure, exit_class) =
                             match test.outcome {
                                 TestOutcome::Passed => (
                                     TestReportOutcome::Passed,
+                                    None,
                                     None,
                                     None,
                                     None,
@@ -287,6 +303,7 @@ pub(crate) async fn run_test(
                                 ),
                                 TestOutcome::Failed(failure) => (
                                     TestReportOutcome::Failed,
+                                    Some(FailureClass::Test),
                                     None,
                                     None,
                                     Some(step_failure_report(*failure, &analyzed.source)),
@@ -294,6 +311,7 @@ pub(crate) async fn run_test(
                                 ),
                                 TestOutcome::TimedOut { timeout } => (
                                     TestReportOutcome::TimedOut,
+                                    Some(FailureClass::Test),
                                     Some(format!("timed out after {}ms", timeout.as_millis())),
                                     Some(nanos(timeout)),
                                     None,
@@ -301,29 +319,30 @@ pub(crate) async fn run_test(
                                 ),
                                 TestOutcome::Cancelled { reason } => (
                                     TestReportOutcome::Cancelled,
+                                    None,
                                     Some(cancellation_reason_name(reason).into()),
                                     None,
                                     None,
                                     ExitClass::TestFailure,
                                 ),
-                                TestOutcome::Skipped { reason } => (
+                                TestOutcome::Skipped {
+                                    reason,
+                                    failure_class,
+                                } => (
                                     TestReportOutcome::Skipped,
+                                    failure_class,
                                     Some(skip_reason_name(reason).into()),
                                     None,
                                     None,
-                                    match reason {
-                                        webtest_runtime::SkipReason::RunCancelled => {
-                                            ExitClass::TestFailure
-                                        }
-                                        webtest_runtime::SkipReason::RunAborted => {
-                                            ExitClass::Infrastructure
-                                        }
-                                    },
+                                    failure_class.map_or(ExitClass::TestFailure, |class| {
+                                        ExitClass::from_failure_class(class)
+                                    }),
                                 ),
                                 TestOutcome::Aborted { failure } => {
                                     let exit_class = run_error_exit_class(&failure);
                                     (
                                         TestReportOutcome::Aborted,
+                                        Some(failure.failure_class()),
                                         Some(failure.to_string()),
                                         None,
                                         Some(run_failure_report(&failure)),
@@ -335,6 +354,7 @@ pub(crate) async fn run_test(
                             name: test.name,
                             exit_class,
                             outcome,
+                            failure_class,
                             reason,
                             timeout_nanos,
                             duration_nanos: nanos(test.duration),
@@ -395,10 +415,7 @@ pub(crate) async fn run_test(
 }
 
 fn run_error_exit_class(error: &RunError) -> ExitClass {
-    match error {
-        RunError::Browser(_) | RunError::Provider(_) => ExitClass::Infrastructure,
-        RunError::Internal(_) => ExitClass::Internal,
-    }
+    ExitClass::from_failure_class(error.failure_class())
 }
 
 fn cancellation_reason_name(reason: webtest_runtime::CancellationReason) -> &'static str {

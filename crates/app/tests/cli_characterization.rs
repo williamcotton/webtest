@@ -123,7 +123,7 @@ fn check_reporters_preserve_output_and_exit_class() {
     assert_eq!(concise.status.code(), Some(0));
     let concise = String::from_utf8(concise.stdout).expect("concise output");
     assert!(concise.contains("files=1 diagnostics=0 tests=0"));
-    assert!(concise.ends_with("infrastructure=0 exit=0\n"));
+    assert!(concise.ends_with("infrastructure=0 internal=0 exit=0\n"));
 
     let json = run(directory.path(), &["check", "--reporter", "json"]);
     assert_eq!(json.status.code(), Some(0));
@@ -150,7 +150,7 @@ fn human_test_reporter_streams_preparation_and_each_test_status_once() {
             "checking 1 test file ... done\n",
             "running 1 test in 1 file\n",
             "test \"works\" ... ok\n",
-            "1 passed; 0 failed; 0 timed out; 0 cancelled; 0 skipped; 0 aborted; 0 infrastructure errors\n",
+            "1 passed; 0 failed; 0 timed out; 0 cancelled; 0 skipped; 0 aborted; 0 infrastructure errors; 0 internal errors\n",
         )
     );
 }

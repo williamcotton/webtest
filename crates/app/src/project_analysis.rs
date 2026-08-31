@@ -75,7 +75,7 @@ pub(crate) fn analyze_project(project: &Project) -> Result<CommandReport, AppErr
             tests: Vec::new(),
             outcome: None,
             reason: None,
-            infrastructure_error: None,
+            execution_error: None,
             events: Vec::new(),
         });
     }

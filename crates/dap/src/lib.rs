@@ -630,12 +630,17 @@ impl DebugState {
                 TestOutcome::Cancelled { reason } => {
                     ("stderr", format!("CANCELLED: {reason:?}"), Value::Null)
                 }
-                TestOutcome::Skipped { reason } => {
+                TestOutcome::Skipped { reason, .. } => {
                     ("stderr", format!("SKIPPED: {reason:?}"), Value::Null)
                 }
-                TestOutcome::Aborted { failure } => {
-                    ("stderr", format!("ABORTED: {failure}"), Value::Null)
-                }
+                TestOutcome::Aborted { failure } => (
+                    "stderr",
+                    format!(
+                        "ABORTED ({} error): {failure}",
+                        failure_class_name(failure.failure_class())
+                    ),
+                    run_failure_output_data(failure),
+                ),
             };
             let _ = self
                 .writer
@@ -649,6 +654,24 @@ impl DebugState {
                 )
                 .await;
         }
+        if result.aborted() == 0
+            && let RunOutcome::Aborted { failure } = &result.outcome
+        {
+            let _ = self
+                .writer
+                .event(
+                    "output",
+                    json!({
+                        "category": "stderr",
+                        "output": format!(
+                            "run ... ABORTED ({} error): {failure}\n",
+                            failure_class_name(failure.failure_class())
+                        ),
+                        "data": run_failure_output_data(failure),
+                    }),
+                )
+                .await;
+        }
         let exit_code = match &result.outcome {
             RunOutcome::Completed => i32::from(
                 result.failed() != 0
@@ -656,7 +679,8 @@ impl DebugState {
                     || result.cancelled() != 0
                     || result.aborted() != 0,
             ),
-            RunOutcome::Cancelled { .. } | RunOutcome::Aborted { .. } => 1,
+            RunOutcome::Cancelled { .. } => 1,
+            RunOutcome::Aborted { failure } => failure_exit_code(failure.failure_class()),
         };
         if self.shutting_down.load(Ordering::Acquire) {
             return;
@@ -682,10 +706,34 @@ fn failure_output_data(failure: &webtest_runtime::StepFailure) -> Value {
         "diagnostic_schema_version": webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
         "repair_hint_schema_version": webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
         "code": failure.error.code(),
+        "failure_class": failure.error.failure_class(),
         "repair_hints": failure.repair_hints,
         "page": failure.inspection.as_ref().map(|inspection| &inspection.page),
         "secondary": failure.secondary_failures,
     })
+}
+
+fn run_failure_output_data(failure: &webtest_runtime::RunError) -> Value {
+    json!({
+        "code": failure.code(),
+        "failure_class": failure.failure_class(),
+    })
+}
+
+const fn failure_exit_code(class: webtest_feedback::FailureClass) -> i32 {
+    match class {
+        webtest_feedback::FailureClass::Test => 1,
+        webtest_feedback::FailureClass::Infrastructure => 3,
+        webtest_feedback::FailureClass::Internal => 4,
+    }
+}
+
+const fn failure_class_name(class: webtest_feedback::FailureClass) -> &'static str {
+    match class {
+        webtest_feedback::FailureClass::Test => "test",
+        webtest_feedback::FailureClass::Infrastructure => "infrastructure",
+        webtest_feedback::FailureClass::Internal => "internal",
+    }
 }
 
 impl DebugState {
@@ -1510,6 +1558,24 @@ mod tests {
         async fn start(&self) -> Result<Box<dyn BrowserSession>, BrowserError> {
             Err(BrowserError::Launch("unused in this test".into()))
         }
+    }
+
+    #[test]
+    fn debug_exit_and_output_distinguish_internal_from_infrastructure_failures() {
+        let infrastructure = webtest_runtime::RunError::Browser(BrowserError::BrowserDisconnected);
+        let internal = webtest_runtime::RunError::Internal("violated invariant".into());
+
+        assert_eq!(failure_exit_code(infrastructure.failure_class()), 3);
+        assert_eq!(failure_exit_code(internal.failure_class()), 4);
+        assert_eq!(
+            run_failure_output_data(&infrastructure)["failure_class"],
+            "infrastructure"
+        );
+        assert_eq!(
+            run_failure_output_data(&internal)["failure_class"],
+            "internal"
+        );
+        assert_eq!(failure_class_name(internal.failure_class()), "internal");
     }
 
     #[test]

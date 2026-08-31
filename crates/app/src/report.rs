@@ -6,7 +6,7 @@ use std::{
 use serde::Serialize;
 use serde_json::Value;
 use webtest_browser::PageSummary;
-use webtest_feedback::RepairHint;
+use webtest_feedback::{FailureClass, RepairHint};
 use webtest_observation::ValueDiff;
 use webtest_project::Project;
 
@@ -43,6 +43,14 @@ impl ExitClass {
             self
         }
     }
+
+    pub const fn from_failure_class(class: FailureClass) -> Self {
+        match class {
+            FailureClass::Test => Self::TestFailure,
+            FailureClass::Infrastructure => Self::Infrastructure,
+            FailureClass::Internal => Self::Internal,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -75,7 +83,7 @@ pub struct FileReport {
     pub outcome: Option<RunReportOutcome>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    pub infrastructure_error: Option<FailureReport>,
+    pub execution_error: Option<ExecutionFailureReport>,
     #[serde(skip)]
     pub events: Vec<EventReport>,
 }
@@ -102,6 +110,8 @@ pub struct TestReport {
     pub name: String,
     pub exit_class: ExitClass,
     pub outcome: TestReportOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<FailureClass>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -164,6 +174,12 @@ pub struct FailureReport {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct ExecutionFailureReport {
+    pub class: FailureClass,
+    pub failure: FailureReport,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct MachineSourceReport {
     pub path: String,
     pub source_revision: String,
@@ -205,6 +221,7 @@ pub struct SummaryReport {
     pub skipped: usize,
     pub aborted: usize,
     pub infrastructure_errors: usize,
+    pub internal_errors: usize,
     pub duration_nanos: u64,
 }
 
@@ -228,6 +245,8 @@ pub struct EventReport {
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_class: Option<ExitClass>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<FailureClass>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -295,8 +314,33 @@ impl CommandReport {
         self.summary.infrastructure_errors = self
             .files
             .iter()
-            .filter(|file| file.infrastructure_error.is_some())
+            .filter(|file| {
+                file.execution_error
+                    .as_ref()
+                    .is_some_and(|error| error.class == FailureClass::Infrastructure)
+            })
             .count();
+        self.summary.internal_errors = self
+            .files
+            .iter()
+            .filter(|file| {
+                file.execution_error
+                    .as_ref()
+                    .is_some_and(|error| error.class == FailureClass::Internal)
+            })
+            .count();
+        for test in self
+            .files
+            .iter()
+            .flat_map(|file| &file.tests)
+            .filter(|test| test.outcome == TestReportOutcome::Aborted)
+        {
+            match test.failure_class {
+                Some(FailureClass::Infrastructure) => self.summary.infrastructure_errors += 1,
+                Some(FailureClass::Internal) => self.summary.internal_errors += 1,
+                Some(FailureClass::Test) | None => {}
+            }
+        }
         self.summary.duration_nanos = self.files.iter().map(|file| file.duration_nanos).sum();
     }
 
@@ -352,7 +396,7 @@ impl CommandReport {
             }
             for test in &file.tests {
                 if include_test_status {
-                    writeln!(output, "test {:?} ... {}", test.name, test.outcome.status())?;
+                    writeln!(output, "test {:?} ... {}", test.name, test_status(test))?;
                 }
                 if let Some(failure) = &test.failure {
                     if !include_test_status {
@@ -367,6 +411,16 @@ impl CommandReport {
                             &failure.message,
                             span,
                         )?;
+                    } else if test.outcome == TestReportOutcome::Aborted {
+                        writeln!(
+                            output,
+                            "{} error[{}]: {}",
+                            failure_class_name(
+                                test.failure_class.unwrap_or(FailureClass::Infrastructure)
+                            ),
+                            failure.code,
+                            failure.message
+                        )?;
                     } else {
                         writeln!(output, "error[{}]: {}", failure.code, failure.message)?;
                     }
@@ -375,18 +429,21 @@ impl CommandReport {
                     }
                 }
             }
-            if let Some(error) = &file.infrastructure_error {
+            if let Some(error) = &file.execution_error {
                 writeln!(
                     output,
-                    "{}: infrastructure error[{}]: {}",
-                    file.path, error.code, error.message
+                    "{}: {} error[{}]: {}",
+                    file.path,
+                    failure_class_name(error.class),
+                    error.failure.code,
+                    error.failure.message
                 )?;
             }
         }
         match self.command.as_str() {
             "test" => writeln!(
                 output,
-                "{} passed; {} failed; {} timed out; {} cancelled; {} skipped; {} aborted; {} infrastructure error{}",
+                "{} passed; {} failed; {} timed out; {} cancelled; {} skipped; {} aborted; {} infrastructure error{}; {} internal error{}",
                 self.summary.passed,
                 self.summary.failed,
                 self.summary.timed_out,
@@ -394,7 +451,9 @@ impl CommandReport {
                 self.summary.skipped,
                 self.summary.aborted,
                 self.summary.infrastructure_errors,
-                plural(self.summary.infrastructure_errors)
+                plural(self.summary.infrastructure_errors),
+                self.summary.internal_errors,
+                plural(self.summary.internal_errors)
             ),
             "check" => writeln!(
                 output,
@@ -431,20 +490,23 @@ impl CommandReport {
                     "{}: test {:?}: {}",
                     file.path,
                     test.name,
-                    test.outcome.status()
+                    test_status(test)
                 )?;
             }
-            if let Some(error) = &file.infrastructure_error {
+            if let Some(error) = &file.execution_error {
                 writeln!(
                     output,
-                    "{}: infrastructure[{}]: {}",
-                    file.path, error.code, error.message
+                    "{}: {}[{}]: {}",
+                    file.path,
+                    failure_class_name(error.class),
+                    error.failure.code,
+                    error.failure.message
                 )?;
             }
         }
         writeln!(
             output,
-            "files={} diagnostics={} tests={} passed={} failed={} timed_out={} cancelled={} skipped={} aborted={} infrastructure={} exit={}",
+            "files={} diagnostics={} tests={} passed={} failed={} timed_out={} cancelled={} skipped={} aborted={} infrastructure={} internal={} exit={}",
             self.summary.files,
             self.summary.diagnostics,
             self.summary.tests,
@@ -455,6 +517,7 @@ impl CommandReport {
             self.summary.skipped,
             self.summary.aborted,
             self.summary.infrastructure_errors,
+            self.summary.internal_errors,
             self.exit_class.code()
         )
     }
@@ -497,14 +560,15 @@ impl CommandReport {
             for event in &file.events {
                 write_json_line(output, event)?;
             }
-            if let Some(error) = &file.infrastructure_error {
+            if let Some(error) = &file.execution_error {
                 write_json_line(
                     output,
                     &serde_json::json!({
                         "schema_version": REPORT_SCHEMA_VERSION,
-                        "type": "infrastructure_error",
+                        "type": "execution_error",
                         "file": file.path,
-                        "failure": error,
+                        "failure_class": error.class,
+                        "failure": error.failure,
                     }),
                 )?;
             }
@@ -528,9 +592,14 @@ impl CommandReport {
             .iter()
             .filter(|file| !file.diagnostics.is_empty() && file.tests.is_empty())
             .count();
-        let tests = self.summary.tests + static_cases + self.summary.infrastructure_errors;
+        let file_execution_errors = self
+            .files
+            .iter()
+            .filter(|file| file.execution_error.is_some())
+            .count();
+        let tests = self.summary.tests + static_cases + file_execution_errors;
         let failures = self.summary.failed + self.summary.timed_out + static_cases;
-        let errors = self.summary.aborted + self.summary.infrastructure_errors;
+        let errors = self.summary.aborted + file_execution_errors;
         let skipped = self.summary.cancelled + self.summary.skipped;
         writeln!(output, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>")?;
         writeln!(
@@ -614,10 +683,11 @@ impl CommandReport {
                         let code = failure.map_or("run_aborted", |failure| failure.code.as_str());
                         let message =
                             failure.map_or("test aborted", |failure| failure.message.as_str());
+                        let class = test.failure_class.unwrap_or(FailureClass::Infrastructure);
                         writeln!(
                             output,
                             "      <error type=\"{}\" message=\"{}\">{}</error>",
-                            xml(code),
+                            xml(&format!("{}.{}", failure_class_name(class), code)),
                             xml(message),
                             xml(message)
                         )?;
@@ -625,14 +695,15 @@ impl CommandReport {
                     }
                 }
             }
-            if let Some(error) = &file.infrastructure_error {
-                writeln!(output, "    <testcase name=\"infrastructure\">")?;
+            if let Some(error) = &file.execution_error {
+                let class = failure_class_name(error.class);
+                writeln!(output, "    <testcase name=\"{class}\">")?;
                 writeln!(
                     output,
                     "      <error type=\"{}\" message=\"{}\">{}</error>",
-                    xml(&error.code),
-                    xml(&error.message),
-                    xml(&error.message)
+                    xml(&format!("{}.{}", class, error.failure.code)),
+                    xml(&error.failure.message),
+                    xml(&error.failure.message)
                 )?;
                 writeln!(output, "    </testcase>")?;
             }
@@ -705,6 +776,26 @@ fn plural(count: usize) -> &'static str {
     if count == 1 { "" } else { "s" }
 }
 
+fn failure_class_name(class: FailureClass) -> &'static str {
+    match class {
+        FailureClass::Test => "test",
+        FailureClass::Infrastructure => "infrastructure",
+        FailureClass::Internal => "internal",
+    }
+}
+
+fn test_status(test: &TestReport) -> String {
+    if test.outcome == TestReportOutcome::Aborted {
+        format!(
+            "{} ({} error)",
+            test.outcome.status(),
+            failure_class_name(test.failure_class.unwrap_or(FailureClass::Infrastructure))
+        )
+    } else {
+        test.outcome.status().into()
+    }
+}
+
 fn xml(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -735,6 +826,7 @@ mod tests {
                 name: "a < b".into(),
                 exit_class: ExitClass::TestFailure,
                 outcome: TestReportOutcome::Failed,
+                failure_class: Some(FailureClass::Test),
                 reason: None,
                 timeout_nanos: None,
                 duration_nanos: 10,
@@ -764,7 +856,7 @@ mod tests {
             }],
             outcome: Some(RunReportOutcome::Completed),
             reason: None,
-            infrastructure_error: None,
+            execution_error: None,
             events: Vec::new(),
         });
         report.exit_class = ExitClass::TestFailure;
@@ -787,16 +879,19 @@ mod tests {
                     execution_id,
                     test_id: TestId(0),
                     outcome: TestOutcomeKind::Cancelled,
+                    failure_class: None,
                 },
                 ExecutionEvent::TestSkipped {
                     execution_id,
                     test_id: TestId(1),
                     name: "later".into(),
                     reason: SkipReason::RunCancelled,
+                    failure_class: None,
                 },
                 ExecutionEvent::RunFinished {
                     execution_id,
                     outcome: RunOutcomeKind::Cancelled,
+                    failure_class: None,
                 },
             ],
         );
@@ -812,6 +907,7 @@ mod tests {
                     name: "active".into(),
                     exit_class: ExitClass::TestFailure,
                     outcome: TestReportOutcome::Cancelled,
+                    failure_class: None,
                     reason: Some("requested".into()),
                     timeout_nanos: None,
                     duration_nanos: 5,
@@ -821,6 +917,7 @@ mod tests {
                     name: "later".into(),
                     exit_class: ExitClass::TestFailure,
                     outcome: TestReportOutcome::Skipped,
+                    failure_class: None,
                     reason: Some("run_cancelled".into()),
                     timeout_nanos: None,
                     duration_nanos: 0,
@@ -829,10 +926,56 @@ mod tests {
             ],
             outcome: Some(RunReportOutcome::Cancelled),
             reason: Some("requested".into()),
-            infrastructure_error: None,
+            execution_error: None,
             events,
         });
         report.exit_class = ExitClass::TestFailure;
+        report.finish();
+        report
+    }
+
+    fn internal_error_sample() -> CommandReport {
+        let execution_id = ExecutionId(9);
+        let events = crate::runtime_output::event_reports(
+            "tests/internal.webtest",
+            &[ExecutionEvent::RunFinished {
+                execution_id,
+                outcome: RunOutcomeKind::Aborted,
+                failure_class: Some(FailureClass::Internal),
+            }],
+        );
+        let failure = FailureReport {
+            diagnostic_schema_version: webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
+            repair_hint_schema_version: webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
+            code: "runtime.internal_error".into(),
+            message: "internal runtime error: violated invariant".into(),
+            span: None,
+            diff: None,
+            artifacts: Vec::new(),
+            semantic_details: Some(serde_json::json!({
+                "failure_class": FailureClass::Internal,
+            })),
+            repair_hints: Vec::new(),
+            page: None,
+            secondary: Vec::new(),
+        };
+        let mut report = CommandReport::new("test", "/project");
+        report.files.push(FileReport {
+            path: "tests/internal.webtest".into(),
+            exit_class: ExitClass::Internal,
+            source_revision: "internal".into(),
+            duration_nanos: 3,
+            diagnostics: Vec::new(),
+            tests: Vec::new(),
+            outcome: Some(RunReportOutcome::Aborted),
+            reason: Some("violated invariant".into()),
+            execution_error: Some(ExecutionFailureReport {
+                class: FailureClass::Internal,
+                failure,
+            }),
+            events,
+        });
+        report.exit_class = ExitClass::Internal;
         report.finish();
         report
     }
@@ -862,7 +1005,7 @@ mod tests {
         assert!(output.contains("failure in test \"a < b\":"));
         assert!(output.contains("error[runtime.locator_not_found]"));
         assert!(output.ends_with(
-            "0 passed; 1 failed; 0 timed out; 0 cancelled; 0 skipped; 0 aborted; 0 infrastructure errors\n"
+            "0 passed; 1 failed; 0 timed out; 0 cancelled; 0 skipped; 0 aborted; 0 infrastructure errors; 0 internal errors\n"
         ));
     }
 
@@ -966,7 +1109,90 @@ mod tests {
     }
 
     #[test]
+    fn internal_execution_error_survives_every_reporter_and_summary() {
+        let report = internal_error_sample();
+        assert_eq!(report.summary.infrastructure_errors, 0);
+        assert_eq!(report.summary.internal_errors, 1);
+        assert_eq!(report.exit_class, ExitClass::Internal);
+
+        for reporter in [
+            Reporter::Human,
+            Reporter::Concise,
+            Reporter::Json,
+            Reporter::Events,
+            Reporter::Junit,
+        ] {
+            let mut output = Vec::new();
+            report.write(reporter, &mut output).expect("render report");
+            let output = String::from_utf8(output).expect("UTF-8");
+            assert!(output.contains("internal"), "{reporter:?}: {output}");
+            assert!(
+                !output.contains("failure_class\": \"infrastructure"),
+                "{reporter:?}: {output}"
+            );
+            assert!(
+                !output.contains("failure_class\":\"infrastructure"),
+                "{reporter:?}: {output}"
+            );
+            if reporter == Reporter::Junit {
+                assert!(output.contains("<error type=\"internal.runtime.internal_error\""));
+            }
+        }
+
+        let mut json = Vec::new();
+        report
+            .write(Reporter::Json, &mut json)
+            .expect("JSON report");
+        let json: serde_json::Value = serde_json::from_slice(&json).expect("valid JSON");
+        assert!(json["files"][0].get("infrastructure_error").is_none());
+        assert_eq!(json["files"][0]["execution_error"]["class"], "internal");
+    }
+
+    #[test]
+    fn internal_active_test_abort_is_counted_and_emitted_once_in_junit() {
+        let mut report = internal_error_sample();
+        let execution_error = report.files[0]
+            .execution_error
+            .take()
+            .expect("execution error");
+        report.files[0].tests = vec![TestReport {
+            name: "active".into(),
+            exit_class: ExitClass::Internal,
+            outcome: TestReportOutcome::Aborted,
+            failure_class: Some(FailureClass::Internal),
+            reason: Some("violated invariant".into()),
+            timeout_nanos: None,
+            duration_nanos: 3,
+            failure: Some(execution_error.failure),
+        }];
+        report.finish();
+
+        assert_eq!(report.summary.aborted, 1);
+        assert_eq!(report.summary.infrastructure_errors, 0);
+        assert_eq!(report.summary.internal_errors, 1);
+
+        let mut junit = Vec::new();
+        report.write(Reporter::Junit, &mut junit).expect("JUnit");
+        let junit = String::from_utf8(junit).expect("UTF-8");
+        assert!(junit.contains("<testsuites tests=\"1\" failures=\"0\" errors=\"1\""));
+        assert_eq!(junit.matches("<error ").count(), 1);
+        assert!(junit.contains("type=\"internal.runtime.internal_error\""));
+
+        let mut human = Vec::new();
+        report.write(Reporter::Human, &mut human).expect("human");
+        assert!(
+            String::from_utf8(human)
+                .expect("UTF-8")
+                .contains("ABORTED (internal error)")
+        );
+    }
+
+    #[test]
     fn exit_classes_combine_by_documented_priority() {
+        assert_eq!(
+            ExitClass::from_failure_class(FailureClass::Internal),
+            ExitClass::Internal
+        );
         assert_eq!(
             ExitClass::TestFailure.combine(ExitClass::Infrastructure),
             ExitClass::Infrastructure
