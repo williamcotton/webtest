@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, collections::HashMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    path::{Component, Path, PathBuf},
+};
 
 use webtest_hir::BindingId;
 use webtest_plan::{PlannedStep, ServerProviderCall};
@@ -17,15 +20,19 @@ pub(super) struct TestExecutionState {
     binding_names: HashMap<BindingId, String>,
     secrets: Vec<String>,
     redacted_fields: Vec<String>,
+    project_root: PathBuf,
+    owned_temporary_directories: BTreeSet<PathBuf>,
 }
 
 impl TestExecutionState {
-    pub(super) fn new(redacted_fields: Vec<String>) -> Self {
+    pub(super) fn new(redacted_fields: Vec<String>, project_root: PathBuf) -> Self {
         Self {
             environment: HashMap::new(),
             binding_names: HashMap::new(),
             secrets: Vec::new(),
             redacted_fields,
+            project_root,
+            owned_temporary_directories: BTreeSet::new(),
         }
     }
 
@@ -62,6 +69,15 @@ impl TestExecutionState {
             &self.redacted_fields,
             &mut self.secrets,
         );
+        if let Some(value) = call
+            .result_binding
+            .and_then(|binding| self.environment.get(&binding))
+        {
+            for path in temporary_directories(value) {
+                self.owned_temporary_directories
+                    .insert(normalize_owned_path(&self.project_root, &path));
+            }
+        }
     }
 
     pub(super) fn visible_step_bindings(&self, step: &PlannedStep) -> BTreeMap<String, Value> {
@@ -119,11 +135,38 @@ impl TestExecutionState {
     }
 
     pub(super) fn temporary_directories(&self) -> Vec<PathBuf> {
-        self.environment
-            .values()
-            .flat_map(temporary_directories)
-            .collect()
+        self.owned_temporary_directories.iter().cloned().collect()
     }
+}
+
+fn normalize_owned_path(project_root: &Path, path: &Path) -> PathBuf {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        project_root.join(path)
+    };
+    let rooted = path.has_root();
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match normalized.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    normalized.pop();
+                }
+                Some(Component::ParentDir) | None if !rooted => normalized.push(".."),
+                Some(Component::Prefix(_))
+                | Some(Component::RootDir)
+                | Some(Component::CurDir)
+                | Some(Component::ParentDir)
+                | None => {}
+            },
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
 }
 
 fn temporary_directories(value: &Value) -> Vec<PathBuf> {
@@ -132,5 +175,27 @@ fn temporary_directories(value: &Value) -> Vec<PathBuf> {
         Value::List(values) => values.iter().flat_map(temporary_directories).collect(),
         Value::Record(values) => values.values().flat_map(temporary_directories).collect(),
         _ => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_owned_path;
+    use std::path::Path;
+
+    #[test]
+    fn owned_path_normalization_deduplicates_without_changing_parent_semantics() {
+        assert_eq!(
+            normalize_owned_path(Path::new("project"), Path::new("tmp/./owned")),
+            Path::new("project/tmp/owned")
+        );
+        assert_eq!(
+            normalize_owned_path(Path::new("project"), Path::new("../outside")),
+            Path::new("outside")
+        );
+        assert_eq!(
+            normalize_owned_path(Path::new("."), Path::new("../outside")),
+            Path::new("../outside")
+        );
     }
 }

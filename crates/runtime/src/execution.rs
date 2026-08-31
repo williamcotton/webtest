@@ -1,13 +1,16 @@
 use std::time::{Duration, Instant};
 
 use webtest_browser::{BrowserSession, Page};
-use webtest_observation::{ExecutionEvent, ExecutionId, ObservationStore};
+use webtest_observation::{
+    CleanupCause, CleanupFailure, CleanupResource, ExecutionEvent, ExecutionId, ObservationStore,
+};
 use webtest_plan::{PlannedTest, TestOperation, TestPlan};
-use webtest_provider::{ProviderError, ProviderRegistry};
+use webtest_provider::ProviderRegistry;
 
 use crate::{
-    CancellationReason, FailureClass, RunControl, RunError, RunEventSink, RunnerOptions,
-    TestOutcome, TestResult, events::emit_event, redaction::redact_step_error,
+    CancellationReason, FailureClass, PriorTestOutcome, RunControl, RunError, RunEventSink,
+    RunnerOptions, StepFailure, TestOutcome, TestResult, events::emit_event,
+    redaction::redact_step_error,
 };
 
 use self::{
@@ -29,7 +32,15 @@ pub(crate) use failure::repair_hints_for_error;
 
 pub(crate) struct ExecutedTest {
     pub(crate) result: TestResult,
-    pub(crate) session_tainted: bool,
+}
+
+#[allow(dead_code)]
+enum ProvisionalTestOutcome {
+    Passed,
+    Failed(Box<StepFailure>),
+    TimedOut { timeout: Duration },
+    Cancelled { reason: CancellationReason },
+    Aborted { failure: RunError },
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -55,7 +66,10 @@ pub(crate) async fn execute_test(
             name: test.name.clone(),
         },
     );
-    let mut state = TestExecutionState::new(options.redacted_json_fields.clone());
+    let mut state = TestExecutionState::new(
+        options.redacted_json_fields.clone(),
+        options.project_root.clone(),
+    );
     let mut outcome = None;
     let mut context = None;
     let mut page: Option<Box<dyn Page>> = None;
@@ -64,7 +78,7 @@ pub(crate) async fn execute_test(
         match session.new_context(&options.browser_context).await {
             Ok(created) => context = Some(created),
             Err(error) => {
-                outcome = Some(TestOutcome::Aborted {
+                outcome = Some(ProvisionalTestOutcome::Aborted {
                     failure: RunError::Browser(error),
                 });
             }
@@ -76,7 +90,7 @@ pub(crate) async fn execute_test(
         match created_context.new_page().await {
             Ok(created) => page = Some(created),
             Err(error) => {
-                outcome = Some(TestOutcome::Aborted {
+                outcome = Some(ProvisionalTestOutcome::Aborted {
                     failure: RunError::Browser(error),
                 });
             }
@@ -88,7 +102,7 @@ pub(crate) async fn execute_test(
             break;
         }
         if control.is_some_and(RunControl::is_cancelled) {
-            outcome = Some(TestOutcome::Cancelled {
+            outcome = Some(ProvisionalTestOutcome::Cancelled {
                 reason: CancellationReason::Requested,
             });
             break;
@@ -105,7 +119,7 @@ pub(crate) async fn execute_test(
                 control.before_step(test, step).await;
             }
             if control.is_cancelled() {
-                outcome = Some(TestOutcome::Cancelled {
+                outcome = Some(ProvisionalTestOutcome::Cancelled {
                     reason: CancellationReason::Requested,
                 });
                 break;
@@ -198,11 +212,11 @@ pub(crate) async fn execute_test(
                 .await;
                 match failure_result {
                     Ok(step_failure) => {
-                        outcome = Some(TestOutcome::Failed(Box::new(step_failure)));
+                        outcome = Some(ProvisionalTestOutcome::Failed(Box::new(step_failure)));
                         break;
                     }
                     Err(error) => {
-                        outcome = Some(TestOutcome::Aborted { failure: error });
+                        outcome = Some(ProvisionalTestOutcome::Aborted { failure: error });
                         break;
                     }
                 }
@@ -210,25 +224,32 @@ pub(crate) async fn execute_test(
         }
     }
 
-    drop(page);
-    let cleanup_failed = if let Some(context) = context.as_mut() {
-        context.close().await.is_err()
-    } else {
-        false
-    };
-    let bindings = state.final_transferable_bindings(&options.redacted_json_fields);
+    drop(page.take());
+    let mut cleanup_failures = Vec::new();
+    if let Some(mut context) = context.take()
+        && let Err(error) = context.close().await
+    {
+        cleanup_failures.push(CleanupFailure {
+            resource: CleanupResource::BrowserContext,
+            cause: CleanupCause::Browser(error),
+        });
+    }
     for directory in state.temporary_directories() {
         if let Err(error) = tokio::fs::remove_dir_all(&directory).await {
-            outcome = Some(TestOutcome::Aborted {
-                failure: RunError::Provider(ProviderError::Filesystem {
-                    path: directory.display().to_string(),
-                    message: format!("temporary resource cleanup failed: {error}"),
-                }),
+            cleanup_failures.push(CleanupFailure {
+                resource: CleanupResource::TemporaryDirectory { path: directory },
+                cause: CleanupCause::Io(error.into()),
             });
-            break;
         }
     }
-    let outcome = outcome.unwrap_or(TestOutcome::Passed);
+    let bindings = state.final_transferable_bindings(&options.redacted_json_fields);
+    for failure in &cleanup_failures {
+        emit_cleanup_failed(events, event_sink, execution_id, Some(test.id), failure);
+    }
+    let outcome = combine_test_outcome(
+        outcome.unwrap_or(ProvisionalTestOutcome::Passed),
+        cleanup_failures,
+    );
     let outcome_kind = outcome.finished_kind();
     let failure_class = outcome.failure_class();
     emit_event(
@@ -248,10 +269,105 @@ pub(crate) async fn execute_test(
             duration: test_started.elapsed(),
             bindings,
         },
-        session_tainted: cleanup_failed,
     }
+}
+
+fn combine_test_outcome(
+    provisional: ProvisionalTestOutcome,
+    cleanup_failures: Vec<CleanupFailure>,
+) -> TestOutcome {
+    if cleanup_failures.is_empty() {
+        return match provisional {
+            ProvisionalTestOutcome::Passed => TestOutcome::Passed,
+            ProvisionalTestOutcome::Failed(failure) => TestOutcome::Failed(failure),
+            ProvisionalTestOutcome::TimedOut { timeout } => TestOutcome::TimedOut { timeout },
+            ProvisionalTestOutcome::Cancelled { reason } => TestOutcome::Cancelled { reason },
+            ProvisionalTestOutcome::Aborted { failure } => TestOutcome::Aborted {
+                failure,
+                prior_outcome: None,
+            },
+        };
+    }
+
+    match provisional {
+        ProvisionalTestOutcome::Aborted { failure } => TestOutcome::Aborted {
+            failure: failure.combine_with_cleanup(cleanup_failures),
+            prior_outcome: None,
+        },
+        ProvisionalTestOutcome::Passed => TestOutcome::Aborted {
+            failure: cleanup_run_error(cleanup_failures),
+            prior_outcome: None,
+        },
+        ProvisionalTestOutcome::Failed(failure) => TestOutcome::Aborted {
+            failure: cleanup_run_error(cleanup_failures),
+            prior_outcome: Some(Box::new(PriorTestOutcome::Failed(failure))),
+        },
+        ProvisionalTestOutcome::TimedOut { timeout } => TestOutcome::Aborted {
+            failure: cleanup_run_error(cleanup_failures),
+            prior_outcome: Some(Box::new(PriorTestOutcome::TimedOut { timeout })),
+        },
+        ProvisionalTestOutcome::Cancelled { reason } => TestOutcome::Aborted {
+            failure: cleanup_run_error(cleanup_failures),
+            prior_outcome: Some(Box::new(PriorTestOutcome::Cancelled { reason })),
+        },
+    }
+}
+
+fn cleanup_run_error(failures: Vec<CleanupFailure>) -> RunError {
+    RunError::from_cleanup_failures(failures).unwrap_or_else(|| {
+        RunError::Internal("cleanup outcome was missing its typed failure".into())
+    })
+}
+
+pub(crate) fn emit_cleanup_failed(
+    events: &mut Vec<ExecutionEvent>,
+    event_sink: Option<&dyn RunEventSink>,
+    execution_id: ExecutionId,
+    test_id: Option<webtest_hir::TestId>,
+    failure: &CleanupFailure,
+) {
+    emit_event(
+        events,
+        event_sink,
+        ExecutionEvent::CleanupFailed {
+            execution_id,
+            test_id,
+            resource: failure.resource.clone(),
+            failure_class: failure.failure_class(),
+            code: failure.code().into(),
+            message: failure.message(),
+        },
+    );
 }
 
 pub(crate) fn duration_millis(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod finalization_tests {
+    use webtest_browser::BrowserError;
+    use webtest_observation::{CleanupCause, CleanupFailure, CleanupResource};
+
+    use super::*;
+
+    #[test]
+    fn cleanup_failure_outranks_a_provisional_timeout_without_flattening_it() {
+        let timeout = Duration::from_secs(3);
+        let outcome = combine_test_outcome(
+            ProvisionalTestOutcome::TimedOut { timeout },
+            vec![CleanupFailure {
+                resource: CleanupResource::BrowserContext,
+                cause: CleanupCause::Browser(BrowserError::BrowserDisconnected),
+            }],
+        );
+
+        assert!(matches!(
+            outcome,
+            TestOutcome::Aborted {
+                failure: RunError::Cleanup(_),
+                prior_outcome: Some(prior),
+            } if matches!(prior.as_ref(), PriorTestOutcome::TimedOut { timeout: actual } if *actual == timeout)
+        ));
+    }
 }

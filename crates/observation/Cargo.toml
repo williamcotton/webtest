@@ -11,3 +11,6 @@ webtest-feedback.workspace = true
 webtest-hir.workspace = true
 webtest-provider.workspace = true
 webtest-text.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -7,12 +7,12 @@ use serde::Serialize;
 use serde_json::Value;
 use webtest_browser::PageSummary;
 use webtest_feedback::{FailureClass, RepairHint};
-use webtest_observation::ValueDiff;
+use webtest_observation::{CleanupResource, ValueDiff};
 use webtest_project::Project;
 
 use crate::{error::AppError, project_context::normalized_path};
 
-pub(crate) const REPORT_SCHEMA_VERSION: u32 = 2;
+pub(crate) const REPORT_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -251,6 +251,8 @@ pub struct EventReport {
     pub code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource: Option<CleanupResource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transport_kind: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -1046,7 +1048,7 @@ mod tests {
         assert_eq!(value["exit_class"], "test_failure");
         assert_eq!(
             String::from_utf8(json).expect("UTF-8 JSON"),
-            include_str!("../tests/fixtures/report-v2.json")
+            include_str!("../tests/fixtures/report-v3.json")
         );
 
         let mut events = Vec::new();
@@ -1058,7 +1060,7 @@ mod tests {
             let value: serde_json::Value = serde_json::from_str(line).expect("json line");
             assert_eq!(value["schema_version"], REPORT_SCHEMA_VERSION);
         }
-        assert_eq!(events, include_str!("../tests/fixtures/report-v2.jsonl"));
+        assert_eq!(events, include_str!("../tests/fixtures/report-v3.jsonl"));
     }
 
     #[test]
@@ -1085,11 +1087,11 @@ mod tests {
             ),
             (
                 Reporter::Json,
-                include_str!("../tests/fixtures/cancellation-v2.json"),
+                include_str!("../tests/fixtures/cancellation-v3.json"),
             ),
             (
                 Reporter::Events,
-                include_str!("../tests/fixtures/cancellation-v2.jsonl"),
+                include_str!("../tests/fixtures/cancellation-v3.jsonl"),
             ),
             (
                 Reporter::Junit,

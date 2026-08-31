@@ -9,9 +9,10 @@ use webtest_observation::{
 use webtest_plan::{PlannedStep, ValueMatcher};
 use webtest_provider::{Type, Value};
 use webtest_runtime::{
-    Artifact, ArtifactKind, AssertionFailure, DecodeFailure, EvaluationFailure, EvidenceOptions,
-    RunControl, RunError, RunEventSink, RunOutcome, RunResult, Runner, RunnerOptions, StepError,
-    StepFailure, TestOutcome, TestResult, resolve_browser_url,
+    Artifact, ArtifactKind, AssertionFailure, CleanupCause, CleanupFailure, CleanupResource,
+    DecodeFailure, EvaluationFailure, EvidenceOptions, RunControl, RunError, RunEventSink,
+    RunOutcome, RunResult, Runner, RunnerOptions, StepError, StepFailure, TestOutcome, TestResult,
+    resolve_browser_url,
 };
 use webtest_text::{FileId, SyntaxOrigin, TextRange};
 
@@ -107,6 +108,11 @@ fn root_public_api_remains_importable_and_constructible() {
     assert_eq!(StepError::Decode(decode).code(), "json_decode_failed");
     assert_eq!(StepError::Evaluation(evaluation).code(), "division_by_zero");
     assert_eq!(step_failure.error.code(), "assertion_failed");
+    let cleanup = CleanupFailure {
+        resource: CleanupResource::BrowserSession,
+        cause: CleanupCause::Browser(BrowserError::BrowserDisconnected),
+    };
+    assert_eq!(cleanup.code(), "cleanup_browser_session_failed");
     assert!(matches!(
         resolve_browser_url(None, "/relative"),
         Err(BrowserError::NavigationFailed { .. })
@@ -166,6 +172,7 @@ fn defaults_and_result_counts_are_exact() {
             }),
             test_result(TestOutcome::Aborted {
                 failure: RunError::Internal("aborted".into()),
+                prior_outcome: None,
             }),
         ],
         events: vec![

@@ -696,7 +696,8 @@ mod tests {
         assert!(matches!(
             result.outcome,
             RunOutcome::Aborted {
-                failure: webtest_runtime::RunError::Browser(BrowserError::BrowserDisconnected)
+                failure: webtest_runtime::RunError::Browser(BrowserError::BrowserDisconnected),
+                ..
             }
         ));
         assert!(

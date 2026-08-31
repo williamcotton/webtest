@@ -1965,6 +1965,7 @@ name = "webtest-observation"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "webtest-browser",
  "webtest-feedback",
  "webtest-hir",

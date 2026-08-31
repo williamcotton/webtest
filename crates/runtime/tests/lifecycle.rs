@@ -25,8 +25,9 @@ use webtest_provider::{
     ProviderName, ProviderRegistry, ProviderResult, ProviderSchema, ServerProvider, Type, Value,
 };
 use webtest_runtime::{
-    CancellationReason, FailureClass, RunControl, RunError, RunEventSink, RunOutcome, Runner,
-    RunnerOptions, SkipReason, StepError, TestOutcome,
+    CancellationReason, CleanupCause, CleanupFailure, CleanupResource, FailureClass,
+    PriorTestOutcome, RunControl, RunError, RunEventSink, RunOutcome, Runner, RunnerOptions,
+    SkipReason, StepError, TestOutcome,
 };
 use webtest_text::{FileId, SourceRevision, SyntaxOrigin, TextRange, TextSize};
 
@@ -36,7 +37,10 @@ struct LifecycleState {
     next_session: AtomicUsize,
     next_context: AtomicUsize,
     context_close_failures: Mutex<BTreeSet<usize>>,
+    session_close_failures: Mutex<BTreeSet<usize>>,
+    page_creation_failures: Mutex<BTreeSet<usize>>,
     page_errors: Mutex<BTreeMap<String, BrowserError>>,
+    page_evidence: Mutex<PageEvidence>,
 }
 
 impl LifecycleState {
@@ -104,7 +108,17 @@ impl BrowserSession for LifecycleSession {
 
     async fn close(&mut self) -> Result<(), BrowserError> {
         self.state.push(format!("session_close:{}", self.id));
-        Ok(())
+        if self
+            .state
+            .session_close_failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&self.id)
+        {
+            Err(BrowserError::BrowserDisconnected)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -112,6 +126,15 @@ impl BrowserSession for LifecycleSession {
 impl BrowserContext for LifecycleContext {
     async fn new_page(&mut self) -> Result<Box<dyn Page>, BrowserError> {
         self.state.push(format!("page_create:{}", self.id));
+        if self
+            .state
+            .page_creation_failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&self.id)
+        {
+            return Err(BrowserError::BrowserDisconnected);
+        }
         Ok(Box::new(LifecyclePage {
             context_id: self.id,
             state: Arc::clone(&self.state),
@@ -166,7 +189,11 @@ impl Page for LifecyclePage {
             "evidence:{}:{}:{}:{}",
             self.context_id, request.include_screenshot, request.include_dom, request.max_dom_bytes
         ));
-        PageEvidence::default()
+        self.state
+            .page_evidence
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     async fn inspect(
@@ -247,6 +274,15 @@ fn pure(value: Value) -> TestOperation {
     })
 }
 
+fn pure_binding(value: Value, binding: BindingId) -> TestOperation {
+    TestOperation::EvaluatePure(EvaluatePureOperation {
+        expression: PlanExpr::Literal(value),
+        result_binding: Some(binding),
+        result_name: Some(format!("binding_{}", binding.0)),
+        result_type: Type::Json,
+    })
+}
+
 fn missing_binding() -> TestOperation {
     TestOperation::EvaluatePure(EvaluatePureOperation {
         expression: PlanExpr::Binding(BindingId(999)),
@@ -268,6 +304,7 @@ fn event_names(events: &[ExecutionEvent]) -> Vec<&'static str> {
             ExecutionEvent::ProviderCallFinished { .. } => "provider_finished",
             ExecutionEvent::ProviderCallFailed { .. } => "provider_failed",
             ExecutionEvent::StepFailed { .. } => "step_failed",
+            ExecutionEvent::CleanupFailed { .. } => "cleanup_failed",
             ExecutionEvent::TestFinished { .. } => "test_finished",
             ExecutionEvent::TestSkipped { .. } => "test_skipped",
             ExecutionEvent::RunFinished { .. } => "run_finished",
@@ -410,6 +447,54 @@ async fn ordinary_failure_stops_one_test_but_later_tests_continue() {
 }
 
 #[tokio::test]
+async fn artifact_write_failure_remains_secondary_to_the_ordinary_test_failure() {
+    let root = tempfile::tempdir().expect("temporary root");
+    let artifact_path = root.path().join("not-a-directory");
+    std::fs::write(&artifact_path, b"file").expect("artifact path file");
+    let state = Arc::new(LifecycleState::default());
+    state.page_errors.lock().expect("errors").insert(
+        "missing".into(),
+        BrowserError::LocatorNotFound {
+            locator: Locator::Id("missing".into()),
+        },
+    );
+    state.page_evidence.lock().expect("evidence").screenshot_png = Some(vec![1, 2, 3]);
+    let plan = plan_with_tests(
+        vec![Capability::Browser],
+        vec![vec![browser_evaluate("missing")]],
+    );
+    let options = RunnerOptions {
+        evidence: webtest_runtime::EvidenceOptions {
+            screenshot_on_failure: true,
+            artifact_directory: artifact_path,
+            ..webtest_runtime::EvidenceOptions::default()
+        },
+        ..RunnerOptions::default()
+    };
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .with_options(options)
+        .run(&plan, &LifecycleHost(state))
+        .await;
+
+    let TestOutcome::Failed(failure) = &result.tests[0].outcome else {
+        panic!("artifact persistence must not replace the ordinary failure")
+    };
+    assert!(matches!(
+        failure.error,
+        StepError::Browser(BrowserError::LocatorNotFound { .. })
+    ));
+    assert_eq!(failure.evidence.capture_failures.len(), 1);
+    assert!(failure.evidence.capture_failures[0].starts_with("artifact directory:"));
+    assert!(
+        result
+            .events
+            .iter()
+            .all(|event| !matches!(event, ExecutionEvent::CleanupFailed { .. }))
+    );
+    assert!(matches!(result.outcome, RunOutcome::Completed));
+}
+
+#[tokio::test]
 async fn infrastructure_browser_failure_aborts_before_later_tests() {
     let state = Arc::new(LifecycleState::default());
     state
@@ -431,7 +516,8 @@ async fn infrastructure_browser_failure_aborts_before_later_tests() {
     assert!(matches!(
         result.outcome,
         RunOutcome::Aborted {
-            failure: RunError::Browser(BrowserError::BrowserDisconnected)
+            failure: RunError::Browser(BrowserError::BrowserDisconnected),
+            ..
         }
     ));
     assert_eq!((result.aborted(), result.skipped()), (1, 1));
@@ -456,7 +542,7 @@ async fn infrastructure_browser_failure_aborts_before_later_tests() {
 }
 
 #[tokio::test]
-async fn context_close_failure_restarts_the_session_before_the_next_test() {
+async fn context_close_failure_aborts_the_test_and_run_before_the_next_test() {
     let state = Arc::new(LifecycleState::default());
     state
         .context_close_failures
@@ -470,10 +556,28 @@ async fn context_close_failure_restarts_the_session_before_the_next_test() {
             vec![browser_evaluate("second")],
         ],
     );
-    Runner::new(Arc::new(ObservationStore::default()))
+    let result = Runner::new(Arc::new(ObservationStore::default()))
         .run(&plan, &LifecycleHost(Arc::clone(&state)))
         .await;
 
+    assert!(matches!(
+        result.tests[0].outcome,
+        TestOutcome::Aborted {
+            failure: RunError::Cleanup(CleanupFailure {
+                resource: CleanupResource::BrowserContext,
+                cause: CleanupCause::Browser(BrowserError::BrowserDisconnected),
+            }),
+            prior_outcome: None,
+        }
+    ));
+    assert!(matches!(
+        result.tests[1].outcome,
+        TestOutcome::Skipped {
+            reason: SkipReason::RunAborted,
+            failure_class: Some(FailureClass::Infrastructure),
+        }
+    ));
+    assert!(matches!(result.outcome, RunOutcome::Aborted { .. }));
     assert_eq!(
         state.log(),
         [
@@ -483,14 +587,179 @@ async fn context_close_failure_restarts_the_session_before_the_next_test() {
             "evaluate:0:first",
             "context_close:0",
             "session_close:0",
-            "session_start:1",
-            "context_create:1:1",
-            "page_create:1",
-            "evaluate:1:second",
-            "context_close:1",
-            "session_close:1",
         ]
     );
+    assert_eq!(
+        event_names(&result.events),
+        [
+            "run_started",
+            "test_started",
+            "step_started",
+            "step_passed",
+            "cleanup_failed",
+            "test_finished",
+            "test_skipped",
+            "run_finished",
+        ]
+    );
+    assert_terminal_event_invariants(&result.events);
+}
+
+#[tokio::test]
+async fn context_close_failure_preserves_an_ordinary_step_failure_as_a_typed_prior_outcome() {
+    let state = Arc::new(LifecycleState::default());
+    state
+        .context_close_failures
+        .lock()
+        .expect("close failures")
+        .insert(0);
+    state.page_errors.lock().expect("page errors").insert(
+        "missing".into(),
+        BrowserError::LocatorNotFound {
+            locator: Locator::Id("missing".into()),
+        },
+    );
+    let plan = plan_with_tests(
+        vec![Capability::Browser],
+        vec![vec![browser_evaluate("missing")]],
+    );
+    let sink = Arc::new(RecordingEventSink::default());
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .with_event_sink(sink.clone())
+        .run(&plan, &LifecycleHost(Arc::clone(&state)))
+        .await;
+
+    let TestOutcome::Aborted {
+        failure:
+            RunError::Cleanup(CleanupFailure {
+                resource: CleanupResource::BrowserContext,
+                cause: CleanupCause::Browser(BrowserError::BrowserDisconnected),
+            }),
+        prior_outcome: Some(prior),
+    } = &result.tests[0].outcome
+    else {
+        panic!("cleanup should outrank and retain the ordinary failure")
+    };
+    assert!(matches!(prior.as_ref(), PriorTestOutcome::Failed(_)));
+    assert_eq!(
+        event_names(&result.events),
+        [
+            "run_started",
+            "test_started",
+            "step_started",
+            "step_failed",
+            "cleanup_failed",
+            "test_finished",
+            "run_finished",
+        ]
+    );
+    assert_eq!(
+        *sink
+            .events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        result.events
+    );
+}
+
+#[tokio::test]
+async fn session_close_failure_aborts_only_after_all_passing_tests_are_final() {
+    let state = Arc::new(LifecycleState::default());
+    state
+        .session_close_failures
+        .lock()
+        .expect("close failures")
+        .insert(0);
+    let plan = plan_with_tests(
+        vec![Capability::Browser],
+        vec![vec![browser_evaluate("first")]],
+    );
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .run(&plan, &LifecycleHost(Arc::clone(&state)))
+        .await;
+
+    assert!(matches!(result.tests[0].outcome, TestOutcome::Passed));
+    assert!(matches!(
+        result.outcome,
+        RunOutcome::Aborted {
+            failure: RunError::Cleanup(CleanupFailure {
+                resource: CleanupResource::BrowserSession,
+                cause: CleanupCause::Browser(BrowserError::BrowserDisconnected),
+            }),
+            prior_outcome: None,
+        }
+    ));
+    assert_eq!(
+        event_names(&result.events),
+        [
+            "run_started",
+            "test_started",
+            "step_started",
+            "step_passed",
+            "test_finished",
+            "cleanup_failed",
+            "run_finished",
+        ]
+    );
+    assert!(matches!(
+        result.events[result.events.len() - 2],
+        ExecutionEvent::CleanupFailed {
+            test_id: None,
+            resource: CleanupResource::BrowserSession,
+            ..
+        }
+    ));
+    assert!(matches!(
+        result.events.last(),
+        Some(ExecutionEvent::RunFinished {
+            outcome: webtest_observation::RunOutcomeKind::Aborted,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn page_creation_failure_closes_the_acquired_context_once_before_terminal_events() {
+    let state = Arc::new(LifecycleState::default());
+    state
+        .page_creation_failures
+        .lock()
+        .expect("page failures")
+        .insert(0);
+    let plan = plan_with_tests(
+        vec![Capability::Browser],
+        vec![vec![browser_evaluate("unreached")]],
+    );
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .run(&plan, &LifecycleHost(Arc::clone(&state)))
+        .await;
+
+    assert!(matches!(
+        result.tests[0].outcome,
+        TestOutcome::Aborted {
+            failure: RunError::Browser(BrowserError::BrowserDisconnected),
+            prior_outcome: None,
+        }
+    ));
+    assert_eq!(
+        state.log(),
+        [
+            "session_start:0",
+            "context_create:0:0",
+            "page_create:0",
+            "context_close:0",
+            "session_close:0",
+        ]
+    );
+    assert_eq!(
+        state
+            .log()
+            .iter()
+            .filter(|entry| entry.as_str() == "context_close:0")
+            .count(),
+        1
+    );
+    assert_terminal_event_invariants(&result.events);
 }
 
 #[tokio::test]
@@ -566,7 +835,8 @@ async fn observations_are_cleared_before_browser_start_can_fail() {
     assert!(matches!(
         result.outcome,
         RunOutcome::Aborted {
-            failure: RunError::Browser(BrowserError::Launch(_))
+            failure: RunError::Browser(BrowserError::Launch(_)),
+            ..
         }
     ));
     assert_eq!((result.aborted(), result.skipped()), (0, 2));
@@ -622,7 +892,8 @@ async fn internal_step_failure_aborts_with_typed_events_and_no_user_observation(
     assert!(matches!(
         result.tests[0].outcome,
         TestOutcome::Aborted {
-            failure: RunError::Internal(_)
+            failure: RunError::Internal(_),
+            ..
         }
     ));
     assert!(matches!(
@@ -635,7 +906,8 @@ async fn internal_step_failure_aborts_with_typed_events_and_no_user_observation(
     assert!(matches!(
         result.outcome,
         RunOutcome::Aborted {
-            failure: RunError::Internal(_)
+            failure: RunError::Internal(_),
+            ..
         }
     ));
     assert!(control.failure.lock().expect("failure hook").is_none());
@@ -855,7 +1127,11 @@ async fn cancellation_and_snapshot_gating_keep_the_existing_hook_order() {
     let after_hook = RecordingControl::new(false, true, false);
     let second_state = Arc::new(LifecycleState::default());
     let result = Runner::new(Arc::new(ObservationStore::default()))
-        .run_with_control(&plan, &LifecycleHost(second_state), Some(&after_hook))
+        .run_with_control(
+            &plan,
+            &LifecycleHost(Arc::clone(&second_state)),
+            Some(&after_hook),
+        )
         .await;
     assert_eq!(
         after_hook.log.lock().expect("control log").as_slice(),
@@ -876,7 +1152,72 @@ async fn cancellation_and_snapshot_gating_keep_the_existing_hook_order() {
             reason: CancellationReason::Requested
         }
     ));
+    assert_eq!(
+        second_state.log(),
+        [
+            "session_start:0",
+            "context_create:0:0",
+            "page_create:0",
+            "context_close:0",
+            "session_close:0",
+        ]
+    );
     assert_terminal_event_invariants(&result.events);
+}
+
+#[tokio::test]
+async fn cleanup_failure_outranks_cancellation_and_retains_the_reason() {
+    let state = Arc::new(LifecycleState::default());
+    state
+        .context_close_failures
+        .lock()
+        .expect("close failures")
+        .insert(0);
+    let plan = plan_with_tests(
+        vec![Capability::Browser],
+        vec![vec![browser_evaluate("unreached")]],
+    );
+    let control = RecordingControl::new(false, true, false);
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .run_with_control(&plan, &LifecycleHost(Arc::clone(&state)), Some(&control))
+        .await;
+
+    assert!(matches!(
+        result.tests[0].outcome,
+        TestOutcome::Aborted {
+            failure: RunError::Cleanup(CleanupFailure {
+                resource: CleanupResource::BrowserContext,
+                ..
+            }),
+            prior_outcome: Some(ref prior),
+        } if matches!(
+            prior.as_ref(),
+            PriorTestOutcome::Cancelled {
+                reason: CancellationReason::Requested,
+            }
+        )
+    ));
+    assert!(matches!(result.outcome, RunOutcome::Aborted { .. }));
+    assert_eq!(
+        event_names(&result.events),
+        [
+            "run_started",
+            "test_started",
+            "cleanup_failed",
+            "test_finished",
+            "run_finished",
+        ]
+    );
+    assert_eq!(
+        state.log(),
+        [
+            "session_start:0",
+            "context_create:0:0",
+            "page_create:0",
+            "context_close:0",
+            "session_close:0",
+        ]
+    );
 }
 
 #[tokio::test]
@@ -1286,6 +1627,199 @@ async fn provider_timeout_falls_back_to_test_timeout_and_nested_temp_resources_a
 }
 
 #[tokio::test]
+async fn temporary_directory_cleanup_failure_aborts_a_passing_provider_only_test() {
+    let root = tempfile::tempdir().expect("temporary root");
+    let claimed_directory = root.path().join("actually-a-file");
+    std::fs::write(&claimed_directory, b"not a directory").expect("claimed directory file");
+    let provider = Arc::new(RecordingProvider::new(Ok(Value::TempDirectory(
+        claimed_directory.clone(),
+    ))));
+    let mut providers = ProviderRegistry::default();
+    providers.register(provider);
+    let plan = plan_with_tests(
+        vec![Capability::Server],
+        vec![vec![secret_binding(), provider_operation(None)]],
+    );
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .with_provider_registry(providers)
+        .run(&plan, &LifecycleHost(Arc::new(LifecycleState::default())))
+        .await;
+
+    assert!(matches!(
+        result.tests[0].outcome,
+        TestOutcome::Aborted {
+            failure: RunError::Cleanup(CleanupFailure {
+                resource: CleanupResource::TemporaryDirectory { ref path },
+                cause: CleanupCause::Io(_),
+            }),
+            prior_outcome: None,
+        } if path == &claimed_directory
+    ));
+    assert_eq!(
+        event_names(&result.events),
+        [
+            "run_started",
+            "test_started",
+            "step_started",
+            "step_passed",
+            "step_started",
+            "provider_started",
+            "provider_finished",
+            "step_passed",
+            "cleanup_failed",
+            "test_finished",
+            "run_finished",
+        ]
+    );
+    let cleanup_index = result
+        .events
+        .iter()
+        .position(|event| matches!(event, ExecutionEvent::CleanupFailed { .. }))
+        .expect("cleanup event");
+    let test_finished_index = result
+        .events
+        .iter()
+        .position(|event| matches!(event, ExecutionEvent::TestFinished { .. }))
+        .expect("test terminal event");
+    assert!(cleanup_index < test_finished_index);
+}
+
+#[tokio::test]
+async fn temporary_directory_cleanup_is_deterministic_continues_and_retains_every_failure() {
+    let root = tempfile::tempdir().expect("temporary root");
+    let first_bad = root.path().join("a-bad");
+    let second_bad = root.path().join("b-bad");
+    let later_good = root.path().join("c-good");
+    std::fs::write(&first_bad, b"file").expect("first bad target");
+    std::fs::write(&second_bad, b"file").expect("second bad target");
+    std::fs::create_dir(&later_good).expect("later good directory");
+    let provider = Arc::new(RecordingProvider::new(Ok(Value::List(vec![
+        Value::TempDirectory(second_bad.clone()),
+        Value::TempDirectory(later_good.clone()),
+        Value::TempDirectory(first_bad.clone()),
+    ]))));
+    let mut providers = ProviderRegistry::default();
+    providers.register(provider);
+    let plan = plan_with_tests(
+        vec![Capability::Server],
+        vec![vec![secret_binding(), provider_operation(None)]],
+    );
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .with_provider_registry(providers)
+        .run(&plan, &LifecycleHost(Arc::new(LifecycleState::default())))
+        .await;
+
+    assert!(!later_good.exists(), "cleanup must continue after failures");
+    let TestOutcome::Aborted {
+        failure: RunError::Multiple { primary, secondary },
+        prior_outcome: None,
+    } = &result.tests[0].outcome
+    else {
+        panic!("both cleanup failures should remain typed")
+    };
+    assert!(matches!(
+        primary.as_ref(),
+        RunError::Cleanup(CleanupFailure {
+            resource: CleanupResource::TemporaryDirectory { path },
+            ..
+        }) if path == &first_bad
+    ));
+    assert!(matches!(
+        secondary.as_slice(),
+        [RunError::Cleanup(CleanupFailure {
+            resource: CleanupResource::TemporaryDirectory { path },
+            ..
+        })] if path == &second_bad
+    ));
+    let cleanup_paths = result
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            ExecutionEvent::CleanupFailed {
+                resource: CleanupResource::TemporaryDirectory { path },
+                ..
+            } => Some(path),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(cleanup_paths, [&first_bad, &second_bad]);
+}
+
+#[tokio::test]
+async fn temporary_directories_are_deduplicated_and_cleaned_after_an_infrastructure_abort() {
+    let root = tempfile::tempdir().expect("temporary root");
+    let owned = root.path().join("owned");
+    std::fs::create_dir(&owned).expect("owned directory");
+    let duplicate = owned.join(".");
+    let provider = Arc::new(RecordingProvider::new(Ok(Value::Record(
+        [(
+            "directories".into(),
+            Value::List(vec![
+                Value::TempDirectory(owned.clone()),
+                Value::TempDirectory(duplicate),
+            ]),
+        )]
+        .into_iter()
+        .collect(),
+    ))));
+    let mut providers = ProviderRegistry::default();
+    providers.register(provider);
+    let state = Arc::new(LifecycleState::default());
+    state
+        .page_errors
+        .lock()
+        .expect("page errors")
+        .insert("disconnect".into(), BrowserError::BrowserDisconnected);
+    let plan = plan_with_tests(
+        vec![Capability::Server, Capability::Browser],
+        vec![vec![
+            secret_binding(),
+            provider_operation(None),
+            browser_evaluate("disconnect"),
+        ]],
+    );
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .with_provider_registry(providers)
+        .run(&plan, &LifecycleHost(state))
+        .await;
+
+    assert!(!owned.exists());
+    assert!(matches!(
+        result.tests[0].outcome,
+        TestOutcome::Aborted {
+            failure: RunError::Browser(BrowserError::BrowserDisconnected),
+            prior_outcome: None,
+        }
+    ));
+    assert!(
+        result
+            .events
+            .iter()
+            .all(|event| !matches!(event, ExecutionEvent::CleanupFailed { .. }))
+    );
+}
+
+#[tokio::test]
+async fn only_provider_result_temp_directories_enter_runtime_cleanup_ownership() {
+    let root = tempfile::tempdir().expect("temporary root");
+    let not_owned = root.path().join("not-owned");
+    std::fs::create_dir(&not_owned).expect("not-owned directory");
+    let plan = plan_with_tests(
+        vec![Capability::Pure],
+        vec![vec![pure_binding(
+            Value::TempDirectory(not_owned.clone()),
+            BindingId(22),
+        )]],
+    );
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .run(&plan, &LifecycleHost(Arc::new(LifecycleState::default())))
+        .await;
+
+    assert!(matches!(result.tests[0].outcome, TestOutcome::Passed));
+    assert!(not_owned.exists());
+}
+
+#[tokio::test]
 async fn provider_infrastructure_failure_aborts_without_recording_an_observation() {
     let provider = Arc::new(RecordingProvider::new(Err(
         ProviderError::BridgeTransport {
@@ -1307,7 +1841,8 @@ async fn provider_infrastructure_failure_aborts_without_recording_an_observation
     assert!(matches!(
         result.outcome,
         RunOutcome::Aborted {
-            failure: RunError::Provider(ProviderError::BridgeTransport { .. })
+            failure: RunError::Provider(ProviderError::BridgeTransport { .. }),
+            ..
         }
     ));
     assert!(
@@ -1349,7 +1884,8 @@ async fn with_options_rebuilds_builtins_before_a_later_registry_override() {
     assert!(matches!(
         result.outcome,
         RunOutcome::Aborted {
-            failure: RunError::Provider(ProviderError::NotRegistered { ref provider })
+            failure: RunError::Provider(ProviderError::NotRegistered { ref provider }),
+            ..
         } if provider == "fake"
     ));
 }

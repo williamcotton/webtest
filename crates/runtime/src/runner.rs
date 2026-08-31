@@ -2,15 +2,18 @@ use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
 use tracing::instrument;
 use webtest_browser::BrowserHost;
-use webtest_observation::{ExecutionEvent, ExecutionId, ObservationStore, SkipReason};
+use webtest_observation::{
+    CleanupCause, CleanupFailure, CleanupResource, ExecutionEvent, ExecutionId, ObservationStore,
+    SkipReason,
+};
 use webtest_plan::{PlannedTest, TestPlan};
 use webtest_provider::{Capability, NativeProviderConfig, ProviderRegistry, Value};
 
 use crate::{
-    CancellationReason, FailureClass, RunControl, RunEventSink, RunOutcome, RunResult,
-    RunnerOptions, TestOutcome, TestResult,
+    CancellationReason, FailureClass, PriorRunOutcome, RunControl, RunError, RunEventSink,
+    RunOutcome, RunResult, RunnerOptions, TestOutcome, TestResult,
     events::emit_event,
-    execution::{ExecutedTest, execute_test},
+    execution::{ExecutedTest, emit_cleanup_failed, execute_test},
 };
 
 pub struct Runner {
@@ -100,6 +103,7 @@ impl Runner {
                     Err(error) => {
                         outcome = RunOutcome::Aborted {
                             failure: error.into(),
+                            prior_outcome: None,
                         };
                         skip_tests(
                             &plan.tests,
@@ -140,10 +144,7 @@ impl Runner {
                     );
                     break;
                 }
-                let ExecutedTest {
-                    result,
-                    session_tainted,
-                } = execute_test(
+                let ExecutedTest { result } = execute_test(
                     plan,
                     test,
                     execution_id,
@@ -162,9 +163,10 @@ impl Runner {
                         SkipReason::RunCancelled,
                         None,
                     )),
-                    TestOutcome::Aborted { failure } => Some((
+                    TestOutcome::Aborted { failure, .. } => Some((
                         RunOutcome::Aborted {
                             failure: failure.clone(),
+                            prior_outcome: None,
                         },
                         SkipReason::RunAborted,
                         Some(failure.failure_class()),
@@ -188,37 +190,23 @@ impl Runner {
                     );
                     break;
                 }
-                if session_tainted && index + 1 < plan.tests.len() {
-                    if let Some(mut current) = session.take() {
-                        let _ = current.close().await;
-                    }
-                    match browser.start().await {
-                        Ok(restarted) => session = Some(restarted),
-                        Err(error) => {
-                            outcome = RunOutcome::Aborted {
-                                failure: error.into(),
-                            };
-                            skip_tests(
-                                &plan.tests[index + 1..],
-                                SkipReason::RunAborted,
-                                Some(FailureClass::Infrastructure),
-                                execution_id,
-                                &mut tests,
-                                &mut events,
-                                self.event_sink.as_deref(),
-                            );
-                            break;
-                        }
-                    }
-                }
             }
 
-            if let Some(mut session) = session
+            if let Some(mut session) = session.take()
                 && let Err(error) = session.close().await
             {
-                outcome = RunOutcome::Aborted {
-                    failure: error.into(),
+                let failure = CleanupFailure {
+                    resource: CleanupResource::BrowserSession,
+                    cause: CleanupCause::Browser(error),
                 };
+                emit_cleanup_failed(
+                    &mut events,
+                    self.event_sink.as_deref(),
+                    execution_id,
+                    None,
+                    &failure,
+                );
+                outcome = combine_run_outcome(outcome, vec![failure]);
             }
             finish_run(
                 execution_id,
@@ -230,6 +218,35 @@ impl Runner {
             )
         }
     }
+}
+
+fn combine_run_outcome(outcome: RunOutcome, cleanup_failures: Vec<CleanupFailure>) -> RunOutcome {
+    if cleanup_failures.is_empty() {
+        return outcome;
+    }
+    match outcome {
+        RunOutcome::Completed => RunOutcome::Aborted {
+            failure: cleanup_run_error(cleanup_failures),
+            prior_outcome: None,
+        },
+        RunOutcome::Cancelled { reason } => RunOutcome::Aborted {
+            failure: cleanup_run_error(cleanup_failures),
+            prior_outcome: Some(PriorRunOutcome::Cancelled { reason }),
+        },
+        RunOutcome::Aborted {
+            failure,
+            prior_outcome,
+        } => RunOutcome::Aborted {
+            failure: failure.combine_with_cleanup(cleanup_failures),
+            prior_outcome,
+        },
+    }
+}
+
+fn cleanup_run_error(failures: Vec<CleanupFailure>) -> RunError {
+    RunError::from_cleanup_failures(failures).unwrap_or_else(|| {
+        RunError::Internal("cleanup outcome was missing its typed failure".into())
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -3,6 +3,7 @@
 use std::{
     collections::BTreeMap,
     collections::HashMap,
+    path::PathBuf,
     sync::{
         Mutex,
         atomic::{AtomicU64, Ordering},
@@ -84,6 +85,161 @@ pub enum RunOutcomeKind {
     Aborted,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CleanupResource {
+    BrowserContext,
+    BrowserSession,
+    TemporaryDirectory { path: PathBuf },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupIoErrorKind {
+    NotFound,
+    PermissionDenied,
+    AlreadyExists,
+    InvalidInput,
+    InvalidData,
+    TimedOut,
+    Interrupted,
+    NotADirectory,
+    IsADirectory,
+    DirectoryNotEmpty,
+    ReadOnlyFilesystem,
+    OutOfMemory,
+    Other,
+}
+
+impl From<std::io::ErrorKind> for CleanupIoErrorKind {
+    fn from(kind: std::io::ErrorKind) -> Self {
+        match kind {
+            std::io::ErrorKind::NotFound => Self::NotFound,
+            std::io::ErrorKind::PermissionDenied => Self::PermissionDenied,
+            std::io::ErrorKind::AlreadyExists => Self::AlreadyExists,
+            std::io::ErrorKind::InvalidInput => Self::InvalidInput,
+            std::io::ErrorKind::InvalidData => Self::InvalidData,
+            std::io::ErrorKind::TimedOut => Self::TimedOut,
+            std::io::ErrorKind::Interrupted => Self::Interrupted,
+            std::io::ErrorKind::NotADirectory => Self::NotADirectory,
+            std::io::ErrorKind::IsADirectory => Self::IsADirectory,
+            std::io::ErrorKind::DirectoryNotEmpty => Self::DirectoryNotEmpty,
+            std::io::ErrorKind::ReadOnlyFilesystem => Self::ReadOnlyFilesystem,
+            std::io::ErrorKind::OutOfMemory => Self::OutOfMemory,
+            _ => Self::Other,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CleanupIoFailure {
+    pub kind: CleanupIoErrorKind,
+    pub raw_os_error: Option<i32>,
+    pub message: String,
+}
+
+impl From<std::io::Error> for CleanupIoFailure {
+    fn from(error: std::io::Error) -> Self {
+        Self {
+            kind: error.kind().into(),
+            raw_os_error: error.raw_os_error(),
+            message: bounded_cleanup_message(error.to_string()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CleanupCause {
+    Browser(webtest_browser::BrowserError),
+    Io(CleanupIoFailure),
+    Internal { message: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CleanupFailure {
+    pub resource: CleanupResource,
+    pub cause: CleanupCause,
+}
+
+impl CleanupFailure {
+    pub const fn failure_class(&self) -> FailureClass {
+        match self.cause {
+            CleanupCause::Browser(_) | CleanupCause::Io(_) => FailureClass::Infrastructure,
+            CleanupCause::Internal { .. } => FailureClass::Internal,
+        }
+    }
+
+    pub const fn code(&self) -> &'static str {
+        match self.resource {
+            CleanupResource::BrowserContext => "cleanup_browser_context_failed",
+            CleanupResource::BrowserSession => "cleanup_browser_session_failed",
+            CleanupResource::TemporaryDirectory { .. } => "cleanup_temporary_directory_failed",
+        }
+    }
+
+    pub fn message(&self) -> String {
+        let resource = match &self.resource {
+            CleanupResource::BrowserContext => "browser context".into(),
+            CleanupResource::BrowserSession => "browser session".into(),
+            CleanupResource::TemporaryDirectory { path } => {
+                format!("temporary directory `{}`", path.display())
+            }
+        };
+        let cause = match &self.cause {
+            CleanupCause::Browser(error) => error.to_string(),
+            CleanupCause::Io(error) => error.message.clone(),
+            CleanupCause::Internal { message } => message.clone(),
+        };
+        bounded_cleanup_message(format!("failed to clean up {resource}: {cause}"))
+    }
+}
+
+fn bounded_cleanup_message(message: String) -> String {
+    const MAX_CHARS: usize = 1_024;
+    if message.chars().count() <= MAX_CHARS {
+        return message;
+    }
+    let mut bounded = message.chars().take(MAX_CHARS - 1).collect::<String>();
+    bounded.push('…');
+    bounded
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    #[test]
+    fn cleanup_failures_keep_typed_resources_causes_codes_and_bounds() {
+        let path = PathBuf::from("owned");
+        let failure = CleanupFailure {
+            resource: CleanupResource::TemporaryDirectory { path: path.clone() },
+            cause: CleanupCause::Io(
+                std::io::Error::new(std::io::ErrorKind::PermissionDenied, "x".repeat(2_000)).into(),
+            ),
+        };
+        assert_eq!(failure.failure_class(), FailureClass::Infrastructure);
+        assert_eq!(failure.code(), "cleanup_temporary_directory_failed");
+        assert!(failure.message().chars().count() <= 1_024);
+        assert_eq!(
+            serde_json::to_value(&failure.resource).expect("serialize resource"),
+            serde_json::json!({"kind": "temporary_directory", "path": path})
+        );
+    }
+
+    #[test]
+    fn internal_cleanup_causes_remain_internal() {
+        let failure = CleanupFailure {
+            resource: CleanupResource::BrowserContext,
+            cause: CleanupCause::Internal {
+                message: "ownership invariant".into(),
+            },
+        };
+        assert_eq!(failure.failure_class(), FailureClass::Internal);
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeFailure {
     Browser(webtest_browser::BrowserError),
@@ -153,6 +309,14 @@ pub enum ExecutionEvent {
         failure: RuntimeFailure,
         repair_hints: Vec<RepairHint>,
         page: Option<PageSummary>,
+    },
+    CleanupFailed {
+        execution_id: ExecutionId,
+        test_id: Option<TestId>,
+        resource: CleanupResource,
+        failure_class: FailureClass,
+        code: String,
+        message: String,
     },
     TestFinished {
         execution_id: ExecutionId,

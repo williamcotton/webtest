@@ -1,9 +1,10 @@
 use webtest_browser::{BrowserError, Locator};
 use webtest_observation::{
-    ExecutionEvent, RunOutcomeKind, RuntimeFailure, SkipReason, TestOutcomeKind,
+    CleanupCause, CleanupFailure, ExecutionEvent, RunOutcomeKind, RuntimeFailure, SkipReason,
+    TestOutcomeKind,
 };
 use webtest_provider::ProviderError;
-use webtest_runtime::{RunError, StepError, StepFailure};
+use webtest_runtime::{PriorRunOutcome, PriorTestOutcome, RunError, StepError, StepFailure};
 
 use crate::{
     project_context::normalized_path,
@@ -70,6 +71,8 @@ pub(crate) fn run_error_code(error: &RunError) -> String {
     match error {
         RunError::Browser(error) => runtime_code(error).into(),
         RunError::Provider(error) => format!("runtime.{}", error.code()),
+        RunError::Cleanup(failure) => format!("runtime.{}", failure.code()),
+        RunError::Multiple { primary, .. } => run_error_code(primary),
         RunError::Internal(_) => "runtime.internal_error".into(),
     }
 }
@@ -77,6 +80,7 @@ pub(crate) fn run_error_code(error: &RunError) -> String {
 pub(crate) fn run_error_message(error: &RunError) -> String {
     match error {
         RunError::Browser(error) => infrastructure_message(error),
+        RunError::Multiple { primary, .. } => run_error_message(primary),
         _ => error.to_string(),
     }
 }
@@ -90,13 +94,106 @@ pub(crate) fn run_failure_report(error: &RunError) -> FailureReport {
         span: None,
         diff: None,
         artifacts: Vec::new(),
-        semantic_details: Some(serde_json::json!({
-            "failure_class": error.failure_class(),
-        })),
+        semantic_details: Some(run_error_semantic_details(error)),
         repair_hints: Vec::new(),
         page: None,
         secondary: Vec::new(),
     }
+}
+
+pub(crate) fn aborted_run_failure_report(
+    error: &RunError,
+    prior_outcome: Option<PriorRunOutcome>,
+) -> FailureReport {
+    let mut report = run_failure_report(error);
+    if let Some(PriorRunOutcome::Cancelled { reason }) = prior_outcome {
+        insert_prior_outcome(
+            &mut report,
+            serde_json::json!({
+                "kind": "cancelled",
+                "reason": format!("{reason:?}").to_ascii_lowercase(),
+            }),
+        );
+    }
+    report
+}
+
+pub(crate) fn aborted_test_failure_report(
+    error: &RunError,
+    prior_outcome: Option<Box<PriorTestOutcome>>,
+    source: &str,
+) -> FailureReport {
+    let mut report = run_failure_report(error);
+    let prior = match prior_outcome.map(|prior| *prior) {
+        Some(PriorTestOutcome::Failed(failure)) => serde_json::json!({
+            "kind": "failed",
+            "failure": step_failure_report(*failure, source),
+        }),
+        Some(PriorTestOutcome::TimedOut { timeout }) => serde_json::json!({
+            "kind": "timed_out",
+            "timeout_nanos": timeout.as_nanos().min(u128::from(u64::MAX)) as u64,
+        }),
+        Some(PriorTestOutcome::Cancelled { reason }) => serde_json::json!({
+            "kind": "cancelled",
+            "reason": format!("{reason:?}").to_ascii_lowercase(),
+        }),
+        None => return report,
+    };
+    insert_prior_outcome(&mut report, prior);
+    report
+}
+
+fn insert_prior_outcome(report: &mut FailureReport, prior: serde_json::Value) {
+    let details = report
+        .semantic_details
+        .get_or_insert_with(|| serde_json::json!({}));
+    if let Some(details) = details.as_object_mut() {
+        details.insert("prior_outcome".into(), prior);
+    }
+}
+
+fn run_error_semantic_details(error: &RunError) -> serde_json::Value {
+    match error {
+        RunError::Cleanup(failure) => cleanup_failure_details(failure),
+        RunError::Multiple { primary, secondary } => serde_json::json!({
+            "failure_class": error.failure_class(),
+            "primary": run_error_semantic_details(primary),
+            "secondary": secondary.iter().map(run_error_semantic_details).collect::<Vec<_>>(),
+        }),
+        RunError::Browser(_) | RunError::Provider(_) | RunError::Internal(_) => {
+            serde_json::json!({
+                "code": run_error_code(error),
+                "failure_class": error.failure_class(),
+                "message": run_error_message(error),
+            })
+        }
+    }
+}
+
+fn cleanup_failure_details(failure: &CleanupFailure) -> serde_json::Value {
+    let cause = match &failure.cause {
+        CleanupCause::Browser(error) => serde_json::json!({
+            "kind": "browser",
+            "code": error.code(),
+            "message": error.to_string(),
+        }),
+        CleanupCause::Io(error) => serde_json::json!({
+            "kind": "io",
+            "error_kind": error.kind,
+            "raw_os_error": error.raw_os_error,
+            "message": error.message,
+        }),
+        CleanupCause::Internal { message } => serde_json::json!({
+            "kind": "internal",
+            "message": message,
+        }),
+    };
+    serde_json::json!({
+        "code": format!("runtime.{}", failure.code()),
+        "failure_class": failure.failure_class(),
+        "resource": failure.resource,
+        "cause": cause,
+    })
 }
 
 fn step_error_code(error: &StepError) -> String {
@@ -407,6 +504,28 @@ pub(crate) fn event_reports(path: &str, events: &[ExecutionEvent]) -> Vec<EventR
                     Some(webtest_feedback::REPAIR_HINT_SCHEMA_VERSION);
                 event
             }
+            ExecutionEvent::CleanupFailed {
+                execution_id,
+                test_id,
+                resource,
+                failure_class,
+                code,
+                message,
+            } => {
+                let mut event = event_report(
+                    path,
+                    "cleanup_failed",
+                    Some(execution_id.0),
+                    test_id.map(|test_id| test_id.0),
+                    None,
+                );
+                event.resource = Some(resource.clone());
+                event.code = Some(format!("runtime.{code}"));
+                event.message = Some(message.clone());
+                event.failure_class = Some(*failure_class);
+                event.exit_class = Some(ExitClass::from_failure_class(*failure_class));
+                event
+            }
             ExecutionEvent::TestFinished {
                 execution_id,
                 test_id,
@@ -520,6 +639,7 @@ fn event_report(
         failure_class: None,
         code: None,
         message: None,
+        resource: None,
         transport_kind: None,
         arguments: Default::default(),
         result: None,
@@ -594,6 +714,47 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_reports_preserve_primary_secondary_and_prior_outcome_structure() {
+        let cleanup = RunError::Cleanup(CleanupFailure {
+            resource: webtest_observation::CleanupResource::BrowserContext,
+            cause: CleanupCause::Browser(BrowserError::BrowserDisconnected),
+        });
+        let aggregate = RunError::Multiple {
+            primary: Box::new(RunError::Internal("body invariant".into())),
+            secondary: vec![RunError::Cleanup(CleanupFailure {
+                resource: webtest_observation::CleanupResource::BrowserSession,
+                cause: CleanupCause::Browser(BrowserError::BrowserDisconnected),
+            })],
+        };
+
+        let cleanup_report = aborted_test_failure_report(
+            &cleanup,
+            Some(Box::new(PriorTestOutcome::Cancelled {
+                reason: webtest_observation::CancellationReason::Requested,
+            })),
+            "",
+        );
+        let cleanup_details = cleanup_report.semantic_details.expect("cleanup details");
+        assert_eq!(
+            cleanup_report.code,
+            "runtime.cleanup_browser_context_failed"
+        );
+        assert_eq!(cleanup_details["resource"]["kind"], "browser_context");
+        assert_eq!(cleanup_details["cause"]["kind"], "browser");
+        assert_eq!(cleanup_details["prior_outcome"]["kind"], "cancelled");
+
+        let aggregate_details = run_failure_report(&aggregate)
+            .semantic_details
+            .expect("aggregate details");
+        assert_eq!(aggregate_details["failure_class"], "internal");
+        assert_eq!(aggregate_details["primary"]["failure_class"], "internal");
+        assert_eq!(
+            aggregate_details["secondary"][0]["resource"]["kind"],
+            "browser_session"
+        );
+    }
+
+    #[test]
     fn every_execution_event_variant_has_a_stable_report_kind() {
         let execution_id = ExecutionId(7);
         let test_id = TestId(3);
@@ -657,6 +818,14 @@ mod tests {
                 repair_hints: Vec::new(),
                 page: None,
             },
+            ExecutionEvent::CleanupFailed {
+                execution_id,
+                test_id: Some(test_id),
+                resource: webtest_observation::CleanupResource::BrowserContext,
+                failure_class: FailureClass::Infrastructure,
+                code: "cleanup_browser_context_failed".into(),
+                message: "failed to clean up browser context".into(),
+            },
             ExecutionEvent::TestFinished {
                 execution_id,
                 test_id,
@@ -691,15 +860,21 @@ mod tests {
                 "provider_call_finished",
                 "provider_call_failed",
                 "step_failed",
+                "cleanup_failed",
                 "test_finished",
                 "test_skipped",
                 "run_finished",
             ]
         );
         assert_eq!(reports[4].arguments["message"], "<redacted>");
-        assert_eq!(reports[8].exit_class, Some(ExitClass::Internal));
-        assert_eq!(reports[8].failure_class, Some(FailureClass::Internal));
-        assert_eq!(reports[8].outcome.as_deref(), Some("aborted"));
-        assert_eq!(reports[9].outcome.as_deref(), Some("skipped"));
+        assert_eq!(reports[8].exit_class, Some(ExitClass::Infrastructure));
+        assert_eq!(
+            reports[8].code.as_deref(),
+            Some("runtime.cleanup_browser_context_failed")
+        );
+        assert_eq!(reports[9].exit_class, Some(ExitClass::Internal));
+        assert_eq!(reports[9].failure_class, Some(FailureClass::Internal));
+        assert_eq!(reports[9].outcome.as_deref(), Some("aborted"));
+        assert_eq!(reports[10].outcome.as_deref(), Some("skipped"));
     }
 }

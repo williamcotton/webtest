@@ -446,7 +446,7 @@ fn check_without_paths_discovers_configured_tests_in_order() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON report");
-    assert_eq!(report["schema_version"], 2);
+    assert_eq!(report["schema_version"], 3);
     let paths = report["files"]
         .as_array()
         .expect("files")

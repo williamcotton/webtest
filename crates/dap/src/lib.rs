@@ -633,13 +633,16 @@ impl DebugState {
                 TestOutcome::Skipped { reason, .. } => {
                     ("stderr", format!("SKIPPED: {reason:?}"), Value::Null)
                 }
-                TestOutcome::Aborted { failure } => (
+                TestOutcome::Aborted {
+                    failure,
+                    prior_outcome,
+                } => (
                     "stderr",
                     format!(
                         "ABORTED ({} error): {failure}",
                         failure_class_name(failure.failure_class())
                     ),
-                    run_failure_output_data(failure),
+                    aborted_failure_output_data(failure, prior_outcome.as_deref()),
                 ),
             };
             let _ = self
@@ -655,7 +658,10 @@ impl DebugState {
                 .await;
         }
         if result.aborted() == 0
-            && let RunOutcome::Aborted { failure } = &result.outcome
+            && let RunOutcome::Aborted {
+                failure,
+                prior_outcome,
+            } = &result.outcome
         {
             let _ = self
                 .writer
@@ -667,7 +673,7 @@ impl DebugState {
                             "run ... ABORTED ({} error): {failure}\n",
                             failure_class_name(failure.failure_class())
                         ),
-                        "data": run_failure_output_data(failure),
+                        "data": aborted_run_failure_output_data(failure, *prior_outcome),
                     }),
                 )
                 .await;
@@ -680,7 +686,7 @@ impl DebugState {
                     || result.aborted() != 0,
             ),
             RunOutcome::Cancelled { .. } => 1,
-            RunOutcome::Aborted { failure } => failure_exit_code(failure.failure_class()),
+            RunOutcome::Aborted { failure, .. } => failure_exit_code(failure.failure_class()),
         };
         if self.shutting_down.load(Ordering::Acquire) {
             return;
@@ -714,10 +720,91 @@ fn failure_output_data(failure: &webtest_runtime::StepFailure) -> Value {
 }
 
 fn run_failure_output_data(failure: &webtest_runtime::RunError) -> Value {
-    json!({
-        "code": failure.code(),
-        "failure_class": failure.failure_class(),
-    })
+    match failure {
+        webtest_runtime::RunError::Cleanup(cleanup) => {
+            let cause = match &cleanup.cause {
+                webtest_runtime::CleanupCause::Browser(error) => json!({
+                    "kind": "browser",
+                    "code": error.code(),
+                    "message": error.to_string(),
+                }),
+                webtest_runtime::CleanupCause::Io(error) => json!({
+                    "kind": "io",
+                    "error_kind": error.kind,
+                    "raw_os_error": error.raw_os_error,
+                    "message": error.message,
+                }),
+                webtest_runtime::CleanupCause::Internal { message } => json!({
+                    "kind": "internal",
+                    "message": message,
+                }),
+            };
+            json!({
+                "code": cleanup.code(),
+                "failure_class": cleanup.failure_class(),
+                "resource": cleanup.resource,
+                "cause": cause,
+            })
+        }
+        webtest_runtime::RunError::Multiple { primary, secondary } => json!({
+            "code": failure.code(),
+            "failure_class": failure.failure_class(),
+            "primary": run_failure_output_data(primary),
+            "secondary": secondary.iter().map(run_failure_output_data).collect::<Vec<_>>(),
+        }),
+        webtest_runtime::RunError::Browser(_)
+        | webtest_runtime::RunError::Provider(_)
+        | webtest_runtime::RunError::Internal(_) => json!({
+            "code": failure.code(),
+            "failure_class": failure.failure_class(),
+        }),
+    }
+}
+
+fn aborted_failure_output_data(
+    failure: &webtest_runtime::RunError,
+    prior: Option<&webtest_runtime::PriorTestOutcome>,
+) -> Value {
+    let mut data = run_failure_output_data(failure);
+    let prior = match prior {
+        Some(webtest_runtime::PriorTestOutcome::Failed(failure)) => json!({
+            "kind": "failed",
+            "failure": failure_output_data(failure),
+        }),
+        Some(webtest_runtime::PriorTestOutcome::TimedOut { timeout }) => json!({
+            "kind": "timed_out",
+            "timeout_ms": timeout.as_millis().min(u128::from(u64::MAX)) as u64,
+        }),
+        Some(webtest_runtime::PriorTestOutcome::Cancelled { reason }) => json!({
+            "kind": "cancelled",
+            "reason": format!("{reason:?}").to_ascii_lowercase(),
+        }),
+        None => return data,
+    };
+    if let Some(data) = data.as_object_mut() {
+        data.insert("prior_outcome".into(), prior);
+    }
+    data
+}
+
+fn aborted_run_failure_output_data(
+    failure: &webtest_runtime::RunError,
+    prior: Option<webtest_runtime::PriorRunOutcome>,
+) -> Value {
+    let mut data = run_failure_output_data(failure);
+    let Some(webtest_runtime::PriorRunOutcome::Cancelled { reason }) = prior else {
+        return data;
+    };
+    if let Some(data) = data.as_object_mut() {
+        data.insert(
+            "prior_outcome".into(),
+            json!({
+                "kind": "cancelled",
+                "reason": format!("{reason:?}").to_ascii_lowercase(),
+            }),
+        );
+    }
+    data
 }
 
 const fn failure_exit_code(class: webtest_feedback::FailureClass) -> i32 {
@@ -1576,6 +1663,29 @@ mod tests {
             "internal"
         );
         assert_eq!(failure_class_name(internal.failure_class()), "internal");
+    }
+
+    #[test]
+    fn cleanup_output_preserves_typed_resource_and_cause() {
+        let cleanup = webtest_runtime::RunError::Cleanup(webtest_runtime::CleanupFailure {
+            resource: webtest_runtime::CleanupResource::BrowserSession,
+            cause: webtest_runtime::CleanupCause::Browser(BrowserError::BrowserDisconnected),
+        });
+        let data = run_failure_output_data(&cleanup);
+
+        assert_eq!(data["code"], "cleanup_browser_session_failed");
+        assert_eq!(data["failure_class"], "infrastructure");
+        assert_eq!(data["resource"]["kind"], "browser_session");
+        assert_eq!(data["cause"]["kind"], "browser");
+        assert_eq!(data["cause"]["code"], "browser_disconnected");
+        let after_cancellation = aborted_run_failure_output_data(
+            &cleanup,
+            Some(webtest_runtime::PriorRunOutcome::Cancelled {
+                reason: webtest_runtime::CancellationReason::Requested,
+            }),
+        );
+        assert_eq!(after_cancellation["prior_outcome"]["kind"], "cancelled");
+        assert_eq!(after_cancellation["prior_outcome"]["reason"], "requested");
     }
 
     #[test]

@@ -45,7 +45,15 @@ pub enum TestOutcome {
     },
     Aborted {
         failure: RunError,
+        prior_outcome: Option<Box<PriorTestOutcome>>,
     },
+}
+
+#[derive(Clone, Debug)]
+pub enum PriorTestOutcome {
+    Failed(Box<StepFailure>),
+    TimedOut { timeout: Duration },
+    Cancelled { reason: CancellationReason },
 }
 
 impl TestOutcome {
@@ -72,7 +80,7 @@ impl TestOutcome {
             Self::Passed | Self::Cancelled { .. } => None,
             Self::Failed(_) | Self::TimedOut { .. } => Some(FailureClass::Test),
             Self::Skipped { failure_class, .. } => *failure_class,
-            Self::Aborted { failure } => Some(failure.failure_class()),
+            Self::Aborted { failure, .. } => Some(failure.failure_class()),
         }
     }
 }
@@ -80,8 +88,18 @@ impl TestOutcome {
 #[derive(Clone, Debug)]
 pub enum RunOutcome {
     Completed,
+    Cancelled {
+        reason: CancellationReason,
+    },
+    Aborted {
+        failure: RunError,
+        prior_outcome: Option<PriorRunOutcome>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PriorRunOutcome {
     Cancelled { reason: CancellationReason },
-    Aborted { failure: RunError },
 }
 
 impl RunOutcome {
@@ -96,7 +114,7 @@ impl RunOutcome {
     pub const fn failure_class(&self) -> Option<FailureClass> {
         match self {
             Self::Completed | Self::Cancelled { .. } => None,
-            Self::Aborted { failure } => Some(failure.failure_class()),
+            Self::Aborted { failure, .. } => Some(failure.failure_class()),
         }
     }
 }

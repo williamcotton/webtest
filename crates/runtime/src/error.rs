@@ -1,6 +1,7 @@
 use thiserror::Error;
 use webtest_browser::BrowserError;
 use webtest_feedback::FailureClass;
+use webtest_observation::CleanupFailure;
 use webtest_observation::ValueDiff;
 use webtest_plan::ValueMatcher;
 use webtest_provider::{ProviderError, Type, Value};
@@ -107,6 +108,13 @@ pub enum RunError {
     Browser(#[from] BrowserError),
     #[error(transparent)]
     Provider(#[from] ProviderError),
+    #[error("{}", .0.message())]
+    Cleanup(CleanupFailure),
+    #[error("{primary}")]
+    Multiple {
+        primary: Box<RunError>,
+        secondary: Vec<RunError>,
+    },
     #[error("internal runtime error: {0}")]
     Internal(String),
 }
@@ -116,6 +124,8 @@ impl RunError {
         match self {
             Self::Browser(error) => error.code(),
             Self::Provider(error) => error.code(),
+            Self::Cleanup(failure) => failure.code(),
+            Self::Multiple { primary, .. } => primary.code(),
             Self::Internal(_) => "internal_error",
         }
     }
@@ -123,15 +133,75 @@ impl RunError {
     pub const fn failure_class(&self) -> FailureClass {
         match self {
             Self::Browser(_) | Self::Provider(_) => FailureClass::Infrastructure,
+            Self::Cleanup(failure) => failure.failure_class(),
+            Self::Multiple { primary, .. } => primary.failure_class(),
             Self::Internal(_) => FailureClass::Internal,
         }
+    }
+
+    pub(crate) fn from_cleanup_failures(failures: Vec<CleanupFailure>) -> Option<Self> {
+        Self::from_errors(failures.into_iter().map(Self::Cleanup).collect())
+    }
+
+    pub(crate) fn combine_with_cleanup(self, failures: Vec<CleanupFailure>) -> Self {
+        if failures.is_empty() {
+            return self;
+        }
+        let mut errors = Vec::with_capacity(failures.len() + 1);
+        errors.push(self);
+        errors.extend(failures.into_iter().map(Self::Cleanup));
+        let primary_index = primary_error_index(&errors);
+        let primary = errors.remove(primary_index);
+        Self::Multiple {
+            primary: Box::new(primary),
+            secondary: errors,
+        }
+    }
+
+    fn from_errors(mut errors: Vec<Self>) -> Option<Self> {
+        if errors.is_empty() {
+            return None;
+        }
+        let primary_index = primary_error_index(&errors);
+        let primary = errors.remove(primary_index);
+        if errors.is_empty() {
+            Some(primary)
+        } else {
+            Some(Self::Multiple {
+                primary: Box::new(primary),
+                secondary: errors,
+            })
+        }
+    }
+}
+
+fn primary_error_index(errors: &[RunError]) -> usize {
+    let mut primary_index = 0;
+    let mut primary_severity = 0;
+    for (index, error) in errors.iter().enumerate() {
+        let severity = failure_severity(error.failure_class());
+        if severity > primary_severity {
+            primary_index = index;
+            primary_severity = severity;
+        }
+    }
+    primary_index
+}
+
+const fn failure_severity(class: FailureClass) -> u8 {
+    match class {
+        FailureClass::Test => 1,
+        FailureClass::Infrastructure => 2,
+        FailureClass::Internal => 3,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use webtest_browser::Locator;
-    use webtest_observation::ValueDiff;
+    use webtest_observation::{CleanupCause, CleanupFailure, CleanupResource, ValueDiff};
     use webtest_plan::ValueMatcher;
 
     use super::*;
@@ -207,6 +277,18 @@ mod tests {
 
     #[test]
     fn every_run_error_variant_has_an_explicit_failure_class() {
+        let infrastructure_cleanup = CleanupFailure {
+            resource: CleanupResource::BrowserContext,
+            cause: CleanupCause::Browser(BrowserError::BrowserDisconnected),
+        };
+        let internal_cleanup = CleanupFailure {
+            resource: CleanupResource::TemporaryDirectory {
+                path: PathBuf::from("owned"),
+            },
+            cause: CleanupCause::Internal {
+                message: "ownership invariant".into(),
+            },
+        };
         let cases = [
             (
                 RunError::Browser(BrowserError::BrowserDisconnected),
@@ -219,6 +301,21 @@ mod tests {
                 FailureClass::Infrastructure,
             ),
             (
+                RunError::Cleanup(infrastructure_cleanup.clone()),
+                FailureClass::Infrastructure,
+            ),
+            (
+                RunError::Cleanup(internal_cleanup.clone()),
+                FailureClass::Internal,
+            ),
+            (
+                RunError::Multiple {
+                    primary: Box::new(RunError::Internal("primary".into())),
+                    secondary: vec![RunError::Cleanup(infrastructure_cleanup.clone())],
+                },
+                FailureClass::Internal,
+            ),
+            (
                 RunError::Internal("violated invariant".into()),
                 FailureClass::Internal,
             ),
@@ -227,5 +324,56 @@ mod tests {
         for (error, expected) in cases {
             assert_eq!(error.failure_class(), expected, "{error:?}");
         }
+    }
+
+    #[test]
+    fn cleanup_combination_uses_exact_severity_and_stable_primary_order() {
+        let infrastructure_cleanup = CleanupFailure {
+            resource: CleanupResource::BrowserSession,
+            cause: CleanupCause::Browser(BrowserError::BrowserDisconnected),
+        };
+        let internal_cleanup = CleanupFailure {
+            resource: CleanupResource::TemporaryDirectory {
+                path: PathBuf::from("owned"),
+            },
+            cause: CleanupCause::Internal {
+                message: "ownership invariant".into(),
+            },
+        };
+
+        let same_class = RunError::Browser(BrowserError::BrowserDisconnected)
+            .combine_with_cleanup(vec![infrastructure_cleanup.clone()]);
+        assert!(matches!(
+            same_class,
+            RunError::Multiple {
+                primary,
+                secondary,
+            } if matches!(*primary, RunError::Browser(BrowserError::BrowserDisconnected))
+                && matches!(secondary.as_slice(), [RunError::Cleanup(_)])
+        ));
+
+        let cleanup_outranks_body = RunError::Browser(BrowserError::BrowserDisconnected)
+            .combine_with_cleanup(vec![internal_cleanup]);
+        assert!(matches!(
+            cleanup_outranks_body,
+            RunError::Multiple {
+                primary,
+                secondary,
+            } if matches!(*primary, RunError::Cleanup(CleanupFailure {
+                cause: CleanupCause::Internal { .. },
+                ..
+            })) && matches!(secondary.as_slice(), [RunError::Browser(_)])
+        ));
+
+        let body_outranks_cleanup = RunError::Internal("body invariant".into())
+            .combine_with_cleanup(vec![infrastructure_cleanup]);
+        assert!(matches!(
+            body_outranks_cleanup,
+            RunError::Multiple {
+                primary,
+                secondary,
+            } if matches!(*primary, RunError::Internal(_))
+                && matches!(secondary.as_slice(), [RunError::Cleanup(_)])
+        ));
     }
 }

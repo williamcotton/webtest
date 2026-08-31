@@ -129,7 +129,7 @@ fn check_reporters_preserve_output_and_exit_class() {
     assert_eq!(json.status.code(), Some(0));
     assert!(json.stderr.is_empty());
     let json: serde_json::Value = serde_json::from_slice(&json.stdout).expect("JSON report");
-    assert_eq!(json["schema_version"], 2);
+    assert_eq!(json["schema_version"], 3);
     assert_eq!(json["command"], "check");
     assert_eq!(json["exit_class"], "success");
     assert_eq!(json["files"][0]["path"], "tests/example.webtest");

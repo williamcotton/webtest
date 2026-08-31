@@ -19,7 +19,9 @@ use crate::{
         write_report,
     },
     runtime_configuration::runner_options,
-    runtime_output::{event_reports, run_failure_report, step_failure_report},
+    runtime_output::{
+        aborted_run_failure_report, aborted_test_failure_report, event_reports, step_failure_report,
+    },
     test_progress::HumanTestProgress,
 };
 
@@ -272,13 +274,16 @@ pub(crate) async fn run_test(
                         file_report.reason = Some(cancellation_reason_name(*reason).into());
                         ExitClass::TestFailure
                     }
-                    RunOutcome::Aborted { failure } => {
+                    RunOutcome::Aborted {
+                        failure,
+                        prior_outcome,
+                    } => {
                         file_report.outcome = Some(RunReportOutcome::Aborted);
                         file_report.reason = Some(failure.to_string());
                         if result.aborted() == 0 {
                             file_report.execution_error = Some(ExecutionFailureReport {
                                 class: failure.failure_class(),
-                                failure: run_failure_report(failure),
+                                failure: aborted_run_failure_report(failure, *prior_outcome),
                             });
                         }
                         run_error_exit_class(failure)
@@ -338,14 +343,21 @@ pub(crate) async fn run_test(
                                         ExitClass::from_failure_class(class)
                                     }),
                                 ),
-                                TestOutcome::Aborted { failure } => {
+                                TestOutcome::Aborted {
+                                    failure,
+                                    prior_outcome,
+                                } => {
                                     let exit_class = run_error_exit_class(&failure);
                                     (
                                         TestReportOutcome::Aborted,
                                         Some(failure.failure_class()),
                                         Some(failure.to_string()),
                                         None,
-                                        Some(run_failure_report(&failure)),
+                                        Some(aborted_test_failure_report(
+                                            &failure,
+                                            prior_outcome,
+                                            &analyzed.source,
+                                        )),
                                         exit_class,
                                     )
                                 }
