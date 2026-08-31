@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites tests="2" failures="0" errors="0" skipped="2">
+  <testsuite name="tests/cancel.webtest">
+    <testcase name="active" time="0.000000005">
+      <skipped message="requested" />
+    </testcase>
+    <testcase name="later" time="0.000000000">
+      <skipped message="run_cancelled" />
+    </testcase>
+  </testsuite>
+</testsuites>

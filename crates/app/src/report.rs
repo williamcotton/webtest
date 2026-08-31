@@ -12,6 +12,8 @@ use webtest_project::Project;
 
 use crate::{error::AppError, project_context::normalized_path};
 
+pub(crate) const REPORT_SCHEMA_VERSION: u32 = 2;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExitClass {
@@ -69,6 +71,10 @@ pub struct FileReport {
     pub duration_nanos: u64,
     pub diagnostics: Vec<DiagnosticReport>,
     pub tests: Vec<TestReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<RunReportOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     pub infrastructure_error: Option<FailureReport>,
     #[serde(skip)]
     pub events: Vec<EventReport>,
@@ -95,9 +101,45 @@ pub struct DiagnosticReport {
 pub struct TestReport {
     pub name: String,
     pub exit_class: ExitClass,
-    pub passed: bool,
+    pub outcome: TestReportOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_nanos: Option<u64>,
     pub duration_nanos: u64,
     pub failure: Option<FailureReport>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestReportOutcome {
+    Passed,
+    Failed,
+    TimedOut,
+    Cancelled,
+    Skipped,
+    Aborted,
+}
+
+impl TestReportOutcome {
+    const fn status(self) -> &'static str {
+        match self {
+            Self::Passed => "ok",
+            Self::Failed => "FAILED",
+            Self::TimedOut => "TIMED OUT",
+            Self::Cancelled => "CANCELLED",
+            Self::Skipped => "SKIPPED",
+            Self::Aborted => "ABORTED",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunReportOutcome {
+    Completed,
+    Cancelled,
+    Aborted,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -158,6 +200,10 @@ pub struct SummaryReport {
     pub tests: usize,
     pub passed: usize,
     pub failed: usize,
+    pub timed_out: usize,
+    pub cancelled: usize,
+    pub skipped: usize,
+    pub aborted: usize,
     pub infrastructure_errors: usize,
     pub duration_nanos: u64,
 }
@@ -177,7 +223,9 @@ pub struct EventReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub passed: Option<bool>,
+    pub outcome: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_class: Option<ExitClass>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -214,7 +262,7 @@ pub enum Reporter {
 impl CommandReport {
     pub fn new(command: impl Into<String>, project_root: impl Into<String>) -> Self {
         Self {
-            schema_version: 1,
+            schema_version: REPORT_SCHEMA_VERSION,
             command: command.into(),
             project_root: project_root.into(),
             warnings: Vec::new(),
@@ -228,13 +276,22 @@ impl CommandReport {
         self.summary.files = self.files.len();
         self.summary.diagnostics = self.files.iter().map(|file| file.diagnostics.len()).sum();
         self.summary.tests = self.files.iter().map(|file| file.tests.len()).sum();
-        self.summary.passed = self
-            .files
-            .iter()
-            .flat_map(|file| &file.tests)
-            .filter(|test| test.passed)
-            .count();
-        self.summary.failed = self.summary.tests - self.summary.passed;
+        self.summary.passed = 0;
+        self.summary.failed = 0;
+        self.summary.timed_out = 0;
+        self.summary.cancelled = 0;
+        self.summary.skipped = 0;
+        self.summary.aborted = 0;
+        for test in self.files.iter().flat_map(|file| &file.tests) {
+            match test.outcome {
+                TestReportOutcome::Passed => self.summary.passed += 1,
+                TestReportOutcome::Failed => self.summary.failed += 1,
+                TestReportOutcome::TimedOut => self.summary.timed_out += 1,
+                TestReportOutcome::Cancelled => self.summary.cancelled += 1,
+                TestReportOutcome::Skipped => self.summary.skipped += 1,
+                TestReportOutcome::Aborted => self.summary.aborted += 1,
+            }
+        }
         self.summary.infrastructure_errors = self
             .files
             .iter()
@@ -295,12 +352,7 @@ impl CommandReport {
             }
             for test in &file.tests {
                 if include_test_status {
-                    writeln!(
-                        output,
-                        "test {:?} ... {}",
-                        test.name,
-                        if test.passed { "ok" } else { "FAILED" }
-                    )?;
+                    writeln!(output, "test {:?} ... {}", test.name, test.outcome.status())?;
                 }
                 if let Some(failure) = &test.failure {
                     if !include_test_status {
@@ -334,9 +386,13 @@ impl CommandReport {
         match self.command.as_str() {
             "test" => writeln!(
                 output,
-                "{} passed; {} failed; {} infrastructure error{}",
+                "{} passed; {} failed; {} timed out; {} cancelled; {} skipped; {} aborted; {} infrastructure error{}",
                 self.summary.passed,
                 self.summary.failed,
+                self.summary.timed_out,
+                self.summary.cancelled,
+                self.summary.skipped,
+                self.summary.aborted,
                 self.summary.infrastructure_errors,
                 plural(self.summary.infrastructure_errors)
             ),
@@ -375,7 +431,7 @@ impl CommandReport {
                     "{}: test {:?}: {}",
                     file.path,
                     test.name,
-                    if test.passed { "ok" } else { "failed" }
+                    test.outcome.status()
                 )?;
             }
             if let Some(error) = &file.infrastructure_error {
@@ -388,12 +444,16 @@ impl CommandReport {
         }
         writeln!(
             output,
-            "files={} diagnostics={} tests={} passed={} failed={} infrastructure={} exit={}",
+            "files={} diagnostics={} tests={} passed={} failed={} timed_out={} cancelled={} skipped={} aborted={} infrastructure={} exit={}",
             self.summary.files,
             self.summary.diagnostics,
             self.summary.tests,
             self.summary.passed,
             self.summary.failed,
+            self.summary.timed_out,
+            self.summary.cancelled,
+            self.summary.skipped,
+            self.summary.aborted,
             self.summary.infrastructure_errors,
             self.exit_class.code()
         )
@@ -403,7 +463,7 @@ impl CommandReport {
         write_json_line(
             output,
             &serde_json::json!({
-                "schema_version": 1,
+                "schema_version": REPORT_SCHEMA_VERSION,
                 "type": "command_started",
                 "command": self.command,
                 "project_root": self.project_root,
@@ -413,7 +473,7 @@ impl CommandReport {
             write_json_line(
                 output,
                 &serde_json::json!({
-                    "schema_version": 1,
+                    "schema_version": REPORT_SCHEMA_VERSION,
                     "type": "warning",
                     "code": warning.code,
                     "key": warning.key,
@@ -426,7 +486,7 @@ impl CommandReport {
                 write_json_line(
                     output,
                     &serde_json::json!({
-                        "schema_version": 1,
+                        "schema_version": REPORT_SCHEMA_VERSION,
                         "type": "diagnostic",
                         "file": file.path,
                         "source_revision": file.source_revision,
@@ -441,7 +501,7 @@ impl CommandReport {
                 write_json_line(
                     output,
                     &serde_json::json!({
-                        "schema_version": 1,
+                        "schema_version": REPORT_SCHEMA_VERSION,
                         "type": "infrastructure_error",
                         "file": file.path,
                         "failure": error,
@@ -452,7 +512,7 @@ impl CommandReport {
         write_json_line(
             output,
             &serde_json::json!({
-                "schema_version": 1,
+                "schema_version": REPORT_SCHEMA_VERSION,
                 "type": "command_finished",
                 "command": self.command,
                 "summary": self.summary,
@@ -469,12 +529,13 @@ impl CommandReport {
             .filter(|file| !file.diagnostics.is_empty() && file.tests.is_empty())
             .count();
         let tests = self.summary.tests + static_cases + self.summary.infrastructure_errors;
-        let failures = self.summary.failed + static_cases;
+        let failures = self.summary.failed + self.summary.timed_out + static_cases;
+        let errors = self.summary.aborted + self.summary.infrastructure_errors;
+        let skipped = self.summary.cancelled + self.summary.skipped;
         writeln!(output, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>")?;
         writeln!(
             output,
-            "<testsuites tests=\"{tests}\" failures=\"{failures}\" errors=\"{}\">",
-            self.summary.infrastructure_errors
+            "<testsuites tests=\"{tests}\" failures=\"{failures}\" errors=\"{errors}\" skipped=\"{skipped}\">"
         )?;
         for file in &self.files {
             writeln!(output, "  <testsuite name=\"{}\">", xml(&file.path))?;
@@ -496,29 +557,72 @@ impl CommandReport {
             }
             for test in &file.tests {
                 let seconds = test.duration_nanos as f64 / 1_000_000_000.0;
-                if test.passed {
-                    writeln!(
-                        output,
-                        "    <testcase name=\"{}\" time=\"{seconds:.9}\" />",
-                        xml(&test.name)
-                    )?;
-                } else {
-                    writeln!(
-                        output,
-                        "    <testcase name=\"{}\" time=\"{seconds:.9}\">",
-                        xml(&test.name)
-                    )?;
-                    let failure = test.failure.as_ref();
-                    let code = failure.map_or("test_failure", |failure| failure.code.as_str());
-                    let message = failure.map_or("test failed", |failure| failure.message.as_str());
-                    writeln!(
-                        output,
-                        "      <failure type=\"{}\" message=\"{}\">{}</failure>",
-                        xml(code),
-                        xml(message),
-                        xml(message)
-                    )?;
-                    writeln!(output, "    </testcase>")?;
+                match test.outcome {
+                    TestReportOutcome::Passed => {
+                        writeln!(
+                            output,
+                            "    <testcase name=\"{}\" time=\"{seconds:.9}\" />",
+                            xml(&test.name)
+                        )?;
+                    }
+                    TestReportOutcome::Failed | TestReportOutcome::TimedOut => {
+                        writeln!(
+                            output,
+                            "    <testcase name=\"{}\" time=\"{seconds:.9}\">",
+                            xml(&test.name)
+                        )?;
+                        let failure = test.failure.as_ref();
+                        let (fallback_code, fallback_message) = match test.outcome {
+                            TestReportOutcome::TimedOut => ("test_timeout", "test timed out"),
+                            TestReportOutcome::Failed => ("test_failure", "test failed"),
+                            TestReportOutcome::Passed
+                            | TestReportOutcome::Cancelled
+                            | TestReportOutcome::Skipped
+                            | TestReportOutcome::Aborted => {
+                                unreachable!("failure outcome already matched")
+                            }
+                        };
+                        let code = failure.map_or(fallback_code, |failure| failure.code.as_str());
+                        let message =
+                            failure.map_or(fallback_message, |failure| failure.message.as_str());
+                        writeln!(
+                            output,
+                            "      <failure type=\"{}\" message=\"{}\">{}</failure>",
+                            xml(code),
+                            xml(message),
+                            xml(message)
+                        )?;
+                        writeln!(output, "    </testcase>")?;
+                    }
+                    TestReportOutcome::Cancelled | TestReportOutcome::Skipped => {
+                        writeln!(
+                            output,
+                            "    <testcase name=\"{}\" time=\"{seconds:.9}\">",
+                            xml(&test.name)
+                        )?;
+                        let message = test.reason.as_deref().unwrap_or("test skipped");
+                        writeln!(output, "      <skipped message=\"{}\" />", xml(message))?;
+                        writeln!(output, "    </testcase>")?;
+                    }
+                    TestReportOutcome::Aborted => {
+                        writeln!(
+                            output,
+                            "    <testcase name=\"{}\" time=\"{seconds:.9}\">",
+                            xml(&test.name)
+                        )?;
+                        let failure = test.failure.as_ref();
+                        let code = failure.map_or("run_aborted", |failure| failure.code.as_str());
+                        let message =
+                            failure.map_or("test aborted", |failure| failure.message.as_str());
+                        writeln!(
+                            output,
+                            "      <error type=\"{}\" message=\"{}\">{}</error>",
+                            xml(code),
+                            xml(message),
+                            xml(message)
+                        )?;
+                        writeln!(output, "    </testcase>")?;
+                    }
                 }
             }
             if let Some(error) = &file.infrastructure_error {
@@ -612,6 +716,11 @@ fn xml(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use webtest_hir::TestId;
+    use webtest_observation::{
+        ExecutionEvent, ExecutionId, RunOutcomeKind, SkipReason, TestOutcomeKind,
+    };
+
     use super::*;
 
     fn sample() -> CommandReport {
@@ -625,7 +734,9 @@ mod tests {
             tests: vec![TestReport {
                 name: "a < b".into(),
                 exit_class: ExitClass::TestFailure,
-                passed: false,
+                outcome: TestReportOutcome::Failed,
+                reason: None,
+                timeout_nanos: None,
                 duration_nanos: 10,
                 failure: Some(FailureReport {
                     diagnostic_schema_version: webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
@@ -651,8 +762,75 @@ mod tests {
                     secondary: Vec::new(),
                 }),
             }],
+            outcome: Some(RunReportOutcome::Completed),
+            reason: None,
             infrastructure_error: None,
             events: Vec::new(),
+        });
+        report.exit_class = ExitClass::TestFailure;
+        report.finish();
+        report
+    }
+
+    fn cancelled_sample() -> CommandReport {
+        let execution_id = ExecutionId(7);
+        let events = crate::runtime_output::event_reports(
+            "tests/cancel.webtest",
+            &[
+                ExecutionEvent::RunStarted { execution_id },
+                ExecutionEvent::TestStarted {
+                    execution_id,
+                    test_id: TestId(0),
+                    name: "active".into(),
+                },
+                ExecutionEvent::TestFinished {
+                    execution_id,
+                    test_id: TestId(0),
+                    outcome: TestOutcomeKind::Cancelled,
+                },
+                ExecutionEvent::TestSkipped {
+                    execution_id,
+                    test_id: TestId(1),
+                    name: "later".into(),
+                    reason: SkipReason::RunCancelled,
+                },
+                ExecutionEvent::RunFinished {
+                    execution_id,
+                    outcome: RunOutcomeKind::Cancelled,
+                },
+            ],
+        );
+        let mut report = CommandReport::new("test", "/project");
+        report.files.push(FileReport {
+            path: "tests/cancel.webtest".into(),
+            exit_class: ExitClass::TestFailure,
+            source_revision: "cancelled".into(),
+            duration_nanos: 5,
+            diagnostics: Vec::new(),
+            tests: vec![
+                TestReport {
+                    name: "active".into(),
+                    exit_class: ExitClass::TestFailure,
+                    outcome: TestReportOutcome::Cancelled,
+                    reason: Some("requested".into()),
+                    timeout_nanos: None,
+                    duration_nanos: 5,
+                    failure: None,
+                },
+                TestReport {
+                    name: "later".into(),
+                    exit_class: ExitClass::TestFailure,
+                    outcome: TestReportOutcome::Skipped,
+                    reason: Some("run_cancelled".into()),
+                    timeout_nanos: None,
+                    duration_nanos: 0,
+                    failure: None,
+                },
+            ],
+            outcome: Some(RunReportOutcome::Cancelled),
+            reason: Some("requested".into()),
+            infrastructure_error: None,
+            events,
         });
         report.exit_class = ExitClass::TestFailure;
         report.finish();
@@ -683,7 +861,9 @@ mod tests {
         assert!(!output.contains("test \"a < b\" ... FAILED"));
         assert!(output.contains("failure in test \"a < b\":"));
         assert!(output.contains("error[runtime.locator_not_found]"));
-        assert!(output.ends_with("0 passed; 1 failed; 0 infrastructure errors\n"));
+        assert!(output.ends_with(
+            "0 passed; 1 failed; 0 timed out; 0 cancelled; 0 skipped; 0 aborted; 0 infrastructure errors\n"
+        ));
     }
 
     #[test]
@@ -719,11 +899,11 @@ mod tests {
         let mut json = Vec::new();
         sample().write(Reporter::Json, &mut json).expect("json");
         let value: serde_json::Value = serde_json::from_slice(&json).expect("valid json");
-        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["schema_version"], REPORT_SCHEMA_VERSION);
         assert_eq!(value["exit_class"], "test_failure");
         assert_eq!(
             String::from_utf8(json).expect("UTF-8 JSON"),
-            include_str!("../tests/fixtures/report-v1.json")
+            include_str!("../tests/fixtures/report-v2.json")
         );
 
         let mut events = Vec::new();
@@ -733,9 +913,9 @@ mod tests {
         let events = String::from_utf8(events).expect("UTF-8 events");
         for line in events.lines() {
             let value: serde_json::Value = serde_json::from_str(line).expect("json line");
-            assert_eq!(value["schema_version"], 1);
+            assert_eq!(value["schema_version"], REPORT_SCHEMA_VERSION);
         }
-        assert_eq!(events, include_str!("../tests/fixtures/report-v1.jsonl"));
+        assert_eq!(events, include_str!("../tests/fixtures/report-v2.jsonl"));
     }
 
     #[test]
@@ -746,7 +926,43 @@ mod tests {
         assert!(output.contains("name=\"a &lt; b\""));
         assert!(output.contains("missing &amp; gone"));
         assert!(output.contains("<failure"));
-        assert_eq!(output, include_str!("../tests/fixtures/report-v1.xml"));
+        assert_eq!(output, include_str!("../tests/fixtures/report-v2.xml"));
+    }
+
+    #[test]
+    fn cancellation_is_golden_across_every_reporter_and_never_serializes_passed() {
+        for (reporter, expected) in [
+            (
+                Reporter::Human,
+                include_str!("../tests/fixtures/cancellation-v2.txt"),
+            ),
+            (
+                Reporter::Concise,
+                include_str!("../tests/fixtures/cancellation-concise-v2.txt"),
+            ),
+            (
+                Reporter::Json,
+                include_str!("../tests/fixtures/cancellation-v2.json"),
+            ),
+            (
+                Reporter::Events,
+                include_str!("../tests/fixtures/cancellation-v2.jsonl"),
+            ),
+            (
+                Reporter::Junit,
+                include_str!("../tests/fixtures/cancellation-v2.xml"),
+            ),
+        ] {
+            let mut output = Vec::new();
+            cancelled_sample()
+                .write(reporter, &mut output)
+                .expect("cancellation report");
+            let output = String::from_utf8(output).expect("UTF-8");
+            assert_eq!(output, expected);
+            assert!(!output.contains("\"passed\": true"));
+            assert!(!output.contains("\"passed\":true"));
+            assert!(!output.contains("... ok"));
+        }
     }
 
     #[test]

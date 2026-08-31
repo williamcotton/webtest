@@ -2,13 +2,16 @@ use std::{collections::BTreeMap, error::Error, path::PathBuf, sync::Arc, time::D
 
 use webtest_browser::{BrowserError, PageEvidence};
 use webtest_hir::{StepId, TestId};
-use webtest_observation::{ExecutionEvent, ExecutionId, ObservationStore, ValueDiff};
+use webtest_observation::{
+    CancellationReason, ExecutionEvent, ExecutionId, ObservationStore, RunOutcomeKind, SkipReason,
+    ValueDiff,
+};
 use webtest_plan::{PlannedStep, ValueMatcher};
 use webtest_provider::{Type, Value};
 use webtest_runtime::{
     Artifact, ArtifactKind, AssertionFailure, DecodeFailure, EvaluationFailure, EvidenceOptions,
-    RunControl, RunError, RunEventSink, RunResult, Runner, RunnerOptions, StepError, StepFailure,
-    TestResult, resolve_browser_url,
+    RunControl, RunError, RunEventSink, RunOutcome, RunResult, Runner, RunnerOptions, StepError,
+    StepFailure, TestOutcome, TestResult, resolve_browser_url,
 };
 use webtest_text::{FileId, SyntaxOrigin, TextRange};
 
@@ -18,14 +21,36 @@ fn accepts_control(_: Option<&dyn RunControl>) {}
 
 fn accepts_event_sink(_: Option<&dyn RunEventSink>) {}
 
-fn test_result(passed: bool) -> TestResult {
+fn test_result(outcome: TestOutcome) -> TestResult {
     TestResult {
         name: "test".into(),
-        passed,
-        failure: None,
+        outcome,
         duration: Duration::ZERO,
         bindings: BTreeMap::new(),
     }
+}
+
+fn failed_outcome() -> TestOutcome {
+    TestOutcome::Failed(Box::new(StepFailure {
+        step: PlannedStep {
+            id: StepId(0),
+            origin: SyntaxOrigin::new(FileId::new(7), TextRange::default()),
+            operation: webtest_plan::TestOperation::EvaluatePure(
+                webtest_plan::EvaluatePureOperation {
+                    expression: webtest_plan::PlanExpr::Literal(Value::Null),
+                    result_binding: None,
+                    result_name: None,
+                    result_type: Type::Null,
+                },
+            ),
+        },
+        error: StepError::Internal("failed".into()),
+        evidence: PageEvidence::default(),
+        artifacts: Vec::new(),
+        inspection: None,
+        repair_hints: Vec::new(),
+        secondary_failures: Vec::new(),
+    }))
 }
 
 #[test]
@@ -122,25 +147,46 @@ fn defaults_and_result_counts_are_exact() {
         ]
     );
 
-    for (tests, passed, failed) in [
-        (Vec::new(), 0, 0),
-        (vec![test_result(true), test_result(true)], 2, 0),
-        (vec![test_result(true), test_result(false)], 1, 1),
-        (vec![test_result(false), test_result(false)], 0, 2),
-    ] {
-        let execution_id = ExecutionId::next();
-        let result = RunResult {
-            execution_id,
-            tests,
-            events: vec![
-                ExecutionEvent::RunStarted { execution_id },
-                ExecutionEvent::RunFinished { execution_id },
-            ],
-            duration: Duration::ZERO,
-        };
-        assert_eq!(result.passed(), passed);
-        assert_eq!(result.failed(), failed);
-    }
+    let execution_id = ExecutionId::next();
+    let result = RunResult {
+        execution_id,
+        outcome: RunOutcome::Completed,
+        tests: vec![
+            test_result(TestOutcome::Passed),
+            test_result(failed_outcome()),
+            test_result(TestOutcome::TimedOut {
+                timeout: Duration::from_secs(1),
+            }),
+            test_result(TestOutcome::Cancelled {
+                reason: CancellationReason::Requested,
+            }),
+            test_result(TestOutcome::Skipped {
+                reason: SkipReason::RunCancelled,
+            }),
+            test_result(TestOutcome::Aborted {
+                failure: RunError::Internal("aborted".into()),
+            }),
+        ],
+        events: vec![
+            ExecutionEvent::RunStarted { execution_id },
+            ExecutionEvent::RunFinished {
+                execution_id,
+                outcome: RunOutcomeKind::Completed,
+            },
+        ],
+        duration: Duration::ZERO,
+    };
+    assert_eq!(
+        (
+            result.passed(),
+            result.failed(),
+            result.timed_out(),
+            result.cancelled(),
+            result.skipped(),
+            result.aborted(),
+        ),
+        (1, 1, 1, 1, 1, 1)
+    );
 
     let _ = TestId(0);
 }

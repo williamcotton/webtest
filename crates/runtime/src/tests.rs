@@ -19,7 +19,7 @@ use webtest_provider::{Capability, Type, Value};
 use webtest_text::{FileId, SourceRevision, SyntaxOrigin, TextRange, TextSize};
 
 use crate::{
-    Runner, StepError,
+    Runner, StepError, TestOutcome,
     execution::repair_hints_for_error,
     redaction::{redact_step_error, visible_step_bindings},
 };
@@ -269,9 +269,11 @@ async fn failure_records_revision_bound_observation_and_success_clears_it() {
         }),
         starts: Arc::clone(&starts),
     };
-    let failed_result = runner.run(&plan(revision), &failed).await.expect("run");
+    let failed_result = runner.run(&plan(revision), &failed).await;
     assert_eq!(failed_result.failed(), 1);
-    let failure = failed_result.tests[0].failure.as_ref().expect("failure");
+    let TestOutcome::Failed(failure) = &failed_result.tests[0].outcome else {
+        panic!("failed outcome")
+    };
     assert_eq!(
         failure.inspection.as_ref().expect("inspection").page.title,
         "Sign in"
@@ -286,7 +288,7 @@ async fn failure_records_revision_bound_observation_and_success_clears_it() {
         result: Ok(()),
         starts,
     };
-    runner.run(&plan(revision), &passed).await.expect("run");
+    runner.run(&plan(revision), &passed).await;
     assert!(store.observations_for(FileId::new(0), revision).is_empty());
 }
 

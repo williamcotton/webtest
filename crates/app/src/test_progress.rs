@@ -3,7 +3,7 @@ use std::{
     sync::Mutex,
 };
 
-use webtest_observation::ExecutionEvent;
+use webtest_observation::{ExecutionEvent, TestOutcomeKind};
 use webtest_runtime::RunEventSink;
 
 pub(crate) struct HumanTestProgress {
@@ -191,10 +191,24 @@ impl HumanTestProgress {
                     write!(state.output, "test {name:?} ... ")?;
                     state.pending = PendingLine::Test;
                 }
-                ExecutionEvent::TestFinished { passed, .. }
+                ExecutionEvent::TestFinished { outcome, .. }
                     if state.pending == PendingLine::Test =>
                 {
-                    writeln!(state.output, "{}", if *passed { "ok" } else { "FAILED" })?;
+                    let status = match outcome {
+                        TestOutcomeKind::Passed => "ok",
+                        TestOutcomeKind::Failed => "FAILED",
+                        TestOutcomeKind::TimedOut => "TIMED OUT",
+                        TestOutcomeKind::Cancelled => "CANCELLED",
+                        TestOutcomeKind::Aborted => "ABORTED",
+                    };
+                    writeln!(state.output, "{status}")?;
+                    state.pending = PendingLine::None;
+                }
+                ExecutionEvent::TestSkipped { name, .. } => {
+                    if state.pending == PendingLine::BrowserStarting {
+                        writeln!(state.output, "ready")?;
+                    }
+                    writeln!(state.output, "test {name:?} ... SKIPPED")?;
                     state.pending = PendingLine::None;
                 }
                 ExecutionEvent::RunFinished { .. } if state.browser_active => {
@@ -204,7 +218,14 @@ impl HumanTestProgress {
                     write!(state.output, "stopping Chrome ... ")?;
                     state.pending = PendingLine::BrowserStopping;
                 }
-                _ => {}
+                ExecutionEvent::TestFinished { .. } | ExecutionEvent::RunFinished { .. } => {}
+                ExecutionEvent::RunStarted { .. }
+                | ExecutionEvent::StepStarted { .. }
+                | ExecutionEvent::StepPassed { .. }
+                | ExecutionEvent::ProviderCallStarted { .. }
+                | ExecutionEvent::ProviderCallFinished { .. }
+                | ExecutionEvent::ProviderCallFailed { .. }
+                | ExecutionEvent::StepFailed { .. } => {}
             }
             Ok(())
         })
@@ -272,9 +293,12 @@ mod tests {
         progress.publish(&ExecutionEvent::TestFinished {
             execution_id,
             test_id: TestId(3),
-            passed: true,
+            outcome: TestOutcomeKind::Passed,
         });
-        progress.publish(&ExecutionEvent::RunFinished { execution_id });
+        progress.publish(&ExecutionEvent::RunFinished {
+            execution_id,
+            outcome: webtest_observation::RunOutcomeKind::Completed,
+        });
         progress.browser_run_finished(true).expect("browser done");
         progress.stopping_application().expect("stopping app");
         progress.application_stopped(true).expect("app stopped");

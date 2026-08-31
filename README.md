@@ -73,7 +73,7 @@ Browser resolution is `--chrome-path`, `WEBTEST_CHROME_PATH`, `browser.path`, ma
 
 The default human `test` reporter streams progress while it works: static checking, application and health-check readiness, per-file Chrome startup and shutdown, and each active test. Concise, JSON, events, and JUnit reporters remain free of human progress text.
 
-Exit codes are stable: `0` success, `1` static/test/format failure, `2` CLI/config/input error, `3` browser/CDP/filesystem/reporter infrastructure failure, and `4` internal invariant failure. JSON and JSONL event output use `schema_version: 1`; machine durations are integer nanoseconds. JUnit distinguishes test failures from infrastructure errors.
+Exit codes are stable: `0` success, `1` static/test/format failure, `2` CLI/config/input error, `3` browser/CDP/filesystem/reporter infrastructure failure, and `4` internal invariant failure. JSON and JSONL event output use `schema_version: 2`; machine durations are integer nanoseconds. Version 2 replaces the ambiguous test/event `passed` boolean with exhaustive `outcome` values and adds timeout, cancellation, skipped, and aborted counts. JUnit distinguishes test failures and timeouts from skipped/cancelled tests and infrastructure/internal aborts.
 
 ## Project configuration
 

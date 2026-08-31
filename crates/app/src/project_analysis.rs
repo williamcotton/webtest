@@ -73,6 +73,8 @@ pub(crate) fn analyze_project(project: &Project) -> Result<CommandReport, AppErr
             duration_nanos: nanos(started.elapsed()),
             diagnostics: analyzed.diagnostics,
             tests: Vec::new(),
+            outcome: None,
+            reason: None,
             infrastructure_error: None,
             events: Vec::new(),
         });

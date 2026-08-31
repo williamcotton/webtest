@@ -53,6 +53,37 @@ impl ExecutionId {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CancellationReason {
+    Requested,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipReason {
+    RunCancelled,
+    RunAborted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestOutcomeKind {
+    Passed,
+    Failed,
+    TimedOut,
+    Cancelled,
+    Aborted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunOutcomeKind {
+    Completed,
+    Cancelled,
+    Aborted,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeFailure {
     Browser(webtest_browser::BrowserError),
@@ -124,10 +155,17 @@ pub enum ExecutionEvent {
     TestFinished {
         execution_id: ExecutionId,
         test_id: TestId,
-        passed: bool,
+        outcome: TestOutcomeKind,
+    },
+    TestSkipped {
+        execution_id: ExecutionId,
+        test_id: TestId,
+        name: String,
+        reason: SkipReason,
     },
     RunFinished {
         execution_id: ExecutionId,
+        outcome: RunOutcomeKind,
     },
 }
 

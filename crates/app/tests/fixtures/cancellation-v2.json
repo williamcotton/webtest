@@ -1,0 +1,50 @@
+{
+  "schema_version": 2,
+  "command": "test",
+  "project_root": "/project",
+  "warnings": [],
+  "files": [
+    {
+      "path": "tests/cancel.webtest",
+      "exit_class": "test_failure",
+      "source_revision": "cancelled",
+      "duration_nanos": 5,
+      "diagnostics": [],
+      "tests": [
+        {
+          "name": "active",
+          "exit_class": "test_failure",
+          "outcome": "cancelled",
+          "reason": "requested",
+          "duration_nanos": 5,
+          "failure": null
+        },
+        {
+          "name": "later",
+          "exit_class": "test_failure",
+          "outcome": "skipped",
+          "reason": "run_cancelled",
+          "duration_nanos": 0,
+          "failure": null
+        }
+      ],
+      "outcome": "cancelled",
+      "reason": "requested",
+      "infrastructure_error": null
+    }
+  ],
+  "summary": {
+    "files": 1,
+    "diagnostics": 0,
+    "tests": 2,
+    "passed": 0,
+    "failed": 0,
+    "timed_out": 0,
+    "cancelled": 1,
+    "skipped": 1,
+    "aborted": 0,
+    "infrastructure_errors": 0,
+    "duration_nanos": 5
+  },
+  "exit_class": "test_failure"
+}

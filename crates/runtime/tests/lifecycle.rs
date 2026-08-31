@@ -23,7 +23,10 @@ use webtest_provider::{
     CallContext, Capability, OperationName, OperationSchema, ProviderCall, ProviderError,
     ProviderName, ProviderRegistry, ProviderResult, ProviderSchema, ServerProvider, Type, Value,
 };
-use webtest_runtime::{RunControl, RunError, RunEventSink, Runner, RunnerOptions, StepError};
+use webtest_runtime::{
+    CancellationReason, RunControl, RunError, RunEventSink, RunOutcome, Runner, RunnerOptions,
+    SkipReason, StepError, TestOutcome,
+};
 use webtest_text::{FileId, SourceRevision, SyntaxOrigin, TextRange, TextSize};
 
 #[derive(Default)]
@@ -256,6 +259,7 @@ fn event_names(events: &[ExecutionEvent]) -> Vec<&'static str> {
             ExecutionEvent::ProviderCallFailed { .. } => "provider_failed",
             ExecutionEvent::StepFailed { .. } => "step_failed",
             ExecutionEvent::TestFinished { .. } => "test_finished",
+            ExecutionEvent::TestSkipped { .. } => "test_skipped",
             ExecutionEvent::RunFinished { .. } => "run_finished",
         })
         .collect()
@@ -283,8 +287,7 @@ async fn event_sink_receives_the_same_ordered_facts_as_the_final_result() {
     let result = Runner::new(Arc::new(ObservationStore::default()))
         .with_event_sink(sink.clone())
         .run(&plan, &LifecycleHost(state))
-        .await
-        .expect("run");
+        .await;
 
     assert_eq!(
         *sink
@@ -301,8 +304,7 @@ async fn provider_only_plan_never_starts_a_browser() {
     let plan = plan_with_tests(vec![Capability::Pure], vec![vec![pure(Value::Null)]]);
     let result = Runner::new(Arc::new(ObservationStore::default()))
         .run(&plan, &LifecycleHost(Arc::clone(&state)))
-        .await
-        .expect("provider-free run");
+        .await;
 
     assert!(state.log().is_empty());
     assert_eq!(
@@ -330,8 +332,7 @@ async fn browser_session_is_shared_and_each_test_gets_a_context_and_page() {
     );
     let result = Runner::new(Arc::new(ObservationStore::default()))
         .run(&plan, &LifecycleHost(Arc::clone(&state)))
-        .await
-        .expect("browser run");
+        .await;
 
     assert_eq!(result.passed(), 2);
     assert_eq!(
@@ -369,8 +370,7 @@ async fn ordinary_failure_stops_one_test_but_later_tests_continue() {
     );
     let result = Runner::new(Arc::new(ObservationStore::default()))
         .run(&plan, &LifecycleHost(Arc::clone(&state)))
-        .await
-        .expect("ordinary failure remains a run result");
+        .await;
 
     assert_eq!((result.passed(), result.failed()), (1, 1));
     assert!(!state.log().iter().any(|event| event.contains("unreached")));
@@ -414,15 +414,30 @@ async fn infrastructure_browser_failure_aborts_before_later_tests() {
             vec![browser_evaluate("unreached")],
         ],
     );
-    let error = Runner::new(Arc::new(ObservationStore::default()))
+    let result = Runner::new(Arc::new(ObservationStore::default()))
         .run(&plan, &LifecycleHost(Arc::clone(&state)))
-        .await
-        .expect_err("infrastructure failure aborts the run");
+        .await;
 
     assert!(matches!(
-        error,
-        RunError::Browser(BrowserError::BrowserDisconnected)
+        result.outcome,
+        RunOutcome::Aborted {
+            failure: RunError::Browser(BrowserError::BrowserDisconnected)
+        }
     ));
+    assert_eq!((result.aborted(), result.skipped()), (1, 1));
+    assert_eq!(
+        event_names(&result.events),
+        [
+            "run_started",
+            "test_started",
+            "step_started",
+            "step_failed",
+            "test_finished",
+            "test_skipped",
+            "run_finished",
+        ]
+    );
+    assert_terminal_event_invariants(&result.events);
     let log = state.log();
     assert!(log.iter().any(|event| event == "context_close:0"));
     assert!(!log.iter().any(|event| event.contains("unreached")));
@@ -447,8 +462,7 @@ async fn context_close_failure_restarts_the_session_before_the_next_test() {
     );
     Runner::new(Arc::new(ObservationStore::default()))
         .run(&plan, &LifecycleHost(Arc::clone(&state)))
-        .await
-        .expect("restart succeeds");
+        .await;
 
     assert_eq!(
         state.log(),
@@ -475,12 +489,32 @@ async fn zero_test_browser_plan_starts_and_normally_closes_its_session() {
     let plan = plan_with_tests(vec![Capability::Browser], Vec::new());
     let result = Runner::new(Arc::new(ObservationStore::default()))
         .run(&plan, &LifecycleHost(Arc::clone(&state)))
-        .await
-        .expect("empty run");
+        .await;
 
     assert!(result.tests.is_empty());
     assert_eq!(state.log(), ["session_start:0", "session_close:0"]);
     assert_eq!(event_names(&result.events), ["run_started", "run_finished"]);
+}
+
+#[tokio::test]
+async fn already_cancelled_empty_plan_is_cancelled_without_starting_a_browser() {
+    let state = Arc::new(LifecycleState::default());
+    let plan = plan_with_tests(vec![Capability::Browser], Vec::new());
+    let control = RecordingControl::new(true, false, true);
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .run_with_control(&plan, &LifecycleHost(Arc::clone(&state)), Some(&control))
+        .await;
+
+    assert!(result.tests.is_empty());
+    assert!(state.log().is_empty());
+    assert!(matches!(
+        result.outcome,
+        RunOutcome::Cancelled {
+            reason: CancellationReason::Requested
+        }
+    ));
+    assert_eq!(event_names(&result.events), ["run_started", "run_finished"]);
+    assert_terminal_event_invariants(&result.events);
 }
 
 struct FailingStartHost;
@@ -495,7 +529,10 @@ impl BrowserHost for FailingStartHost {
 #[tokio::test]
 async fn observations_are_cleared_before_browser_start_can_fail() {
     let store = Arc::new(ObservationStore::default());
-    let plan = plan_with_tests(vec![Capability::Browser], Vec::new());
+    let plan = plan_with_tests(
+        vec![Capability::Browser],
+        vec![vec![pure(Value::Null)], vec![pure(Value::Null)]],
+    );
     store.record(RuntimeObservation {
         execution_id: ExecutionId::next(),
         file: plan.file,
@@ -513,11 +550,26 @@ async fn observations_are_cleared_before_browser_start_can_fail() {
         },
     });
 
-    let error = Runner::new(Arc::clone(&store))
+    let result = Runner::new(Arc::clone(&store))
         .run(&plan, &FailingStartHost)
-        .await
-        .expect_err("browser start fails");
-    assert!(matches!(error, RunError::Browser(BrowserError::Launch(_))));
+        .await;
+    assert!(matches!(
+        result.outcome,
+        RunOutcome::Aborted {
+            failure: RunError::Browser(BrowserError::Launch(_))
+        }
+    ));
+    assert_eq!((result.aborted(), result.skipped()), (0, 2));
+    assert_eq!(
+        event_names(&result.events),
+        [
+            "run_started",
+            "test_skipped",
+            "test_skipped",
+            "run_finished"
+        ]
+    );
+    assert_terminal_event_invariants(&result.events);
     assert!(
         store
             .observations_for(plan.file, plan.source_revision)
@@ -588,6 +640,55 @@ impl RunControl for RecordingControl {
     }
 }
 
+struct CancelOnCheck {
+    checks: AtomicUsize,
+    cancel_at: usize,
+}
+
+impl CancelOnCheck {
+    fn new(cancel_at: usize) -> Self {
+        Self {
+            checks: AtomicUsize::new(0),
+            cancel_at,
+        }
+    }
+}
+
+#[async_trait]
+impl RunControl for CancelOnCheck {
+    fn is_cancelled(&self) -> bool {
+        self.checks.fetch_add(1, Ordering::SeqCst) + 1 >= self.cancel_at
+    }
+
+    async fn before_step(&self, _test: &PlannedTest, _step: &PlannedStep) {}
+}
+
+fn assert_terminal_event_invariants(events: &[ExecutionEvent]) {
+    let started_tests = events
+        .iter()
+        .filter(|event| matches!(event, ExecutionEvent::TestStarted { .. }))
+        .count();
+    let finished_tests = events
+        .iter()
+        .filter(|event| matches!(event, ExecutionEvent::TestFinished { .. }))
+        .count();
+    assert_eq!(started_tests, finished_tests);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, ExecutionEvent::RunStarted { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, ExecutionEvent::RunFinished { .. }))
+            .count(),
+        1
+    );
+}
+
 #[tokio::test]
 async fn cancellation_and_snapshot_gating_keep_the_existing_hook_order() {
     let state = Arc::new(LifecycleState::default());
@@ -599,16 +700,42 @@ async fn cancellation_and_snapshot_gating_keep_the_existing_hook_order() {
     let cancelled = RecordingControl::new(true, false, true);
     let result = Runner::new(Arc::new(ObservationStore::default()))
         .run_with_control(&plan, &LifecycleHost(Arc::clone(&state)), Some(&cancelled))
-        .await
-        .expect("cancelled run");
-    assert!(result.tests.is_empty());
-    assert_eq!(event_names(&result.events), ["run_started", "run_finished"]);
+        .await;
+    assert_eq!((result.cancelled(), result.skipped()), (0, 1));
+    assert!(matches!(
+        result.outcome,
+        RunOutcome::Cancelled {
+            reason: CancellationReason::Requested
+        }
+    ));
+    assert_eq!(
+        event_names(&result.events),
+        ["run_started", "test_skipped", "run_finished"]
+    );
+    assert!(
+        state.log().is_empty(),
+        "cancellation precedes browser startup"
+    );
+    assert!(
+        result
+            .tests
+            .iter()
+            .all(|test| !matches!(test.outcome, TestOutcome::Passed))
+    );
+    assert!(result.events.iter().all(|event| !matches!(
+        event,
+        ExecutionEvent::TestFinished {
+            outcome: webtest_observation::TestOutcomeKind::Passed,
+            ..
+        }
+    )));
+    assert_terminal_event_invariants(&result.events);
 
     let after_hook = RecordingControl::new(false, true, false);
+    let second_state = Arc::new(LifecycleState::default());
     let result = Runner::new(Arc::new(ObservationStore::default()))
-        .run_with_control(&plan, &LifecycleHost(state), Some(&after_hook))
-        .await
-        .expect("hook cancellation");
+        .run_with_control(&plan, &LifecycleHost(second_state), Some(&after_hook))
+        .await;
     assert_eq!(
         after_hook.log.lock().expect("control log").as_slice(),
         ["before"]
@@ -622,6 +749,134 @@ async fn cancellation_and_snapshot_gating_keep_the_existing_hook_order() {
             "run_finished"
         ]
     );
+    assert!(matches!(
+        result.tests[0].outcome,
+        TestOutcome::Cancelled {
+            reason: CancellationReason::Requested
+        }
+    ));
+    assert_terminal_event_invariants(&result.events);
+}
+
+#[tokio::test]
+async fn cancellation_before_first_step_finishes_active_test_and_skips_later_tests_in_plan_order() {
+    let plan = plan_with_tests(
+        vec![Capability::Pure],
+        vec![vec![pure(Value::Int(1))], vec![pure(Value::Int(2))]],
+    );
+    let control = CancelOnCheck::new(3);
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .run_with_control(
+            &plan,
+            &LifecycleHost(Arc::new(LifecycleState::default())),
+            Some(&control),
+        )
+        .await;
+
+    assert_eq!(
+        result
+            .tests
+            .iter()
+            .map(|test| test.name.as_str())
+            .collect::<Vec<_>>(),
+        ["test-0", "test-1"]
+    );
+    assert!(matches!(
+        result.tests[0].outcome,
+        TestOutcome::Cancelled {
+            reason: CancellationReason::Requested
+        }
+    ));
+    assert!(matches!(
+        result.tests[1].outcome,
+        TestOutcome::Skipped {
+            reason: SkipReason::RunCancelled
+        }
+    ));
+    assert_eq!(
+        event_names(&result.events),
+        [
+            "run_started",
+            "test_started",
+            "test_finished",
+            "test_skipped",
+            "run_finished",
+        ]
+    );
+    assert_terminal_event_invariants(&result.events);
+}
+
+#[tokio::test]
+async fn cancellation_between_tests_preserves_the_completed_result_and_skips_the_remainder() {
+    let plan = plan_with_tests(
+        vec![Capability::Pure],
+        vec![vec![pure(Value::Int(1))], vec![pure(Value::Int(2))]],
+    );
+    let control = CancelOnCheck::new(5);
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .run_with_control(
+            &plan,
+            &LifecycleHost(Arc::new(LifecycleState::default())),
+            Some(&control),
+        )
+        .await;
+
+    assert!(matches!(result.tests[0].outcome, TestOutcome::Passed));
+    assert!(matches!(
+        result.tests[1].outcome,
+        TestOutcome::Skipped {
+            reason: SkipReason::RunCancelled
+        }
+    ));
+    assert_eq!((result.passed(), result.skipped()), (1, 1));
+    assert_eq!(
+        event_names(&result.events),
+        [
+            "run_started",
+            "test_started",
+            "step_started",
+            "step_passed",
+            "test_finished",
+            "test_skipped",
+            "run_finished",
+        ]
+    );
+    assert_terminal_event_invariants(&result.events);
+}
+
+#[tokio::test]
+async fn cancellation_between_steps_keeps_the_passed_step_but_cancels_the_test() {
+    let plan = plan_with_tests(
+        vec![Capability::Pure],
+        vec![vec![pure(Value::Int(1)), pure(Value::Int(2))]],
+    );
+    let control = CancelOnCheck::new(5);
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .run_with_control(
+            &plan,
+            &LifecycleHost(Arc::new(LifecycleState::default())),
+            Some(&control),
+        )
+        .await;
+
+    assert!(matches!(
+        result.tests[0].outcome,
+        TestOutcome::Cancelled {
+            reason: CancellationReason::Requested
+        }
+    ));
+    assert_eq!(
+        event_names(&result.events),
+        [
+            "run_started",
+            "test_started",
+            "step_started",
+            "step_passed",
+            "test_finished",
+            "run_finished",
+        ]
+    );
+    assert_terminal_event_invariants(&result.events);
 }
 
 #[derive(Clone, Debug)]
@@ -753,8 +1008,7 @@ async fn provider_context_events_binding_and_builder_precedence_are_preserved() 
         .with_options(options.clone())
         .with_provider_registry(providers)
         .run(&plan, &LifecycleHost(Arc::clone(&state)))
-        .await
-        .expect("custom registry applied last");
+        .await;
 
     assert!(state.log().is_empty());
     assert_eq!(
@@ -823,8 +1077,7 @@ async fn provider_failure_is_redacted_before_control_events_and_observation() {
             &LifecycleHost(Arc::new(LifecycleState::default())),
             Some(&control),
         )
-        .await
-        .expect("application error is a test failure");
+        .await;
 
     let hook_log = control.log.lock().expect("control log").join("\n");
     let hook_failure = control
@@ -885,8 +1138,7 @@ async fn provider_timeout_falls_back_to_test_timeout_and_nested_temp_resources_a
         .with_options(options)
         .with_provider_registry(providers)
         .run(&plan, &LifecycleHost(Arc::new(LifecycleState::default())))
-        .await
-        .expect("provider run");
+        .await;
 
     assert_eq!(
         provider.calls.lock().expect("calls")[0].timeout,
@@ -909,15 +1161,16 @@ async fn provider_infrastructure_failure_aborts_without_recording_an_observation
         vec![vec![secret_binding(), provider_operation(None)]],
     );
     let store = Arc::new(ObservationStore::default());
-    let error = Runner::new(Arc::clone(&store))
+    let result = Runner::new(Arc::clone(&store))
         .with_provider_registry(providers)
         .run(&plan, &LifecycleHost(Arc::new(LifecycleState::default())))
-        .await
-        .expect_err("transport failure aborts");
+        .await;
 
     assert!(matches!(
-        error,
-        RunError::Provider(ProviderError::BridgeTransport { .. })
+        result.outcome,
+        RunOutcome::Aborted {
+            failure: RunError::Provider(ProviderError::BridgeTransport { .. })
+        }
     ));
     assert!(
         store
@@ -935,14 +1188,15 @@ async fn with_options_rebuilds_builtins_before_a_later_registry_override() {
         vec![Capability::Server],
         vec![vec![secret_binding(), provider_operation(None)]],
     );
-    let error = Runner::new(Arc::new(ObservationStore::default()))
+    let result = Runner::new(Arc::new(ObservationStore::default()))
         .with_provider_registry(providers)
         .with_options(RunnerOptions::default())
         .run(&plan, &LifecycleHost(Arc::new(LifecycleState::default())))
-        .await
-        .expect_err("with_options replaces the earlier custom registry");
+        .await;
     assert!(matches!(
-        error,
-        RunError::Provider(ProviderError::NotRegistered { provider }) if provider == "fake"
+        result.outcome,
+        RunOutcome::Aborted {
+            failure: RunError::Provider(ProviderError::NotRegistered { ref provider })
+        } if provider == "fake"
     ));
 }

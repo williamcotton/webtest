@@ -129,7 +129,7 @@ fn check_reporters_preserve_output_and_exit_class() {
     assert_eq!(json.status.code(), Some(0));
     assert!(json.stderr.is_empty());
     let json: serde_json::Value = serde_json::from_slice(&json.stdout).expect("JSON report");
-    assert_eq!(json["schema_version"], 1);
+    assert_eq!(json["schema_version"], 2);
     assert_eq!(json["command"], "check");
     assert_eq!(json["exit_class"], "success");
     assert_eq!(json["files"][0]["path"], "tests/example.webtest");
@@ -150,7 +150,7 @@ fn human_test_reporter_streams_preparation_and_each_test_status_once() {
             "checking 1 test file ... done\n",
             "running 1 test in 1 file\n",
             "test \"works\" ... ok\n",
-            "1 passed; 0 failed; 0 infrastructure errors\n",
+            "1 passed; 0 failed; 0 timed out; 0 cancelled; 0 skipped; 0 aborted; 0 infrastructure errors\n",
         )
     );
 }

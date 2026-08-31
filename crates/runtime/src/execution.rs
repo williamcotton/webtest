@@ -6,8 +6,8 @@ use webtest_plan::{PlannedTest, TestOperation, TestPlan};
 use webtest_provider::{ProviderError, ProviderRegistry};
 
 use crate::{
-    RunControl, RunError, RunEventSink, RunnerOptions, TestResult, events::emit_event,
-    redaction::redact_step_error,
+    CancellationReason, RunControl, RunError, RunEventSink, RunnerOptions, TestOutcome, TestResult,
+    events::emit_event, redaction::redact_step_error,
 };
 
 use self::{
@@ -44,7 +44,7 @@ pub(crate) async fn execute_test(
     options: &RunnerOptions,
     providers: &ProviderRegistry,
     observations: &ObservationStore,
-) -> Result<ExecutedTest, RunError> {
+) -> ExecutedTest {
     let test_started = Instant::now();
     emit_event(
         events,
@@ -55,21 +55,42 @@ pub(crate) async fn execute_test(
             name: test.name.clone(),
         },
     );
-    let mut context = if let Some(session) = session.as_deref_mut() {
-        Some(session.new_context(&options.browser_context).await?)
-    } else {
-        None
-    };
-    let mut page: Option<Box<dyn Page>> = if let Some(context) = context.as_mut() {
-        Some(context.new_page().await?)
-    } else {
-        None
-    };
-    let mut failure = None;
     let mut state = TestExecutionState::new(options.redacted_json_fields.clone());
+    let mut outcome = None;
+    let mut context = None;
+    let mut page: Option<Box<dyn Page>> = None;
+
+    if let Some(session) = session.as_deref_mut() {
+        match session.new_context(&options.browser_context).await {
+            Ok(created) => context = Some(created),
+            Err(error) => {
+                outcome = Some(TestOutcome::Aborted {
+                    failure: RunError::Browser(error),
+                });
+            }
+        }
+    }
+    if outcome.is_none()
+        && let Some(created_context) = context.as_mut()
+    {
+        match created_context.new_page().await {
+            Ok(created) => page = Some(created),
+            Err(error) => {
+                outcome = Some(TestOutcome::Aborted {
+                    failure: RunError::Browser(error),
+                });
+            }
+        }
+    }
 
     for step in &test.steps {
+        if outcome.is_some() {
+            break;
+        }
         if control.is_some_and(RunControl::is_cancelled) {
+            outcome = Some(TestOutcome::Cancelled {
+                reason: CancellationReason::Requested,
+            });
             break;
         }
         if let TestOperation::ServerProviderCall(call) = &step.operation {
@@ -84,6 +105,9 @@ pub(crate) async fn execute_test(
                 control.before_step(test, step).await;
             }
             if control.is_cancelled() {
+                outcome = Some(TestOutcome::Cancelled {
+                    reason: CancellationReason::Requested,
+                });
                 break;
             }
         }
@@ -154,7 +178,7 @@ pub(crate) async fn execute_test(
                         .after_step_failure(test, step, &error, &state.visible_step_bindings(step))
                         .await;
                 }
-                let outcome = process_failure(FailureInput {
+                let failure_result = process_failure(FailureInput {
                     plan,
                     test_id: test.id,
                     step,
@@ -170,17 +194,14 @@ pub(crate) async fn execute_test(
                     secrets,
                 })
                 .await;
-                match outcome {
+                match failure_result {
                     Ok(step_failure) => {
-                        failure = Some(step_failure);
+                        outcome = Some(TestOutcome::Failed(Box::new(step_failure)));
                         break;
                     }
                     Err(error) => {
-                        drop(page);
-                        if let Some(context) = context.as_mut() {
-                            let _ = context.close().await;
-                        }
-                        return Err(error);
+                        outcome = Some(TestOutcome::Aborted { failure: error });
+                        break;
                     }
                 }
             }
@@ -193,37 +214,38 @@ pub(crate) async fn execute_test(
     } else {
         false
     };
-    let passed = failure.is_none();
+    let bindings = state.final_transferable_bindings(&options.redacted_json_fields);
+    for directory in state.temporary_directories() {
+        if let Err(error) = tokio::fs::remove_dir_all(&directory).await {
+            outcome = Some(TestOutcome::Aborted {
+                failure: RunError::Provider(ProviderError::Filesystem {
+                    path: directory.display().to_string(),
+                    message: format!("temporary resource cleanup failed: {error}"),
+                }),
+            });
+            break;
+        }
+    }
+    let outcome = outcome.unwrap_or(TestOutcome::Passed);
+    let outcome_kind = outcome.finished_kind();
     emit_event(
         events,
         event_sink,
         ExecutionEvent::TestFinished {
             execution_id,
             test_id: test.id,
-            passed,
+            outcome: outcome_kind,
         },
     );
-    let bindings = state.final_transferable_bindings(&options.redacted_json_fields);
-    for directory in state.temporary_directories() {
-        tokio::fs::remove_dir_all(&directory)
-            .await
-            .map_err(|error| {
-                RunError::Provider(ProviderError::Filesystem {
-                    path: directory.display().to_string(),
-                    message: format!("temporary resource cleanup failed: {error}"),
-                })
-            })?;
-    }
-    Ok(ExecutedTest {
+    ExecutedTest {
         result: TestResult {
             name: test.name.clone(),
-            passed,
-            failure,
+            outcome,
             duration: test_started.elapsed(),
             bindings,
         },
         session_tainted: cleanup_failed,
-    })
+    }
 }
 
 pub(crate) fn duration_millis(duration: Duration) -> u64 {

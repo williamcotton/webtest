@@ -10,7 +10,7 @@ use webtest_analysis::{
 use webtest_browser::{BrowserError, BrowserHost, Locator};
 use webtest_observation::{ObservationStore, RuntimeObservationKind};
 use webtest_provider::ProviderRegistry;
-use webtest_runtime::{RunError, RunResult, Runner, RunnerOptions};
+use webtest_runtime::{RunResult, Runner, RunnerOptions};
 use webtest_syntax::SyntaxKind;
 use webtest_text::{FileId, TextRange};
 
@@ -43,8 +43,6 @@ pub enum EditorError {
     Analysis(#[from] AnalysisError),
     #[error(transparent)]
     Browser(#[from] BrowserError),
-    #[error(transparent)]
-    Runtime(#[from] RunError),
     #[error("the file has static errors and cannot be executed")]
     StaticErrors,
 }
@@ -401,7 +399,7 @@ impl EditorService {
         let runner = Runner::new(Arc::clone(&self.observations))
             .with_options(runner_options)
             .with_provider_registry(providers);
-        Ok(runner.run(&plan, browser).await?)
+        Ok(runner.run(&plan, browser).await)
     }
 
     fn read_database(&self) -> std::sync::RwLockReadGuard<'_, AnalysisDatabase> {
@@ -511,6 +509,7 @@ mod tests {
     use webtest_provider::{
         Capability, OperationName, OperationSchema, ProviderName, ProviderSchema, Type,
     };
+    use webtest_runtime::RunOutcome;
 
     use super::*;
 
@@ -690,13 +689,15 @@ mod tests {
                 .any(|diagnostic| diagnostic.source == DiagnosticSource::Runtime)
         );
 
-        let error = editor
+        let result = editor
             .run_file(file, &DisconnectHost)
             .await
-            .expect_err("forced disconnect");
+            .expect("forced disconnect is an aborted runtime result");
         assert!(matches!(
-            error,
-            EditorError::Runtime(RunError::Browser(BrowserError::BrowserDisconnected))
+            result.outcome,
+            RunOutcome::Aborted {
+                failure: webtest_runtime::RunError::Browser(BrowserError::BrowserDisconnected)
+            }
         ));
         assert!(
             editor

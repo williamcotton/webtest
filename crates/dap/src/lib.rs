@@ -23,7 +23,7 @@ use webtest_plan::{
     AssertionOperation, BrowserOperation, PlannedStep, PlannedTest, TestOperation, TestPlan,
 };
 use webtest_provider::ProviderRegistry;
-use webtest_runtime::{RunControl, Runner, RunnerOptions, StepError};
+use webtest_runtime::{RunControl, RunOutcome, Runner, RunnerOptions, StepError, TestOutcome};
 use webtest_text::TextRange;
 
 const THREAD_ID: i64 = 1;
@@ -607,57 +607,56 @@ impl DebugState {
         let result = runner
             .run_with_control(&program.plan, self.browser.as_ref(), Some(self.as_ref()))
             .await;
-        let exit_code = match result {
-            Ok(result) => {
-                for test in &result.tests {
-                    let (category, status, data) = if test.passed {
-                        ("stdout", "ok".to_owned(), Value::Null)
-                    } else {
-                        let error = test
-                            .failure
-                            .as_ref()
-                            .map(|failure| failure.error.to_string())
-                            .unwrap_or_else(|| "failed".into());
-                        let details = test
-                            .failure
-                            .as_ref()
-                            .map_or(Value::Null, failure_output_data);
-                        let hints = test
-                            .failure
-                            .as_ref()
-                            .filter(|failure| !failure.repair_hints.is_empty())
-                            .and_then(|failure| serde_json::to_string(&failure.repair_hints).ok())
-                            .map(|hints| format!("\nsemantic repair candidates: {hints}"))
-                            .unwrap_or_default();
-                        ("stderr", format!("FAILED: {error}{hints}"), details)
-                    };
-                    let _ = self
-                        .writer
-                        .event(
-                            "output",
-                            json!({
-                                "category": category,
-                                "output": format!("test {:?} ... {status}\n", test.name),
-                                "data": data,
-                            }),
-                        )
-                        .await;
-                }
-                i32::from(result.failed() != 0)
-            }
-            Err(error) => {
-                let _ = self
-                    .writer
-                    .event(
-                        "output",
-                        json!({
-                            "category": "stderr",
-                            "output": format!("browser infrastructure error: {error}\n"),
-                        }),
+        for test in &result.tests {
+            let (category, status, data) = match &test.outcome {
+                TestOutcome::Passed => ("stdout", "ok".to_owned(), Value::Null),
+                TestOutcome::Failed(failure) => {
+                    let hints = (!failure.repair_hints.is_empty())
+                        .then(|| serde_json::to_string(&failure.repair_hints).ok())
+                        .flatten()
+                        .map(|hints| format!("\nsemantic repair candidates: {hints}"))
+                        .unwrap_or_default();
+                    (
+                        "stderr",
+                        format!("FAILED: {}{hints}", failure.error),
+                        failure_output_data(failure),
                     )
-                    .await;
-                1
-            }
+                }
+                TestOutcome::TimedOut { timeout } => (
+                    "stderr",
+                    format!("TIMED OUT after {}ms", timeout.as_millis()),
+                    Value::Null,
+                ),
+                TestOutcome::Cancelled { reason } => {
+                    ("stderr", format!("CANCELLED: {reason:?}"), Value::Null)
+                }
+                TestOutcome::Skipped { reason } => {
+                    ("stderr", format!("SKIPPED: {reason:?}"), Value::Null)
+                }
+                TestOutcome::Aborted { failure } => {
+                    ("stderr", format!("ABORTED: {failure}"), Value::Null)
+                }
+            };
+            let _ = self
+                .writer
+                .event(
+                    "output",
+                    json!({
+                        "category": category,
+                        "output": format!("test {:?} ... {status}\n", test.name),
+                        "data": data,
+                    }),
+                )
+                .await;
+        }
+        let exit_code = match &result.outcome {
+            RunOutcome::Completed => i32::from(
+                result.failed() != 0
+                    || result.timed_out() != 0
+                    || result.cancelled() != 0
+                    || result.aborted() != 0,
+            ),
+            RunOutcome::Cancelled { .. } | RunOutcome::Aborted { .. } => 1,
         };
         if self.shutting_down.load(Ordering::Acquire) {
             return;
@@ -1787,5 +1786,78 @@ mod tests {
             lock(&state.pending_pause).is_none(),
             "continue must cancel queued step mode"
         );
+    }
+
+    #[tokio::test]
+    async fn disconnect_releases_a_paused_step_as_a_cancelled_runtime_outcome() {
+        let source = "test \"x\" {\n    server {\n        let value = 1\n        expect value == 1\n    }\n}\n";
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join("cancel.webtest");
+        let program = LoadedProgram::load(path, Some(source.into())).expect("program");
+        let state = DebugState::new_with_options(
+            ProtocolWriter::new(tokio::io::sink()),
+            Arc::new(UnusedBrowserHost),
+            RunnerOptions::default(),
+        );
+        lock(&state.breakpoints).insert(program.path.clone(), HashSet::from([3]));
+        *lock(&state.program) = Some(program.clone());
+
+        let run_state = Arc::clone(&state);
+        let plan = program.plan.clone();
+        let task = tokio::spawn(async move {
+            Runner::new(Arc::new(ObservationStore::default()))
+                .run_with_control(&plan, &UnusedBrowserHost, Some(run_state.as_ref()))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while lock(&state.paused).is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("breakpoint pause");
+
+        let disconnected = state
+            .handle(Request {
+                seq: 2,
+                message_type: "request".into(),
+                command: "disconnect".into(),
+                arguments: json!({ "terminateDebuggee": true }),
+            })
+            .await
+            .expect("disconnect response");
+        assert!(disconnected);
+
+        let result = task.await.expect("runtime task");
+        assert!(matches!(
+            result.outcome,
+            RunOutcome::Cancelled {
+                reason: webtest_runtime::CancellationReason::Requested
+            }
+        ));
+        assert!(matches!(
+            result.tests[0].outcome,
+            TestOutcome::Cancelled {
+                reason: webtest_runtime::CancellationReason::Requested
+            }
+        ));
+        assert_eq!(
+            result
+                .events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    webtest_observation::ExecutionEvent::TestFinished { .. }
+                ))
+                .count(),
+            1
+        );
+        assert!(matches!(
+            result.events.last(),
+            Some(webtest_observation::ExecutionEvent::RunFinished {
+                outcome: webtest_observation::RunOutcomeKind::Cancelled,
+                ..
+            })
+        ));
     }
 }

@@ -1,13 +1,14 @@
-use std::{sync::Arc, time::Instant};
+use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
 use tracing::instrument;
 use webtest_browser::BrowserHost;
-use webtest_observation::{ExecutionEvent, ExecutionId, ObservationStore};
-use webtest_plan::TestPlan;
-use webtest_provider::{Capability, NativeProviderConfig, ProviderRegistry};
+use webtest_observation::{ExecutionEvent, ExecutionId, ObservationStore, SkipReason};
+use webtest_plan::{PlannedTest, TestPlan};
+use webtest_provider::{Capability, NativeProviderConfig, ProviderRegistry, Value};
 
 use crate::{
-    RunControl, RunError, RunEventSink, RunResult, RunnerOptions,
+    CancellationReason, RunControl, RunEventSink, RunOutcome, RunResult, RunnerOptions,
+    TestOutcome, TestResult,
     events::emit_event,
     execution::{ExecutedTest, execute_test},
 };
@@ -46,11 +47,7 @@ impl Runner {
     }
 
     #[instrument(skip_all, fields(file = plan.file.get()))]
-    pub async fn run(
-        &self,
-        plan: &TestPlan,
-        browser: &dyn BrowserHost,
-    ) -> Result<RunResult, RunError> {
+    pub async fn run(&self, plan: &TestPlan, browser: &dyn BrowserHost) -> RunResult {
         self.run_with_control(plan, browser, None).await
     }
 
@@ -60,7 +57,7 @@ impl Runner {
         plan: &TestPlan,
         browser: &dyn BrowserHost,
         control: Option<&dyn RunControl>,
-    ) -> Result<RunResult, RunError> {
+    ) -> RunResult {
         self.observations.clear_for_file(plan.file);
         let run_started = Instant::now();
         let execution_id = ExecutionId::next();
@@ -70,58 +67,214 @@ impl Runner {
             self.event_sink.as_deref(),
             ExecutionEvent::RunStarted { execution_id },
         );
-        let needs_browser = plan
-            .required_host_capabilities
-            .contains(&Capability::Browser);
-        let mut session = if needs_browser {
-            Some(browser.start().await?)
-        } else {
-            None
-        };
         let mut tests = Vec::with_capacity(plan.tests.len());
-
-        for (index, test) in plan.tests.iter().enumerate() {
-            if control.is_some_and(RunControl::is_cancelled) {
-                break;
-            }
-            let ExecutedTest {
-                result,
-                session_tainted,
-            } = execute_test(
-                plan,
-                test,
+        let mut outcome = RunOutcome::Completed;
+        if control.is_some_and(RunControl::is_cancelled) {
+            outcome = RunOutcome::Cancelled {
+                reason: CancellationReason::Requested,
+            };
+            skip_tests(
+                &plan.tests,
+                SkipReason::RunCancelled,
                 execution_id,
+                &mut tests,
                 &mut events,
                 self.event_sink.as_deref(),
-                &mut session,
-                control,
-                &self.options,
-                &self.providers,
-                &self.observations,
+            );
+            finish_run(
+                execution_id,
+                outcome,
+                tests,
+                events,
+                run_started,
+                self.event_sink.as_deref(),
             )
-            .await?;
-            tests.push(result);
-            if session_tainted && index + 1 < plan.tests.len() {
-                if let Some(mut current) = session.take() {
-                    let _ = current.close().await;
+        } else {
+            let needs_browser = plan
+                .required_host_capabilities
+                .contains(&Capability::Browser);
+            let mut session = if needs_browser {
+                match browser.start().await {
+                    Ok(session) => Some(session),
+                    Err(error) => {
+                        outcome = RunOutcome::Aborted {
+                            failure: error.into(),
+                        };
+                        skip_tests(
+                            &plan.tests,
+                            SkipReason::RunAborted,
+                            execution_id,
+                            &mut tests,
+                            &mut events,
+                            self.event_sink.as_deref(),
+                        );
+                        return finish_run(
+                            execution_id,
+                            outcome,
+                            tests,
+                            events,
+                            run_started,
+                            self.event_sink.as_deref(),
+                        );
+                    }
                 }
-                session = Some(browser.start().await?);
-            }
-        }
+            } else {
+                None
+            };
 
-        emit_event(
-            &mut events,
-            self.event_sink.as_deref(),
-            ExecutionEvent::RunFinished { execution_id },
-        );
-        if let Some(mut session) = session {
-            session.close().await?;
+            for (index, test) in plan.tests.iter().enumerate() {
+                if control.is_some_and(RunControl::is_cancelled) {
+                    outcome = RunOutcome::Cancelled {
+                        reason: CancellationReason::Requested,
+                    };
+                    skip_tests(
+                        &plan.tests[index..],
+                        SkipReason::RunCancelled,
+                        execution_id,
+                        &mut tests,
+                        &mut events,
+                        self.event_sink.as_deref(),
+                    );
+                    break;
+                }
+                let ExecutedTest {
+                    result,
+                    session_tainted,
+                } = execute_test(
+                    plan,
+                    test,
+                    execution_id,
+                    &mut events,
+                    self.event_sink.as_deref(),
+                    &mut session,
+                    control,
+                    &self.options,
+                    &self.providers,
+                    &self.observations,
+                )
+                .await;
+                let terminal = match &result.outcome {
+                    TestOutcome::Cancelled { reason } => Some((
+                        RunOutcome::Cancelled { reason: *reason },
+                        SkipReason::RunCancelled,
+                    )),
+                    TestOutcome::Aborted { failure } => Some((
+                        RunOutcome::Aborted {
+                            failure: failure.clone(),
+                        },
+                        SkipReason::RunAborted,
+                    )),
+                    TestOutcome::Passed
+                    | TestOutcome::Failed(_)
+                    | TestOutcome::TimedOut { .. }
+                    | TestOutcome::Skipped { .. } => None,
+                };
+                tests.push(result);
+                if let Some((terminal, reason)) = terminal {
+                    outcome = terminal;
+                    skip_tests(
+                        &plan.tests[index + 1..],
+                        reason,
+                        execution_id,
+                        &mut tests,
+                        &mut events,
+                        self.event_sink.as_deref(),
+                    );
+                    break;
+                }
+                if session_tainted && index + 1 < plan.tests.len() {
+                    if let Some(mut current) = session.take() {
+                        let _ = current.close().await;
+                    }
+                    match browser.start().await {
+                        Ok(restarted) => session = Some(restarted),
+                        Err(error) => {
+                            outcome = RunOutcome::Aborted {
+                                failure: error.into(),
+                            };
+                            skip_tests(
+                                &plan.tests[index + 1..],
+                                SkipReason::RunAborted,
+                                execution_id,
+                                &mut tests,
+                                &mut events,
+                                self.event_sink.as_deref(),
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if let Some(mut session) = session
+                && let Err(error) = session.close().await
+            {
+                outcome = RunOutcome::Aborted {
+                    failure: error.into(),
+                };
+            }
+            finish_run(
+                execution_id,
+                outcome,
+                tests,
+                events,
+                run_started,
+                self.event_sink.as_deref(),
+            )
         }
-        Ok(RunResult {
-            execution_id,
-            tests,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn skip_tests(
+    planned: &[PlannedTest],
+    reason: SkipReason,
+    execution_id: ExecutionId,
+    results: &mut Vec<TestResult>,
+    events: &mut Vec<ExecutionEvent>,
+    event_sink: Option<&dyn RunEventSink>,
+) {
+    for test in planned {
+        emit_event(
             events,
-            duration: run_started.elapsed(),
-        })
+            event_sink,
+            ExecutionEvent::TestSkipped {
+                execution_id,
+                test_id: test.id,
+                name: test.name.clone(),
+                reason,
+            },
+        );
+        results.push(TestResult {
+            name: test.name.clone(),
+            outcome: TestOutcome::Skipped { reason },
+            duration: std::time::Duration::ZERO,
+            bindings: BTreeMap::<String, Value>::new(),
+        });
+    }
+}
+
+fn finish_run(
+    execution_id: ExecutionId,
+    outcome: RunOutcome,
+    tests: Vec<TestResult>,
+    mut events: Vec<ExecutionEvent>,
+    started: Instant,
+    event_sink: Option<&dyn RunEventSink>,
+) -> RunResult {
+    emit_event(
+        &mut events,
+        event_sink,
+        ExecutionEvent::RunFinished {
+            execution_id,
+            outcome: outcome.kind(),
+        },
+    );
+    RunResult {
+        execution_id,
+        outcome,
+        tests,
+        events,
+        duration: started.elapsed(),
     }
 }

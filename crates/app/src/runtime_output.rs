@@ -1,11 +1,13 @@
 use webtest_browser::{BrowserError, Locator};
-use webtest_observation::{ExecutionEvent, RuntimeFailure};
+use webtest_observation::{
+    ExecutionEvent, RunOutcomeKind, RuntimeFailure, SkipReason, TestOutcomeKind,
+};
 use webtest_provider::ProviderError;
 use webtest_runtime::{RunError, StepError, StepFailure};
 
 use crate::{
     project_context::normalized_path,
-    report::{EventReport, ExitClass, FailureReport},
+    report::{EventReport, ExitClass, FailureReport, REPORT_SCHEMA_VERSION},
     source_output::source_span,
 };
 
@@ -76,6 +78,27 @@ pub(crate) fn run_error_message(error: &RunError) -> String {
     match error {
         RunError::Browser(error) => infrastructure_message(error),
         _ => error.to_string(),
+    }
+}
+
+pub(crate) fn run_failure_report(error: &RunError) -> FailureReport {
+    FailureReport {
+        diagnostic_schema_version: webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
+        repair_hint_schema_version: webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
+        code: run_error_code(error),
+        message: run_error_message(error),
+        span: None,
+        diff: None,
+        artifacts: Vec::new(),
+        semantic_details: Some(serde_json::json!({
+            "failure_class": match error {
+                RunError::Browser(_) | RunError::Provider(_) => "infrastructure",
+                RunError::Internal(_) => "internal",
+            },
+        })),
+        repair_hints: Vec::new(),
+        page: None,
+        secondary: Vec::new(),
     }
 }
 
@@ -384,7 +407,7 @@ pub(crate) fn event_reports(path: &str, events: &[ExecutionEvent]) -> Vec<EventR
             ExecutionEvent::TestFinished {
                 execution_id,
                 test_id,
-                passed,
+                outcome,
             } => {
                 let mut event = event_report(
                     path,
@@ -393,16 +416,55 @@ pub(crate) fn event_reports(path: &str, events: &[ExecutionEvent]) -> Vec<EventR
                     Some(test_id.0),
                     None,
                 );
-                event.passed = Some(*passed);
-                event.exit_class = Some(if *passed {
-                    ExitClass::Success
-                } else {
-                    ExitClass::TestFailure
+                event.outcome = Some(test_outcome_name(*outcome).into());
+                event.exit_class = Some(match outcome {
+                    TestOutcomeKind::Passed => ExitClass::Success,
+                    TestOutcomeKind::Failed
+                    | TestOutcomeKind::TimedOut
+                    | TestOutcomeKind::Cancelled => ExitClass::TestFailure,
+                    TestOutcomeKind::Aborted => ExitClass::Infrastructure,
                 });
                 event
             }
-            ExecutionEvent::RunFinished { execution_id } => {
-                event_report(path, "run_finished", Some(execution_id.0), None, None)
+            ExecutionEvent::TestSkipped {
+                execution_id,
+                test_id,
+                name,
+                reason,
+            } => {
+                let mut event = event_report(
+                    path,
+                    "test_skipped",
+                    Some(execution_id.0),
+                    Some(test_id.0),
+                    None,
+                );
+                event.name = Some(name.clone());
+                event.outcome = Some("skipped".into());
+                event.reason = Some(skip_reason_name(*reason).into());
+                event.exit_class = Some(match reason {
+                    SkipReason::RunCancelled => ExitClass::TestFailure,
+                    SkipReason::RunAborted => ExitClass::Infrastructure,
+                });
+                event
+            }
+            ExecutionEvent::RunFinished {
+                execution_id,
+                outcome,
+            } => {
+                let mut event =
+                    event_report(path, "run_finished", Some(execution_id.0), None, None);
+                event.outcome = Some(run_outcome_name(*outcome).into());
+                match outcome {
+                    RunOutcomeKind::Completed => {}
+                    RunOutcomeKind::Cancelled => {
+                        event.exit_class = Some(ExitClass::TestFailure);
+                    }
+                    RunOutcomeKind::Aborted => {
+                        event.exit_class = Some(ExitClass::Infrastructure);
+                    }
+                }
+                event
             }
         })
         .collect()
@@ -433,14 +495,15 @@ fn event_report(
     step_id: Option<u32>,
 ) -> EventReport {
     EventReport {
-        schema_version: 1,
+        schema_version: REPORT_SCHEMA_VERSION,
         kind: kind.into(),
         file: path.into(),
         execution_id,
         test_id,
         step_id,
         name: None,
-        passed: None,
+        outcome: None,
+        reason: None,
         exit_class: None,
         code: None,
         message: None,
@@ -452,6 +515,31 @@ fn event_report(
         diff: None,
         repair_hints: Vec::new(),
         page: None,
+    }
+}
+
+const fn test_outcome_name(outcome: TestOutcomeKind) -> &'static str {
+    match outcome {
+        TestOutcomeKind::Passed => "passed",
+        TestOutcomeKind::Failed => "failed",
+        TestOutcomeKind::TimedOut => "timed_out",
+        TestOutcomeKind::Cancelled => "cancelled",
+        TestOutcomeKind::Aborted => "aborted",
+    }
+}
+
+const fn run_outcome_name(outcome: RunOutcomeKind) -> &'static str {
+    match outcome {
+        RunOutcomeKind::Completed => "completed",
+        RunOutcomeKind::Cancelled => "cancelled",
+        RunOutcomeKind::Aborted => "aborted",
+    }
+}
+
+const fn skip_reason_name(reason: SkipReason) -> &'static str {
+    match reason {
+        SkipReason::RunCancelled => "run_cancelled",
+        SkipReason::RunAborted => "run_aborted",
     }
 }
 
@@ -556,9 +644,18 @@ mod tests {
             ExecutionEvent::TestFinished {
                 execution_id,
                 test_id,
-                passed: false,
+                outcome: TestOutcomeKind::Failed,
             },
-            ExecutionEvent::RunFinished { execution_id },
+            ExecutionEvent::TestSkipped {
+                execution_id,
+                test_id: TestId(4),
+                name: "skipped".into(),
+                reason: SkipReason::RunCancelled,
+            },
+            ExecutionEvent::RunFinished {
+                execution_id,
+                outcome: RunOutcomeKind::Completed,
+            },
         ];
         let reports = event_reports("tests/a.webtest", &events);
         assert_eq!(
@@ -576,10 +673,13 @@ mod tests {
                 "provider_call_failed",
                 "step_failed",
                 "test_finished",
+                "test_skipped",
                 "run_finished",
             ]
         );
         assert_eq!(reports[4].arguments["message"], "<redacted>");
         assert_eq!(reports[8].exit_class, Some(ExitClass::TestFailure));
+        assert_eq!(reports[8].outcome.as_deref(), Some("failed"));
+        assert_eq!(reports[9].outcome.as_deref(), Some("skipped"));
     }
 }

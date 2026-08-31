@@ -95,7 +95,7 @@ impl std::fmt::Display for EvaluationFailure {
     }
 }
 
-#[derive(Debug, Error)]
+#[derive(Clone, Debug, Error)]
 pub enum RunError {
     #[error(transparent)]
     Browser(#[from] BrowserError),

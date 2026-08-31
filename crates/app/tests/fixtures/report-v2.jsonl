@@ -1,0 +1,2 @@
+{"command":"test","project_root":"/project","schema_version":2,"type":"command_started"}
+{"command":"test","exit_class":"test_failure","exit_code":1,"schema_version":2,"summary":{"aborted":0,"cancelled":0,"diagnostics":0,"duration_nanos":12,"failed":1,"files":1,"infrastructure_errors":0,"passed":0,"skipped":0,"tests":1,"timed_out":0},"type":"command_finished"}
