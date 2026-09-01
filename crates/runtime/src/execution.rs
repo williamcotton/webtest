@@ -20,7 +20,9 @@ use crate::{
 };
 
 use self::{
-    failure::{FailureInput, process_failure},
+    failure::{
+        FailureInput, PendingFailure, PrepareFailureInput, prepare_failure, process_failure,
+    },
     state::TestExecutionState,
     steps::execute_step,
 };
@@ -54,6 +56,11 @@ enum ProvisionalTestOutcome {
     Aborted {
         failure: RunError,
     },
+}
+
+enum TestBodyOutcome {
+    Provisional(ProvisionalTestOutcome),
+    PendingFailure(Box<PendingFailure>),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -92,10 +99,9 @@ pub(crate) async fn execute_test(
         .required_host_capabilities
         .contains(&Capability::Browser);
 
-    let outcome = match run_until_deadline(
+    let body_outcome = run_until_deadline(
         deadline.at,
         execute_test_body(
-            plan,
             test,
             execution_id,
             events,
@@ -105,7 +111,6 @@ pub(crate) async fn execute_test(
             control,
             options,
             providers,
-            observations,
             &deadline,
             uses_browser,
             &mut state,
@@ -114,9 +119,28 @@ pub(crate) async fn execute_test(
             &mut active_step,
         ),
     )
-    .await
-    {
-        Some(provisional) => provisional,
+    .await;
+    let outcome = match body_outcome {
+        Some(TestBodyOutcome::PendingFailure(pending)) => {
+            let failure_result = process_failure(FailureInput {
+                plan,
+                test_id: test.id,
+                execution_id,
+                pending: *pending,
+                artifact_deadline: deadline.at,
+                options,
+                providers,
+                observations,
+                events,
+                event_sink,
+            })
+            .await;
+            match failure_result {
+                Ok(step_failure) => ProvisionalTestOutcome::Failed(Box::new(step_failure)),
+                Err(error) => ProvisionalTestOutcome::Aborted { failure: error },
+            }
+        }
+        Some(TestBodyOutcome::Provisional(provisional)) => provisional,
         None => {
             let active = active_step.and_then(|id| test.steps.iter().find(|step| step.id == id));
             if let Some(control) = control {
@@ -226,7 +250,6 @@ where
 
 #[allow(clippy::too_many_arguments)]
 async fn execute_test_body(
-    plan: &TestPlan,
     test: &PlannedTest,
     execution_id: ExecutionId,
     events: &mut Vec<ExecutionEvent>,
@@ -236,53 +259,52 @@ async fn execute_test_body(
     control: Option<&dyn RunControl>,
     options: &RunnerOptions,
     providers: &ProviderRegistry,
-    observations: &ObservationStore,
     deadline: &TestDeadline,
     uses_browser: bool,
     state: &mut TestExecutionState,
     context: &mut Option<Box<dyn BrowserContext>>,
     page: &mut Option<Box<dyn Page>>,
     active_step: &mut Option<StepId>,
-) -> ProvisionalTestOutcome {
+) -> TestBodyOutcome {
     if uses_browser {
         if session.is_none() {
             match browser.start().await {
                 Ok(started) => *session = Some(started),
                 Err(error) => {
-                    return ProvisionalTestOutcome::Aborted {
+                    return TestBodyOutcome::Provisional(ProvisionalTestOutcome::Aborted {
                         failure: RunError::Browser(error),
-                    };
+                    });
                 }
             }
         }
         let Some(browser_session) = session.as_deref_mut() else {
-            return ProvisionalTestOutcome::Aborted {
+            return TestBodyOutcome::Provisional(ProvisionalTestOutcome::Aborted {
                 failure: RunError::Internal("browser test has no active browser session".into()),
-            };
+            });
         };
         match browser_session.new_context(&options.browser_context).await {
             Ok(created) => *context = Some(created),
             Err(error) => {
-                return ProvisionalTestOutcome::Aborted {
+                return TestBodyOutcome::Provisional(ProvisionalTestOutcome::Aborted {
                     failure: RunError::Browser(error),
-                };
+                });
             }
         }
         match context.as_deref_mut() {
             Some(created_context) => match created_context.new_page().await {
                 Ok(created) => *page = Some(created),
                 Err(error) => {
-                    return ProvisionalTestOutcome::Aborted {
+                    return TestBodyOutcome::Provisional(ProvisionalTestOutcome::Aborted {
                         failure: RunError::Browser(error),
-                    };
+                    });
                 }
             },
             None => {
-                return ProvisionalTestOutcome::Aborted {
+                return TestBodyOutcome::Provisional(ProvisionalTestOutcome::Aborted {
                     failure: RunError::Internal(
                         "browser context disappeared during page acquisition".into(),
                     ),
-                };
+                });
             }
         }
     }
@@ -290,9 +312,9 @@ async fn execute_test_body(
     for step in &test.steps {
         *active_step = Some(step.id);
         if control.is_some_and(RunControl::is_cancelled) {
-            return ProvisionalTestOutcome::Cancelled {
+            return TestBodyOutcome::Provisional(ProvisionalTestOutcome::Cancelled {
                 reason: CancellationReason::Requested,
-            };
+            });
         }
         if let TestOperation::ServerProviderCall(call) = &step.operation {
             state.prepare_provider_arguments(call);
@@ -306,9 +328,9 @@ async fn execute_test_body(
                 control.before_step(test, step).await;
             }
             if control.is_cancelled() {
-                return ProvisionalTestOutcome::Cancelled {
+                return TestBodyOutcome::Provisional(ProvisionalTestOutcome::Cancelled {
                     reason: CancellationReason::Requested,
-                };
+                });
             }
         }
         emit_event(
@@ -380,31 +402,21 @@ async fn execute_test_body(
                         .after_step_failure(test, step, &error, &state.visible_step_bindings(step))
                         .await;
                 }
-                let failure_result = process_failure(FailureInput {
-                    plan,
-                    test_id: test.id,
+                let pending = prepare_failure(PrepareFailureInput {
                     step,
-                    execution_id,
                     error,
                     page,
                     options,
-                    providers,
-                    observations,
-                    events,
-                    event_sink,
                     elapsed_ms: duration_millis(step_started.elapsed()),
                     secrets,
                 })
                 .await;
-                return match failure_result {
-                    Ok(step_failure) => ProvisionalTestOutcome::Failed(Box::new(step_failure)),
-                    Err(error) => ProvisionalTestOutcome::Aborted { failure: error },
-                };
+                return TestBodyOutcome::PendingFailure(Box::new(pending));
             }
         }
     }
     *active_step = None;
-    ProvisionalTestOutcome::Passed
+    TestBodyOutcome::Provisional(ProvisionalTestOutcome::Passed)
 }
 
 #[allow(clippy::too_many_arguments)]

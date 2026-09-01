@@ -438,6 +438,39 @@ impl RunEventSink for RecordingEventSink {
     }
 }
 
+struct ArtifactCheckingEventSink {
+    directory: PathBuf,
+    artifacts_ready: AtomicBool,
+}
+
+impl RunEventSink for ArtifactCheckingEventSink {
+    fn publish(&self, event: &ExecutionEvent) {
+        let ExecutionEvent::StepFailed {
+            execution_id,
+            test_id,
+            step_id,
+            ..
+        } = event
+        else {
+            return;
+        };
+        let stem = format!(
+            "test-{}-step-{}-execution-{}",
+            test_id.0, step_id.0, execution_id.0
+        );
+        self.artifacts_ready.store(
+            [
+                self.directory.join(format!("{stem}.png")),
+                self.directory.join(format!("{stem}.dom.html")),
+                self.directory.join(format!("{stem}.evidence.txt")),
+            ]
+            .iter()
+            .all(|path| path.is_file()),
+            Ordering::SeqCst,
+        );
+    }
+}
+
 #[tokio::test]
 async fn event_sink_receives_the_same_ordered_facts_as_the_final_result() {
     let state = Arc::new(LifecycleState::default());
@@ -642,6 +675,58 @@ async fn artifact_write_failure_remains_secondary_to_the_ordinary_test_failure()
             .all(|event| !matches!(event, ExecutionEvent::CleanupFailed { .. }))
     );
     assert!(matches!(result.outcome, RunOutcome::Completed));
+}
+
+#[tokio::test]
+async fn failure_event_is_published_only_after_referenced_artifacts_exist() {
+    let root = tempfile::tempdir().expect("temporary root");
+    let artifact_directory = root.path().join("artifacts");
+    let state = Arc::new(LifecycleState::default());
+    state.page_errors.lock().expect("errors").insert(
+        "missing".into(),
+        BrowserError::LocatorNotFound {
+            locator: Locator::Id("missing".into()),
+        },
+    );
+    *state.page_evidence.lock().expect("evidence") = PageEvidence {
+        screenshot_png: Some(vec![1, 2, 3]),
+        dom_snapshot: Some("<main>failure</main>".into()),
+        current_url: Some("https://example.test/".into()),
+        ..PageEvidence::default()
+    };
+    let sink = Arc::new(ArtifactCheckingEventSink {
+        directory: artifact_directory.clone(),
+        artifacts_ready: AtomicBool::new(false),
+    });
+    let plan = plan_with_tests(
+        vec![Capability::Browser],
+        vec![vec![browser_evaluate("missing")]],
+    );
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .with_options(RunnerOptions {
+            evidence: webtest_runtime::EvidenceOptions {
+                screenshot_on_failure: true,
+                dom_snapshot_on_failure: true,
+                artifact_directory,
+                ..webtest_runtime::EvidenceOptions::default()
+            },
+            ..RunnerOptions::default()
+        })
+        .with_event_sink(sink.clone())
+        .run(&plan, &LifecycleHost(state))
+        .await;
+
+    assert!(sink.artifacts_ready.load(Ordering::SeqCst));
+    let TestOutcome::Failed(failure) = &result.tests[0].outcome else {
+        panic!("browser failure")
+    };
+    assert_eq!(failure.artifacts.len(), 3);
+    assert!(
+        failure
+            .artifacts
+            .iter()
+            .all(|artifact| artifact.path.is_file())
+    );
 }
 
 #[tokio::test]

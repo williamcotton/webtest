@@ -18,35 +18,43 @@ use crate::{
 
 use super::browser::step_browser_locator;
 
+pub(super) struct PrepareFailureInput<'a> {
+    pub(super) step: &'a PlannedStep,
+    pub(super) error: StepError,
+    pub(super) page: &'a mut Option<Box<dyn Page>>,
+    pub(super) options: &'a RunnerOptions,
+    pub(super) elapsed_ms: u64,
+    pub(super) secrets: &'a [String],
+}
+
+pub(super) struct PendingFailure {
+    step: PlannedStep,
+    error: StepError,
+    evidence: PageEvidence,
+    inspection: Option<PageInspection>,
+    secondary_failures: Vec<String>,
+    elapsed_ms: u64,
+}
+
 pub(super) struct FailureInput<'a> {
     pub(super) plan: &'a TestPlan,
     pub(super) test_id: TestId,
-    pub(super) step: &'a PlannedStep,
     pub(super) execution_id: ExecutionId,
-    pub(super) error: StepError,
-    pub(super) page: &'a mut Option<Box<dyn Page>>,
+    pub(super) pending: PendingFailure,
+    pub(super) artifact_deadline: tokio::time::Instant,
     pub(super) options: &'a RunnerOptions,
     pub(super) providers: &'a ProviderRegistry,
     pub(super) observations: &'a ObservationStore,
     pub(super) events: &'a mut Vec<ExecutionEvent>,
     pub(super) event_sink: Option<&'a dyn RunEventSink>,
-    pub(super) elapsed_ms: u64,
-    pub(super) secrets: &'a [String],
 }
 
-pub(super) async fn process_failure(input: FailureInput<'_>) -> Result<StepFailure, RunError> {
-    let FailureInput {
-        plan,
-        test_id,
+pub(super) async fn prepare_failure(input: PrepareFailureInput<'_>) -> PendingFailure {
+    let PrepareFailureInput {
         step,
-        execution_id,
         error,
         page,
         options,
-        providers,
-        observations,
-        events,
-        event_sink,
         elapsed_ms,
         secrets,
     } = input;
@@ -89,10 +97,41 @@ pub(super) async fn process_failure(input: FailureInput<'_>) -> Result<StepFailu
     } else {
         (None, Vec::new())
     };
+    PendingFailure {
+        step: step.clone(),
+        error,
+        evidence,
+        inspection,
+        secondary_failures,
+        elapsed_ms,
+    }
+}
+
+pub(super) async fn process_failure(input: FailureInput<'_>) -> Result<StepFailure, RunError> {
+    let FailureInput {
+        plan,
+        test_id,
+        execution_id,
+        pending,
+        artifact_deadline,
+        options,
+        providers,
+        observations,
+        events,
+        event_sink,
+    } = input;
+    let PendingFailure {
+        step,
+        error,
+        evidence,
+        inspection,
+        secondary_failures,
+        elapsed_ms,
+    } = pending;
     finish_failure(FinishFailureInput {
         plan,
         test_id,
-        step,
+        step: &step,
         execution_id,
         error,
         evidence,
@@ -104,7 +143,9 @@ pub(super) async fn process_failure(input: FailureInput<'_>) -> Result<StepFailu
         events,
         event_sink,
         elapsed_ms,
+        artifact_deadline,
     })
+    .await
 }
 
 struct FinishFailureInput<'a> {
@@ -122,9 +163,10 @@ struct FinishFailureInput<'a> {
     events: &'a mut Vec<ExecutionEvent>,
     event_sink: Option<&'a dyn RunEventSink>,
     elapsed_ms: u64,
+    artifact_deadline: tokio::time::Instant,
 }
 
-fn finish_failure(input: FinishFailureInput<'_>) -> Result<StepFailure, RunError> {
+async fn finish_failure(input: FinishFailureInput<'_>) -> Result<StepFailure, RunError> {
     let FinishFailureInput {
         plan,
         test_id,
@@ -140,6 +182,7 @@ fn finish_failure(input: FinishFailureInput<'_>) -> Result<StepFailure, RunError
         events,
         event_sink,
         elapsed_ms,
+        artifact_deadline,
     } = input;
     let failure_class = error.failure_class();
     let eligible_browser_failure =
@@ -165,8 +208,10 @@ fn finish_failure(input: FinishFailureInput<'_>) -> Result<StepFailure, RunError
             execution_id,
             test_id,
             step.id,
+            artifact_deadline,
             &mut evidence,
         )
+        .await
     } else {
         Vec::new()
     };
@@ -424,4 +469,101 @@ fn runtime_edit_distance(left: &str, right: &str) -> usize {
         previous = current;
     }
     previous[right.len()]
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use webtest_browser::Locator;
+    use webtest_hir::StepId;
+    use webtest_plan::{BrowserOperation, PlannedStep, TestOperation};
+    use webtest_text::{FileId, SourceRevision, SyntaxOrigin, TextRange, TextSize};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn exhausted_artifact_budget_preserves_the_primary_step_failure() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let file = FileId::new(91);
+        let step = PlannedStep {
+            id: StepId(7),
+            origin: SyntaxOrigin::new(file, TextRange::new(TextSize::new(4), TextSize::new(12))),
+            operation: TestOperation::Browser(BrowserOperation::Click {
+                locator: webtest_plan::Locator::Id("missing".into()),
+            }),
+        };
+        let plan = TestPlan {
+            file,
+            source_revision: SourceRevision::of("failure"),
+            required_host_capabilities: Vec::new(),
+            tests: Vec::new(),
+        };
+        let pending = PendingFailure {
+            step,
+            error: StepError::Browser(BrowserError::LocatorNotFound {
+                locator: Locator::Id("missing".into()),
+            }),
+            evidence: PageEvidence {
+                screenshot_png: Some(vec![1, 2, 3]),
+                dom_snapshot: Some("<main>later</main>".into()),
+                ..PageEvidence::default()
+            },
+            inspection: None,
+            secondary_failures: Vec::new(),
+            elapsed_ms: 10,
+        };
+        let options = RunnerOptions {
+            evidence: crate::EvidenceOptions {
+                screenshot_on_failure: true,
+                dom_snapshot_on_failure: true,
+                artifact_directory: root.path().join("artifacts"),
+                ..crate::EvidenceOptions::default()
+            },
+            ..RunnerOptions::default()
+        };
+        let providers = ProviderRegistry::default();
+        let observations = Arc::new(ObservationStore::default());
+        let execution_id = ExecutionId::next();
+        let mut events = Vec::new();
+
+        let failure = process_failure(FailureInput {
+            plan: &plan,
+            test_id: TestId(3),
+            execution_id,
+            pending,
+            artifact_deadline: tokio::time::Instant::now(),
+            options: &options,
+            providers: &providers,
+            observations: &observations,
+            events: &mut events,
+            event_sink: None,
+        })
+        .await
+        .expect("ordinary failure remains primary");
+
+        assert!(matches!(
+            failure.error,
+            StepError::Browser(BrowserError::LocatorNotFound { .. })
+        ));
+        assert!(failure.artifacts.is_empty());
+        assert_eq!(
+            failure.evidence.capture_failures,
+            ["artifact persistence exceeded the remaining test budget"]
+        );
+        assert!(!options.evidence.artifact_directory.exists());
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ExecutionEvent::StepFailed {
+                failure: RuntimeFailure::Browser(BrowserError::LocatorNotFound { .. }),
+                ..
+            }
+        )));
+        let stored = observations.observations_for(plan.file, plan.source_revision);
+        assert_eq!(stored.len(), 1);
+        assert!(matches!(
+            &stored[0].kind,
+            RuntimeObservationKind::BrowserFailure { artifacts, .. } if artifacts.is_empty()
+        ));
+    }
 }
