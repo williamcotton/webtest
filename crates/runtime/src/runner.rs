@@ -7,7 +7,7 @@ use webtest_observation::{
     SkipReason,
 };
 use webtest_plan::{AssertionOperation, PlannedTest, TestOperation, TestPlan};
-use webtest_provider::{Capability, NativeProviderConfig, ProviderRegistry, Value};
+use webtest_provider::{Capability, ProviderRegistry, Value};
 
 use crate::{
     CancellationReason, FailureClass, PriorRunOutcome, RunControl, RunError, RunEventSink,
@@ -19,8 +19,13 @@ use crate::{
 pub struct Runner {
     observations: Arc<ObservationStore>,
     options: RunnerOptions,
-    providers: ProviderRegistry,
+    providers: ProviderSelection,
     event_sink: Option<Arc<dyn RunEventSink>>,
+}
+
+enum ProviderSelection {
+    BuiltInsFromOptions,
+    Explicit(ProviderRegistry),
 }
 
 impl Runner {
@@ -28,22 +33,31 @@ impl Runner {
         Self {
             observations,
             options: RunnerOptions::default(),
-            providers: ProviderRegistry::built_in(NativeProviderConfig::default()),
+            providers: ProviderSelection::BuiltInsFromOptions,
             event_sink: None,
         }
     }
 
+    /// Replaces the runtime options without changing an explicit provider registry.
+    ///
+    /// When no registry has been supplied, built-in providers are configured from
+    /// the final options at the start of each run. This setter therefore commutes
+    /// with [`Self::with_provider_registry`].
     pub fn with_options(mut self, options: RunnerOptions) -> Self {
-        self.providers = ProviderRegistry::built_in(options.provider_config.clone());
         self.options = options;
         self
     }
 
+    /// Selects an explicit provider registry, which takes precedence over the
+    /// built-in provider configuration regardless of builder call order.
+    ///
+    /// Calling this method repeatedly replaces the previous explicit registry.
     pub fn with_provider_registry(mut self, providers: ProviderRegistry) -> Self {
-        self.providers = providers;
+        self.providers = ProviderSelection::Explicit(providers);
         self
     }
 
+    /// Installs an event sink independently of runtime options and providers.
     pub fn with_event_sink(mut self, sink: Arc<dyn RunEventSink>) -> Self {
         self.event_sink = Some(sink);
         self
@@ -61,6 +75,15 @@ impl Runner {
         browser: &dyn BrowserHost,
         control: Option<&dyn RunControl>,
     ) -> RunResult {
+        // Resolve once so every test in this run observes the same registry. An
+        // explicit registry is cloned as a stable map while retaining the same
+        // provider instances behind their shared references.
+        let providers = match &self.providers {
+            ProviderSelection::BuiltInsFromOptions => {
+                ProviderRegistry::built_in(self.options.provider_config.clone())
+            }
+            ProviderSelection::Explicit(providers) => providers.clone(),
+        };
         self.observations.clear_for_file(plan.file);
         let run_started = Instant::now();
         let execution_id = ExecutionId::next();
@@ -144,7 +167,7 @@ impl Runner {
                     &mut session,
                     control,
                     &self.options,
-                    &self.providers,
+                    &providers,
                     &self.observations,
                 )
                 .await;

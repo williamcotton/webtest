@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -21,7 +21,8 @@ use webtest_plan::{
     ServerProviderCall, TestOperation, TestPlan,
 };
 use webtest_provider::{
-    CallContext, Capability, OperationName, OperationSchema, ProviderCall, ProviderError,
+    CallContext, Capability, FsProviderConfig, HttpProviderConfig, NativeProviderConfig,
+    OperationName, OperationSchema, ProcessProviderConfig, ProviderCall, ProviderError,
     ProviderName, ProviderRegistry, ProviderResult, ProviderSchema, ServerProvider, Type, Value,
 };
 use webtest_runtime::{
@@ -1723,6 +1724,30 @@ fn provider_operation(timeout: Option<Duration>) -> TestOperation {
     })
 }
 
+fn built_in_provider_operation(
+    provider: &str,
+    operation: &str,
+    arguments: impl IntoIterator<Item = (&'static str, Value)>,
+    result_type: Type,
+) -> TestOperation {
+    TestOperation::ServerProviderCall(ServerProviderCall {
+        provider: provider.into(),
+        operation: operation.into(),
+        arguments: arguments
+            .into_iter()
+            .map(|(name, value)| (name.into(), PlanExpr::Literal(value)))
+            .collect(),
+        result_binding: None,
+        result_name: None,
+        result_type,
+        schema_hash: String::new(),
+        timeout: None,
+        redacted_arguments: Vec::new(),
+        redacted_result_fields: Vec::new(),
+        retry_safe: false,
+    })
+}
+
 fn secret_binding() -> TestOperation {
     TestOperation::EvaluatePure(EvaluatePureOperation {
         expression: PlanExpr::Literal(Value::String("private".into())),
@@ -2158,26 +2183,221 @@ async fn provider_infrastructure_failure_aborts_without_recording_an_observation
 }
 
 #[tokio::test]
-async fn with_options_rebuilds_builtins_before_a_later_registry_override() {
+async fn explicit_registry_survives_options_in_both_builder_orders() {
     let provider = Arc::new(RecordingProvider::new(Ok(Value::Null)));
     let mut providers = ProviderRegistry::default();
-    providers.register(provider);
+    providers.register(provider.clone());
+    let plan = plan_with_tests(
+        vec![Capability::Server],
+        vec![vec![secret_binding(), provider_operation(None)]],
+    );
+    let options = RunnerOptions {
+        project_root: PathBuf::from("configured-project"),
+        ..RunnerOptions::default()
+    };
+    let registry_then_options = Runner::new(Arc::new(ObservationStore::default()))
+        .with_provider_registry(providers.clone())
+        .with_options(options.clone())
+        .run(&plan, &LifecycleHost(Arc::new(LifecycleState::default())))
+        .await;
+    let options_then_registry = Runner::new(Arc::new(ObservationStore::default()))
+        .with_options(options)
+        .with_provider_registry(providers)
+        .run(&plan, &LifecycleHost(Arc::new(LifecycleState::default())))
+        .await;
+
+    assert_eq!(registry_then_options.passed(), 1);
+    assert_eq!(options_then_registry.passed(), 1);
+    let calls = provider.calls.lock().expect("calls");
+    assert_eq!(calls.len(), 2);
+    assert!(
+        calls
+            .iter()
+            .all(|call| call.project_root == Path::new("configured-project"))
+    );
+}
+
+#[tokio::test]
+async fn repeated_options_preserve_explicit_registry_and_last_options_win() {
+    let provider = Arc::new(RecordingProvider::new(Ok(Value::Null)));
+    let mut providers = ProviderRegistry::default();
+    providers.register(provider.clone());
     let plan = plan_with_tests(
         vec![Capability::Server],
         vec![vec![secret_binding(), provider_operation(None)]],
     );
     let result = Runner::new(Arc::new(ObservationStore::default()))
+        .with_options(RunnerOptions {
+            project_root: PathBuf::from("first-project"),
+            provider_call_timeout: Duration::from_secs(3),
+            ..RunnerOptions::default()
+        })
+        .with_provider_registry(providers)
+        .with_options(RunnerOptions {
+            project_root: PathBuf::from("final-project"),
+            provider_call_timeout: Duration::from_secs(7),
+            ..RunnerOptions::default()
+        })
+        .run(&plan, &LifecycleHost(Arc::new(LifecycleState::default())))
+        .await;
+
+    assert_eq!(result.passed(), 1);
+    let calls = provider.calls.lock().expect("calls");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].project_root, PathBuf::from("final-project"));
+    assert_eq!(calls[0].timeout, Duration::from_secs(7));
+}
+
+#[tokio::test]
+async fn repeated_explicit_registries_use_the_last_registry() {
+    let first_provider = Arc::new(RecordingProvider::new(Ok(Value::Null)));
+    let second_provider = Arc::new(RecordingProvider::new(Ok(Value::Null)));
+    let mut first_registry = ProviderRegistry::default();
+    first_registry.register(first_provider.clone());
+    let mut second_registry = ProviderRegistry::default();
+    second_registry.register(second_provider.clone());
+    let plan = plan_with_tests(
+        vec![Capability::Server],
+        vec![vec![secret_binding(), provider_operation(None)]],
+    );
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .with_provider_registry(first_registry)
+        .with_provider_registry(second_registry)
+        .run(&plan, &LifecycleHost(Arc::new(LifecycleState::default())))
+        .await;
+
+    assert_eq!(result.passed(), 1);
+    assert!(first_provider.calls.lock().expect("first calls").is_empty());
+    assert_eq!(second_provider.calls.lock().expect("second calls").len(), 1);
+}
+
+#[tokio::test]
+async fn event_sink_commutes_with_provider_and_options_setters() {
+    let provider = Arc::new(RecordingProvider::new(Ok(Value::Null)));
+    let mut providers = ProviderRegistry::default();
+    providers.register(provider.clone());
+    let sink = Arc::new(RecordingEventSink::default());
+    let plan = plan_with_tests(
+        vec![Capability::Server],
+        vec![vec![secret_binding(), provider_operation(None)]],
+    );
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .with_event_sink(sink.clone())
         .with_provider_registry(providers)
         .with_options(RunnerOptions::default())
         .run(&plan, &LifecycleHost(Arc::new(LifecycleState::default())))
         .await;
+
+    assert_eq!(result.passed(), 1);
+    assert_eq!(provider.calls.lock().expect("calls").len(), 1);
+    assert_eq!(*sink.events.lock().expect("events"), result.events);
+}
+
+#[tokio::test]
+async fn final_options_configure_all_built_in_providers_without_an_explicit_registry() {
+    let root = tempfile::tempdir().expect("temporary project root");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("HTTP fixture listener");
+    let address = listener.local_addr().expect("HTTP fixture address");
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut stream, _) = listener.accept().await.expect("HTTP fixture request");
+        let mut request = [0_u8; 1024];
+        let _ = stream.read(&mut request).await;
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await
+            .expect("HTTP fixture response");
+    });
+
+    let final_options = RunnerOptions {
+        project_root: root.path().to_path_buf(),
+        provider_config: NativeProviderConfig {
+            http: HttpProviderConfig {
+                base_url: Some(format!("http://{address}")),
+                ..HttpProviderConfig::default()
+            },
+            process: ProcessProviderConfig {
+                allowed_working_roots: Vec::new(),
+                ..ProcessProviderConfig::default()
+            },
+            fs: FsProviderConfig {
+                write_root: PathBuf::from("generated"),
+                ..FsProviderConfig::default()
+            },
+        },
+        ..RunnerOptions::default()
+    };
+    let initial_options = RunnerOptions {
+        project_root: root.path().to_path_buf(),
+        ..RunnerOptions::default()
+    };
+    let host = LifecycleHost(Arc::new(LifecycleState::default()));
+
+    let http_plan = plan_with_tests(
+        vec![Capability::Server],
+        vec![vec![built_in_provider_operation(
+            "http",
+            "get",
+            [("url", Value::String("/health".into()))],
+            Type::Response(Box::new(Type::Json)),
+        )]],
+    );
+    let http_result = Runner::new(Arc::new(ObservationStore::default()))
+        .with_options(initial_options.clone())
+        .with_options(final_options.clone())
+        .run(&http_plan, &host)
+        .await;
+    assert_eq!(http_result.passed(), 1);
+
+    let process_plan = plan_with_tests(
+        vec![Capability::Server],
+        vec![vec![built_in_provider_operation(
+            "process",
+            "run",
+            [
+                ("executable", Value::String("not-started".into())),
+                ("cwd", Value::String(".".into())),
+            ],
+            Type::ProcessResult,
+        )]],
+    );
+    let process_result = Runner::new(Arc::new(ObservationStore::default()))
+        .with_options(initial_options.clone())
+        .with_options(final_options.clone())
+        .run(&process_plan, &host)
+        .await;
     assert!(matches!(
-        result.outcome,
-        RunOutcome::Aborted {
-            failure: RunError::Provider(ProviderError::NotRegistered { ref provider }),
-            ..
-        } if provider == "fake"
+        process_result.tests[0].outcome,
+        TestOutcome::Failed(ref failure)
+            if matches!(failure.error, StepError::Provider(ProviderError::PathEscape { .. }))
     ));
+
+    let fs_plan = plan_with_tests(
+        vec![Capability::Server],
+        vec![vec![built_in_provider_operation(
+            "fs",
+            "write_text",
+            [
+                ("path", Value::String("generated/result.txt".into())),
+                ("contents", Value::String("final configuration".into())),
+            ],
+            Type::FilePath,
+        )]],
+    );
+    let fs_result = Runner::new(Arc::new(ObservationStore::default()))
+        .with_options(initial_options)
+        .with_options(final_options)
+        .run(&fs_plan, &host)
+        .await;
+    assert_eq!(fs_result.passed(), 1);
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("generated/result.txt"))
+            .expect("configured filesystem output"),
+        "final configuration"
+    );
 }
 
 #[tokio::test(start_paused = true)]

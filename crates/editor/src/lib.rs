@@ -413,8 +413,8 @@ impl EditorService {
             )
         };
         let runner = Runner::new(Arc::clone(&self.observations))
-            .with_options(runner_options)
-            .with_provider_registry(providers);
+            .with_provider_registry(providers)
+            .with_options(runner_options);
         Ok(runner.run(&plan, browser).await)
     }
 
@@ -519,11 +519,14 @@ fn value_runtime_diagnostic_code(code: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use async_trait::async_trait;
     use webtest_browser::{BrowserSession, Page};
     use webtest_browser_cdp::ChromeHost;
     use webtest_provider::{
-        Capability, OperationName, OperationSchema, ProviderName, ProviderSchema, Type,
+        CallContext, Capability, OperationName, OperationSchema, ProviderCall, ProviderName,
+        ProviderResult, ProviderSchema, ServerProvider, Type, Value,
     };
     use webtest_runtime::RunOutcome;
 
@@ -533,6 +536,44 @@ mod tests {
     struct FakeSession(bool);
     struct FakePage(bool);
     struct DisconnectHost;
+
+    struct CountingProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ServerProvider for CountingProvider {
+        fn schema(&self) -> ProviderSchema {
+            ProviderSchema {
+                name: ProviderName("fake".into()),
+                operations: [(
+                    "call".into(),
+                    OperationSchema {
+                        name: OperationName("call".into()),
+                        parameters: Vec::new(),
+                        result: Type::String,
+                        capability: Capability::Server,
+                        documentation: "Call the adapter test provider.".into(),
+                        retry_safe: false,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                schema_identity: Some("counting-provider".into()),
+            }
+        }
+
+        async fn call(
+            &self,
+            _call: ProviderCall,
+            _context: CallContext,
+        ) -> Result<ProviderResult, webtest_provider::ProviderError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ProviderResult {
+                value: Value::String("called".into()),
+            })
+        }
+    }
 
     fn app_registry(functions: &[&str]) -> ProviderRegistry {
         let mut providers = ProviderRegistry::built_in_schemas();
@@ -585,6 +626,26 @@ mod tests {
                 .expect("reconfigured diagnostics")
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn run_file_keeps_the_composed_registry_with_reversed_runner_builder_order() {
+        let provider = Arc::new(CountingProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let mut providers = ProviderRegistry::built_in_schemas();
+        providers.register(provider.clone());
+        let editor = EditorService::with_provider_registry(RunnerOptions::default(), providers);
+        let source = "test \"custom\" { server { let value = fake.call() } }";
+        let file = editor.open_document("file:///custom-provider.webtest", source);
+
+        let result = editor
+            .run_file(file, &FakeHost(true))
+            .await
+            .expect("custom provider run");
+
+        assert_eq!(result.passed(), 1);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     }
 
     #[async_trait]
