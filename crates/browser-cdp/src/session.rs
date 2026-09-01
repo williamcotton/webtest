@@ -128,6 +128,13 @@ async fn create_page(
         .command("Page.enable", None, Some(&session_id))
         .await?;
     connection
+        .command(
+            "Page.setLifecycleEventsEnabled",
+            Some(json!({ "enabled": true })),
+            Some(&session_id),
+        )
+        .await?;
+    connection
         .command("Runtime.enable", None, Some(&session_id))
         .await?;
     connection
@@ -259,7 +266,19 @@ mod tests {
         );
         respond(&mut server, &attach, json!({"sessionId": "page-session"})).await;
 
-        for method in ["Page.enable", "Runtime.enable"] {
+        let page_enable = receive_command(&mut server).await;
+        assert_eq!(page_enable["method"], "Page.enable");
+        assert_eq!(page_enable["sessionId"], "page-session");
+        assert!(page_enable.get("params").is_none());
+        respond(&mut server, &page_enable, json!({})).await;
+
+        let lifecycle = receive_command(&mut server).await;
+        assert_eq!(lifecycle["method"], "Page.setLifecycleEventsEnabled");
+        assert_eq!(lifecycle["sessionId"], "page-session");
+        assert_eq!(lifecycle["params"], json!({"enabled": true}));
+        respond(&mut server, &lifecycle, json!({})).await;
+
+        for method in ["Runtime.enable"] {
             let command = receive_command(&mut server).await;
             assert_eq!(command["method"], method);
             assert_eq!(command["sessionId"], "page-session");

@@ -10,6 +10,7 @@ use super::{
     CdpPage,
     evaluation::{self, evaluation_value, invalid_evaluation},
     locator::{self, ResolveSnapshot, locator_array_expression, rect_stable},
+    navigation,
 };
 
 pub(super) async fn perform(
@@ -20,7 +21,20 @@ pub(super) async fn perform(
 ) -> Result<(), BrowserError> {
     let snapshot = wait_for_actionability(page, action, timeout, deadline).await?;
     match action {
-        Action::Click { .. } => physical_click(page, &snapshot).await,
+        Action::Click { .. } => {
+            let mut navigation = navigation::watch(page);
+            physical_click(page, &snapshot).await?;
+            if super::navigation::wait_for_navigation_after_action(page, &mut navigation, deadline)
+                .await?
+            {
+                Ok(())
+            } else {
+                Err(BrowserError::ActionTimeout {
+                    locator: action.locator().clone(),
+                    timeout_ms: duration_millis(timeout),
+                })
+            }
+        }
         Action::Hover { .. } => mouse_move(page, &snapshot).await,
         Action::Fill { value, .. } => {
             physical_click(page, &snapshot).await?;

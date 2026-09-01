@@ -371,6 +371,83 @@ async fn real_chrome_runs_semantic_form_flow_with_physical_input_when_available(
 }
 
 #[tokio::test]
+async fn native_form_navigation_settles_before_the_next_browser_step_when_available() {
+    let host = ChromeHost::default();
+    if host.locate().is_none() {
+        return;
+    }
+    let Ok(listener) = tokio::net::TcpListener::bind("127.0.0.1:0").await else {
+        return;
+    };
+    let address = listener.local_addr().expect("fixture address");
+    let fixture = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = [0u8; 2048];
+                let read = stream.read(&mut request).await.expect("read request");
+                let request = String::from_utf8_lossy(&request[..read]);
+                let filtered = request.starts_with("GET /tasks?query=Figma ");
+                if filtered {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                let result = if filtered {
+                    "<div id='filtered-result'>Filtered response</div>"
+                } else {
+                    "<div>Design Landing Page</div>"
+                };
+                let body = format!(
+                    "<!doctype html><body><form action='/tasks' method='get'><input id='search-query' name='query'><button id='btn-filter'>Filter</button></form>{result}</body>"
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("serve navigation fixture");
+            });
+        }
+    });
+
+    let mut browser = host.start().await.expect("start Chrome");
+    let mut page = browser.new_page().await.expect("page");
+    let tasks_url = format!("http://{address}/tasks");
+    page.open(&tasks_url).await.expect("open tasks");
+    page.perform(
+        &Action::Fill {
+            locator: Locator::Id("search-query".into()),
+            value: "Figma".into(),
+        },
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("fill search");
+    page.perform(
+        &Action::Click {
+            locator: Locator::Id("btn-filter".into()),
+        },
+        Duration::from_secs(2),
+    )
+    .await
+    .expect("submit native form");
+    assert_eq!(
+        page.current_url().await.expect("filtered URL"),
+        format!("{tasks_url}?query=Figma")
+    );
+    page.expect_visible(&Locator::Id("filtered-result".into()))
+        .await
+        .expect("filtered document is current");
+    page.open(&tasks_url)
+        .await
+        .expect("subsequent explicit navigation");
+
+    drop(page);
+    browser.close().await.expect("close and reap Chrome");
+    fixture.abort();
+}
+
+#[tokio::test]
 async fn actionability_failures_are_distinct_and_candidate_evidence_is_bounded() {
     let host = ChromeHost::default();
     if host.locate().is_none() {

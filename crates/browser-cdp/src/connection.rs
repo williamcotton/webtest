@@ -10,7 +10,7 @@ use std::{
 use futures::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio::{
-    sync::{Mutex, mpsc, oneshot},
+    sync::{Mutex, broadcast, mpsc, oneshot},
     time::{Instant, interval, timeout},
 };
 use tokio_tungstenite::tungstenite::Message;
@@ -27,6 +27,15 @@ pub(crate) struct CdpConnection {
     command_timeout: Duration,
     in_flight: Arc<AtomicUsize>,
     console_errors: Arc<Mutex<Vec<String>>>,
+    events: broadcast::Sender<CdpEvent>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CdpEvent {
+    pub(crate) session_id: Option<String>,
+    pub(crate) method: String,
+    pub(crate) params: Value,
+    pub(crate) terminal: Option<BrowserError>,
 }
 
 struct OutgoingCommand {
@@ -62,6 +71,8 @@ impl CdpConnection {
         let actor_in_flight = Arc::clone(&in_flight);
         let console_errors = Arc::new(Mutex::new(Vec::new()));
         let actor_console_errors = Arc::clone(&console_errors);
+        let (events, _) = broadcast::channel(256);
+        let actor_events = events.clone();
 
         tokio::spawn(async move {
             let mut next_id = 1u64;
@@ -141,6 +152,14 @@ impl CdpConnection {
                                 if errors.len() == 20 { errors.remove(0); }
                                 errors.push(entry);
                             }
+                            if let (Some(method), Some(params)) = (message.method, message.params) {
+                                let _ = actor_events.send(CdpEvent {
+                                    session_id: message.session_id,
+                                    method,
+                                    params,
+                                    terminal: None,
+                                });
+                            }
                             continue
                         };
                         let Some(pending_command) = pending.remove(&id) else {
@@ -190,6 +209,12 @@ impl CdpConnection {
                     }
                 }
             };
+            let _ = actor_events.send(CdpEvent {
+                session_id: None,
+                method: String::new(),
+                params: Value::Null,
+                terminal: Some(terminal.clone()),
+            });
             for (_, command) in pending {
                 actor_in_flight.fetch_sub(1, Ordering::Relaxed);
                 let _ = command.response.send(Err(terminal.clone()));
@@ -201,6 +226,7 @@ impl CdpConnection {
             command_timeout,
             in_flight,
             console_errors,
+            events,
         })
     }
 
@@ -255,6 +281,10 @@ impl CdpConnection {
 
     pub(crate) const fn command_timeout(&self) -> Duration {
         self.command_timeout
+    }
+
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<CdpEvent> {
+        self.events.subscribe()
     }
 
     #[cfg(test)]
