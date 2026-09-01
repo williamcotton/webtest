@@ -108,7 +108,7 @@ impl Compiler<'_> {
                 ),
             );
         }
-        self.required.insert(operation_schema.capability);
+        self.record_capability(operation_schema.capability);
         let values =
             self.provider_arguments(operation_schema, arguments, domain, expression.origin.range);
         Some(CompiledProviderCall {

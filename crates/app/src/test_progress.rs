@@ -13,6 +13,7 @@ pub(crate) struct HumanTestProgress {
 struct ProgressState {
     output: Box<dyn Write + Send>,
     pending: PendingLine,
+    pending_test: Option<String>,
     browser_active: bool,
     error: Option<(io::ErrorKind, String)>,
 }
@@ -23,7 +24,6 @@ enum PendingLine {
     None,
     Stage,
     BrowserStarting,
-    Test,
     BrowserStopping,
 }
 
@@ -37,6 +37,7 @@ impl HumanTestProgress {
             inner: Mutex::new(ProgressState {
                 output,
                 pending: PendingLine::None,
+                pending_test: None,
                 browser_active: false,
                 error: None,
             }),
@@ -118,25 +119,43 @@ impl HumanTestProgress {
                 if headed { "headed" } else { "headless" }
             )?;
             state.pending = PendingLine::BrowserStarting;
-            state.browser_active = true;
             Ok(())
         })
     }
 
-    pub(crate) fn browser_run_finished(&self, succeeded: bool) -> io::Result<()> {
+    pub(crate) fn browser_started(&self, succeeded: bool) -> io::Result<()> {
         self.write(|state| {
-            if succeeded {
-                if state.pending == PendingLine::BrowserStopping {
-                    writeln!(state.output, "done")?;
-                    state.pending = PendingLine::None;
-                }
-            } else {
-                let status = match state.pending {
-                    PendingLine::Test => "ERROR",
-                    PendingLine::None => return Ok(()),
-                    _ => "FAILED",
-                };
-                writeln!(state.output, "{status}")?;
+            if state.pending == PendingLine::BrowserStarting {
+                writeln!(
+                    state.output,
+                    "{}",
+                    if succeeded { "ready" } else { "FAILED" }
+                )?;
+                state.pending = PendingLine::None;
+            }
+            state.browser_active = succeeded;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn stopping_browser(&self) -> io::Result<()> {
+        self.write(|state| {
+            if state.browser_active {
+                write!(state.output, "stopping Chrome ... ")?;
+                state.pending = PendingLine::BrowserStopping;
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn browser_stopped(&self, succeeded: bool) -> io::Result<()> {
+        self.write(|state| {
+            if state.pending == PendingLine::BrowserStopping {
+                writeln!(
+                    state.output,
+                    "{}",
+                    if succeeded { "done" } else { "FAILED" }
+                )?;
                 state.pending = PendingLine::None;
             }
             state.browser_active = false;
@@ -185,15 +204,9 @@ impl HumanTestProgress {
         self.write(|state| {
             match event {
                 ExecutionEvent::TestStarted { name, .. } => {
-                    if state.pending == PendingLine::BrowserStarting {
-                        writeln!(state.output, "ready")?;
-                    }
-                    write!(state.output, "test {name:?} ... ")?;
-                    state.pending = PendingLine::Test;
+                    state.pending_test = Some(name.clone());
                 }
-                ExecutionEvent::TestFinished { outcome, .. }
-                    if state.pending == PendingLine::Test =>
-                {
+                ExecutionEvent::TestFinished { outcome, .. } => {
                     let status = match outcome {
                         TestOutcomeKind::Passed => "ok",
                         TestOutcomeKind::Failed => "FAILED",
@@ -201,24 +214,14 @@ impl HumanTestProgress {
                         TestOutcomeKind::Cancelled => "CANCELLED",
                         TestOutcomeKind::Aborted => "ABORTED",
                     };
-                    writeln!(state.output, "{status}")?;
-                    state.pending = PendingLine::None;
+                    if let Some(name) = state.pending_test.take() {
+                        writeln!(state.output, "test {name:?} ... {status}")?;
+                    }
                 }
                 ExecutionEvent::TestSkipped { name, .. } => {
-                    if state.pending == PendingLine::BrowserStarting {
-                        writeln!(state.output, "ready")?;
-                    }
                     writeln!(state.output, "test {name:?} ... SKIPPED")?;
-                    state.pending = PendingLine::None;
                 }
-                ExecutionEvent::RunFinished { .. } if state.browser_active => {
-                    if state.pending == PendingLine::BrowserStarting {
-                        writeln!(state.output, "ready")?;
-                    }
-                    write!(state.output, "stopping Chrome ... ")?;
-                    state.pending = PendingLine::BrowserStopping;
-                }
-                ExecutionEvent::TestFinished { .. } | ExecutionEvent::RunFinished { .. } => {}
+                ExecutionEvent::RunFinished { .. } => {}
                 ExecutionEvent::RunStarted { .. }
                 | ExecutionEvent::StepStarted { .. }
                 | ExecutionEvent::StepPassed { .. }
@@ -286,6 +289,7 @@ mod tests {
         progress
             .starting_browser("tests/login.webtest", false)
             .expect("browser");
+        progress.browser_started(true).expect("browser ready");
         progress.publish(&ExecutionEvent::RunStarted { execution_id });
         progress.publish(&ExecutionEvent::TestStarted {
             execution_id,
@@ -303,7 +307,8 @@ mod tests {
             outcome: webtest_observation::RunOutcomeKind::Completed,
             failure_class: None,
         });
-        progress.browser_run_finished(true).expect("browser done");
+        progress.stopping_browser().expect("browser stopping");
+        progress.browser_stopped(true).expect("browser done");
         progress.stopping_application().expect("stopping app");
         progress.application_stopped(true).expect("app stopped");
 
@@ -333,7 +338,7 @@ mod tests {
         progress
             .starting_browser("tests/login.webtest", false)
             .expect("browser");
-        progress.browser_run_finished(false).expect("failed");
+        progress.browser_started(false).expect("failed");
 
         let bytes = output
             .0

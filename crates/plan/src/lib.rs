@@ -1,13 +1,16 @@
 //! Runtime-facing, syntax-independent, serializable test plans.
 
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 use webtest_hir::{BinaryOperator, BindingId, StepId, TestId, UnaryOperator};
 use webtest_provider::{Capability, Type, Value};
 use webtest_text::{FileId, SourceRevision, SyntaxOrigin};
 
-pub const PLAN_FORMAT_VERSION: u32 = 1;
+pub const PLAN_FORMAT_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PlanEnvelope {
@@ -59,6 +62,10 @@ impl PlanEnvelope {
             })
         }
     }
+
+    pub fn validate_capabilities(&self) -> Result<(), CapabilityInvariantError> {
+        validate_capability_contract(&self.required_host_capabilities, &self.tests)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -87,12 +94,87 @@ pub struct TestPlan {
     pub tests: Vec<PlannedTest>,
 }
 
+impl TestPlan {
+    pub fn required_capability_union(tests: &[PlannedTest]) -> Vec<Capability> {
+        tests
+            .iter()
+            .flat_map(|test| test.required_host_capabilities.iter().copied())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    pub fn validate_capabilities(&self) -> Result<(), CapabilityInvariantError> {
+        validate_capability_contract(&self.required_host_capabilities, &self.tests)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PlannedTest {
     pub id: TestId,
     pub name: String,
+    pub required_host_capabilities: Vec<Capability>,
     pub steps: Vec<PlannedStep>,
     pub origin: SyntaxOrigin,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CapabilityInvariantError {
+    TestCapabilitiesNotSorted {
+        test: TestId,
+    },
+    PlanCapabilitiesNotSorted,
+    PlanUnionMismatch {
+        declared: Vec<Capability>,
+        expected: Vec<Capability>,
+    },
+}
+
+impl std::fmt::Display for CapabilityInvariantError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TestCapabilitiesNotSorted { test } => write!(
+                formatter,
+                "test {} host capabilities are not sorted and unique",
+                test.0
+            ),
+            Self::PlanCapabilitiesNotSorted => {
+                formatter.write_str("plan host capabilities are not sorted and unique")
+            }
+            Self::PlanUnionMismatch { declared, expected } => write!(
+                formatter,
+                "plan host capabilities {declared:?} do not equal the per-test union {expected:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CapabilityInvariantError {}
+
+fn validate_capability_contract(
+    declared: &[Capability],
+    tests: &[PlannedTest],
+) -> Result<(), CapabilityInvariantError> {
+    if !is_sorted_unique(declared) {
+        return Err(CapabilityInvariantError::PlanCapabilitiesNotSorted);
+    }
+    for test in tests {
+        if !is_sorted_unique(&test.required_host_capabilities) {
+            return Err(CapabilityInvariantError::TestCapabilitiesNotSorted { test: test.id });
+        }
+    }
+    let expected = TestPlan::required_capability_union(tests);
+    if declared != expected {
+        return Err(CapabilityInvariantError::PlanUnionMismatch {
+            declared: declared.to_vec(),
+            expected,
+        });
+    }
+    Ok(())
+}
+
+fn is_sorted_unique(capabilities: &[Capability]) -> bool {
+    capabilities.windows(2).all(|pair| pair[0] < pair[1])
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -330,6 +412,7 @@ mod tests {
             tests: vec![PlannedTest {
                 id: TestId(0),
                 name: "x".into(),
+                required_host_capabilities: vec![Capability::Server],
                 steps: vec![PlannedStep {
                     id: StepId(0),
                     operation: TestOperation::EvaluatePure(EvaluatePureOperation {
@@ -344,11 +427,62 @@ mod tests {
             }],
         };
         let envelope = PlanEnvelope::from_plan(&plan, "x.webtest", "project", BTreeMap::new());
+        assert_eq!(envelope.format_version, 2);
+        assert_eq!(
+            envelope.tests[0].required_host_capabilities,
+            [Capability::Server]
+        );
+        assert!(envelope.validate_capabilities().is_ok());
         let encoded = serde_json::to_string(&envelope).expect("serialize plan");
         let decoded: PlanEnvelope = serde_json::from_str(&encoded).expect("deserialize plan");
         assert_eq!(decoded, envelope);
-        let mut unsupported = decoded;
-        unsupported.format_version += 1;
-        assert!(unsupported.validate_version().is_err());
+        for version in [1, PLAN_FORMAT_VERSION + 1] {
+            let mut unsupported = decoded.clone();
+            unsupported.format_version = version;
+            assert!(unsupported.validate_version().is_err());
+        }
+
+        let mut version_one_shape = serde_json::to_value(&decoded).expect("plan value");
+        version_one_shape["format_version"] = serde_json::json!(1);
+        version_one_shape["tests"][0]
+            .as_object_mut()
+            .expect("test object")
+            .remove("required_host_capabilities");
+        assert!(serde_json::from_value::<PlanEnvelope>(version_one_shape).is_err());
+    }
+
+    #[test]
+    fn capability_contract_requires_sorted_exact_test_union() {
+        let file = FileId::new(7);
+        let planned_test = |id, capabilities| PlannedTest {
+            id: TestId(id),
+            name: format!("test-{id}"),
+            required_host_capabilities: capabilities,
+            steps: Vec::new(),
+            origin: SyntaxOrigin::new(file, TextRange::default()),
+        };
+        let mut plan = TestPlan {
+            file,
+            source_revision: SourceRevision::of("tests"),
+            required_host_capabilities: vec![Capability::Server, Capability::Browser],
+            tests: vec![
+                planned_test(0, vec![Capability::Server]),
+                planned_test(1, vec![Capability::Browser]),
+            ],
+        };
+        assert!(plan.validate_capabilities().is_ok());
+
+        plan.required_host_capabilities = vec![Capability::Browser];
+        assert!(matches!(
+            plan.validate_capabilities(),
+            Err(CapabilityInvariantError::PlanUnionMismatch { .. })
+        ));
+
+        plan.required_host_capabilities = vec![Capability::Server, Capability::Browser];
+        plan.tests[1].required_host_capabilities = vec![Capability::Browser, Capability::Server];
+        assert!(matches!(
+            plan.validate_capabilities(),
+            Err(CapabilityInvariantError::TestCapabilitiesNotSorted { test: TestId(1) })
+        ));
     }
 }

@@ -224,7 +224,7 @@ impl Compiler<'_> {
             }
             (ValueMatcher::Truthy, value.expression, None, Type::Bool)
         };
-        self.required.insert(Capability::Test);
+        self.record_capability(Capability::Test);
         self.push_step(
             steps,
             expression.origin,

@@ -65,6 +65,56 @@ fn compiles_typed_server_to_browser_flow() {
         plan.required_host_capabilities,
         vec![Capability::Server, Capability::Browser, Capability::Test]
     );
+    assert_eq!(
+        plan.tests[0].required_host_capabilities,
+        vec![Capability::Server, Capability::Browser, Capability::Test]
+    );
+    assert!(plan.validate_capabilities().is_ok());
+}
+
+#[test]
+fn capabilities_are_exact_per_test_and_the_plan_is_their_sorted_union() {
+    let source = r#"test "server" {
+    server { let response = http.get("http://example.test") }
+}
+test "browser" {
+    browser { open "/" }
+}
+test "mixed" {
+    server { let response = http.get("http://example.test") }
+    browser { open "/account" }
+    expect true
+}
+test "pure" {
+    let answer = 42
+}
+test "value assertion" {
+    expect 1 == 1
+}"#;
+    let (diagnostics, plan) = analyze(source);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    assert_eq!(
+        plan.tests
+            .iter()
+            .map(|test| test.required_host_capabilities.clone())
+            .collect::<Vec<_>>(),
+        [
+            vec![Capability::Server],
+            vec![Capability::Browser],
+            vec![Capability::Server, Capability::Browser, Capability::Test],
+            vec![],
+            vec![Capability::Test],
+        ]
+    );
+    assert_eq!(
+        plan.required_host_capabilities,
+        vec![Capability::Server, Capability::Browser, Capability::Test]
+    );
+    assert_eq!(
+        plan.required_host_capabilities,
+        TestPlan::required_capability_union(&plan.tests)
+    );
+    assert!(plan.validate_capabilities().is_ok());
 }
 
 #[test]

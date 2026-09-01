@@ -33,7 +33,7 @@ impl Compiler<'_> {
                 ],
             );
         }
-        self.required.insert(Capability::Browser);
+        self.record_capability(Capability::Browser);
         let (operation, origin, assertion) = match operation {
             HirBrowserOp::Open(open) => {
                 let url = self.infer_expr(&open.url, domain, Some(&Type::String));

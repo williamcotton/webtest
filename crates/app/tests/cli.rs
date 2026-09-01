@@ -503,14 +503,15 @@ fn static_usage_and_browser_failures_have_distinct_exit_codes() {
     let report: serde_json::Value =
         serde_json::from_slice(&infrastructure.stdout).expect("infrastructure JSON");
     assert_eq!(report["exit_class"], "infrastructure");
+    assert!(report["files"][0]["execution_error"].is_null());
     assert!(
-        report["files"][0]["execution_error"]["failure"]["message"]
+        report["files"][0]["tests"][0]["failure"]["message"]
             .as_str()
             .expect("message")
             .contains("does not exist")
     );
     assert_eq!(
-        report["files"][0]["execution_error"]["class"],
+        report["files"][0]["tests"][0]["failure_class"],
         "infrastructure"
     );
 }
@@ -581,8 +582,12 @@ fn build_emits_a_versioned_typed_plan_deterministically() {
     let first_bytes = fs::read(&first).expect("first plan");
     assert_eq!(first_bytes, fs::read(&second).expect("second plan"));
     let plan: serde_json::Value = serde_json::from_slice(&first_bytes).expect("plan JSON");
-    assert_eq!(plan["format_version"], 1);
+    assert_eq!(plan["format_version"], 2);
     assert_eq!(plan["required_host_capabilities"][0], "server");
+    assert_eq!(
+        plan["tests"][0]["required_host_capabilities"],
+        serde_json::json!(["server", "test"])
+    );
     assert_eq!(
         plan["tests"][0]["steps"][0]["operation"]["kind"],
         "server_provider_call"

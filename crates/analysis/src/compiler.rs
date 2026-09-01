@@ -62,6 +62,7 @@ struct Compiler<'a> {
     names: HashMap<String, SyntaxOrigin>,
     declared_names: HashSet<String>,
     required: BTreeSet<Capability>,
+    test_required: BTreeSet<Capability>,
     next_step: u32,
 }
 
@@ -92,6 +93,7 @@ impl<'a> Compiler<'a> {
             names: HashMap::new(),
             declared_names: HashSet::new(),
             required: BTreeSet::new(),
+            test_required: BTreeSet::new(),
             next_step: 0,
         }
     }
@@ -104,6 +106,7 @@ impl<'a> Compiler<'a> {
                 self.bindings.clear();
                 self.names.clear();
                 self.declared_names.clear();
+                self.test_required.clear();
                 for statement in &test.body {
                     statements::collect_binding_names(statement, &mut self.declared_names);
                 }
@@ -114,21 +117,31 @@ impl<'a> Compiler<'a> {
                 webtest_plan::PlannedTest {
                     id: test.id,
                     name: test.name.clone(),
+                    required_host_capabilities: std::mem::take(&mut self.test_required)
+                        .into_iter()
+                        .collect(),
                     steps,
                     origin: test.origin,
                 }
             })
             .collect();
+        let plan = TestPlan {
+            file: self.file,
+            source_revision: self.revision,
+            required_host_capabilities: self.required.into_iter().collect(),
+            tests,
+        };
+        debug_assert!(plan.validate_capabilities().is_ok());
         CompileResult {
             diagnostics: self.diagnostics,
             type_facts: self.type_facts,
-            plan: TestPlan {
-                file: self.file,
-                source_revision: self.revision,
-                required_host_capabilities: self.required.into_iter().collect(),
-                tests,
-            },
+            plan,
         }
+    }
+
+    fn record_capability(&mut self, capability: Capability) {
+        self.test_required.insert(capability);
+        self.required.insert(capability);
     }
 
     fn type_fact(&mut self, range: TextRange, ty: Type, capability: Capability) {

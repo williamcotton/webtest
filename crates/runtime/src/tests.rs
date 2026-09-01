@@ -136,6 +136,7 @@ fn plan(revision: SourceRevision) -> TestPlan {
         tests: vec![PlannedTest {
             id: TestId(0),
             name: "x".into(),
+            required_host_capabilities: vec![Capability::Browser],
             origin: SyntaxOrigin::new(file, TextRange::empty(TextSize::new(0))),
             steps: vec![PlannedStep {
                 id: StepId(0),

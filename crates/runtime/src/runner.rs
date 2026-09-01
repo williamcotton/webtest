@@ -6,14 +6,14 @@ use webtest_observation::{
     CleanupCause, CleanupFailure, CleanupResource, ExecutionEvent, ExecutionId, ObservationStore,
     SkipReason,
 };
-use webtest_plan::{PlannedTest, TestPlan};
+use webtest_plan::{AssertionOperation, PlannedTest, TestOperation, TestPlan};
 use webtest_provider::{Capability, NativeProviderConfig, ProviderRegistry, Value};
 
 use crate::{
     CancellationReason, FailureClass, PriorRunOutcome, RunControl, RunError, RunEventSink,
     RunOutcome, RunResult, RunnerOptions, TestOutcome, TestResult,
     events::emit_event,
-    execution::{ExecutedTest, emit_cleanup_failed, execute_test, test_requires_browser},
+    execution::{ExecutedTest, emit_cleanup_failed, execute_test},
 };
 
 pub struct Runner {
@@ -72,7 +72,29 @@ impl Runner {
         );
         let mut tests = Vec::with_capacity(plan.tests.len());
         let mut outcome = RunOutcome::Completed;
-        if control.is_some_and(RunControl::is_cancelled) {
+        if let Err(error) = validate_plan(plan) {
+            outcome = RunOutcome::Aborted {
+                failure: RunError::Internal(error),
+                prior_outcome: None,
+            };
+            skip_tests(
+                &plan.tests,
+                SkipReason::RunAborted,
+                Some(FailureClass::Internal),
+                execution_id,
+                &mut tests,
+                &mut events,
+                self.event_sink.as_deref(),
+            );
+            finish_run(
+                execution_id,
+                outcome,
+                tests,
+                events,
+                run_started,
+                self.event_sink.as_deref(),
+            )
+        } else if control.is_some_and(RunControl::is_cancelled) {
             outcome = RunOutcome::Cancelled {
                 reason: CancellationReason::Requested,
             };
@@ -94,39 +116,7 @@ impl Runner {
                 self.event_sink.as_deref(),
             )
         } else {
-            let needs_browser = plan
-                .required_host_capabilities
-                .contains(&Capability::Browser);
-            let mut session = if needs_browser {
-                match browser.start().await {
-                    Ok(started) => Some(started),
-                    Err(error) => {
-                        outcome = RunOutcome::Aborted {
-                            failure: error.into(),
-                            prior_outcome: None,
-                        };
-                        skip_tests(
-                            &plan.tests,
-                            SkipReason::RunAborted,
-                            Some(FailureClass::Infrastructure),
-                            execution_id,
-                            &mut tests,
-                            &mut events,
-                            self.event_sink.as_deref(),
-                        );
-                        return finish_run(
-                            execution_id,
-                            outcome,
-                            tests,
-                            events,
-                            run_started,
-                            self.event_sink.as_deref(),
-                        );
-                    }
-                }
-            } else {
-                None
-            };
+            let mut session = None;
 
             for (index, test) in plan.tests.iter().enumerate() {
                 if control.is_some_and(RunControl::is_cancelled) {
@@ -144,33 +134,13 @@ impl Runner {
                     );
                     break;
                 }
-                if test_requires_browser(test) && session.is_none() {
-                    match browser.start().await {
-                        Ok(started) => session = Some(started),
-                        Err(error) => {
-                            outcome = RunOutcome::Aborted {
-                                failure: error.into(),
-                                prior_outcome: None,
-                            };
-                            skip_tests(
-                                &plan.tests[index..],
-                                SkipReason::RunAborted,
-                                Some(FailureClass::Infrastructure),
-                                execution_id,
-                                &mut tests,
-                                &mut events,
-                                self.event_sink.as_deref(),
-                            );
-                            break;
-                        }
-                    }
-                }
                 let ExecutedTest { result } = execute_test(
                     plan,
                     test,
                     execution_id,
                     &mut events,
                     self.event_sink.as_deref(),
+                    browser,
                     &mut session,
                     control,
                     &self.options,
@@ -239,6 +209,37 @@ impl Runner {
             )
         }
     }
+}
+
+fn validate_plan(plan: &TestPlan) -> Result<(), String> {
+    plan.validate_capabilities()
+        .map_err(|error| format!("invalid plan capability metadata: {error}"))?;
+    for test in &plan.tests {
+        if test
+            .steps
+            .iter()
+            .any(|step| operation_requires_browser(&step.operation))
+            && !test
+                .required_host_capabilities
+                .contains(&Capability::Browser)
+        {
+            return Err(format!(
+                "test {} contains a browser operation without the Browser capability",
+                test.id.0
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn operation_requires_browser(operation: &TestOperation) -> bool {
+    matches!(operation, TestOperation::Browser(_))
+        || matches!(
+            operation,
+            TestOperation::Assertion(
+                AssertionOperation::Locator { .. } | AssertionOperation::Url { .. }
+            )
+        )
 }
 
 fn combine_run_outcome(outcome: RunOutcome, cleanup_failures: Vec<CleanupFailure>) -> RunOutcome {

@@ -4,14 +4,14 @@ use std::{
 };
 
 use tokio::time::Instant;
-use webtest_browser::{BrowserContext, BrowserSession, Page};
+use webtest_browser::{BrowserContext, BrowserHost, BrowserSession, Page};
 use webtest_hir::StepId;
 use webtest_observation::{
     CleanupCause, CleanupFailure, CleanupResource, ExecutionEvent, ExecutionId, ObservationStore,
     RuntimeFailure, RuntimeObservation, RuntimeObservationKind,
 };
-use webtest_plan::{AssertionOperation, PlannedStep, PlannedTest, TestOperation, TestPlan};
-use webtest_provider::ProviderRegistry;
+use webtest_plan::{PlannedStep, PlannedTest, TestOperation, TestPlan};
+use webtest_provider::{Capability, ProviderRegistry};
 
 use crate::{
     CancellationReason, FailureClass, PriorTestOutcome, RunControl, RunError, RunEventSink,
@@ -63,6 +63,7 @@ pub(crate) async fn execute_test(
     execution_id: ExecutionId,
     events: &mut Vec<ExecutionEvent>,
     event_sink: Option<&dyn RunEventSink>,
+    browser: &dyn BrowserHost,
     session: &mut Option<Box<dyn BrowserSession>>,
     control: Option<&dyn RunControl>,
     options: &RunnerOptions,
@@ -87,7 +88,9 @@ pub(crate) async fn execute_test(
     let mut context: Option<Box<dyn BrowserContext>> = None;
     let mut page: Option<Box<dyn Page>> = None;
     let mut active_step = None;
-    let uses_browser = test_requires_browser(test);
+    let uses_browser = test
+        .required_host_capabilities
+        .contains(&Capability::Browser);
 
     let outcome = match run_until_deadline(
         deadline.at,
@@ -97,6 +100,7 @@ pub(crate) async fn execute_test(
             execution_id,
             events,
             event_sink,
+            browser,
             session,
             control,
             options,
@@ -227,6 +231,7 @@ async fn execute_test_body(
     execution_id: ExecutionId,
     events: &mut Vec<ExecutionEvent>,
     event_sink: Option<&dyn RunEventSink>,
+    browser: &dyn BrowserHost,
     session: &mut Option<Box<dyn BrowserSession>>,
     control: Option<&dyn RunControl>,
     options: &RunnerOptions,
@@ -240,6 +245,16 @@ async fn execute_test_body(
     active_step: &mut Option<StepId>,
 ) -> ProvisionalTestOutcome {
     if uses_browser {
+        if session.is_none() {
+            match browser.start().await {
+                Ok(started) => *session = Some(started),
+                Err(error) => {
+                    return ProvisionalTestOutcome::Aborted {
+                        failure: RunError::Browser(error),
+                    };
+                }
+            }
+        }
         let Some(browser_session) = session.as_deref_mut() else {
             return ProvisionalTestOutcome::Aborted {
                 failure: RunError::Internal("browser test has no active browser session".into()),
@@ -390,18 +405,6 @@ async fn execute_test_body(
     }
     *active_step = None;
     ProvisionalTestOutcome::Passed
-}
-
-pub(crate) fn test_requires_browser(test: &PlannedTest) -> bool {
-    test.steps.iter().any(|step| {
-        matches!(step.operation, TestOperation::Browser(_))
-            || matches!(
-                step.operation,
-                TestOperation::Assertion(
-                    AssertionOperation::Locator { .. } | AssertionOperation::Url { .. }
-                )
-            )
-    })
 }
 
 #[allow(clippy::too_many_arguments)]

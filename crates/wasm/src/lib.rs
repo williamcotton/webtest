@@ -448,6 +448,28 @@ mod tests {
     }
 
     #[test]
+    fn portable_and_native_plans_match_with_per_test_capabilities() {
+        let source = r#"test "server" {
+    server { let response = http.get("http://example.test") }
+}
+test "pure" { let value = 1 }
+test "browser" { browser { open "/" } }"#;
+        let portable = compile(source).plan.expect("portable plan");
+        let mut database = AnalysisDatabase::default();
+        let file = database.open_file("memory://document.webtest", source);
+        let native = database.test_plan(file).expect("native plan");
+        assert_eq!(portable, *native);
+        assert_eq!(
+            portable
+                .tests
+                .iter()
+                .map(|test| test.required_host_capabilities.clone())
+                .collect::<Vec<_>>(),
+            [vec![Capability::Server], vec![], vec![Capability::Browser]]
+        );
+    }
+
+    #[test]
     fn descriptions_and_static_repair_diagnostics_match_the_native_core() {
         let portable = serde_json::to_value(describe(Some("locator.role"), None))
             .expect("portable description");

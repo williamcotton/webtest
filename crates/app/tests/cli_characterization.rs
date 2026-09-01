@@ -156,8 +156,11 @@ fn human_test_reporter_streams_preparation_and_each_test_status_once() {
 }
 
 #[test]
-fn human_test_reporter_closes_browser_startup_when_resolution_fails() {
-    let directory = fixture("test \"browser\" { browser { open \"about:blank\" } }\n");
+fn human_test_reporter_resolves_chrome_only_after_earlier_independent_tests() {
+    let directory = fixture(
+        "test \"independent\" { let value = 1 expect value == 1 }\n\
+test \"browser\" { browser { open \"about:blank\" } }\n",
+    );
     let output = run(
         directory.path(),
         &["test", "--chrome-path", "missing-chrome"],
@@ -165,7 +168,16 @@ fn human_test_reporter_closes_browser_startup_when_resolution_fails() {
     assert_eq!(output.status.code(), Some(3));
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8(output.stdout).expect("human output");
-    assert!(stdout.contains("starting Chrome for tests/example.webtest (headless) ... FAILED\n"));
+    let independent = stdout
+        .find("test \"independent\" ... ok\n")
+        .expect("first test");
+    let chrome = stdout
+        .find("starting Chrome for tests/example.webtest (headless) ... FAILED\n")
+        .expect("lazy Chrome failure");
+    let browser = stdout
+        .find("test \"browser\" ... ABORTED\n")
+        .expect("browser outcome");
+    assert!(independent < chrome && chrome < browser, "{stdout}");
     assert!(stdout.contains("infrastructure error[runtime.browser_launch]"));
 }
 
@@ -230,8 +242,12 @@ fn build_is_deterministic_and_description_json_remains_machine_clean() {
     );
     let plan: serde_json::Value =
         serde_json::from_slice(&fs::read(first).expect("plan")).expect("plan JSON");
-    assert_eq!(plan["format_version"], 1);
+    assert_eq!(plan["format_version"], 2);
     assert_eq!(plan["tests"][0]["id"], 0);
+    assert_eq!(
+        plan["tests"][0]["required_host_capabilities"],
+        serde_json::json!(["test"])
+    );
     assert_eq!(plan["tests"][0]["steps"][0]["id"], 0);
 
     for arguments in [

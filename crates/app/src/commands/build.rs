@@ -81,6 +81,9 @@ fn build_project(project: &webtest_project::Project, emit: &Path) -> Result<Exit
         provider_schema_hashes: database.provider_schema_hashes(),
         tests,
     };
+    envelope
+        .validate_capabilities()
+        .map_err(AppError::internal)?;
     reject_literal_secrets(&envelope, project)?;
     let encoded = serde_json::to_vec_pretty(&envelope).map_err(AppError::internal)?;
     if let Some(parent) = emit.parent()

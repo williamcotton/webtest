@@ -1,9 +1,7 @@
 use std::{path::PathBuf, sync::Arc};
 
-use webtest_browser_cdp::ChromeHost;
-
 use crate::{
-    chrome::resolve_chrome, error::AppError, project_context::project,
+    chrome::LazyChromeHost, error::AppError, project_context::project,
     provider_composition::runtime_provider_registry, report::ExitClass,
     runtime_configuration::runner_options,
 };
@@ -17,15 +15,7 @@ pub(crate) async fn run_dap(
         Some(path) => project(std::slice::from_ref(&path))?,
         None => project(&[])?,
     };
-    let executable = resolve_chrome(&project, chrome_path)
-        .ok()
-        .map(|resolved| resolved.path);
-    let browser = ChromeHost::new(executable)
-        .with_headed(!headless)
-        .with_timeouts(
-            project.config.timeouts.browser_command,
-            project.config.timeouts.navigation,
-        );
+    let browser = LazyChromeHost::new(project.clone(), chrome_path, !headless, None);
     let options = runner_options(&project);
     let providers = runtime_provider_registry(&project, &options)?;
     let serve_result =

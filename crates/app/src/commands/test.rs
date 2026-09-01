@@ -1,13 +1,11 @@
 use std::{io, path::PathBuf, sync::Arc, time::Instant};
 
-use webtest_browser_cdp::ChromeHost;
 use webtest_feedback::FailureClass;
 use webtest_observation::ObservationStore;
-use webtest_provider::Capability;
 use webtest_runtime::{RunError, RunOutcome, Runner, TestOutcome};
 
 use crate::{
-    chrome::resolve_chrome,
+    chrome::LazyChromeHost,
     cli::TestReporter,
     error::AppError,
     project_analysis::analyze_file,
@@ -34,12 +32,12 @@ pub(crate) async fn run_test(
     let project = project(&paths)?;
     let mut report = base_report("test", &project);
     let show_browser = headed || !project.config.browser.headless;
-    let mut browser = None;
     let options = runner_options(&project);
     let runtime_providers = runtime_provider_registry(&project, &options)?;
     let providers = runtime_providers.registry;
     let app_provider = runtime_providers.app;
     let progress = (reporter == TestReporter::Human).then(|| Arc::new(HumanTestProgress::stdout()));
+    let browser = LazyChromeHost::new(project.clone(), chrome_path, show_browser, progress.clone());
     let mut progress_error = None;
 
     if let Some(progress) = &progress {
@@ -168,67 +166,8 @@ pub(crate) async fn run_test(
                 }
             }
         }
-        let needs_browser = analyzed
-            .plan
-            .required_host_capabilities
-            .contains(&Capability::Browser);
-        if needs_browser && let Some(progress) = &progress {
-            record_progress_error(
-                progress.starting_browser(&file_report.path, show_browser),
-                &mut progress_error,
-            );
-        }
-        if needs_browser && browser.is_none() {
-            match resolve_chrome(&project, chrome_path.clone()) {
-                Ok(resolved) => {
-                    browser = Some(
-                        ChromeHost::new(Some(resolved.path))
-                            .with_headed(show_browser)
-                            .with_timeouts(
-                                project.config.timeouts.browser_command,
-                                project.config.timeouts.navigation,
-                            ),
-                    );
-                }
-                Err(error) => {
-                    if let Some(progress) = &progress {
-                        record_progress_error(
-                            progress.browser_run_finished(false),
-                            &mut progress_error,
-                        );
-                    }
-                    file_report.execution_error = Some(ExecutionFailureReport {
-                        class: FailureClass::Infrastructure,
-                        failure: FailureReport {
-                            diagnostic_schema_version: webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
-                            repair_hint_schema_version:
-                                webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
-                            code: "runtime.browser_launch".into(),
-                            message: error.message,
-                            span: None,
-                            diff: None,
-                            artifacts: Vec::new(),
-                            semantic_details: None,
-                            repair_hints: Vec::new(),
-                            page: None,
-                            secondary: Vec::new(),
-                        },
-                    });
-                    file_report.duration_nanos =
-                        nanos(analysis_duration.saturating_add(started.elapsed()));
-                    report.exit_class = report.exit_class.combine(ExitClass::Infrastructure);
-                    file_report.exit_class = ExitClass::Infrastructure;
-                    report.files.push(file_report);
-                    continue;
-                }
-            }
-        }
-        let inactive_browser = ChromeHost::new(None);
-        let browser = browser.as_ref().unwrap_or(&inactive_browser);
-        let result = runner.run(&analyzed.plan, browser).await;
-        if let Some(progress) = &progress {
-            record_progress_error(progress.browser_run_finished(true), &mut progress_error);
-        }
+        let file_browser = browser.for_file(file_report.path.clone());
+        let result = runner.run(&analyzed.plan, &file_browser).await;
         file_report.duration_nanos = nanos(result.duration);
         file_report.events = event_reports(&file_report.path, &result.events);
         let run_exit_class = match &result.outcome {

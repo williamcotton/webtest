@@ -1,21 +1,13 @@
 use std::{path::PathBuf, sync::Arc};
 
-use webtest_browser_cdp::ChromeHost;
-
 use crate::{
-    chrome::resolve_chrome, error::AppError, lsp_projects::LspProjectEditors,
+    chrome::LazyChromeHost, error::AppError, lsp_projects::LspProjectEditors,
     project_context::project, report::ExitClass,
 };
 
 pub(crate) async fn run_lsp(chrome_path: Option<PathBuf>) -> Result<ExitClass, AppError> {
     let project = project(&[])?;
-    let executable = resolve_chrome(&project, chrome_path)
-        .ok()
-        .map(|resolved| resolved.path);
-    let browser = ChromeHost::new(executable).with_timeouts(
-        project.config.timeouts.browser_command,
-        project.config.timeouts.navigation,
-    );
+    let browser = LazyChromeHost::new(project.clone(), chrome_path, false, None);
     let project_editors = Arc::new(LspProjectEditors::default());
     let editor = project_editors.editor_for_project(&project)?;
     let document_projects = Arc::clone(&project_editors);

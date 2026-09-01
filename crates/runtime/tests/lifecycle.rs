@@ -299,28 +299,37 @@ fn origin(file: FileId, offset: u32) -> SyntaxOrigin {
     )
 }
 
-fn plan_with_tests(capabilities: Vec<Capability>, operations: Vec<Vec<TestOperation>>) -> TestPlan {
+fn plan_with_tests(
+    mut capabilities: Vec<Capability>,
+    operations: Vec<Vec<TestOperation>>,
+) -> TestPlan {
     let file = FileId::new(41);
     let mut next_step = 0;
+    capabilities.sort_unstable();
+    capabilities.dedup();
     let tests = operations
         .into_iter()
         .enumerate()
-        .map(|(test_index, operations)| PlannedTest {
-            id: TestId(test_index as u32),
-            name: format!("test-{test_index}"),
-            origin: origin(file, test_index as u32),
-            steps: operations
-                .into_iter()
-                .map(|operation| {
-                    let step_id = StepId(next_step);
-                    next_step += 1;
-                    PlannedStep {
-                        id: step_id,
-                        origin: origin(file, step_id.0 + 10),
-                        operation,
-                    }
-                })
-                .collect(),
+        .map(|(test_index, operations)| {
+            let required_host_capabilities = test_capabilities(&capabilities, &operations);
+            PlannedTest {
+                id: TestId(test_index as u32),
+                name: format!("test-{test_index}"),
+                required_host_capabilities,
+                origin: origin(file, test_index as u32),
+                steps: operations
+                    .into_iter()
+                    .map(|operation| {
+                        let step_id = StepId(next_step);
+                        next_step += 1;
+                        PlannedStep {
+                            id: step_id,
+                            origin: origin(file, step_id.0 + 10),
+                            operation,
+                        }
+                    })
+                    .collect(),
+            }
         })
         .collect();
     TestPlan {
@@ -329,6 +338,35 @@ fn plan_with_tests(capabilities: Vec<Capability>, operations: Vec<Vec<TestOperat
         required_host_capabilities: capabilities,
         tests,
     }
+}
+
+fn test_capabilities(
+    plan_capabilities: &[Capability],
+    operations: &[TestOperation],
+) -> Vec<Capability> {
+    let mut capabilities = BTreeSet::new();
+    for operation in operations {
+        match operation {
+            TestOperation::ServerProviderCall(_) => {
+                capabilities.insert(Capability::Server);
+            }
+            TestOperation::Browser(_)
+            | TestOperation::Assertion(
+                webtest_plan::AssertionOperation::Locator { .. }
+                | webtest_plan::AssertionOperation::Url { .. },
+            ) => {
+                capabilities.insert(Capability::Browser);
+            }
+            TestOperation::Assertion(webtest_plan::AssertionOperation::Value { .. }) => {
+                capabilities.insert(Capability::Test);
+            }
+            TestOperation::EvaluatePure(_) => {}
+        }
+    }
+    if capabilities.is_empty() && plan_capabilities.contains(&Capability::Pure) {
+        capabilities.insert(Capability::Pure);
+    }
+    capabilities.into_iter().collect()
 }
 
 fn browser_evaluate(expression: &str) -> TestOperation {
@@ -455,6 +493,44 @@ async fn browser_session_is_shared_and_each_test_gets_a_context_and_page() {
         .await;
 
     assert_eq!(result.passed(), 2);
+    assert_eq!(
+        state.log(),
+        [
+            "session_start:0",
+            "context_create:0:0",
+            "page_create:0",
+            "evaluate:0:first",
+            "context_close:0",
+            "context_create:0:1",
+            "page_create:1",
+            "evaluate:1:second",
+            "context_close:1",
+            "session_close:0",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn server_browser_server_browser_only_allocates_for_browser_tests() {
+    let provider = Arc::new(DelayedProvider::new([Duration::ZERO, Duration::ZERO]));
+    let mut providers = ProviderRegistry::default();
+    providers.register(provider);
+    let state = Arc::new(LifecycleState::default());
+    let plan = plan_with_tests(
+        vec![Capability::Server, Capability::Browser],
+        vec![
+            vec![secret_binding(), provider_operation(None)],
+            vec![browser_evaluate("first")],
+            vec![secret_binding(), provider_operation(None)],
+            vec![browser_evaluate("second")],
+        ],
+    );
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .with_provider_registry(providers)
+        .run(&plan, &LifecycleHost(Arc::clone(&state)))
+        .await;
+
+    assert_eq!(result.passed(), 4);
     assert_eq!(
         state.log(),
         [
@@ -836,22 +912,22 @@ async fn page_creation_failure_closes_the_acquired_context_once_before_terminal_
 }
 
 #[tokio::test]
-async fn zero_test_browser_plan_starts_and_normally_closes_its_session() {
+async fn zero_test_plan_never_starts_or_closes_a_browser_session() {
     let state = Arc::new(LifecycleState::default());
-    let plan = plan_with_tests(vec![Capability::Browser], Vec::new());
+    let plan = plan_with_tests(Vec::new(), Vec::new());
     let result = Runner::new(Arc::new(ObservationStore::default()))
         .run(&plan, &LifecycleHost(Arc::clone(&state)))
         .await;
 
     assert!(result.tests.is_empty());
-    assert_eq!(state.log(), ["session_start:0", "session_close:0"]);
+    assert!(state.log().is_empty());
     assert_eq!(event_names(&result.events), ["run_started", "run_finished"]);
 }
 
 #[tokio::test]
 async fn already_cancelled_empty_plan_is_cancelled_without_starting_a_browser() {
     let state = Arc::new(LifecycleState::default());
-    let plan = plan_with_tests(vec![Capability::Browser], Vec::new());
+    let plan = plan_with_tests(Vec::new(), Vec::new());
     let control = RecordingControl::new(true, false, true);
     let result = Runner::new(Arc::new(ObservationStore::default()))
         .run_with_control(&plan, &LifecycleHost(Arc::clone(&state)), Some(&control))
@@ -879,11 +955,14 @@ impl BrowserHost for FailingStartHost {
 }
 
 #[tokio::test]
-async fn observations_are_cleared_before_browser_start_can_fail() {
+async fn observations_are_cleared_before_lazy_browser_start_can_fail() {
     let store = Arc::new(ObservationStore::default());
     let plan = plan_with_tests(
         vec![Capability::Browser],
-        vec![vec![pure(Value::Null)], vec![pure(Value::Null)]],
+        vec![
+            vec![browser_evaluate("unreached")],
+            vec![browser_evaluate("also-unreached")],
+        ],
     );
     store.record(RuntimeObservation {
         execution_id: ExecutionId::next(),
@@ -912,12 +991,13 @@ async fn observations_are_cleared_before_browser_start_can_fail() {
             ..
         }
     ));
-    assert_eq!((result.aborted(), result.skipped()), (0, 2));
+    assert_eq!((result.aborted(), result.skipped()), (1, 1));
     assert_eq!(
         event_names(&result.events),
         [
             "run_started",
-            "test_skipped",
+            "test_started",
+            "test_finished",
             "test_skipped",
             "run_finished"
         ]
@@ -928,6 +1008,89 @@ async fn observations_are_cleared_before_browser_start_can_fail() {
             .observations_for(plan.file, plan.source_revision)
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn browser_launch_failure_preserves_earlier_independent_test_result() {
+    let state = Arc::new(LifecycleState::default());
+    let plan = plan_with_tests(
+        vec![Capability::Pure, Capability::Browser],
+        vec![
+            vec![pure(Value::String("completed first".into()))],
+            vec![browser_evaluate("unreached")],
+            vec![pure(Value::String("skipped".into()))],
+        ],
+    );
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .run(&plan, &FailingStartHost)
+        .await;
+
+    assert!(state.log().is_empty());
+    assert!(matches!(result.tests[0].outcome, TestOutcome::Passed));
+    assert!(matches!(
+        result.tests[1].outcome,
+        TestOutcome::Aborted {
+            failure: RunError::Browser(BrowserError::Launch(_)),
+            ..
+        }
+    ));
+    assert!(matches!(
+        result.tests[2].outcome,
+        TestOutcome::Skipped {
+            reason: SkipReason::RunAborted,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn browser_step_without_test_capability_is_an_internal_plan_error() {
+    let state = Arc::new(LifecycleState::default());
+    let mut plan = plan_with_tests(
+        vec![Capability::Browser],
+        vec![vec![browser_evaluate("must-not-run")]],
+    );
+    plan.tests[0].required_host_capabilities.clear();
+    plan.required_host_capabilities.clear();
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .run(&plan, &LifecycleHost(Arc::clone(&state)))
+        .await;
+
+    assert!(state.log().is_empty());
+    assert!(matches!(
+        result.outcome,
+        RunOutcome::Aborted {
+            failure: RunError::Internal(_),
+            ..
+        }
+    ));
+    assert_eq!((result.aborted(), result.skipped()), (0, 1));
+}
+
+#[tokio::test]
+async fn inconsistent_plan_union_is_rejected_without_browser_allocation() {
+    let state = Arc::new(LifecycleState::default());
+    let mut plan = plan_with_tests(vec![Capability::Pure], vec![vec![pure(Value::Null)]]);
+    plan.required_host_capabilities = vec![Capability::Browser];
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .run(&plan, &LifecycleHost(Arc::clone(&state)))
+        .await;
+
+    assert!(state.log().is_empty());
+    assert!(matches!(
+        result.outcome,
+        RunOutcome::Aborted {
+            failure: RunError::Internal(_),
+            ..
+        }
+    ));
+    assert!(matches!(
+        result.tests[0].outcome,
+        TestOutcome::Skipped {
+            failure_class: Some(FailureClass::Internal),
+            ..
+        }
+    ));
 }
 
 #[tokio::test]
@@ -2209,9 +2372,10 @@ async fn timed_out_browser_test_gets_a_fresh_session_for_the_next_browser_test()
         .expect("page delays")
         .insert("slow".into(), Duration::from_secs(5));
     let plan = plan_with_tests(
-        vec![Capability::Browser],
+        vec![Capability::Pure, Capability::Browser],
         vec![
             vec![browser_evaluate("slow")],
+            vec![pure(Value::String("between browser tests".into()))],
             vec![browser_evaluate("fast")],
         ],
     );
@@ -2228,6 +2392,7 @@ async fn timed_out_browser_test_gets_a_fresh_session_for_the_next_browser_test()
         TestOutcome::TimedOut { .. }
     ));
     assert!(matches!(result.tests[1].outcome, TestOutcome::Passed));
+    assert!(matches!(result.tests[2].outcome, TestOutcome::Passed));
     let log = state.log();
     assert!(log.contains(&"session_start:0".into()));
     assert!(log.contains(&"session_close:0".into()));
