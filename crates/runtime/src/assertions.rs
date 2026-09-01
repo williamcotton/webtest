@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
 use webtest_browser::Page;
 use webtest_hir::BindingId;
@@ -21,6 +22,7 @@ pub(crate) async fn execute_assertion(
     assertion: &AssertionOperation,
     environment: &HashMap<BindingId, Value>,
     options: &RunnerOptions,
+    remaining: Duration,
 ) -> Result<(), StepError> {
     match assertion {
         AssertionOperation::Locator {
@@ -32,10 +34,7 @@ pub(crate) async fn execute_assertion(
             .wait_for_locator(
                 &browser_locator(locator),
                 browser_state(*state),
-                bounded_timeout(
-                    timeout.unwrap_or(options.assertion_timeout),
-                    options.test_timeout,
-                ),
+                bounded_timeout(timeout.unwrap_or(options.assertion_timeout), remaining),
             )
             .await
             .map_err(StepError::Browser),
@@ -46,10 +45,7 @@ pub(crate) async fn execute_assertion(
             page.ok_or_else(|| StepError::Internal("URL assertion has no browser page".into()))?
                 .wait_for_url(
                     &expected,
-                    bounded_timeout(
-                        timeout.unwrap_or(options.assertion_timeout),
-                        options.test_timeout,
-                    ),
+                    bounded_timeout(timeout.unwrap_or(options.assertion_timeout), remaining),
                 )
                 .await
                 .map_err(StepError::Browser)

@@ -13,7 +13,7 @@ use crate::{
     CancellationReason, FailureClass, PriorRunOutcome, RunControl, RunError, RunEventSink,
     RunOutcome, RunResult, RunnerOptions, TestOutcome, TestResult,
     events::emit_event,
-    execution::{ExecutedTest, emit_cleanup_failed, execute_test},
+    execution::{ExecutedTest, emit_cleanup_failed, execute_test, test_requires_browser},
 };
 
 pub struct Runner {
@@ -99,7 +99,7 @@ impl Runner {
                 .contains(&Capability::Browser);
             let mut session = if needs_browser {
                 match browser.start().await {
-                    Ok(session) => Some(session),
+                    Ok(started) => Some(started),
                     Err(error) => {
                         outcome = RunOutcome::Aborted {
                             failure: error.into(),
@@ -143,6 +143,27 @@ impl Runner {
                         self.event_sink.as_deref(),
                     );
                     break;
+                }
+                if test_requires_browser(test) && session.is_none() {
+                    match browser.start().await {
+                        Ok(started) => session = Some(started),
+                        Err(error) => {
+                            outcome = RunOutcome::Aborted {
+                                failure: error.into(),
+                                prior_outcome: None,
+                            };
+                            skip_tests(
+                                &plan.tests[index..],
+                                SkipReason::RunAborted,
+                                Some(FailureClass::Infrastructure),
+                                execution_id,
+                                &mut tests,
+                                &mut events,
+                                self.event_sink.as_deref(),
+                            );
+                            break;
+                        }
+                    }
                 }
                 let ExecutedTest { result } = execute_test(
                     plan,
@@ -272,6 +293,7 @@ fn skip_tests(
             },
         );
         results.push(TestResult {
+            test_id: test.id,
             name: test.name.clone(),
             outcome: TestOutcome::Skipped {
                 reason,

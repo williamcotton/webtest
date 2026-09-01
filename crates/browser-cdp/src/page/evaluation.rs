@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use serde_json::{Value, json};
 use webtest_browser::BrowserError;
 
@@ -16,8 +18,36 @@ pub(super) async fn evaluate_expression(
         .await
 }
 
+pub(super) async fn evaluate_expression_with_timeout(
+    page: &CdpPage,
+    expression: String,
+    timeout: Duration,
+) -> Result<Value, BrowserError> {
+    page.connection
+        .command_with_timeout(
+            "Runtime.evaluate",
+            Some(json!({ "expression": expression, "returnByValue": true })),
+            Some(&page.session_id),
+            timeout,
+        )
+        .await
+}
+
 pub(super) async fn evaluate(page: &CdpPage, expression: &str) -> Result<(), BrowserError> {
     let evaluation = evaluate_expression(page, expression.to_owned()).await?;
+    validate_evaluation(expression, evaluation)
+}
+
+pub(super) async fn evaluate_with_timeout(
+    page: &CdpPage,
+    expression: &str,
+    timeout: Duration,
+) -> Result<(), BrowserError> {
+    let evaluation = evaluate_expression_with_timeout(page, expression.to_owned(), timeout).await?;
+    validate_evaluation(expression, evaluation)
+}
+
+fn validate_evaluation(expression: &str, evaluation: Value) -> Result<(), BrowserError> {
     if let Some(message) = evaluation.get("errorText").and_then(Value::as_str) {
         return Err(BrowserError::EvaluationFailed {
             expression: expression.to_owned(),

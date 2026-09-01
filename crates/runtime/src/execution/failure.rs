@@ -337,7 +337,7 @@ fn record_observation(
         file: plan.file,
         source_revision: plan.source_revision,
         test_id,
-        step_id: step.id,
+        step_id: Some(step.id),
         range: step.origin.range,
         kind,
     });

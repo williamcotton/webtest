@@ -129,9 +129,13 @@ pub(crate) fn aborted_test_failure_report(
             "kind": "failed",
             "failure": step_failure_report(*failure, source),
         }),
-        Some(PriorTestOutcome::TimedOut { timeout }) => serde_json::json!({
+        Some(PriorTestOutcome::TimedOut {
+            timeout,
+            active_step,
+        }) => serde_json::json!({
             "kind": "timed_out",
             "timeout_nanos": timeout.as_nanos().min(u128::from(u64::MAX)) as u64,
+            "active_step_id": active_step.map(|step| step.0),
         }),
         Some(PriorTestOutcome::Cancelled { reason }) => serde_json::json!({
             "kind": "cancelled",
@@ -504,6 +508,26 @@ pub(crate) fn event_reports(path: &str, events: &[ExecutionEvent]) -> Vec<EventR
                     Some(webtest_feedback::REPAIR_HINT_SCHEMA_VERSION);
                 event
             }
+            ExecutionEvent::TestTimedOut {
+                execution_id,
+                test_id,
+                active_step,
+                timeout_ms,
+            } => {
+                let mut event = event_report(
+                    path,
+                    "test_timed_out",
+                    Some(execution_id.0),
+                    Some(test_id.0),
+                    active_step.map(|step| step.0),
+                );
+                event.outcome = Some("timed_out".into());
+                event.code = Some("runtime.test_timeout".into());
+                event.message = Some(format!("test timed out after {timeout_ms}ms"));
+                event.failure_class = Some(webtest_feedback::FailureClass::Test);
+                event.exit_class = Some(ExitClass::TestFailure);
+                event
+            }
             ExecutionEvent::CleanupFailed {
                 execution_id,
                 test_id,
@@ -603,6 +627,10 @@ pub(crate) fn event_reports(path: &str, events: &[ExecutionEvent]) -> Vec<EventR
 
 fn runtime_failure_report(failure: &RuntimeFailure) -> (String, String) {
     match failure {
+        RuntimeFailure::TestTimeout { timeout_ms, .. } => (
+            "runtime.test_timeout".into(),
+            format!("test timed out after {timeout_ms}ms"),
+        ),
         RuntimeFailure::Browser(error) => (runtime_code(error).into(), runtime_message(error)),
         RuntimeFailure::Provider(error) => (format!("runtime.{}", error.code()), error.to_string()),
         RuntimeFailure::Assertion { message, .. } => {
@@ -818,6 +846,12 @@ mod tests {
                 repair_hints: Vec::new(),
                 page: None,
             },
+            ExecutionEvent::TestTimedOut {
+                execution_id,
+                test_id,
+                active_step: Some(step_id),
+                timeout_ms: 25,
+            },
             ExecutionEvent::CleanupFailed {
                 execution_id,
                 test_id: Some(test_id),
@@ -860,6 +894,7 @@ mod tests {
                 "provider_call_finished",
                 "provider_call_failed",
                 "step_failed",
+                "test_timed_out",
                 "cleanup_failed",
                 "test_finished",
                 "test_skipped",
@@ -867,14 +902,16 @@ mod tests {
             ]
         );
         assert_eq!(reports[4].arguments["message"], "<redacted>");
-        assert_eq!(reports[8].exit_class, Some(ExitClass::Infrastructure));
+        assert_eq!(reports[8].exit_class, Some(ExitClass::TestFailure));
+        assert_eq!(reports[8].code.as_deref(), Some("runtime.test_timeout"));
+        assert_eq!(reports[9].exit_class, Some(ExitClass::Infrastructure));
         assert_eq!(
-            reports[8].code.as_deref(),
+            reports[9].code.as_deref(),
             Some("runtime.cleanup_browser_context_failed")
         );
-        assert_eq!(reports[9].exit_class, Some(ExitClass::Internal));
-        assert_eq!(reports[9].failure_class, Some(FailureClass::Internal));
-        assert_eq!(reports[9].outcome.as_deref(), Some("aborted"));
-        assert_eq!(reports[10].outcome.as_deref(), Some("skipped"));
+        assert_eq!(reports[10].exit_class, Some(ExitClass::Internal));
+        assert_eq!(reports[10].failure_class, Some(FailureClass::Internal));
+        assert_eq!(reports[10].outcome.as_deref(), Some("aborted"));
+        assert_eq!(reports[11].outcome.as_deref(), Some("skipped"));
     }
 }

@@ -130,9 +130,15 @@ async fn every_browser_operation_maps_to_the_page_with_current_timeouts() {
     };
     let mut page = RecordingPage::default();
     for operation in &operations {
-        execute_browser(&mut page, operation, &HashMap::new(), &options)
-            .await
-            .expect("browser operation");
+        execute_browser(
+            &mut page,
+            operation,
+            &HashMap::new(),
+            &options,
+            options.test_timeout,
+        )
+        .await
+        .expect("browser operation");
     }
 
     let target = BrowserLocator::Id("target".into());

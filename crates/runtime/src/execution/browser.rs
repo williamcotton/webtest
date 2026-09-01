@@ -20,23 +20,28 @@ pub(super) async fn execute_browser(
     operation: &BrowserOperation,
     environment: &HashMap<BindingId, Value>,
     options: &RunnerOptions,
+    remaining: Duration,
 ) -> Result<(), StepError> {
     match operation {
         BrowserOperation::Navigate { url } => {
             let url = string_value(evaluate(url, environment)?)?;
-            page.open(&resolve_url(options.base_url.as_deref(), &url)?)
-                .await
-                .map_err(StepError::Browser)
+            page.open_with_timeout(
+                &resolve_url(options.base_url.as_deref(), &url)?,
+                bounded_timeout(options.navigation_timeout, remaining),
+            )
+            .await
+            .map_err(StepError::Browser)
         }
-        BrowserOperation::Evaluate { expression } => {
-            page.evaluate(expression).await.map_err(StepError::Browser)
-        }
+        BrowserOperation::Evaluate { expression } => page
+            .evaluate_with_timeout(expression, remaining)
+            .await
+            .map_err(StepError::Browser),
         BrowserOperation::Click { locator } => page
             .perform(
                 &Action::Click {
                     locator: browser_locator(locator),
                 },
-                options.action_timeout,
+                bounded_timeout(options.action_timeout, remaining),
             )
             .await
             .map_err(StepError::Browser),
@@ -47,7 +52,7 @@ pub(super) async fn execute_browser(
                     locator: browser_locator(locator),
                     value,
                 },
-                options.action_timeout,
+                bounded_timeout(options.action_timeout, remaining),
             )
             .await
             .map_err(StepError::Browser)
@@ -59,7 +64,7 @@ pub(super) async fn execute_browser(
                     locator: browser_locator(locator),
                     value,
                 },
-                options.action_timeout,
+                bounded_timeout(options.action_timeout, remaining),
             )
             .await
             .map_err(StepError::Browser)
@@ -71,7 +76,7 @@ pub(super) async fn execute_browser(
                     locator: browser_locator(locator),
                     key,
                 },
-                options.action_timeout,
+                bounded_timeout(options.action_timeout, remaining),
             )
             .await
             .map_err(StepError::Browser)
@@ -82,7 +87,7 @@ pub(super) async fn execute_browser(
                     locator: browser_locator(locator),
                     checked: *checked,
                 },
-                options.action_timeout,
+                bounded_timeout(options.action_timeout, remaining),
             )
             .await
             .map_err(StepError::Browser),
@@ -93,7 +98,7 @@ pub(super) async fn execute_browser(
                     locator: browser_locator(locator),
                     option,
                 },
-                options.action_timeout,
+                bounded_timeout(options.action_timeout, remaining),
             )
             .await
             .map_err(StepError::Browser)
@@ -103,7 +108,7 @@ pub(super) async fn execute_browser(
                 &Action::Hover {
                     locator: browser_locator(locator),
                 },
-                options.action_timeout,
+                bounded_timeout(options.action_timeout, remaining),
             )
             .await
             .map_err(StepError::Browser),
@@ -115,10 +120,7 @@ pub(super) async fn execute_browser(
             .wait_for_locator(
                 &browser_locator(locator),
                 browser_state(*state),
-                bounded_timeout(
-                    timeout.unwrap_or(options.assertion_timeout),
-                    options.test_timeout,
-                ),
+                bounded_timeout(timeout.unwrap_or(options.assertion_timeout), remaining),
             )
             .await
             .map_err(StepError::Browser),
@@ -127,10 +129,7 @@ pub(super) async fn execute_browser(
             let expected = resolve_url(options.base_url.as_deref(), &url)?;
             page.wait_for_url(
                 &expected,
-                bounded_timeout(
-                    timeout.unwrap_or(options.assertion_timeout),
-                    options.test_timeout,
-                ),
+                bounded_timeout(timeout.unwrap_or(options.assertion_timeout), remaining),
             )
             .await
             .map_err(StepError::Browser)
@@ -138,8 +137,8 @@ pub(super) async fn execute_browser(
     }
 }
 
-pub(crate) fn bounded_timeout(timeout: Duration, test_timeout: Duration) -> Duration {
-    timeout.min(test_timeout)
+pub(crate) fn bounded_timeout(timeout: Duration, remaining: Duration) -> Duration {
+    timeout.min(remaining)
 }
 
 pub(crate) fn browser_locator(locator: &Locator) -> BrowserLocator {

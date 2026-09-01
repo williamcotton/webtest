@@ -242,12 +242,26 @@ mod cleanup_tests {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeFailure {
+    TestTimeout {
+        timeout_ms: u64,
+        active_step: Option<StepId>,
+    },
     Browser(webtest_browser::BrowserError),
     Provider(webtest_provider::ProviderError),
-    Assertion { message: String, diff: ValueDiff },
-    Decode { message: String },
-    Evaluation { code: String, message: String },
-    Internal { message: String },
+    Assertion {
+        message: String,
+        diff: ValueDiff,
+    },
+    Decode {
+        message: String,
+    },
+    Evaluation {
+        code: String,
+        message: String,
+    },
+    Internal {
+        message: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -310,6 +324,12 @@ pub enum ExecutionEvent {
         repair_hints: Vec<RepairHint>,
         page: Option<PageSummary>,
     },
+    TestTimedOut {
+        execution_id: ExecutionId,
+        test_id: TestId,
+        active_step: Option<StepId>,
+        timeout_ms: u64,
+    },
     CleanupFailed {
         execution_id: ExecutionId,
         test_id: Option<TestId>,
@@ -344,13 +364,17 @@ pub struct RuntimeObservation {
     pub file: FileId,
     pub source_revision: SourceRevision,
     pub test_id: TestId,
-    pub step_id: StepId,
+    pub step_id: Option<StepId>,
     pub range: TextRange,
     pub kind: RuntimeObservationKind,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeObservationKind {
+    TestTimeout {
+        timeout_ms: u64,
+        active_step: Option<StepId>,
+    },
     BrowserFailure {
         code: String,
         message: String,
@@ -467,7 +491,7 @@ mod tests {
             file,
             source_revision: revision,
             test_id: TestId(0),
-            step_id: StepId(0),
+            step_id: Some(StepId(0)),
             range: TextRange::empty(TextSize::new(0)),
             kind: RuntimeObservationKind::LocatorNotFound {
                 locator: Locator::Id("missing".into()),

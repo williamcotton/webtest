@@ -145,4 +145,8 @@ Run `webtest inspect [<url>] --reporter json` to obtain bounded semantic element
 
 Diagnostics may contain canonical `reference_queries` and bounded `repair_hints`. Runtime failures may contain locator replacement candidates when WebTest has safe evidence. Treat both as advisory, preserve their source ranges, and rerun `check` or `test` after any edit; WebTest does not apply repairs automatically.
 
+## Understand timeout budgets
+
+`[timeouts].test` is one deadline for each test, measured from that test's start through browser resource acquisition and body execution. It is not a file or suite timeout. Browser action, assertion, navigation, and provider-call defaults are each capped by the remaining test time. `[timeouts].provider_call` is the distinct default for provider calls; an explicit typed provider `timeout` may shorten that call but cannot extend the per-test deadline. Debugger pause time currently counts toward the same deadline. Cleanup runs after the provisional body outcome under the owned backend bounds and cannot turn a timeout into a pass.
+
 Do not infer unavailable roadmap syntax from prose or model memory. If a query is unknown, search the installed reference or inspect `webtest describe language --reporter json` rather than inventing a construct.

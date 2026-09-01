@@ -622,10 +622,17 @@ impl DebugState {
                         failure_output_data(failure),
                     )
                 }
-                TestOutcome::TimedOut { timeout } => (
+                TestOutcome::TimedOut {
+                    timeout,
+                    active_step,
+                } => (
                     "stderr",
                     format!("TIMED OUT after {}ms", timeout.as_millis()),
-                    Value::Null,
+                    json!({
+                        "code": "runtime.test_timeout",
+                        "timeout_ms": timeout.as_millis().min(u128::from(u64::MAX)) as u64,
+                        "active_step_id": active_step.map(|step| step.0),
+                    }),
                 ),
                 TestOutcome::Cancelled { reason } => {
                     ("stderr", format!("CANCELLED: {reason:?}"), Value::Null)
@@ -771,9 +778,13 @@ fn aborted_failure_output_data(
             "kind": "failed",
             "failure": failure_output_data(failure),
         }),
-        Some(webtest_runtime::PriorTestOutcome::TimedOut { timeout }) => json!({
+        Some(webtest_runtime::PriorTestOutcome::TimedOut {
+            timeout,
+            active_step,
+        }) => json!({
             "kind": "timed_out",
             "timeout_ms": timeout.as_millis().min(u128::from(u64::MAX)) as u64,
+            "active_step_id": active_step.map(|step| step.0),
         }),
         Some(webtest_runtime::PriorTestOutcome::Cancelled { reason }) => json!({
             "kind": "cancelled",
@@ -971,6 +982,10 @@ impl RunControl for DebugState {
 
     async fn before_step(&self, test: &PlannedTest, step: &PlannedStep) {
         self.pause_before_step(test, step, BTreeMap::new()).await;
+    }
+
+    fn after_test_timeout(&self, _test: &PlannedTest, _active_step: Option<&PlannedStep>) {
+        *lock(&self.paused) = None;
     }
 
     fn should_capture_bindings(&self, _test: &PlannedTest, step: &PlannedStep) -> bool {
@@ -1962,6 +1977,42 @@ mod tests {
             lock(&state.pending_pause).is_none(),
             "continue must cancel queued step mode"
         );
+    }
+
+    #[tokio::test]
+    async fn per_test_timeout_releases_the_visible_dap_pause_state() {
+        let source = "test \"x\" {\n    browser {\n        open \"about:blank\"\n    }\n}\n";
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join("timeout.webtest");
+        let program = LoadedProgram::load(path, Some(source.into())).expect("program");
+        let test = program.plan.tests[0].clone();
+        let step = test.steps[0].clone();
+        let state = DebugState::new_with_options(
+            ProtocolWriter::new(tokio::io::sink()),
+            Arc::new(UnusedBrowserHost),
+            RunnerOptions::default(),
+        );
+        lock(&state.breakpoints).insert(program.path.clone(), HashSet::from([3]));
+        *lock(&state.program) = Some(program);
+        let paused_state = Arc::clone(&state);
+        let paused_test = test.clone();
+        let paused_step = step.clone();
+        let task = tokio::spawn(async move {
+            paused_state.before_step(&paused_test, &paused_step).await;
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while lock(&state.paused).is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("breakpoint pause");
+
+        state.after_test_timeout(&test, Some(&step));
+
+        assert!(lock(&state.paused).is_none());
+        task.abort();
+        let _ = task.await;
     }
 
     #[tokio::test]

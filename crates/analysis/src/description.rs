@@ -42,6 +42,8 @@ pub struct ResolvedRuntimeConfiguration {
     pub schema_path: Option<String>,
     pub browser_base_url: Option<String>,
     pub server_base_url: Option<String>,
+    pub test_timeout_ms: u64,
+    pub provider_call_timeout_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1506,6 +1508,8 @@ mod tests {
             schema_path: Some("/project/.webtest/app-schema.json".into()),
             browser_base_url: None,
             server_base_url: None,
+            test_timeout_ms: 60_000,
+            provider_call_timeout_ms: 60_000,
         };
         let project = DescriptionProject {
             root: "/project".into(),

@@ -129,14 +129,17 @@ json_fields = ["password", "token", "secret"]
 
 [timeouts]
 browser_command = "10s"
+action = "5s"
+assertion = "5s"
 navigation = "30s"
+provider_call = "60s"
 test = "60s"
 
 [artifacts]
 directory = ".webtest/artifacts"
 ```
 
-Durations accept positive `ms`, `s`, or `m` values. Test roots, provider roots, and artifact paths must remain project-relative. Filesystem and process working roots are canonicalized before use. Excludes use slash-normalized glob syntax: `*` matches within one path component and `**` crosses directories. Hidden and symlinked discovery directories are not traversed. Unknown keys warn; malformed values and contradictory `browser.channel = "system"` plus `browser.path` are errors.
+Durations accept positive `ms`, `s`, or `m` values. `timeouts.test` is a fresh deadline for each test, not a file-wide deadline. Browser operations are capped by their action/assertion/navigation defaults and the remaining test time; provider calls use `timeouts.provider_call` and the same remaining-time cap. An explicit operation timeout can shorten but never extend its parent test deadline. Test roots, provider roots, and artifact paths must remain project-relative. Filesystem and process working roots are canonicalized before use. Excludes use slash-normalized glob syntax: `*` matches within one path component and `**` crosses directories. Hidden and symlinked discovery directories are not traversed. Unknown keys warn; malformed values and contradictory `browser.channel = "system"` plus `browser.path` are errors.
 
 `webtest build --emit` writes a versioned plan only after successful static analysis. Emission refuses literal values in configured secret fields or schema-secret provider arguments; it never writes a redacted placeholder that would alter execution semantics.
 

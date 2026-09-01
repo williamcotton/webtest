@@ -226,6 +226,7 @@ impl HumanTestProgress {
                 | ExecutionEvent::ProviderCallFinished { .. }
                 | ExecutionEvent::ProviderCallFailed { .. }
                 | ExecutionEvent::StepFailed { .. }
+                | ExecutionEvent::TestTimedOut { .. }
                 | ExecutionEvent::CleanupFailed { .. } => {}
             }
             Ok(())

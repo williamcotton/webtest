@@ -1911,6 +1911,7 @@ dependencies = [
  "webtest-browser",
  "webtest-browser-cdp",
  "webtest-format",
+ "webtest-hir",
  "webtest-observation",
  "webtest-plan",
  "webtest-provider",

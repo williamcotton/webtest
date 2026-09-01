@@ -84,6 +84,7 @@ pub struct TimeoutSection {
     pub action: Duration,
     pub assertion: Duration,
     pub navigation: Duration,
+    pub provider_call: Duration,
     pub test: Duration,
 }
 
@@ -232,6 +233,7 @@ impl Default for ProjectConfig {
                 action: Duration::from_secs(5),
                 assertion: Duration::from_secs(5),
                 navigation: Duration::from_secs(30),
+                provider_call: Duration::from_secs(60),
                 test: Duration::from_secs(60),
             },
             artifacts: ArtifactSection {
@@ -380,6 +382,7 @@ struct RawTimeouts {
     action: Option<String>,
     assertion: Option<String>,
     navigation: Option<String>,
+    provider_call: Option<String>,
     test: Option<String>,
     #[serde(flatten)]
     extra: toml::Table,
@@ -817,6 +820,11 @@ fn parse_config(
             raw.timeouts.navigation,
             defaults.timeouts.navigation,
         )?,
+        provider_call: timeout(
+            "provider_call",
+            raw.timeouts.provider_call,
+            defaults.timeouts.provider_call,
+        )?,
         test: timeout("test", raw.timeouts.test, defaults.timeouts.test)?,
     };
     let server_app = raw
@@ -832,6 +840,7 @@ fn parse_config(
         ("action", resolved_timeouts.action),
         ("assertion", resolved_timeouts.assertion),
         ("navigation", resolved_timeouts.navigation),
+        ("provider_call", resolved_timeouts.provider_call),
     ] {
         if value > resolved_timeouts.test {
             return Err(ProjectError::InvalidConfig {
@@ -1470,12 +1479,14 @@ mod tests {
         let path = Path::new("webtest.toml");
         let (config, warnings) = parse_config(
             path,
-            "mystery = true\n[timeouts]\nbrowser_command = \"250ms\"\n[test]\nfuture = true\n",
+            "mystery = true\n[timeouts]\nbrowser_command = \"250ms\"\nfuture = true\n[test]\nfuture = true\n",
         )
         .expect("config");
         assert_eq!(config.timeouts.browser_command, Duration::from_millis(250));
+        assert_eq!(config.timeouts.provider_call, Duration::from_secs(60));
         assert_eq!(warnings[0].key, "mystery");
         assert_eq!(warnings[1].key, "test");
+        assert_eq!(warnings[2].key, "timeouts.future");
 
         let error = parse_config(path, "[browser]\nchannel = \"system\"\npath = \"chrome\"\n")
             .expect_err("contradictory browser config");
@@ -1594,6 +1605,7 @@ test_id_attribute = "data-test"
 action = "2s"
 assertion = "3s"
 navigation = "10s"
+provider_call = "11s"
 test = "20s"
 
 [evidence]
@@ -1618,12 +1630,20 @@ max_dom_bytes = 4096
         assert_eq!(config.browser.test_id_attribute, "data-test");
         assert_eq!(config.timeouts.action, Duration::from_secs(2));
         assert_eq!(config.timeouts.assertion, Duration::from_secs(3));
+        assert_eq!(config.timeouts.provider_call, Duration::from_secs(11));
         assert_eq!(config.evidence.dom_snapshot, EvidenceMode::Off);
         assert_eq!(config.evidence.max_dom_bytes, 4096);
 
         assert!(parse_config(path, "[browser]\nbase_url = \"/relative\"\n").is_err());
         assert!(parse_config(path, "[browser]\nviewport = { width = 0, height = 10 }\n").is_err());
         assert!(parse_config(path, "[timeouts]\naction = \"61s\"\ntest = \"60s\"\n").is_err());
+        assert!(
+            parse_config(
+                path,
+                "[timeouts]\nprovider_call = \"61s\"\ntest = \"60s\"\n"
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -57,6 +57,31 @@ async fn command_timeout_removes_correlation_entry() {
 }
 
 #[tokio::test]
+async fn operation_remainder_caps_the_browser_command_budget() {
+    let Some((connection, mut server)) = fake_cdp(Duration::from_secs(5)).await else {
+        return;
+    };
+    let server_task = tokio::spawn(async move {
+        let _ = server.next().await.expect("command").expect("websocket");
+        sleep(Duration::from_millis(100)).await;
+    });
+
+    let error = connection
+        .command_with_timeout("Capped", None, None, Duration::from_millis(20))
+        .await
+        .expect_err("operation cap");
+    assert_eq!(
+        error,
+        BrowserError::CommandTimeout {
+            method: "Capped".into(),
+            timeout_ms: 20,
+        }
+    );
+    assert_eq!(connection.in_flight(), 0);
+    server_task.await.expect("server task");
+}
+
+#[tokio::test]
 async fn out_of_order_responses_remain_correlated() {
     let Some((connection, mut server)) = fake_cdp(Duration::from_secs(1)).await else {
         return;

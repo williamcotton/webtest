@@ -603,6 +603,7 @@ fn runtime_configuration_reference() -> ConstructDescription {
         "resolved adapter transport command arguments".into(),
         "working directory schema path".into(),
         "browser base URL server base URL".into(),
+        "per-test deadline provider call timeout".into(),
         "configuration debugging".into(),
     ];
     value.constraints = vec![
@@ -622,7 +623,7 @@ fn runtime_configuration_reference() -> ConstructDescription {
     value.guidance = vec![
         guidance(
             "runtime_configuration_fields",
-            "The machine-readable `resolved_configuration` object reports selected adapter and transport, resolved command and arguments, working directory, schema path, browser base URL, and server base URL. Absent configuration is represented as null or an empty argument list.",
+            "The machine-readable `resolved_configuration` object reports selected adapter and transport, resolved command and arguments, working directory, schema path, browser and server base URLs, the per-test deadline, and the distinct provider-call default. Absent optional configuration is represented as null or an empty argument list; timeout values are integer milliseconds.",
         ),
         guidance(
             "runtime_configuration_transport",

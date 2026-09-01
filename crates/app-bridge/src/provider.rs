@@ -966,6 +966,75 @@ struct PendingRequest {
     expected: ExpectedResponse,
 }
 
+struct PendingRequestCancellation {
+    id: u64,
+    expected: ExpectedResponse,
+    pending: Arc<Mutex<PendingState>>,
+    writer: Arc<Mutex<WriteHalf<DynIo>>>,
+    max_message_bytes: usize,
+    supports_cancel: bool,
+    armed: bool,
+}
+
+impl PendingRequestCancellation {
+    fn new(client: &BridgeClient, id: u64, expected: ExpectedResponse) -> Self {
+        Self {
+            id,
+            expected,
+            pending: Arc::clone(&client.pending),
+            writer: Arc::clone(&client.writer),
+            max_message_bytes: client.max_message_bytes,
+            supports_cancel: client.supports_cancel,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingRequestCancellation {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let id = self.id;
+        let expected = self.expected;
+        let pending = Arc::clone(&self.pending);
+        let writer = Arc::clone(&self.writer);
+        let max_message_bytes = self.max_message_bytes;
+        let supports_cancel = self.supports_cancel;
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        runtime.spawn(async move {
+            let removed = {
+                let mut state = pending.lock().await;
+                let request = state.requests.remove(&id);
+                if let Some(request) = request {
+                    state.cancelled.insert(id, request.expected);
+                    true
+                } else {
+                    state.event_counts.remove(&id);
+                    false
+                }
+            };
+            if removed && expected == ExpectedResponse::Call && supports_cancel {
+                let _ = write_frame(
+                    &mut *writer.lock().await,
+                    &BridgeMessage::Cancel {
+                        id,
+                        reason: "deadline".into(),
+                    },
+                    max_message_bytes,
+                )
+                .await;
+            }
+        });
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExpectedResponse {
     Call,
@@ -1231,6 +1300,7 @@ impl BridgeClient {
                 pending.event_counts.insert(id, 0);
             }
         }
+        let mut cancellation = PendingRequestCancellation::new(self, id, expected);
         if let Err(error) = write_frame(
             &mut *self.writer.lock().await,
             &message,
@@ -1241,9 +1311,10 @@ impl BridgeClient {
             let mut pending = self.pending.lock().await;
             pending.requests.remove(&id);
             pending.event_counts.remove(&id);
+            cancellation.disarm();
             return Err(protocol_from_frame(error));
         }
-        match tokio::time::timeout(timeout, receiver).await {
+        let result = match tokio::time::timeout(timeout, receiver).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(ProviderError::BridgeTransport {
                 message: "bridge response channel closed".into(),
@@ -1260,7 +1331,9 @@ impl BridgeClient {
                     timeout_ms: duration_millis(timeout),
                 })
             }
-        }
+        };
+        cancellation.disarm();
+        result
     }
 
     async fn shutdown(&self, timeout: Duration) -> Result<(), ProviderError> {
@@ -2261,6 +2334,57 @@ mod tests {
                 .expect("later call"),
             serde_json::json!("fast")
         );
+        client
+            .shutdown(Duration::from_secs(1))
+            .await
+            .expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn dropping_a_call_future_reserves_correlation_and_sends_cancel_cleanup() {
+        let manifest = manifest();
+        let token = "secret".to_owned();
+        let (runner, bridge) = tokio::io::duplex(16_384);
+        tokio::spawn(delayed_bridge(bridge, token.clone(), manifest.clone()));
+        let client = Arc::new(
+            BridgeClient::handshake(
+                Box::new(runner),
+                token,
+                "run".into(),
+                &manifest,
+                &AppProviderConfig::default(),
+            )
+            .await
+            .expect("handshake"),
+        );
+        let active = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                client
+                    .call(
+                        "echo",
+                        serde_json::json!({"value": "slow"}),
+                        Duration::from_secs(30),
+                    )
+                    .await
+            })
+        };
+        for _ in 0..20 {
+            if !client.pending.lock().await.requests.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        active.abort();
+        let _ = active.await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        {
+            let pending = client.pending.lock().await;
+            assert!(pending.requests.is_empty());
+            assert_eq!(pending.cancelled.get(&2), Some(&ExpectedResponse::Call));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(client.pending.lock().await.cancelled.is_empty());
         client
             .shutdown(Duration::from_secs(1))
             .await

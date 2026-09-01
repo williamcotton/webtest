@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use serde::Deserialize;
-use tokio::time::{Instant, sleep};
+use tokio::time::Instant;
 use webtest_browser::{BrowserError, CandidateEvidence, Locator, LocatorState};
 
 use super::{
@@ -32,12 +32,30 @@ pub(super) async fn wait_for_locator(
     page: &CdpPage,
     locator: &Locator,
     state: LocatorState,
-    timeout: Duration,
+    deadline: Instant,
 ) -> Result<(), BrowserError> {
-    let deadline = Instant::now() + timeout;
     let mut backoff = Duration::from_millis(20);
+    let mut last_snapshot = None;
     loop {
-        match resolve(page, locator).await {
+        if Instant::now() >= deadline {
+            return Err(locator_deadline_failure(
+                locator,
+                state,
+                last_snapshot.take(),
+            ));
+        }
+        let resolution =
+            match super::complete_before_deadline(deadline, resolve(page, locator)).await {
+                Ok(resolution) => resolution,
+                Err(()) => {
+                    return Err(locator_deadline_failure(
+                        locator,
+                        state,
+                        last_snapshot.take(),
+                    ));
+                }
+            };
+        match resolution {
             Err(BrowserError::LocatorInvalid { locator, message }) => {
                 return Err(BrowserError::LocatorInvalid { locator, message });
             }
@@ -46,38 +64,57 @@ pub(super) async fn wait_for_locator(
                 if state_satisfied(&snapshot, state) {
                     return Ok(());
                 }
-                let final_actual = snapshot.state_summary();
-                if snapshot.matches > 1 {
-                    if Instant::now() >= deadline {
-                        return Err(BrowserError::LocatorAmbiguous {
-                            locator: locator.clone(),
-                            matches: snapshot.matches,
-                        });
-                    }
-                } else if Instant::now() >= deadline {
-                    if snapshot.matches == 0
-                        && !matches!(state, LocatorState::Hidden | LocatorState::Detached)
-                    {
-                        return Err(BrowserError::LocatorNotFound {
-                            locator: locator.clone(),
-                        });
-                    }
-                    if state == LocatorState::Visible && snapshot.matches == 1 && !snapshot.visible
-                    {
-                        return Err(BrowserError::LocatorNotVisible {
-                            locator: locator.clone(),
-                        });
-                    }
-                    return Err(BrowserError::AssertionFailed {
-                        locator: locator.clone(),
-                        expected: state,
-                        actual: final_actual,
-                    });
+                if Instant::now() >= deadline {
+                    return Err(locator_state_failure(locator, state, snapshot));
                 }
+                last_snapshot = Some(snapshot);
             }
         }
-        sleep(backoff).await;
+        tokio::time::sleep_until(deadline.min(Instant::now() + backoff)).await;
         backoff = (backoff * 2).min(Duration::from_millis(100));
+    }
+}
+
+fn locator_deadline_failure(
+    locator: &Locator,
+    state: LocatorState,
+    last_snapshot: Option<ResolveSnapshot>,
+) -> BrowserError {
+    last_snapshot.map_or_else(
+        || BrowserError::AssertionFailed {
+            locator: locator.clone(),
+            expected: state,
+            actual: "the deadline expired before the locator state could be observed".into(),
+        },
+        |snapshot| locator_state_failure(locator, state, snapshot),
+    )
+}
+
+fn locator_state_failure(
+    locator: &Locator,
+    state: LocatorState,
+    snapshot: ResolveSnapshot,
+) -> BrowserError {
+    if snapshot.matches > 1 {
+        return BrowserError::LocatorAmbiguous {
+            locator: locator.clone(),
+            matches: snapshot.matches,
+        };
+    }
+    if snapshot.matches == 0 && !matches!(state, LocatorState::Hidden | LocatorState::Detached) {
+        return BrowserError::LocatorNotFound {
+            locator: locator.clone(),
+        };
+    }
+    if state == LocatorState::Visible && snapshot.matches == 1 && !snapshot.visible {
+        return BrowserError::LocatorNotVisible {
+            locator: locator.clone(),
+        };
+    }
+    BrowserError::AssertionFailed {
+        locator: locator.clone(),
+        expected: state,
+        actual: snapshot.state_summary(),
     }
 }
 

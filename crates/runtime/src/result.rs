@@ -2,6 +2,7 @@ use std::{collections::BTreeMap, time::Duration};
 
 use webtest_browser::{PageEvidence, PageInspection, RepairHint};
 use webtest_feedback::FailureClass;
+use webtest_hir::{StepId, TestId};
 use webtest_observation::{
     CancellationReason, ExecutionEvent, ExecutionId, RunOutcomeKind, SkipReason, TestOutcomeKind,
 };
@@ -23,6 +24,7 @@ pub struct StepFailure {
 
 #[derive(Clone, Debug)]
 pub struct TestResult {
+    pub test_id: TestId,
     pub name: String,
     pub outcome: TestOutcome,
     pub duration: Duration,
@@ -35,6 +37,7 @@ pub enum TestOutcome {
     Failed(Box<StepFailure>),
     TimedOut {
         timeout: Duration,
+        active_step: Option<StepId>,
     },
     Cancelled {
         reason: CancellationReason,
@@ -52,8 +55,13 @@ pub enum TestOutcome {
 #[derive(Clone, Debug)]
 pub enum PriorTestOutcome {
     Failed(Box<StepFailure>),
-    TimedOut { timeout: Duration },
-    Cancelled { reason: CancellationReason },
+    TimedOut {
+        timeout: Duration,
+        active_step: Option<StepId>,
+    },
+    Cancelled {
+        reason: CancellationReason,
+    },
 }
 
 impl TestOutcome {

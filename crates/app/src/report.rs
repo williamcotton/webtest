@@ -809,7 +809,7 @@ fn xml(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use webtest_hir::TestId;
+    use webtest_hir::{StepId, TestId};
     use webtest_observation::{
         ExecutionEvent, ExecutionId, RunOutcomeKind, SkipReason, TestOutcomeKind,
     };
@@ -982,6 +982,86 @@ mod tests {
         report
     }
 
+    fn timeout_sample() -> CommandReport {
+        let execution_id = ExecutionId(11);
+        let test_id = TestId(3);
+        let step_id = StepId(7);
+        let events = crate::runtime_output::event_reports(
+            "tests/timeout.webtest",
+            &[
+                ExecutionEvent::RunStarted { execution_id },
+                ExecutionEvent::TestStarted {
+                    execution_id,
+                    test_id,
+                    name: "slow".into(),
+                },
+                ExecutionEvent::StepStarted {
+                    execution_id,
+                    test_id,
+                    step_id,
+                },
+                ExecutionEvent::TestTimedOut {
+                    execution_id,
+                    test_id,
+                    active_step: Some(step_id),
+                    timeout_ms: 250,
+                },
+                ExecutionEvent::TestFinished {
+                    execution_id,
+                    test_id,
+                    outcome: TestOutcomeKind::TimedOut,
+                    failure_class: Some(FailureClass::Test),
+                },
+                ExecutionEvent::RunFinished {
+                    execution_id,
+                    outcome: RunOutcomeKind::Completed,
+                    failure_class: None,
+                },
+            ],
+        );
+        let mut report = CommandReport::new("test", "/project");
+        report.files.push(FileReport {
+            path: "tests/timeout.webtest".into(),
+            exit_class: ExitClass::TestFailure,
+            source_revision: "timeout".into(),
+            duration_nanos: 250_000_000,
+            diagnostics: Vec::new(),
+            tests: vec![TestReport {
+                name: "slow".into(),
+                exit_class: ExitClass::TestFailure,
+                outcome: TestReportOutcome::TimedOut,
+                failure_class: Some(FailureClass::Test),
+                reason: Some("timed out after 250ms".into()),
+                timeout_nanos: Some(250_000_000),
+                duration_nanos: 250_000_000,
+                failure: Some(FailureReport {
+                    diagnostic_schema_version: webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
+                    repair_hint_schema_version: webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
+                    code: "runtime.test_timeout".into(),
+                    message: "test timed out after 250ms".into(),
+                    span: None,
+                    diff: None,
+                    artifacts: Vec::new(),
+                    semantic_details: Some(serde_json::json!({
+                        "test_id": 3,
+                        "active_step_id": 7,
+                        "timeout_ms": 250,
+                    })),
+                    repair_hints: Vec::new(),
+                    page: None,
+                    secondary: Vec::new(),
+                }),
+            }],
+            outcome: Some(RunReportOutcome::Completed),
+            reason: None,
+            execution_error: None,
+            events,
+        });
+        report.exit_class = ExitClass::TestFailure;
+        report.finish();
+        report
+    }
+
     #[test]
     fn human_output_has_source_snippet_and_precise_underline() {
         let mut output = Vec::new();
@@ -1107,6 +1187,61 @@ mod tests {
             assert!(!output.contains("\"passed\": true"));
             assert!(!output.contains("\"passed\":true"));
             assert!(!output.contains("... ok"));
+        }
+    }
+
+    #[test]
+    fn timeout_is_typed_and_consistent_across_every_reporter() {
+        for reporter in [
+            Reporter::Human,
+            Reporter::Concise,
+            Reporter::Json,
+            Reporter::Events,
+            Reporter::Junit,
+        ] {
+            let mut output = Vec::new();
+            timeout_sample()
+                .write(reporter, &mut output)
+                .expect("timeout report");
+            let output = String::from_utf8(output).expect("UTF-8");
+            assert!(
+                output.contains("TIMED OUT")
+                    || output.contains("timed_out")
+                    || output.contains("test timed out"),
+                "{reporter:?}: {output}"
+            );
+            assert!(
+                !output.contains("test file exceeded"),
+                "{reporter:?}: {output}"
+            );
+            match reporter {
+                Reporter::Human => assert!(
+                    output.contains("error[runtime.test_timeout]: test timed out after 250ms")
+                ),
+                Reporter::Concise => {
+                    assert!(output.contains("tests/timeout.webtest: test \"slow\": TIMED OUT"))
+                }
+                Reporter::Json => {
+                    let value: serde_json::Value = serde_json::from_str(&output).expect("JSON");
+                    assert_eq!(value["files"][0]["tests"][0]["outcome"], "timed_out");
+                    assert_eq!(
+                        value["files"][0]["tests"][0]["failure"]["code"],
+                        "runtime.test_timeout"
+                    );
+                    assert_eq!(
+                        value["files"][0]["tests"][0]["failure"]["semantic_details"]["active_step_id"],
+                        7
+                    );
+                }
+                Reporter::Events => {
+                    assert!(output.contains("\"type\":\"test_timed_out\""));
+                    assert!(output.contains("\"code\":\"runtime.test_timeout\""));
+                    assert!(output.contains("\"step_id\":7"));
+                }
+                Reporter::Junit => assert!(output.contains(
+                    "<failure type=\"runtime.test_timeout\" message=\"test timed out after 250ms\""
+                )),
+            }
         }
     }
 

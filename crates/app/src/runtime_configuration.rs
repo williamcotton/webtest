@@ -13,6 +13,8 @@ pub(crate) fn runner_options(project: &Project) -> RunnerOptions {
         base_url: project.config.browser.base_url.clone(),
         action_timeout: project.config.timeouts.action,
         assertion_timeout: project.config.timeouts.assertion,
+        navigation_timeout: project.config.timeouts.navigation,
+        provider_call_timeout: project.config.timeouts.provider_call,
         test_timeout: project.config.timeouts.test,
         browser_context: browser_context_options(project),
         evidence: EvidenceOptions {
@@ -120,7 +122,13 @@ pub(crate) fn resolved_runtime_configuration(project: &Project) -> ResolvedRunti
         schema_path: provider.map(|app| normalized_path(&project.root.join(&app.schema))),
         browser_base_url: project.config.browser.base_url.clone(),
         server_base_url: project.config.server.base_url.clone(),
+        test_timeout_ms: duration_millis(project.config.timeouts.test),
+        provider_call_timeout_ms: duration_millis(project.config.timeouts.provider_call),
     }
+}
+
+fn duration_millis(duration: std::time::Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
 
 fn redact_secret_arguments(arguments: &[String]) -> Vec<String> {

@@ -1,3 +1,4 @@
+use std::time::Duration;
 use webtest_browser::Page;
 use webtest_plan::{PlannedStep, TestOperation};
 use webtest_provider::ProviderRegistry;
@@ -12,6 +13,7 @@ pub(super) async fn execute_step(
     page: &mut Option<Box<dyn Page>>,
     step: &PlannedStep,
     state: &mut TestExecutionState,
+    remaining: Duration,
 ) -> Result<(), StepError> {
     match &step.operation {
         TestOperation::EvaluatePure(operation) => {
@@ -22,7 +24,8 @@ pub(super) async fn execute_step(
             Ok(())
         }
         TestOperation::ServerProviderCall(call) => {
-            let value = execute_provider(providers, options, call, state.environment()).await?;
+            let value =
+                execute_provider(providers, options, call, state.environment(), remaining).await?;
             if let Some(binding) = call.result_binding {
                 state.bind(binding, call.result_name.as_deref(), value);
             }
@@ -32,10 +35,17 @@ pub(super) async fn execute_step(
             let page = page.as_deref_mut().ok_or_else(|| {
                 StepError::Internal("browser operation has no browser page".into())
             })?;
-            execute_browser(page, operation, state.environment(), options).await
+            execute_browser(page, operation, state.environment(), options, remaining).await
         }
         TestOperation::Assertion(assertion) => {
-            execute_assertion(page.as_deref_mut(), assertion, state.environment(), options).await
+            execute_assertion(
+                page.as_deref_mut(),
+                assertion,
+                state.environment(),
+                options,
+                remaining,
+            )
+            .await
         }
     }
 }

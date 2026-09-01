@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use tokio::time::{Instant, sleep};
+use tokio::time::Instant;
 use webtest_browser::{Action, BrowserError, Locator, LocatorState};
 
 use crate::wire::bounded_text;
@@ -16,8 +16,9 @@ pub(super) async fn perform(
     page: &CdpPage,
     action: &Action,
     timeout: Duration,
+    deadline: Instant,
 ) -> Result<(), BrowserError> {
-    let snapshot = wait_for_actionability(page, action, timeout).await?;
+    let snapshot = wait_for_actionability(page, action, timeout, deadline).await?;
     match action {
         Action::Click { .. } => physical_click(page, &snapshot).await,
         Action::Hover { .. } => mouse_move(page, &snapshot).await,
@@ -73,14 +74,34 @@ async fn wait_for_actionability(
     page: &CdpPage,
     action: &Action,
     timeout: Duration,
+    deadline: Instant,
 ) -> Result<ResolveSnapshot, BrowserError> {
     let locator = action.locator();
-    let deadline = Instant::now() + timeout;
     let mut backoff = Duration::from_millis(20);
-    let mut observed_failure = None;
+    let mut last_failure = None;
     let mut failures_changed = false;
     loop {
-        let first = locator::resolve(page, locator).await?;
+        if Instant::now() >= deadline {
+            return terminal_actionability_failure(
+                locator,
+                timeout,
+                failures_changed,
+                last_failure.take(),
+            );
+        }
+        let first = match super::complete_before_deadline(deadline, locator::resolve(page, locator))
+            .await
+        {
+            Ok(result) => result?,
+            Err(()) => {
+                return terminal_actionability_failure(
+                    locator,
+                    timeout,
+                    failures_changed,
+                    last_failure.take(),
+                );
+            }
+        };
         let last_error = match first.matches {
             0 => BrowserError::LocatorNotFound {
                 locator: locator.clone(),
@@ -122,8 +143,32 @@ async fn wait_for_actionability(
                 }
             }
             _ => {
-                sleep(Duration::from_millis(50)).await;
-                let second = locator::resolve(page, locator).await?;
+                tokio::time::sleep_until(deadline.min(Instant::now() + Duration::from_millis(50)))
+                    .await;
+                if Instant::now() >= deadline {
+                    return terminal_actionability_failure(
+                        locator,
+                        timeout,
+                        failures_changed,
+                        last_failure.take(),
+                    );
+                }
+                let second = match super::complete_before_deadline(
+                    deadline,
+                    locator::resolve(page, locator),
+                )
+                .await
+                {
+                    Ok(result) => result?,
+                    Err(()) => {
+                        return terminal_actionability_failure(
+                            locator,
+                            timeout,
+                            failures_changed,
+                            last_failure.take(),
+                        );
+                    }
+                };
                 if second.matches == 0 {
                     BrowserError::ElementDetached {
                         locator: locator.clone(),
@@ -146,22 +191,35 @@ async fn wait_for_actionability(
                 }
             }
         };
-        if let Some(previous) = observed_failure {
-            failures_changed |= previous != last_error.code();
+        if let Some(previous) = last_failure.as_ref() {
+            failures_changed |= previous.code() != last_error.code();
         }
-        observed_failure = Some(last_error.code());
         if Instant::now() >= deadline {
-            return if failures_changed {
-                Err(BrowserError::ActionTimeout {
-                    locator: locator.clone(),
-                    timeout_ms: duration_millis(timeout),
-                })
-            } else {
-                Err(last_error)
-            };
+            return terminal_actionability_failure(
+                locator,
+                timeout,
+                failures_changed,
+                Some(last_error),
+            );
         }
-        sleep(backoff.min(deadline.saturating_duration_since(Instant::now()))).await;
+        last_failure = Some(last_error);
+        tokio::time::sleep_until(deadline.min(Instant::now() + backoff)).await;
         backoff = (backoff * 2).min(Duration::from_millis(100));
+    }
+}
+
+fn terminal_actionability_failure(
+    locator: &Locator,
+    timeout: Duration,
+    failures_changed: bool,
+    last_failure: Option<BrowserError>,
+) -> Result<ResolveSnapshot, BrowserError> {
+    match (failures_changed, last_failure) {
+        (false, Some(last_failure)) => Err(last_failure),
+        _ => Err(BrowserError::ActionTimeout {
+            locator: locator.clone(),
+            timeout_ms: duration_millis(timeout),
+        }),
     }
 }
 

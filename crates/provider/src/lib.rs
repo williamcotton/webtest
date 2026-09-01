@@ -750,7 +750,7 @@ impl ProviderRegistry {
     pub async fn call(
         &self,
         call: ProviderCall,
-        context: CallContext,
+        mut context: CallContext,
     ) -> Result<ProviderResult, ProviderError> {
         let provider =
             self.providers
@@ -758,6 +758,20 @@ impl ProviderRegistry {
                 .ok_or_else(|| ProviderError::NotRegistered {
                     provider: call.provider.0.clone(),
                 })?;
+        if self
+            .schemas
+            .get(&call.provider.0)
+            .and_then(|schema| schema.operation(&call.operation.0))
+            .is_some_and(|operation| {
+                operation
+                    .parameters
+                    .iter()
+                    .any(|parameter| parameter.name == "timeout" && parameter.ty == Type::Duration)
+            })
+            && let Some(explicit) = duration_argument_value(&call.arguments, "timeout")
+        {
+            context.timeout = context.timeout.min(explicit);
+        }
         provider.call(call, context).await
     }
 
@@ -1011,7 +1025,7 @@ impl ServerProvider for HttpProvider {
         let arguments = call.arguments.clone();
         let limit = self.config.max_response_bytes;
         let agent = self.agent.clone();
-        let timeout = duration_argument(&arguments, "timeout").unwrap_or(context.timeout);
+        let timeout = effective_timeout(&arguments, context.timeout);
         tokio::task::spawn_blocking(move || {
             let mut request = agent.request(&method, &url).timeout(timeout);
             if let Some(headers) = record_argument(&arguments, "headers")? {
@@ -1162,6 +1176,7 @@ impl ServerProvider for ProcessProvider {
             .map_err(|error| ProviderError::ProcessSpawn {
                 message: error.to_string(),
             })?;
+        let mut process_group = ProcessGroupGuard::new(child.id());
         if let Some(Value::String(stdin)) = call.arguments.get("stdin")
             && let Some(mut input) = child.stdin.take()
         {
@@ -1171,16 +1186,23 @@ impl ServerProvider for ProcessProvider {
                 }
             })?;
         }
-        let timeout = duration_argument(&call.arguments, "timeout").unwrap_or(context.timeout);
+        let timeout = effective_timeout(&call.arguments, context.timeout);
         let process_id = child.id();
         let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
-            Ok(output) => output.map_err(|error| ProviderError::ProcessSpawn {
-                message: error.to_string(),
-            })?,
+            Ok(output) => {
+                process_group.disarm();
+                output.map_err(|error| ProviderError::ProcessSpawn {
+                    message: error.to_string(),
+                })?
+            }
             Err(_) => {
+                let cleanup_succeeded = cleanup_process_group(process_id).await;
+                if cleanup_succeeded {
+                    process_group.disarm();
+                }
                 return Err(ProviderError::ProcessTimeout {
                     timeout_ms: timeout.as_millis().min(u128::from(u64::MAX)) as u64,
-                    cleanup_succeeded: cleanup_process_group(process_id).await,
+                    cleanup_succeeded,
                 });
             }
         };
@@ -1201,6 +1223,41 @@ impl ServerProvider for ProcessProvider {
             }),
         })
     }
+}
+
+#[cfg(feature = "native")]
+struct ProcessGroupGuard {
+    process_id: Option<u32>,
+}
+
+#[cfg(feature = "native")]
+impl ProcessGroupGuard {
+    const fn new(process_id: Option<u32>) -> Self {
+        Self { process_id }
+    }
+
+    fn disarm(&mut self) {
+        self.process_id = None;
+    }
+}
+
+#[cfg(all(feature = "native", unix))]
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        let Some(process_id) = self.process_id.and_then(|id| i32::try_from(id).ok()) else {
+            return;
+        };
+        // The provider created this process group. A synchronous signal in Drop
+        // keeps cancellation of the parent future from leaving descendants alive.
+        unsafe {
+            libc::kill(-process_id, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(all(feature = "native", not(unix)))]
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {}
 }
 
 #[cfg(feature = "native")]
@@ -1413,6 +1470,17 @@ fn scalar_string(value: &Value) -> Result<std::borrow::Cow<'_, str>, ProviderErr
 
 #[cfg(feature = "native")]
 fn duration_argument(arguments: &BTreeMap<String, Value>, name: &str) -> Option<Duration> {
+    duration_argument_value(arguments, name)
+}
+
+#[cfg(feature = "native")]
+fn effective_timeout(arguments: &BTreeMap<String, Value>, maximum: Duration) -> Duration {
+    duration_argument(arguments, "timeout")
+        .unwrap_or(maximum)
+        .min(maximum)
+}
+
+fn duration_argument_value(arguments: &BTreeMap<String, Value>, name: &str) -> Option<Duration> {
     match arguments.get(name) {
         Some(Value::DurationMillis(value)) => Some(Duration::from_millis(*value)),
         _ => None,
@@ -1503,6 +1571,7 @@ async fn cleanup_process_group(_process_id: Option<u32>) -> bool {
 #[cfg(all(test, feature = "native"))]
 mod tests {
     use std::io::{Read, Write};
+    use std::sync::Mutex;
 
     use super::*;
 
@@ -1521,6 +1590,75 @@ mod tests {
             arguments,
             schema_hash: String::new(),
         }
+    }
+
+    struct TimeoutCapture {
+        calls: Mutex<Vec<Duration>>,
+    }
+
+    #[async_trait]
+    impl ServerProvider for TimeoutCapture {
+        fn schema(&self) -> ProviderSchema {
+            ProviderSchema {
+                name: ProviderName("timed".into()),
+                operations: [(
+                    "call".into(),
+                    OperationSchema {
+                        name: OperationName("call".into()),
+                        parameters: vec![parameter("timeout", Type::Duration, false, false)],
+                        result: Type::Null,
+                        capability: Capability::Server,
+                        documentation: String::new(),
+                        retry_safe: false,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                schema_identity: None,
+            }
+        }
+
+        async fn call(
+            &self,
+            _call: ProviderCall,
+            context: CallContext,
+        ) -> Result<ProviderResult, ProviderError> {
+            self.calls.lock().expect("calls").push(context.timeout);
+            Ok(ProviderResult { value: Value::Null })
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_provider_timeout_shortens_but_never_extends_parent_context() {
+        let provider = Arc::new(TimeoutCapture {
+            calls: Mutex::new(Vec::new()),
+        });
+        let mut registry = ProviderRegistry::default();
+        registry.register(provider.clone());
+        let root = tempfile::tempdir().expect("project root");
+        for explicit in [500, 5_000] {
+            registry
+                .call(
+                    call(
+                        "timed",
+                        "call",
+                        [("timeout".into(), Value::DurationMillis(explicit))]
+                            .into_iter()
+                            .collect(),
+                    ),
+                    CallContext {
+                        project_root: root.path().into(),
+                        timeout: Duration::from_secs(2),
+                        redacted_json_fields: Vec::new(),
+                    },
+                )
+                .await
+                .expect("provider call");
+        }
+        assert_eq!(
+            *provider.calls.lock().expect("calls"),
+            [Duration::from_millis(500), Duration::from_secs(2)]
+        );
     }
 
     #[test]
@@ -1563,6 +1701,28 @@ mod tests {
             safe_path(Path::new("/project"), "../secret"),
             Err(ProviderError::PathEscape { .. })
         ));
+    }
+
+    #[test]
+    fn built_in_http_and_process_timeout_arguments_share_the_parent_cap() {
+        let explicit = [("timeout".into(), Value::DurationMillis(5_000))]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            effective_timeout(&explicit, Duration::from_secs(2)),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            effective_timeout(&BTreeMap::new(), Duration::from_secs(2)),
+            Duration::from_secs(2)
+        );
+        let shorter = [("timeout".into(), Value::DurationMillis(250))]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            effective_timeout(&shorter, Duration::from_secs(2)),
+            Duration::from_millis(250)
+        );
     }
 
     #[test]

@@ -21,6 +21,7 @@ browser_command = "10s"
 action = "5s"
 assertion = "5s"
 navigation = "30s"
+provider_call = "60s"
 test = "60s"
 
 [artifacts]

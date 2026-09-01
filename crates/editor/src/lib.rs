@@ -139,6 +139,22 @@ impl EditorService {
                 .observations_for(file, revision)
                 .into_iter()
                 .map(|observation| match observation.kind {
+                    RuntimeObservationKind::TestTimeout {
+                        timeout_ms,
+                        active_step,
+                    } => Diagnostic {
+                        range: observation.range,
+                        severity: DiagnosticSeverity::Error,
+                        code: "runtime.test_timeout",
+                        message: format!("Test timed out after {timeout_ms}ms."),
+                        source: DiagnosticSource::Runtime,
+                        semantic_details: Some(serde_json::json!({
+                            "timeout_ms": timeout_ms,
+                            "active_step_id": active_step.map(|step| step.0),
+                        })),
+                        repair_hints: Vec::new(),
+                        reference_queries: Vec::new(),
+                    },
                     RuntimeObservationKind::BrowserFailure {
                         code,
                         message,
@@ -667,6 +683,52 @@ mod tests {
             editor
                 .diagnostics(file)
                 .expect("passing diagnostics")
+                .iter()
+                .all(|diagnostic| diagnostic.source != DiagnosticSource::Runtime)
+        );
+    }
+
+    #[test]
+    fn per_test_timeout_observation_is_revision_bound_and_not_an_assertion_mismatch() {
+        let editor = EditorService::new();
+        let source = "test \"slow\" {}";
+        let file = editor.open_document("file:///timeout.webtest", source);
+        editor
+            .observations()
+            .record(webtest_observation::RuntimeObservation {
+                execution_id: webtest_observation::ExecutionId::next(),
+                file,
+                source_revision: webtest_text::SourceRevision::of(source),
+                test_id: webtest_hir::TestId(0),
+                step_id: None,
+                range: webtest_text::TextRange::new(
+                    webtest_text::TextSize::new(0),
+                    webtest_text::TextSize::new(source.len() as u32),
+                ),
+                kind: RuntimeObservationKind::TestTimeout {
+                    timeout_ms: 250,
+                    active_step: None,
+                },
+            });
+
+        let diagnostic = editor
+            .diagnostics(file)
+            .expect("diagnostics")
+            .into_iter()
+            .find(|diagnostic| diagnostic.source == DiagnosticSource::Runtime)
+            .expect("timeout diagnostic");
+        assert_eq!(diagnostic.code, "runtime.test_timeout");
+        assert_eq!(diagnostic.message, "Test timed out after 250ms.");
+        assert_eq!(
+            diagnostic.range.len(),
+            webtest_text::TextSize::new(source.len() as u32)
+        );
+
+        editor.update_document(file, format!("{source}\n"));
+        assert!(
+            editor
+                .diagnostics(file)
+                .expect("new revision diagnostics")
                 .iter()
                 .all(|diagnostic| diagnostic.source != DiagnosticSource::Runtime)
         );

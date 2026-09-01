@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex,
@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use webtest_browser::{
-    BrowserContext, BrowserContextOptions, BrowserError, BrowserHost, BrowserSession,
-    EvidenceRequest, InspectionOptions, Locator, Page, PageEvidence, PageInspection,
+    Action, BrowserContext, BrowserContextOptions, BrowserError, BrowserHost, BrowserSession,
+    EvidenceRequest, InspectionOptions, Locator, LocatorState, Page, PageEvidence, PageInspection,
 };
 use webtest_hir::{BindingId, StepId, TestId};
 use webtest_observation::{
@@ -39,7 +39,10 @@ struct LifecycleState {
     context_close_failures: Mutex<BTreeSet<usize>>,
     session_close_failures: Mutex<BTreeSet<usize>>,
     page_creation_failures: Mutex<BTreeSet<usize>>,
+    page_creation_delays: Mutex<BTreeMap<usize, Duration>>,
     page_errors: Mutex<BTreeMap<String, BrowserError>>,
+    page_delays: Mutex<BTreeMap<String, Duration>>,
+    operation_timeouts: Mutex<Vec<(String, Duration)>>,
     page_evidence: Mutex<PageEvidence>,
 }
 
@@ -126,6 +129,16 @@ impl BrowserSession for LifecycleSession {
 impl BrowserContext for LifecycleContext {
     async fn new_page(&mut self) -> Result<Box<dyn Page>, BrowserError> {
         self.state.push(format!("page_create:{}", self.id));
+        let delay = self
+            .state
+            .page_creation_delays
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&self.id)
+            .copied();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         if self
             .state
             .page_creation_failures
@@ -175,6 +188,16 @@ impl Page for LifecyclePage {
     async fn evaluate(&mut self, expression: &str) -> Result<(), BrowserError> {
         self.state
             .push(format!("evaluate:{}:{expression}", self.context_id));
+        let delay = self
+            .state
+            .page_delays
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(expression)
+            .copied();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         self.state
             .page_errors
             .lock()
@@ -182,6 +205,55 @@ impl Page for LifecyclePage {
             .get(expression)
             .cloned()
             .map_or(Ok(()), Err)
+    }
+
+    async fn open_with_timeout(
+        &mut self,
+        url: &str,
+        timeout: Duration,
+    ) -> Result<(), BrowserError> {
+        self.state
+            .operation_timeouts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(("navigation".into(), timeout));
+        self.open(url).await
+    }
+
+    async fn evaluate_with_timeout(
+        &mut self,
+        expression: &str,
+        timeout: Duration,
+    ) -> Result<(), BrowserError> {
+        self.state
+            .operation_timeouts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((format!("evaluate:{expression}"), timeout));
+        self.evaluate(expression).await
+    }
+
+    async fn perform(&mut self, action: &Action, timeout: Duration) -> Result<(), BrowserError> {
+        self.state
+            .operation_timeouts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(("action".into(), timeout));
+        self.click(action.locator()).await
+    }
+
+    async fn wait_for_locator(
+        &mut self,
+        _locator: &Locator,
+        _state: LocatorState,
+        timeout: Duration,
+    ) -> Result<(), BrowserError> {
+        self.state
+            .operation_timeouts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(("wait".into(), timeout));
+        Ok(())
     }
 
     async fn capture_evidence(&mut self, request: &EvidenceRequest) -> PageEvidence {
@@ -304,6 +376,7 @@ fn event_names(events: &[ExecutionEvent]) -> Vec<&'static str> {
             ExecutionEvent::ProviderCallFinished { .. } => "provider_finished",
             ExecutionEvent::ProviderCallFailed { .. } => "provider_failed",
             ExecutionEvent::StepFailed { .. } => "step_failed",
+            ExecutionEvent::TestTimedOut { .. } => "test_timed_out",
             ExecutionEvent::CleanupFailed { .. } => "cleanup_failed",
             ExecutionEvent::TestFinished { .. } => "test_finished",
             ExecutionEvent::TestSkipped { .. } => "test_skipped",
@@ -817,7 +890,7 @@ async fn observations_are_cleared_before_browser_start_can_fail() {
         file: plan.file,
         source_revision: plan.source_revision,
         test_id: TestId(0),
-        step_id: StepId(0),
+        step_id: Some(StepId(0)),
         range: TextRange::default(),
         kind: RuntimeObservationKind::ValueFailure {
             code: "stale".into(),
@@ -869,7 +942,7 @@ async fn internal_step_failure_aborts_with_typed_events_and_no_user_observation(
         file: plan.file,
         source_revision: plan.source_revision,
         test_id: TestId(0),
-        step_id: StepId(0),
+        step_id: Some(StepId(0)),
         range: TextRange::default(),
         kind: RuntimeObservationKind::ValueFailure {
             code: "stale".into(),
@@ -944,7 +1017,7 @@ async fn internal_step_failure_aborts_with_typed_events_and_no_user_observation(
         file: plan.file,
         source_revision: plan.source_revision,
         test_id: TestId(0),
-        step_id: StepId(0),
+        step_id: Some(StepId(0)),
         range: TextRange::default(),
         kind: RuntimeObservationKind::ValueFailure {
             code: "old_internal_run".into(),
@@ -1356,6 +1429,59 @@ struct RecordingProvider {
     calls: Mutex<Vec<CapturedCall>>,
 }
 
+struct DelayedProvider {
+    delays: Mutex<VecDeque<Duration>>,
+    calls: Mutex<Vec<Duration>>,
+}
+
+impl DelayedProvider {
+    fn new(delays: impl IntoIterator<Item = Duration>) -> Self {
+        Self {
+            delays: Mutex::new(delays.into_iter().collect()),
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl ServerProvider for DelayedProvider {
+    fn schema(&self) -> ProviderSchema {
+        ProviderSchema {
+            name: ProviderName("fake".into()),
+            operations: [(
+                "call".into(),
+                OperationSchema {
+                    name: OperationName("call".into()),
+                    parameters: Vec::new(),
+                    result: Type::Json,
+                    capability: Capability::Server,
+                    documentation: String::new(),
+                    retry_safe: false,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            schema_identity: Some("schema".into()),
+        }
+    }
+
+    async fn call(
+        &self,
+        _call: ProviderCall,
+        context: CallContext,
+    ) -> Result<ProviderResult, ProviderError> {
+        self.calls.lock().expect("calls").push(context.timeout);
+        let delay = self
+            .delays
+            .lock()
+            .expect("delays")
+            .pop_front()
+            .unwrap_or(Duration::ZERO);
+        tokio::time::sleep(delay).await;
+        Ok(ProviderResult { value: Value::Null })
+    }
+}
+
 impl RecordingProvider {
     fn new(result: Result<Value, ProviderError>) -> Self {
         Self {
@@ -1590,7 +1716,7 @@ async fn provider_failure_is_redacted_before_control_events_and_observation() {
 }
 
 #[tokio::test]
-async fn provider_timeout_falls_back_to_test_timeout_and_nested_temp_resources_are_cleaned() {
+async fn provider_timeout_uses_distinct_default_and_nested_temp_resources_are_cleaned() {
     let root = tempfile::tempdir().expect("temporary root");
     let owned = root.path().join("owned");
     std::fs::create_dir(&owned).expect("owned directory");
@@ -1611,6 +1737,7 @@ async fn provider_timeout_falls_back_to_test_timeout_and_nested_temp_resources_a
     );
     let options = RunnerOptions {
         test_timeout: Duration::from_secs(19),
+        provider_call_timeout: Duration::from_secs(7),
         ..RunnerOptions::default()
     };
     Runner::new(Arc::new(ObservationStore::default()))
@@ -1621,7 +1748,7 @@ async fn provider_timeout_falls_back_to_test_timeout_and_nested_temp_resources_a
 
     assert_eq!(
         provider.calls.lock().expect("calls")[0].timeout,
-        Duration::from_secs(19)
+        Duration::from_secs(7)
     );
     assert!(!owned.exists());
 }
@@ -1888,4 +2015,346 @@ async fn with_options_rebuilds_builtins_before_a_later_registry_override() {
             ..
         } if provider == "fake"
     ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn each_test_gets_its_own_deadline_even_when_aggregate_duration_exceeds_it() {
+    let provider = Arc::new(DelayedProvider::new([
+        Duration::from_secs(4),
+        Duration::from_secs(4),
+    ]));
+    let mut providers = ProviderRegistry::default();
+    providers.register(provider);
+    let plan = plan_with_tests(
+        vec![Capability::Server],
+        vec![
+            vec![secret_binding(), provider_operation(None)],
+            vec![secret_binding(), provider_operation(None)],
+        ],
+    );
+    let options = RunnerOptions {
+        test_timeout: Duration::from_secs(5),
+        provider_call_timeout: Duration::from_secs(5),
+        ..RunnerOptions::default()
+    };
+
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .with_options(options)
+        .with_provider_registry(providers)
+        .run(&plan, &LifecycleHost(Arc::new(LifecycleState::default())))
+        .await;
+
+    assert_eq!(result.passed(), 2);
+    assert_eq!(result.timed_out(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cumulative_steps_share_one_deadline_and_late_provider_uses_remaining_time() {
+    let provider = Arc::new(DelayedProvider::new([
+        Duration::from_secs(4),
+        Duration::from_secs(4),
+    ]));
+    let mut providers = ProviderRegistry::default();
+    providers.register(provider.clone());
+    let plan = plan_with_tests(
+        vec![Capability::Server],
+        vec![vec![
+            secret_binding(),
+            provider_operation(None),
+            provider_operation(Some(Duration::from_secs(10))),
+        ]],
+    );
+    let store = Arc::new(ObservationStore::default());
+    let result = Runner::new(Arc::clone(&store))
+        .with_options(RunnerOptions {
+            test_timeout: Duration::from_secs(6),
+            provider_call_timeout: Duration::from_secs(5),
+            ..RunnerOptions::default()
+        })
+        .with_provider_registry(providers)
+        .run(&plan, &LifecycleHost(Arc::new(LifecycleState::default())))
+        .await;
+
+    assert!(matches!(
+        result.tests[0].outcome,
+        TestOutcome::TimedOut {
+            timeout,
+            active_step: Some(StepId(2)),
+        } if timeout == Duration::from_secs(6)
+    ));
+    let calls = provider.calls.lock().expect("calls");
+    assert_eq!(calls[0], Duration::from_secs(5));
+    assert!(calls[1] <= Duration::from_secs(2));
+    assert!(matches!(
+        store.observations_for(plan.file, plan.source_revision)[0].kind,
+        RuntimeObservationKind::TestTimeout {
+            timeout_ms: 6_000,
+            active_step: Some(StepId(2)),
+        }
+    ));
+    assert!(result.events.iter().any(|event| matches!(
+        event,
+        ExecutionEvent::TestTimedOut {
+            active_step: Some(StepId(2)),
+            timeout_ms: 6_000,
+            ..
+        }
+    )));
+}
+
+#[tokio::test(start_paused = true)]
+async fn late_browser_action_wait_and_navigation_receive_only_remaining_time() {
+    let provider = Arc::new(DelayedProvider::new([Duration::from_secs(4)]));
+    let mut providers = ProviderRegistry::default();
+    providers.register(provider);
+    let locator = webtest_plan::Locator::Id("target".into());
+    let plan = plan_with_tests(
+        vec![Capability::Server, Capability::Browser],
+        vec![vec![
+            secret_binding(),
+            provider_operation(None),
+            TestOperation::Browser(BrowserOperation::Click {
+                locator: locator.clone(),
+            }),
+            TestOperation::Browser(BrowserOperation::WaitForLocator {
+                locator,
+                state: webtest_plan::LocatorState::Visible,
+                timeout: None,
+            }),
+            TestOperation::Browser(BrowserOperation::Navigate {
+                url: PlanExpr::Literal(Value::String("/late".into())),
+            }),
+        ]],
+    );
+    let state = Arc::new(LifecycleState::default());
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .with_options(RunnerOptions {
+            base_url: Some("http://example.test".into()),
+            test_timeout: Duration::from_secs(6),
+            provider_call_timeout: Duration::from_secs(5),
+            action_timeout: Duration::from_secs(5),
+            assertion_timeout: Duration::from_secs(5),
+            navigation_timeout: Duration::from_secs(5),
+            ..RunnerOptions::default()
+        })
+        .with_provider_registry(providers)
+        .run(&plan, &LifecycleHost(Arc::clone(&state)))
+        .await;
+
+    assert!(matches!(result.tests[0].outcome, TestOutcome::Passed));
+    let timeouts = state
+        .operation_timeouts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert_eq!(timeouts.len(), 3);
+    assert_eq!(
+        timeouts
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        ["action", "wait", "navigation",]
+    );
+    assert!(
+        timeouts.iter().all(|(_, timeout)| {
+            *timeout > Duration::ZERO && *timeout <= Duration::from_secs(2)
+        })
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn timeout_during_page_acquisition_closes_context_and_tainted_session() {
+    let state = Arc::new(LifecycleState::default());
+    state
+        .page_creation_delays
+        .lock()
+        .expect("page delays")
+        .insert(0, Duration::from_secs(5));
+    let plan = plan_with_tests(
+        vec![Capability::Browser],
+        vec![vec![browser_evaluate("unreached")]],
+    );
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .with_options(RunnerOptions {
+            test_timeout: Duration::from_secs(2),
+            ..RunnerOptions::default()
+        })
+        .run(&plan, &LifecycleHost(Arc::clone(&state)))
+        .await;
+
+    assert!(matches!(
+        result.tests[0].outcome,
+        TestOutcome::TimedOut {
+            active_step: None,
+            ..
+        }
+    ));
+    assert_eq!(
+        state.log(),
+        [
+            "session_start:0",
+            "context_create:0:0",
+            "page_create:0",
+            "context_close:0",
+            "session_close:0",
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn timed_out_browser_test_gets_a_fresh_session_for_the_next_browser_test() {
+    let state = Arc::new(LifecycleState::default());
+    state
+        .page_delays
+        .lock()
+        .expect("page delays")
+        .insert("slow".into(), Duration::from_secs(5));
+    let plan = plan_with_tests(
+        vec![Capability::Browser],
+        vec![
+            vec![browser_evaluate("slow")],
+            vec![browser_evaluate("fast")],
+        ],
+    );
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .with_options(RunnerOptions {
+            test_timeout: Duration::from_secs(2),
+            ..RunnerOptions::default()
+        })
+        .run(&plan, &LifecycleHost(Arc::clone(&state)))
+        .await;
+
+    assert!(matches!(
+        result.tests[0].outcome,
+        TestOutcome::TimedOut { .. }
+    ));
+    assert!(matches!(result.tests[1].outcome, TestOutcome::Passed));
+    let log = state.log();
+    assert!(log.contains(&"session_start:0".into()));
+    assert!(log.contains(&"session_close:0".into()));
+    assert!(log.contains(&"session_start:1".into()));
+    assert!(log.contains(&"session_close:1".into()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn provider_only_timeout_does_not_taint_an_existing_browser_session() {
+    let provider = Arc::new(DelayedProvider::new([Duration::from_secs(5)]));
+    let mut providers = ProviderRegistry::default();
+    providers.register(provider);
+    let state = Arc::new(LifecycleState::default());
+    let plan = plan_with_tests(
+        vec![Capability::Browser, Capability::Server],
+        vec![
+            vec![browser_evaluate("first")],
+            vec![secret_binding(), provider_operation(None)],
+            vec![browser_evaluate("last")],
+        ],
+    );
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .with_options(RunnerOptions {
+            test_timeout: Duration::from_secs(2),
+            provider_call_timeout: Duration::from_secs(2),
+            ..RunnerOptions::default()
+        })
+        .with_provider_registry(providers)
+        .run(&plan, &LifecycleHost(Arc::clone(&state)))
+        .await;
+
+    assert!(matches!(result.tests[0].outcome, TestOutcome::Passed));
+    assert!(matches!(
+        result.tests[1].outcome,
+        TestOutcome::TimedOut { .. }
+    ));
+    assert!(matches!(result.tests[2].outcome, TestOutcome::Passed));
+    assert_eq!(
+        state
+            .log()
+            .into_iter()
+            .filter(|entry| entry.starts_with("session_start:"))
+            .collect::<Vec<_>>(),
+        ["session_start:0"]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn cleanup_failure_after_timeout_outranks_and_retains_the_timeout() {
+    let state = Arc::new(LifecycleState::default());
+    state
+        .page_delays
+        .lock()
+        .expect("page delays")
+        .insert("slow".into(), Duration::from_secs(5));
+    state
+        .context_close_failures
+        .lock()
+        .expect("context failures")
+        .insert(0);
+    let plan = plan_with_tests(
+        vec![Capability::Browser],
+        vec![vec![browser_evaluate("slow")]],
+    );
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .with_options(RunnerOptions {
+            test_timeout: Duration::from_secs(2),
+            ..RunnerOptions::default()
+        })
+        .run(&plan, &LifecycleHost(state))
+        .await;
+
+    assert!(matches!(
+        result.tests[0].outcome,
+        TestOutcome::Aborted {
+            failure: RunError::Cleanup(CleanupFailure {
+                resource: CleanupResource::BrowserContext,
+                ..
+            }),
+            prior_outcome: Some(ref prior),
+        } if matches!(prior.as_ref(), PriorTestOutcome::TimedOut {
+            timeout,
+            active_step: Some(StepId(0)),
+        } if *timeout == Duration::from_secs(2))
+    ));
+}
+
+struct DeadlinePauseControl {
+    timeout_notified: AtomicBool,
+}
+
+#[async_trait]
+impl RunControl for DeadlinePauseControl {
+    async fn before_step(&self, _test: &PlannedTest, _step: &PlannedStep) {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+
+    fn after_test_timeout(&self, _test: &PlannedTest, active_step: Option<&PlannedStep>) {
+        assert_eq!(active_step.map(|step| step.id), Some(StepId(0)));
+        self.timeout_notified.store(true, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn debugger_pause_time_counts_toward_the_single_test_deadline() {
+    let control = DeadlinePauseControl {
+        timeout_notified: AtomicBool::new(false),
+    };
+    let plan = plan_with_tests(vec![Capability::Pure], vec![vec![pure(Value::Null)]]);
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .with_options(RunnerOptions {
+            test_timeout: Duration::from_secs(2),
+            ..RunnerOptions::default()
+        })
+        .run_with_control(
+            &plan,
+            &LifecycleHost(Arc::new(LifecycleState::default())),
+            Some(&control),
+        )
+        .await;
+
+    assert!(matches!(
+        result.tests[0].outcome,
+        TestOutcome::TimedOut {
+            active_step: Some(StepId(0)),
+            ..
+        }
+    ));
+    assert!(control.timeout_notified.load(Ordering::SeqCst));
 }

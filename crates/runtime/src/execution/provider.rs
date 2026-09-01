@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    time::Duration,
+};
 
 use webtest_hir::BindingId;
 use webtest_plan::ServerProviderCall;
@@ -13,6 +16,7 @@ pub(super) async fn execute_provider(
     options: &RunnerOptions,
     call: &ServerProviderCall,
     environment: &HashMap<BindingId, Value>,
+    remaining: Duration,
 ) -> Result<Value, StepError> {
     let mut arguments = BTreeMap::new();
     for (name, expression) in &call.arguments {
@@ -28,7 +32,10 @@ pub(super) async fn execute_provider(
             },
             CallContext {
                 project_root: options.project_root.clone(),
-                timeout: call.timeout.unwrap_or(options.test_timeout),
+                timeout: call
+                    .timeout
+                    .unwrap_or(options.provider_call_timeout)
+                    .min(remaining),
                 redacted_json_fields: options.redacted_json_fields.clone(),
             },
         )

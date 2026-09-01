@@ -225,166 +225,172 @@ pub(crate) async fn run_test(
         }
         let inactive_browser = ChromeHost::new(None);
         let browser = browser.as_ref().unwrap_or(&inactive_browser);
-        let run = tokio::time::timeout(
-            project.config.timeouts.test,
-            runner.run(&analyzed.plan, browser),
-        )
-        .await;
+        let result = runner.run(&analyzed.plan, browser).await;
         if let Some(progress) = &progress {
-            record_progress_error(
-                progress.browser_run_finished(run.is_ok()),
-                &mut progress_error,
-            );
+            record_progress_error(progress.browser_run_finished(true), &mut progress_error);
         }
-        match run {
-            Err(_) => {
+        file_report.duration_nanos = nanos(result.duration);
+        file_report.events = event_reports(&file_report.path, &result.events);
+        let run_exit_class = match &result.outcome {
+            RunOutcome::Completed => ExitClass::Success,
+            RunOutcome::Cancelled { reason } => {
+                file_report.outcome = Some(RunReportOutcome::Cancelled);
+                file_report.reason = Some(cancellation_reason_name(*reason).into());
+                ExitClass::TestFailure
+            }
+            RunOutcome::Aborted {
+                failure,
+                prior_outcome,
+            } => {
                 file_report.outcome = Some(RunReportOutcome::Aborted);
-                file_report.reason = Some("test file timeout".into());
-                file_report.execution_error = Some(ExecutionFailureReport {
-                    class: FailureClass::Infrastructure,
-                    failure: FailureReport {
-                        diagnostic_schema_version: webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
-                        repair_hint_schema_version: webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
-                        code: "runtime.test_timeout".into(),
-                        message: format!(
-                            "test file exceeded its {}ms timeout",
-                            project.config.timeouts.test.as_millis()
-                        ),
-                        span: None,
-                        diff: None,
-                        artifacts: Vec::new(),
-                        semantic_details: Some(serde_json::json!({
-                            "timeout_ms": project.config.timeouts.test.as_millis(),
-                        })),
-                        repair_hints: Vec::new(),
-                        page: None,
-                        secondary: Vec::new(),
-                    },
-                });
-                report.exit_class = report.exit_class.combine(ExitClass::Infrastructure);
-                file_report.exit_class = ExitClass::Infrastructure;
-            }
-            Ok(result) => {
-                file_report.duration_nanos = nanos(result.duration);
-                file_report.events = event_reports(&file_report.path, &result.events);
-                let run_exit_class = match &result.outcome {
-                    RunOutcome::Completed => ExitClass::Success,
-                    RunOutcome::Cancelled { reason } => {
-                        file_report.outcome = Some(RunReportOutcome::Cancelled);
-                        file_report.reason = Some(cancellation_reason_name(*reason).into());
-                        ExitClass::TestFailure
-                    }
-                    RunOutcome::Aborted {
-                        failure,
-                        prior_outcome,
-                    } => {
-                        file_report.outcome = Some(RunReportOutcome::Aborted);
-                        file_report.reason = Some(failure.to_string());
-                        if result.aborted() == 0 {
-                            file_report.execution_error = Some(ExecutionFailureReport {
-                                class: failure.failure_class(),
-                                failure: aborted_run_failure_report(failure, *prior_outcome),
-                            });
-                        }
-                        run_error_exit_class(failure)
-                    }
-                };
-                if matches!(result.outcome, RunOutcome::Completed) {
-                    file_report.outcome = Some(RunReportOutcome::Completed);
-                }
-                file_report.tests = result
-                    .tests
-                    .into_iter()
-                    .map(|test| {
-                        let (outcome, failure_class, reason, timeout_nanos, failure, exit_class) =
-                            match test.outcome {
-                                TestOutcome::Passed => (
-                                    TestReportOutcome::Passed,
-                                    None,
-                                    None,
-                                    None,
-                                    None,
-                                    ExitClass::Success,
-                                ),
-                                TestOutcome::Failed(failure) => (
-                                    TestReportOutcome::Failed,
-                                    Some(FailureClass::Test),
-                                    None,
-                                    None,
-                                    Some(step_failure_report(*failure, &analyzed.source)),
-                                    ExitClass::TestFailure,
-                                ),
-                                TestOutcome::TimedOut { timeout } => (
-                                    TestReportOutcome::TimedOut,
-                                    Some(FailureClass::Test),
-                                    Some(format!("timed out after {}ms", timeout.as_millis())),
-                                    Some(nanos(timeout)),
-                                    None,
-                                    ExitClass::TestFailure,
-                                ),
-                                TestOutcome::Cancelled { reason } => (
-                                    TestReportOutcome::Cancelled,
-                                    None,
-                                    Some(cancellation_reason_name(reason).into()),
-                                    None,
-                                    None,
-                                    ExitClass::TestFailure,
-                                ),
-                                TestOutcome::Skipped {
-                                    reason,
-                                    failure_class,
-                                } => (
-                                    TestReportOutcome::Skipped,
-                                    failure_class,
-                                    Some(skip_reason_name(reason).into()),
-                                    None,
-                                    None,
-                                    failure_class.map_or(ExitClass::TestFailure, |class| {
-                                        ExitClass::from_failure_class(class)
-                                    }),
-                                ),
-                                TestOutcome::Aborted {
-                                    failure,
-                                    prior_outcome,
-                                } => {
-                                    let exit_class = run_error_exit_class(&failure);
-                                    (
-                                        TestReportOutcome::Aborted,
-                                        Some(failure.failure_class()),
-                                        Some(failure.to_string()),
-                                        None,
-                                        Some(aborted_test_failure_report(
-                                            &failure,
-                                            prior_outcome,
-                                            &analyzed.source,
-                                        )),
-                                        exit_class,
-                                    )
-                                }
-                            };
-                        TestReport {
-                            name: test.name,
-                            exit_class,
-                            outcome,
-                            failure_class,
-                            reason,
-                            timeout_nanos,
-                            duration_nanos: nanos(test.duration),
-                            failure,
-                        }
-                    })
-                    .collect();
-                let tests_exit_class = file_report
-                    .tests
-                    .iter()
-                    .fold(ExitClass::Success, |class, test| {
-                        class.combine(test.exit_class)
+                file_report.reason = Some(failure.to_string());
+                if result.aborted() == 0 {
+                    file_report.execution_error = Some(ExecutionFailureReport {
+                        class: failure.failure_class(),
+                        failure: aborted_run_failure_report(failure, *prior_outcome),
                     });
-                file_report.exit_class = run_exit_class.combine(tests_exit_class);
-                if file_report.exit_class != ExitClass::Success {
-                    report.exit_class = report.exit_class.combine(file_report.exit_class);
                 }
+                run_error_exit_class(failure)
             }
+        };
+        if matches!(result.outcome, RunOutcome::Completed) {
+            file_report.outcome = Some(RunReportOutcome::Completed);
+        }
+        file_report.tests = result
+            .tests
+            .into_iter()
+            .map(|test| {
+                let test_id = test.test_id;
+                let (outcome, failure_class, reason, timeout_nanos, failure, exit_class) =
+                    match test.outcome {
+                        TestOutcome::Passed => (
+                            TestReportOutcome::Passed,
+                            None,
+                            None,
+                            None,
+                            None,
+                            ExitClass::Success,
+                        ),
+                        TestOutcome::Failed(failure) => (
+                            TestReportOutcome::Failed,
+                            Some(FailureClass::Test),
+                            None,
+                            None,
+                            Some(step_failure_report(*failure, &analyzed.source)),
+                            ExitClass::TestFailure,
+                        ),
+                        TestOutcome::TimedOut {
+                            timeout,
+                            active_step,
+                        } => (
+                            TestReportOutcome::TimedOut,
+                            Some(FailureClass::Test),
+                            Some(format!("timed out after {}ms", timeout.as_millis())),
+                            Some(nanos(timeout)),
+                            analyzed
+                                .plan
+                                .tests
+                                .iter()
+                                .find(|planned| planned.id == test_id)
+                                .map(|planned| {
+                                    let origin = active_step
+                                        .and_then(|id| {
+                                            planned
+                                                .steps
+                                                .iter()
+                                                .find(|step| step.id == id)
+                                                .map(|step| step.origin)
+                                        })
+                                        .unwrap_or(planned.origin);
+                                    FailureReport {
+                                        diagnostic_schema_version:
+                                            webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
+                                        repair_hint_schema_version:
+                                            webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
+                                        code: "runtime.test_timeout".into(),
+                                        message: format!(
+                                            "test timed out after {}ms",
+                                            timeout.as_millis()
+                                        ),
+                                        span: Some(crate::source_output::source_span(
+                                            &analyzed.source,
+                                            origin.range,
+                                        )),
+                                        diff: None,
+                                        artifacts: Vec::new(),
+                                        semantic_details: Some(serde_json::json!({
+                                            "test_id": test_id.0,
+                                            "active_step_id": active_step.map(|step| step.0),
+                                            "timeout_ms": timeout.as_millis(),
+                                        })),
+                                        repair_hints: Vec::new(),
+                                        page: None,
+                                        secondary: Vec::new(),
+                                    }
+                                }),
+                            ExitClass::TestFailure,
+                        ),
+                        TestOutcome::Cancelled { reason } => (
+                            TestReportOutcome::Cancelled,
+                            None,
+                            Some(cancellation_reason_name(reason).into()),
+                            None,
+                            None,
+                            ExitClass::TestFailure,
+                        ),
+                        TestOutcome::Skipped {
+                            reason,
+                            failure_class,
+                        } => (
+                            TestReportOutcome::Skipped,
+                            failure_class,
+                            Some(skip_reason_name(reason).into()),
+                            None,
+                            None,
+                            failure_class.map_or(ExitClass::TestFailure, |class| {
+                                ExitClass::from_failure_class(class)
+                            }),
+                        ),
+                        TestOutcome::Aborted {
+                            failure,
+                            prior_outcome,
+                        } => {
+                            let exit_class = run_error_exit_class(&failure);
+                            (
+                                TestReportOutcome::Aborted,
+                                Some(failure.failure_class()),
+                                Some(failure.to_string()),
+                                None,
+                                Some(aborted_test_failure_report(
+                                    &failure,
+                                    prior_outcome,
+                                    &analyzed.source,
+                                )),
+                                exit_class,
+                            )
+                        }
+                    };
+                TestReport {
+                    name: test.name,
+                    exit_class,
+                    outcome,
+                    failure_class,
+                    reason,
+                    timeout_nanos,
+                    duration_nanos: nanos(test.duration),
+                    failure,
+                }
+            })
+            .collect();
+        let tests_exit_class = file_report
+            .tests
+            .iter()
+            .fold(ExitClass::Success, |class, test| {
+                class.combine(test.exit_class)
+            });
+        file_report.exit_class = run_exit_class.combine(tests_exit_class);
+        if file_report.exit_class != ExitClass::Success {
+            report.exit_class = report.exit_class.combine(file_report.exit_class);
         }
         if file_report.duration_nanos == 0 {
             file_report.duration_nanos = nanos(analysis_duration.saturating_add(started.elapsed()));

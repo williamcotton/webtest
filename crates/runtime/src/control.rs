@@ -14,6 +14,10 @@ pub trait RunControl: Send + Sync {
 
     async fn before_step(&self, test: &PlannedTest, step: &PlannedStep);
 
+    /// Called after the per-test deadline drops an active debugger hook or step.
+    /// Debug pause time counts toward the deadline in the current runtime.
+    fn after_test_timeout(&self, _test: &PlannedTest, _active_step: Option<&PlannedStep>) {}
+
     fn should_capture_bindings(&self, _test: &PlannedTest, _step: &PlannedStep) -> bool {
         true
     }

@@ -35,6 +35,7 @@ struct OutgoingCommand {
     session_id: Option<String>,
     response: oneshot::Sender<Result<Value, BrowserError>>,
     deadline: Instant,
+    timeout: Duration,
 }
 
 struct PendingCommand {
@@ -42,6 +43,7 @@ struct PendingCommand {
     session_id: Option<String>,
     response: oneshot::Sender<Result<Value, BrowserError>>,
     deadline: Instant,
+    timeout: Duration,
 }
 
 impl CdpConnection {
@@ -96,6 +98,7 @@ impl CdpConnection {
                             session_id,
                             response: outgoing.response,
                             deadline: outgoing.deadline,
+                            timeout: outgoing.timeout,
                         });
                         actor_in_flight.fetch_add(1, Ordering::Relaxed);
                         let remaining = outgoing.deadline.saturating_duration_since(Instant::now());
@@ -107,7 +110,7 @@ impl CdpConnection {
                                     actor_in_flight.fetch_sub(1, Ordering::Relaxed);
                                     let _ = command.response.send(Err(BrowserError::CommandTimeout {
                                         method: command.method,
-                                        timeout_ms: duration_millis(command_timeout),
+                                        timeout_ms: duration_millis(command.timeout),
                                     }));
                                 }
                             }
@@ -180,7 +183,7 @@ impl CdpConnection {
                             if !command.response.is_closed() {
                                 let _ = command.response.send(Err(BrowserError::CommandTimeout {
                                     method: command.method,
-                                    timeout_ms: duration_millis(command_timeout),
+                                    timeout_ms: duration_millis(command.timeout),
                                 }));
                             }
                         }
@@ -208,17 +211,38 @@ impl CdpConnection {
         params: Option<Value>,
         session_id: Option<&str>,
     ) -> Result<Value, BrowserError> {
+        self.command_with_timeout(method, params, session_id, self.command_timeout)
+            .await
+    }
+
+    #[instrument(skip_all, fields(method))]
+    pub(crate) async fn command_with_timeout(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        session_id: Option<&str>,
+        maximum: Duration,
+    ) -> Result<Value, BrowserError> {
+        let timeout = self.command_timeout.min(maximum);
+        let deadline = Instant::now() + timeout;
         let (response, receive) = oneshot::channel();
-        self.sender
-            .send(OutgoingCommand {
+        tokio::time::timeout_at(
+            deadline,
+            self.sender.send(OutgoingCommand {
                 method: method.to_owned(),
                 params,
                 session_id: session_id.map(str::to_owned),
                 response,
-                deadline: Instant::now() + self.command_timeout,
-            })
-            .await
-            .map_err(|_| BrowserError::BrowserDisconnected)?;
+                deadline,
+                timeout,
+            }),
+        )
+        .await
+        .map_err(|_| BrowserError::CommandTimeout {
+            method: method.to_owned(),
+            timeout_ms: duration_millis(timeout),
+        })?
+        .map_err(|_| BrowserError::BrowserDisconnected)?;
         let result = receive
             .await
             .map_err(|_| BrowserError::BrowserDisconnected)?;
@@ -227,6 +251,10 @@ impl CdpConnection {
             "completed CDP command"
         );
         result
+    }
+
+    pub(crate) const fn command_timeout(&self) -> Duration {
+        self.command_timeout
     }
 
     #[cfg(test)]

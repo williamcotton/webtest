@@ -455,6 +455,22 @@ pub trait Page: Send {
     async fn expect_visible(&mut self, locator: &Locator) -> Result<(), BrowserError>;
     async fn evaluate(&mut self, expression: &str) -> Result<(), BrowserError>;
 
+    async fn open_with_timeout(
+        &mut self,
+        url: &str,
+        _timeout: Duration,
+    ) -> Result<(), BrowserError> {
+        self.open(url).await
+    }
+
+    async fn evaluate_with_timeout(
+        &mut self,
+        expression: &str,
+        _timeout: Duration,
+    ) -> Result<(), BrowserError> {
+        self.evaluate(expression).await
+    }
+
     async fn perform(&mut self, action: &Action, _timeout: Duration) -> Result<(), BrowserError> {
         match action {
             Action::Click { locator } => self.click(locator).await,

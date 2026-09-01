@@ -24,6 +24,7 @@ fn accepts_event_sink(_: Option<&dyn RunEventSink>) {}
 
 fn test_result(outcome: TestOutcome) -> TestResult {
     TestResult {
+        test_id: webtest_hir::TestId(0),
         name: "test".into(),
         outcome,
         duration: Duration::ZERO,
@@ -139,6 +140,8 @@ fn defaults_and_result_counts_are_exact() {
     assert_eq!(options.base_url, None);
     assert_eq!(options.action_timeout, Duration::from_secs(5));
     assert_eq!(options.assertion_timeout, Duration::from_secs(5));
+    assert_eq!(options.navigation_timeout, Duration::from_secs(30));
+    assert_eq!(options.provider_call_timeout, Duration::from_secs(60));
     assert_eq!(options.test_timeout, Duration::from_secs(60));
     assert_eq!(options.project_root, PathBuf::from("."));
     assert_eq!(
@@ -162,6 +165,7 @@ fn defaults_and_result_counts_are_exact() {
             test_result(failed_outcome()),
             test_result(TestOutcome::TimedOut {
                 timeout: Duration::from_secs(1),
+                active_step: Some(webtest_hir::StepId(0)),
             }),
             test_result(TestOutcome::Cancelled {
                 reason: CancellationReason::Requested,
