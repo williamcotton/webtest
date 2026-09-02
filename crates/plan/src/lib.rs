@@ -10,7 +10,7 @@ use webtest_hir::{BinaryOperator, BindingId, StepId, TestId, UnaryOperator};
 use webtest_provider::{Capability, Type, Value};
 use webtest_text::{FileId, SourceRevision, SyntaxOrigin};
 
-pub const PLAN_FORMAT_VERSION: u32 = 2;
+pub const PLAN_FORMAT_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PlanEnvelope {
@@ -229,6 +229,7 @@ pub enum PlanExpr {
     Member {
         receiver: Box<PlanExpr>,
         member: String,
+        missing_is_null: bool,
     },
     Unary {
         operator: UnaryOperator,
@@ -427,7 +428,7 @@ mod tests {
             }],
         };
         let envelope = PlanEnvelope::from_plan(&plan, "x.webtest", "project", BTreeMap::new());
-        assert_eq!(envelope.format_version, 2);
+        assert_eq!(envelope.format_version, 3);
         assert_eq!(
             envelope.tests[0].required_host_capabilities,
             [Capability::Server]
@@ -449,6 +450,30 @@ mod tests {
             .expect("test object")
             .remove("required_host_capabilities");
         assert!(serde_json::from_value::<PlanEnvelope>(version_one_shape).is_err());
+    }
+
+    #[test]
+    fn optional_member_fact_is_serialized_deterministically() {
+        let expression = PlanExpr::Member {
+            receiver: Box::new(PlanExpr::Record(BTreeMap::new())),
+            member: "optional".into(),
+            missing_is_null: true,
+        };
+        let first = serde_json::to_string(&expression).expect("serialize member");
+        let second = serde_json::to_string(&expression).expect("serialize member again");
+        assert_eq!(first, second);
+        assert!(first.contains("\"missing_is_null\":true"));
+        assert_eq!(
+            serde_json::from_str::<PlanExpr>(&first).expect("deserialize member"),
+            expression
+        );
+
+        let mut old_shape = serde_json::to_value(&expression).expect("member JSON");
+        old_shape["value"]
+            .as_object_mut()
+            .expect("member value")
+            .remove("missing_is_null");
+        assert!(serde_json::from_value::<PlanExpr>(old_shape).is_err());
     }
 
     #[test]

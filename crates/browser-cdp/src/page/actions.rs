@@ -103,8 +103,11 @@ async fn wait_for_actionability(
                 last_failure.take(),
             );
         }
-        let first = match super::complete_before_deadline(deadline, locator::resolve(page, locator))
-            .await
+        let initial = match super::complete_before_deadline(
+            deadline,
+            locator::resolve(page, locator),
+        )
+        .await
         {
             Ok(result) => result?,
             Err(()) => {
@@ -116,58 +119,26 @@ async fn wait_for_actionability(
                 );
             }
         };
-        let last_error = match first.matches {
-            0 => BrowserError::LocatorNotFound {
-                locator: locator.clone(),
-            },
-            count if count > 1 => BrowserError::LocatorAmbiguous {
-                locator: locator.clone(),
-                matches: count,
-            },
-            _ if !first.visible => BrowserError::LocatorNotVisible {
-                locator: locator.clone(),
-            },
-            _ if first.disabled => BrowserError::ElementDisabled {
-                locator: locator.clone(),
-            },
-            _ if matches!(action, Action::Fill { .. } | Action::Type { .. }) && !first.editable => {
-                BrowserError::ElementNotEditable {
-                    locator: locator.clone(),
-                }
-            }
-            _ if matches!(action, Action::Select { .. })
-                && first.tag.as_deref() != Some("select") =>
-            {
-                BrowserError::ElementNotEditable {
-                    locator: locator.clone(),
-                }
-            }
-            _ if matches!(action, Action::Check { .. }) && first.checked.is_none() => {
-                BrowserError::ElementNotEditable {
-                    locator: locator.clone(),
-                }
-            }
-            _ if matches!(
-                action,
-                Action::Click { .. } | Action::Hover { .. } | Action::Check { .. }
-            ) && first.obscured =>
-            {
-                BrowserError::ElementObscured {
-                    locator: locator.clone(),
-                }
-            }
+        let last_error = match preparation_failure(locator, action, &initial) {
+            Some(error) => error,
             _ => {
-                tokio::time::sleep_until(deadline.min(Instant::now() + Duration::from_millis(50)))
-                    .await;
-                if Instant::now() >= deadline {
-                    return terminal_actionability_failure(
-                        locator,
-                        timeout,
-                        failures_changed,
-                        last_failure.take(),
-                    );
+                match super::complete_before_deadline(
+                    deadline,
+                    locator::scroll_into_view(page, locator),
+                )
+                .await
+                {
+                    Ok(result) => result?,
+                    Err(()) => {
+                        return terminal_actionability_failure(
+                            locator,
+                            timeout,
+                            failures_changed,
+                            last_failure.take(),
+                        );
+                    }
                 }
-                let second = match super::complete_before_deadline(
+                let first = match super::complete_before_deadline(
                     deadline,
                     locator::resolve(page, locator),
                 )
@@ -183,25 +154,55 @@ async fn wait_for_actionability(
                         );
                     }
                 };
-                if second.matches == 0 {
-                    BrowserError::ElementDetached {
-                        locator: locator.clone(),
-                    }
-                } else if !rect_stable(first.rect.as_ref(), second.rect.as_ref()) {
-                    BrowserError::ElementUnstable {
-                        locator: locator.clone(),
-                    }
-                } else if second.obscured
-                    && matches!(
-                        action,
-                        Action::Click { .. } | Action::Hover { .. } | Action::Check { .. }
-                    )
-                {
-                    BrowserError::ElementObscured {
-                        locator: locator.clone(),
-                    }
+                if let Some(error) = post_scroll_failure(locator, action, &first) {
+                    error
                 } else {
-                    return Ok(second);
+                    tokio::time::sleep_until(
+                        deadline.min(Instant::now() + Duration::from_millis(50)),
+                    )
+                    .await;
+                    if Instant::now() >= deadline {
+                        return terminal_actionability_failure(
+                            locator,
+                            timeout,
+                            failures_changed,
+                            last_failure.take(),
+                        );
+                    }
+                    let second = match super::complete_before_deadline(
+                        deadline,
+                        locator::resolve(page, locator),
+                    )
+                    .await
+                    {
+                        Ok(result) => result?,
+                        Err(()) => {
+                            return terminal_actionability_failure(
+                                locator,
+                                timeout,
+                                failures_changed,
+                                last_failure.take(),
+                            );
+                        }
+                    };
+                    if second.matches == 0 {
+                        BrowserError::ElementDetached {
+                            locator: locator.clone(),
+                        }
+                    } else if second.matches > 1 {
+                        BrowserError::LocatorAmbiguous {
+                            locator: locator.clone(),
+                            matches: second.matches,
+                        }
+                    } else if !rect_stable(first.rect.as_ref(), second.rect.as_ref()) {
+                        BrowserError::ElementUnstable {
+                            locator: locator.clone(),
+                        }
+                    } else if let Some(error) = post_scroll_failure(locator, action, &second) {
+                        error
+                    } else {
+                        return Ok(second);
+                    }
                 }
             }
         };
@@ -220,6 +221,80 @@ async fn wait_for_actionability(
         tokio::time::sleep_until(deadline.min(Instant::now() + backoff)).await;
         backoff = (backoff * 2).min(Duration::from_millis(100));
     }
+}
+
+fn preparation_failure(
+    locator: &Locator,
+    action: &Action,
+    snapshot: &ResolveSnapshot,
+) -> Option<BrowserError> {
+    if snapshot.matches == 0 {
+        return Some(BrowserError::LocatorNotFound {
+            locator: locator.clone(),
+        });
+    }
+    common_actionability_failure(locator, action, snapshot)
+}
+
+fn post_scroll_failure(
+    locator: &Locator,
+    action: &Action,
+    snapshot: &ResolveSnapshot,
+) -> Option<BrowserError> {
+    if snapshot.matches == 0 {
+        return Some(BrowserError::ElementDetached {
+            locator: locator.clone(),
+        });
+    }
+    common_actionability_failure(locator, action, snapshot).or_else(|| {
+        (requires_physical_pointer(action) && snapshot.obscured).then(|| {
+            BrowserError::ElementObscured {
+                locator: locator.clone(),
+            }
+        })
+    })
+}
+
+fn common_actionability_failure(
+    locator: &Locator,
+    action: &Action,
+    snapshot: &ResolveSnapshot,
+) -> Option<BrowserError> {
+    if snapshot.matches > 1 {
+        Some(BrowserError::LocatorAmbiguous {
+            locator: locator.clone(),
+            matches: snapshot.matches,
+        })
+    } else if !snapshot.visible {
+        Some(BrowserError::LocatorNotVisible {
+            locator: locator.clone(),
+        })
+    } else if snapshot.disabled {
+        Some(BrowserError::ElementDisabled {
+            locator: locator.clone(),
+        })
+    } else if matches!(action, Action::Fill { .. } | Action::Type { .. }) && !snapshot.editable
+        || matches!(action, Action::Select { .. }) && snapshot.tag.as_deref() != Some("select")
+        || matches!(action, Action::Check { .. }) && snapshot.checked.is_none()
+    {
+        Some(BrowserError::ElementNotEditable {
+            locator: locator.clone(),
+        })
+    } else {
+        None
+    }
+}
+
+fn requires_physical_pointer(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::Click { .. }
+            | Action::Hover { .. }
+            | Action::Fill { .. }
+            | Action::Type { .. }
+            | Action::Press { .. }
+            | Action::Check { .. }
+    )
 }
 
 fn terminal_actionability_failure(
@@ -491,5 +566,40 @@ mod tests {
         assert!(parse_key("").is_none());
         assert!(parse_key("Enter+Tab").is_none());
         assert!(parse_key("Unsupported").is_none());
+    }
+
+    #[test]
+    fn physical_pointer_requirement_covers_every_click_dependent_action() {
+        let locator = Locator::Id("target".into());
+        for action in [
+            Action::Click {
+                locator: locator.clone(),
+            },
+            Action::Hover {
+                locator: locator.clone(),
+            },
+            Action::Fill {
+                locator: locator.clone(),
+                value: "value".into(),
+            },
+            Action::Type {
+                locator: locator.clone(),
+                value: "value".into(),
+            },
+            Action::Press {
+                locator: locator.clone(),
+                key: "Enter".into(),
+            },
+            Action::Check {
+                locator: locator.clone(),
+                checked: true,
+            },
+        ] {
+            assert!(requires_physical_pointer(&action), "{action:?}");
+        }
+        assert!(!requires_physical_pointer(&Action::Select {
+            locator,
+            option: "one".into(),
+        }));
     }
 }

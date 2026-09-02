@@ -45,6 +45,56 @@ fn dynamic_expression_errors_are_test_failures_not_internal_invariants() {
     assert!(matches!(error, StepError::Evaluation(_)));
 }
 
+fn evaluate_unary(operator: UnaryOperator, operand: Value) -> Result<Value, StepError> {
+    evaluate(
+        &PlanExpr::Unary {
+            operator,
+            operand: Box::new(PlanExpr::Literal(operand)),
+        },
+        &HashMap::new(),
+    )
+}
+
+fn evaluate_binary_result(
+    operator: BinaryOperator,
+    left: Value,
+    right: Value,
+) -> Result<Value, StepError> {
+    evaluate(
+        &PlanExpr::Binary {
+            operator,
+            left: Box::new(PlanExpr::Literal(left)),
+            right: Box::new(PlanExpr::Literal(right)),
+        },
+        &HashMap::new(),
+    )
+}
+
+#[test]
+fn all_integer_overflow_boundaries_are_structured_test_failures() {
+    let operations = [
+        evaluate_unary(UnaryOperator::Negate, Value::Int(i64::MIN)),
+        evaluate_binary_result(BinaryOperator::Add, Value::Int(i64::MAX), Value::Int(1)),
+        evaluate_binary_result(
+            BinaryOperator::Subtract,
+            Value::Int(i64::MIN),
+            Value::Int(1),
+        ),
+        evaluate_binary_result(
+            BinaryOperator::Multiply,
+            Value::Int(i64::MAX),
+            Value::Int(2),
+        ),
+    ];
+    for error in operations.map(|result| result.expect_err("integer operation must overflow")) {
+        assert_eq!(error.code(), "integer_overflow");
+        assert_eq!(error.failure_class(), crate::FailureClass::Test);
+        assert!(matches!(error, StepError::Evaluation(_)));
+        assert!(error.to_string().starts_with("integer "));
+        assert!(error.to_string().ends_with(" overflow"));
+    }
+}
+
 fn binary(operator: BinaryOperator, left: Value, right: Value) -> Value {
     evaluate(
         &PlanExpr::Binary {
@@ -175,6 +225,181 @@ fn operators_preserve_numeric_string_boolean_and_containment_semantics() {
         .expect("negate"),
         Value::Int(-2)
     );
+}
+
+#[test]
+fn numeric_relations_are_exact_across_integer_and_float_boundaries() {
+    let bool_result = |operator, left, right| {
+        assert_eq!(binary(operator, left, right), Value::Bool(true));
+    };
+    bool_result(
+        BinaryOperator::Less,
+        Value::Int(9_007_199_254_740_992),
+        Value::Int(9_007_199_254_740_993),
+    );
+    bool_result(
+        BinaryOperator::NotEqual,
+        Value::Int(9_007_199_254_740_993),
+        Value::Float(9_007_199_254_740_992.0),
+    );
+    bool_result(
+        BinaryOperator::Less,
+        Value::Int(i64::MAX),
+        Value::Float(9_223_372_036_854_775_808.0),
+    );
+    bool_result(
+        BinaryOperator::Equal,
+        Value::Int(i64::MIN),
+        Value::Float(-9_223_372_036_854_775_808.0),
+    );
+
+    for (integer, float, expected) in [
+        (1, 1.5, Ordering::Less),
+        (-1, -1.5, Ordering::Greater),
+        (0, -0.0, Ordering::Equal),
+        (i64::MAX, f64::INFINITY, Ordering::Less),
+        (i64::MIN, f64::NEG_INFINITY, Ordering::Greater),
+    ] {
+        assert_eq!(
+            compare_values(&Value::Int(integer), &Value::Float(float)).expect("numeric values"),
+            Some(expected)
+        );
+        assert_eq!(
+            compare_values(&Value::Float(float), &Value::Int(integer)).expect("numeric values"),
+            Some(expected.reverse())
+        );
+    }
+
+    assert_eq!(
+        compare_values(&Value::Float(f64::NAN), &Value::Int(0)).expect("numeric values"),
+        None
+    );
+    assert_eq!(
+        binary(
+            BinaryOperator::Equal,
+            Value::Float(f64::NAN),
+            Value::Float(f64::NAN)
+        ),
+        Value::Bool(false)
+    );
+    assert_eq!(
+        binary(BinaryOperator::Less, Value::Float(f64::NAN), Value::Int(0)),
+        Value::Bool(false)
+    );
+    assert!(matches!(
+        compare_values(&Value::Bool(false), &Value::Bool(true)),
+        Err(StepError::Internal(_))
+    ));
+
+    assert!(!value_contains(
+        &Value::List(vec![Value::Int(9_007_199_254_740_993)]),
+        &Value::Float(9_007_199_254_740_992.0)
+    ));
+}
+
+#[test]
+fn optional_member_absence_is_null_only_when_the_plan_marks_it_optional() {
+    let member = |missing_is_null| PlanExpr::Member {
+        receiver: Box::new(PlanExpr::Literal(Value::Record(BTreeMap::new()))),
+        member: "value".into(),
+        missing_is_null,
+    };
+    assert_eq!(
+        evaluate(&member(true), &HashMap::new()).expect("optional member"),
+        Value::Null
+    );
+    assert!(matches!(
+        evaluate(&member(false), &HashMap::new()),
+        Err(StepError::Internal(_))
+    ));
+
+    let present = PlanExpr::Member {
+        receiver: Box::new(PlanExpr::Literal(Value::Record(BTreeMap::from([(
+            "value".into(),
+            Value::String("present".into()),
+        )])))),
+        member: "value".into(),
+        missing_is_null: true,
+    };
+    assert_eq!(
+        evaluate(&present, &HashMap::new()).expect("present optional member"),
+        Value::String("present".into())
+    );
+}
+
+#[test]
+fn nested_typed_json_populates_optional_members_and_response_decode_failures_stay_structured() {
+    let item_type = Type::Record(BTreeMap::from([
+        (
+            "id".into(),
+            RecordField {
+                ty: Type::Int,
+                optional: false,
+                documentation: String::new(),
+                secret: false,
+            },
+        ),
+        (
+            "nickname".into(),
+            RecordField {
+                ty: Type::String,
+                optional: true,
+                documentation: String::new(),
+                secret: false,
+            },
+        ),
+    ]));
+    let decoded = decode_value(
+        &Value::Record(BTreeMap::from([(
+            "items".into(),
+            Value::List(vec![Value::Record(BTreeMap::from([(
+                "id".into(),
+                Value::Int(7),
+            )]))]),
+        )])),
+        &Type::Record(BTreeMap::from([(
+            "items".into(),
+            RecordField {
+                ty: Type::List(Box::new(item_type)),
+                optional: false,
+                documentation: String::new(),
+                secret: false,
+            },
+        )])),
+        "$",
+        None,
+    )
+    .expect("nested decode");
+    let Value::Record(root) = decoded else {
+        panic!("decoded record")
+    };
+    let Some(Value::List(items)) = root.get("items") else {
+        panic!("decoded items")
+    };
+    let Value::Record(item) = &items[0] else {
+        panic!("decoded item")
+    };
+    assert_eq!(item.get("nickname"), Some(&Value::Null));
+
+    let response = Value::Response(webtest_provider::ResponseValue {
+        status: 204,
+        headers: BTreeMap::new(),
+        body: vec![0xff],
+        json: None,
+    });
+    for member in ["text", "json"] {
+        let error = evaluate(
+            &PlanExpr::Member {
+                receiver: Box::new(PlanExpr::Literal(response.clone())),
+                member: member.into(),
+                missing_is_null: false,
+            },
+            &HashMap::new(),
+        )
+        .expect_err("unavailable response decoding");
+        assert_eq!(error.code(), "response_decode_failed");
+        assert!(matches!(error, StepError::Evaluation(_)));
+    }
 }
 
 #[test]

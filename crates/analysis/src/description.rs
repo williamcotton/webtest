@@ -1020,6 +1020,23 @@ mod tests {
         };
         assert_eq!(search.results[0].id, "browser.click");
 
+        for (query, expected) in [
+            ("integer overflow", "type.Int"),
+            ("optional member", "type.Record"),
+            ("passive locator observation", "browser.wait.locator"),
+        ] {
+            let DescriptionResponse::Search(search) =
+                response(DescriptionRequest::Search(query.into()))
+            else {
+                panic!("search {query}")
+            };
+            assert!(
+                search.results.iter().any(|result| result.id == expected),
+                "{query}: {:?}",
+                search.results
+            );
+        }
+
         let DescriptionResponse::Diagnostic(unknown) =
             response(DescriptionRequest::Query("locator.rol".into()))
         else {
@@ -1310,6 +1327,58 @@ mod tests {
                 .constraints
                 .iter()
                 .any(|constraint| constraint.code == "structural_matches_pattern")
+        );
+        assert!(
+            core["assertion.value"]
+                .constraints
+                .iter()
+                .any(|constraint| constraint.code == "exact_numeric_relation")
+        );
+        assert!(
+            core["type.Int"]
+                .failure_modes
+                .contains(&"integer_overflow".into())
+        );
+        assert!(
+            core["type.Option"]
+                .guidance
+                .iter()
+                .any(|guidance| guidance.code == "option_assignment")
+        );
+        assert!(
+            core["type.Record"]
+                .guidance
+                .iter()
+                .any(|guidance| guidance.code == "optional_record_members")
+        );
+        for operation in [
+            "browser.click",
+            "browser.fill",
+            "browser.type",
+            "browser.press",
+            "browser.check",
+            "browser.uncheck",
+            "browser.hover",
+        ] {
+            assert!(
+                core[operation]
+                    .failure_modes
+                    .contains(&"element_obscured".into()),
+                "{operation}"
+            );
+            assert!(
+                core[operation]
+                    .constraints
+                    .iter()
+                    .any(|constraint| constraint.code == "physical_pointer_target"),
+                "{operation}"
+            );
+        }
+        assert!(
+            core["browser.wait.locator"]
+                .constraints
+                .iter()
+                .any(|constraint| constraint.code == "passive_locator_observation")
         );
 
         let providers = ProviderRegistry::built_in_schemas();

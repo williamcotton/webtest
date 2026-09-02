@@ -73,7 +73,7 @@ pub(crate) async fn execute_assertion(
                     .as_ref()
                     .map(|expected| evaluate(expected, environment))
                     .transpose()?;
-                if assertion_matches(*matcher, &actual, expected.as_ref()) {
+                if assertion_matches(*matcher, &actual, expected.as_ref())? {
                     Ok(())
                 } else {
                     Err(StepError::Assertion(Box::new(AssertionFailure {
@@ -89,26 +89,47 @@ pub(crate) async fn execute_assertion(
     }
 }
 
-fn assertion_matches(matcher: ValueMatcher, actual: &Value, expected: Option<&Value>) -> bool {
+fn assertion_matches(
+    matcher: ValueMatcher,
+    actual: &Value,
+    expected: Option<&Value>,
+) -> Result<bool, StepError> {
     match matcher {
-        ValueMatcher::Truthy => matches!(actual, Value::Bool(true)),
-        ValueMatcher::Equal => expected.is_some_and(|expected| values_equal(actual, expected)),
-        ValueMatcher::NotEqual => expected.is_some_and(|expected| !values_equal(actual, expected)),
-        ValueMatcher::Less => expected
-            .and_then(|expected| compare_values(actual, expected))
-            .is_some_and(|ordering| ordering < 0),
-        ValueMatcher::LessEqual => expected
-            .and_then(|expected| compare_values(actual, expected))
-            .is_some_and(|ordering| ordering <= 0),
-        ValueMatcher::Greater => expected
-            .and_then(|expected| compare_values(actual, expected))
-            .is_some_and(|ordering| ordering > 0),
-        ValueMatcher::GreaterEqual => expected
-            .and_then(|expected| compare_values(actual, expected))
-            .is_some_and(|ordering| ordering >= 0),
-        ValueMatcher::Contains => expected.is_some_and(|expected| value_contains(actual, expected)),
-        ValueMatcher::Matches => false,
+        ValueMatcher::Truthy => Ok(matches!(actual, Value::Bool(true))),
+        ValueMatcher::Equal => Ok(expected.is_some_and(|expected| values_equal(actual, expected))),
+        ValueMatcher::NotEqual => {
+            Ok(expected.is_some_and(|expected| !values_equal(actual, expected)))
+        }
+        ValueMatcher::Less => ordered_assertion(actual, expected, |ordering| ordering.is_lt()),
+        ValueMatcher::LessEqual => ordered_assertion(actual, expected, |ordering| {
+            matches!(
+                ordering,
+                std::cmp::Ordering::Less | std::cmp::Ordering::Equal
+            )
+        }),
+        ValueMatcher::Greater => ordered_assertion(actual, expected, |ordering| ordering.is_gt()),
+        ValueMatcher::GreaterEqual => ordered_assertion(actual, expected, |ordering| {
+            matches!(
+                ordering,
+                std::cmp::Ordering::Greater | std::cmp::Ordering::Equal
+            )
+        }),
+        ValueMatcher::Contains => {
+            Ok(expected.is_some_and(|expected| value_contains(actual, expected)))
+        }
+        ValueMatcher::Matches => Ok(false),
     }
+}
+
+fn ordered_assertion(
+    actual: &Value,
+    expected: Option<&Value>,
+    matches: impl FnOnce(std::cmp::Ordering) -> bool,
+) -> Result<bool, StepError> {
+    let Some(expected) = expected else {
+        return Ok(false);
+    };
+    Ok(compare_values(actual, expected)?.is_some_and(matches))
 }
 
 pub(crate) fn assertion_message(
@@ -285,51 +306,85 @@ mod tests {
 
     #[test]
     fn all_value_matchers_preserve_current_semantics() {
-        assert!(assertion_matches(
-            ValueMatcher::Truthy,
-            &Value::Bool(true),
-            None
-        ));
-        assert!(assertion_matches(
-            ValueMatcher::Equal,
-            &Value::Int(2),
-            Some(&Value::Float(2.0))
-        ));
-        assert!(assertion_matches(
-            ValueMatcher::NotEqual,
-            &Value::Int(2),
-            Some(&Value::Int(3))
-        ));
-        assert!(assertion_matches(
-            ValueMatcher::Less,
-            &Value::Int(2),
-            Some(&Value::Int(3))
-        ));
-        assert!(assertion_matches(
-            ValueMatcher::LessEqual,
-            &Value::Int(2),
-            Some(&Value::Int(2))
-        ));
-        assert!(assertion_matches(
-            ValueMatcher::Greater,
-            &Value::String("b".into()),
-            Some(&Value::String("a".into()))
-        ));
-        assert!(assertion_matches(
-            ValueMatcher::GreaterEqual,
-            &Value::Int(2),
-            Some(&Value::Int(2))
-        ));
-        assert!(assertion_matches(
-            ValueMatcher::Contains,
-            &Value::List(vec![Value::Int(1), Value::Float(2.0)]),
-            Some(&Value::Int(2))
-        ));
-        assert!(!assertion_matches(
-            ValueMatcher::Matches,
-            &Value::Int(2),
-            None
-        ));
+        assert!(
+            assertion_matches(ValueMatcher::Truthy, &Value::Bool(true), None)
+                .expect("typed matcher")
+        );
+        assert!(
+            assertion_matches(
+                ValueMatcher::Equal,
+                &Value::Int(2),
+                Some(&Value::Float(2.0))
+            )
+            .expect("typed matcher")
+        );
+        assert!(
+            assertion_matches(ValueMatcher::NotEqual, &Value::Int(2), Some(&Value::Int(3)))
+                .expect("typed matcher")
+        );
+        assert!(
+            assertion_matches(ValueMatcher::Less, &Value::Int(2), Some(&Value::Int(3)))
+                .expect("typed matcher")
+        );
+        assert!(
+            assertion_matches(
+                ValueMatcher::LessEqual,
+                &Value::Int(2),
+                Some(&Value::Int(2))
+            )
+            .expect("typed matcher")
+        );
+        assert!(
+            assertion_matches(
+                ValueMatcher::Greater,
+                &Value::String("b".into()),
+                Some(&Value::String("a".into()))
+            )
+            .expect("typed matcher")
+        );
+        assert!(
+            assertion_matches(
+                ValueMatcher::GreaterEqual,
+                &Value::Int(2),
+                Some(&Value::Int(2))
+            )
+            .expect("typed matcher")
+        );
+        assert!(
+            assertion_matches(
+                ValueMatcher::Contains,
+                &Value::List(vec![Value::Int(1), Value::Float(2.0)]),
+                Some(&Value::Int(2))
+            )
+            .expect("typed matcher")
+        );
+        assert!(
+            assertion_matches(
+                ValueMatcher::NotEqual,
+                &Value::Int(9_007_199_254_740_993),
+                Some(&Value::Float(9_007_199_254_740_992.0))
+            )
+            .expect("exact mixed equality")
+        );
+        assert!(
+            assertion_matches(
+                ValueMatcher::Less,
+                &Value::Int(i64::MAX),
+                Some(&Value::Float(9_223_372_036_854_775_808.0))
+            )
+            .expect("exact mixed ordering")
+        );
+        assert!(
+            !assertion_matches(
+                ValueMatcher::Contains,
+                &Value::List(vec![Value::Int(9_007_199_254_740_993)]),
+                Some(&Value::Float(9_007_199_254_740_992.0))
+            )
+            .expect("exact list containment")
+        );
+        assert!(
+            !assertion_matches(ValueMatcher::Matches, &Value::Int(2), None).expect("typed matcher")
+        );
     }
 
     #[test]

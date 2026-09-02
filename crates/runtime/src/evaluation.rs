@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, HashMap},
+};
 
 use webtest_hir::{BinaryOperator, BindingId, UnaryOperator};
 use webtest_plan::PlanExpr;
@@ -28,28 +31,42 @@ pub(crate) fn evaluate(
         PlanExpr::Type(_) => Err(StepError::Internal(
             "type pattern cannot be evaluated as a value".into(),
         )),
-        PlanExpr::Member { receiver, member } => {
+        PlanExpr::Member {
+            receiver,
+            member,
+            missing_is_null,
+        } => {
             let receiver = evaluate(receiver, environment)?;
-            receiver.member(member).ok_or_else(|| {
-                if matches!(receiver, Value::Response(_))
-                    && matches!(member.as_str(), "json" | "text")
-                {
-                    StepError::Evaluation(EvaluationFailure {
-                        code: "response_decode_failed",
-                        message: format!(
-                            "response body is not available as `{member}` for this operation"
-                        ),
-                    })
-                } else {
-                    StepError::Internal(format!("runtime value has no member `{member}`"))
-                }
-            })
+            receiver.member(member).map_or_else(
+                || {
+                    if matches!(receiver, Value::Response(_))
+                        && matches!(member.as_str(), "json" | "text")
+                    {
+                        Err(StepError::Evaluation(EvaluationFailure {
+                            code: "response_decode_failed",
+                            message: format!(
+                                "response body is not available as `{member}` for this operation"
+                            ),
+                        }))
+                    } else if *missing_is_null {
+                        Ok(Value::Null)
+                    } else {
+                        Err(StepError::Internal(format!(
+                            "runtime value has no member `{member}`"
+                        )))
+                    }
+                },
+                Ok,
+            )
         }
         PlanExpr::Unary { operator, operand } => {
             let operand = evaluate(operand, environment)?;
             match (operator, operand) {
                 (UnaryOperator::Not, Value::Bool(value)) => Ok(Value::Bool(!value)),
-                (UnaryOperator::Negate, Value::Int(value)) => Ok(Value::Int(-value)),
+                (UnaryOperator::Negate, Value::Int(value)) => value
+                    .checked_neg()
+                    .map(Value::Int)
+                    .ok_or_else(|| integer_overflow("negation")),
                 (UnaryOperator::Negate, Value::Float(value)) => Ok(Value::Float(-value)),
                 _ => Err(StepError::Internal("invalid typed unary operation".into())),
             }
@@ -85,18 +102,25 @@ fn evaluate_binary(
     let value = match operator {
         BinaryOperator::Equal => Value::Bool(values_equal(&left, &right)),
         BinaryOperator::NotEqual => Value::Bool(!values_equal(&left, &right)),
-        BinaryOperator::Less => Value::Bool(compare_values(&left, &right).is_some_and(|it| it < 0)),
-        BinaryOperator::LessEqual => {
-            Value::Bool(compare_values(&left, &right).is_some_and(|it| it <= 0))
+        BinaryOperator::Less => {
+            Value::Bool(compare_values(&left, &right)?.is_some_and(|it| it == Ordering::Less))
         }
+        BinaryOperator::LessEqual => Value::Bool(
+            compare_values(&left, &right)?
+                .is_some_and(|it| matches!(it, Ordering::Less | Ordering::Equal)),
+        ),
         BinaryOperator::Greater => {
-            Value::Bool(compare_values(&left, &right).is_some_and(|it| it > 0))
+            Value::Bool(compare_values(&left, &right)?.is_some_and(|it| it == Ordering::Greater))
         }
-        BinaryOperator::GreaterEqual => {
-            Value::Bool(compare_values(&left, &right).is_some_and(|it| it >= 0))
-        }
+        BinaryOperator::GreaterEqual => Value::Bool(
+            compare_values(&left, &right)?
+                .is_some_and(|it| matches!(it, Ordering::Greater | Ordering::Equal)),
+        ),
         BinaryOperator::Add => match (left, right) {
-            (Value::Int(left), Value::Int(right)) => Value::Int(left + right),
+            (Value::Int(left), Value::Int(right)) => Value::Int(
+                left.checked_add(right)
+                    .ok_or_else(|| integer_overflow("addition"))?,
+            ),
             (Value::Float(left), Value::Float(right)) => Value::Float(left + right),
             (Value::Int(left), Value::Float(right)) => Value::Float(left as f64 + right),
             (Value::Float(left), Value::Int(right)) => Value::Float(left + right as f64),
@@ -137,8 +161,12 @@ fn numeric_binary(operator: BinaryOperator, left: Value, right: Value) -> Result
         && operator != BinaryOperator::Divide
     {
         return Ok(Value::Int(match operator {
-            BinaryOperator::Subtract => left - right,
-            BinaryOperator::Multiply => left * right,
+            BinaryOperator::Subtract => left
+                .checked_sub(*right)
+                .ok_or_else(|| integer_overflow("subtraction"))?,
+            BinaryOperator::Multiply => left
+                .checked_mul(*right)
+                .ok_or_else(|| integer_overflow("multiplication"))?,
             _ => unreachable!(),
         }));
     }
@@ -246,32 +274,57 @@ pub(crate) fn decode_value(
     }
 }
 
+fn integer_overflow(operation: &str) -> StepError {
+    StepError::Evaluation(EvaluationFailure {
+        code: "integer_overflow",
+        message: format!("integer {operation} overflow"),
+    })
+}
+
 pub(crate) fn values_equal(left: &Value, right: &Value) -> bool {
+    numeric_relation(left, right).map_or_else(
+        || left == right,
+        |relation| relation == Some(Ordering::Equal),
+    )
+}
+
+pub(crate) fn compare_values(left: &Value, right: &Value) -> Result<Option<Ordering>, StepError> {
     match (left, right) {
-        (Value::Int(left), Value::Float(right)) => *left as f64 == *right,
-        (Value::Float(left), Value::Int(right)) => *left == *right as f64,
-        _ => left == right,
+        (Value::String(left), Value::String(right)) => Ok(Some(left.cmp(right))),
+        _ => numeric_relation(left, right).ok_or_else(|| {
+            StepError::Internal("ordered comparison expected numbers or strings".into())
+        }),
     }
 }
 
-pub(crate) fn compare_values(left: &Value, right: &Value) -> Option<i8> {
-    match (left, right) {
-        (Value::String(left), Value::String(right)) => Some(match left.cmp(right) {
-            std::cmp::Ordering::Less => -1,
-            std::cmp::Ordering::Equal => 0,
-            std::cmp::Ordering::Greater => 1,
-        }),
-        _ => {
-            let left = number(left)?;
-            let right = number(right)?;
-            Some(if left < right {
-                -1
-            } else if left > right {
-                1
-            } else {
-                0
-            })
+fn numeric_relation(left: &Value, right: &Value) -> Option<Option<Ordering>> {
+    Some(match (left, right) {
+        (Value::Int(left), Value::Int(right)) => Some(left.cmp(right)),
+        (Value::Float(left), Value::Float(right)) => left.partial_cmp(right),
+        (Value::Int(left), Value::Float(right)) => compare_int_float(*left, *right),
+        (Value::Float(left), Value::Int(right)) => {
+            compare_int_float(*right, *left).map(Ordering::reverse)
         }
+        _ => return None,
+    })
+}
+
+fn compare_int_float(integer: i64, float: f64) -> Option<Ordering> {
+    if float.is_nan() {
+        return None;
+    }
+    if float >= 9_223_372_036_854_775_808.0 {
+        return Some(Ordering::Less);
+    }
+    if float < -9_223_372_036_854_775_808.0 {
+        return Some(Ordering::Greater);
+    }
+
+    let truncated = float.trunc() as i64;
+    match integer.cmp(&truncated) {
+        Ordering::Equal if float.fract() > 0.0 => Some(Ordering::Less),
+        Ordering::Equal if float.fract() < 0.0 => Some(Ordering::Greater),
+        ordering => Some(ordering),
     }
 }
 

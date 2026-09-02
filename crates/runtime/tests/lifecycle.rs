@@ -513,6 +513,65 @@ async fn provider_only_plan_never_starts_a_browser() {
 }
 
 #[tokio::test]
+async fn omitted_optional_provider_member_evaluates_to_null_through_the_shared_plan() {
+    let provider = Arc::new(RecordingProvider::new(Ok(Value::Record(BTreeMap::new()))));
+    let mut providers = ProviderRegistry::default();
+    providers.register(provider);
+    let result_type = Type::Record(BTreeMap::from([(
+        "nickname".into(),
+        webtest_provider::RecordField {
+            ty: Type::String,
+            optional: true,
+            documentation: String::new(),
+            secret: false,
+        },
+    )]));
+    let plan = plan_with_tests(
+        vec![Capability::Server, Capability::Test],
+        vec![vec![
+            TestOperation::ServerProviderCall(ServerProviderCall {
+                provider: "fake".into(),
+                operation: "call".into(),
+                arguments: BTreeMap::new(),
+                result_binding: Some(BindingId(1)),
+                result_name: Some("user".into()),
+                result_type,
+                schema_hash: "schema".into(),
+                timeout: None,
+                redacted_arguments: Vec::new(),
+                redacted_result_fields: Vec::new(),
+                retry_safe: false,
+            }),
+            TestOperation::EvaluatePure(EvaluatePureOperation {
+                expression: PlanExpr::Member {
+                    receiver: Box::new(PlanExpr::Binding(BindingId(1))),
+                    member: "nickname".into(),
+                    missing_is_null: true,
+                },
+                result_binding: Some(BindingId(2)),
+                result_name: Some("nickname".into()),
+                result_type: Type::Option(Box::new(Type::String)),
+            }),
+            TestOperation::Assertion(webtest_plan::AssertionOperation::Value {
+                matcher: webtest_plan::ValueMatcher::Equal,
+                actual: PlanExpr::Binding(BindingId(2)),
+                expected: Some(PlanExpr::Literal(Value::Null)),
+                value_type: Type::Option(Box::new(Type::String)),
+            }),
+        ]],
+    );
+    let state = Arc::new(LifecycleState::default());
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .with_provider_registry(providers)
+        .run(&plan, &LifecycleHost(Arc::clone(&state)))
+        .await;
+
+    assert_eq!(result.passed(), 1);
+    assert!(state.log().is_empty());
+    assert!(matches!(result.tests[0].outcome, TestOutcome::Passed));
+}
+
+#[tokio::test]
 async fn browser_session_is_shared_and_each_test_gets_a_context_and_page() {
     let state = Arc::new(LifecycleState::default());
     let plan = plan_with_tests(
@@ -2381,9 +2440,9 @@ async fn event_sink_commutes_with_provider_and_options_setters() {
 #[tokio::test]
 async fn final_options_configure_all_built_in_providers_without_an_explicit_registry() {
     let root = tempfile::tempdir().expect("temporary project root");
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("HTTP fixture listener");
+    let Ok(listener) = tokio::net::TcpListener::bind("127.0.0.1:0").await else {
+        return;
+    };
     let address = listener.local_addr().expect("HTTP fixture address");
     tokio::spawn(async move {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

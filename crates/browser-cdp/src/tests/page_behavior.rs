@@ -61,6 +61,199 @@ async fn real_chrome_clicks_and_checks_visible_text_when_available() {
 }
 
 #[tokio::test]
+async fn passive_locator_consumers_do_not_scroll_or_focus_but_actions_do_when_available() {
+    let host = ChromeHost::default();
+    if host.locate().is_none() {
+        return;
+    }
+    let Ok(listener) = tokio::net::TcpListener::bind("127.0.0.1:0").await else {
+        return;
+    };
+    let address = listener.local_addr().expect("fixture address");
+    let fixture = r#"<!doctype html><body>
+        <input id="sentinel" aria-label="Sentinel">
+        <div style="height:2400px"></div>
+        <button id="offscreen" onclick="document.body.dataset.clicked='yes'">Offscreen action</button>
+        <script>
+            window.scrollEvents = 0;
+            addEventListener('scroll', () => window.scrollEvents++);
+            document.getElementById('sentinel').focus();
+        </script>
+    </body>"#;
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept passive fixture");
+        let mut request = [0u8; 1024];
+        let _ = stream.read(&mut request).await;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{fixture}",
+            fixture.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("serve passive fixture");
+    });
+
+    let mut browser = host.start().await.expect("start Chrome");
+    let mut page = browser.new_page().await.expect("page");
+    page.open(&format!("http://{address}"))
+        .await
+        .expect("open fixture");
+    page.evaluate(
+        "scrollTo(0, 0); window.scrollEvents = 0; document.getElementById('sentinel').focus()",
+    )
+    .await
+    .expect("reset observation state");
+
+    let target = Locator::Id("offscreen".into());
+    page.wait_for_locator(&target, LocatorState::Visible, Duration::from_secs(1))
+        .await
+        .expect("passive visible wait");
+    page.capture_evidence(&EvidenceRequest {
+        locator: Some(target.clone()),
+        include_screenshot: false,
+        include_dom: false,
+        max_dom_bytes: 0,
+        redactions: Vec::new(),
+        redacted_query_parameters: Vec::new(),
+    })
+    .await;
+    page.inspect(&InspectionOptions::default())
+        .await
+        .expect("passive semantic inspection");
+    page.evaluate(
+        "if (scrollY !== 0 || window.scrollEvents !== 0 || document.activeElement.id !== 'sentinel') throw new Error('passive locator consumer mutated page state')",
+    )
+    .await
+    .expect("passive state remained unchanged");
+
+    page.perform(&Action::Click { locator: target }, Duration::from_secs(2))
+        .await
+        .expect("offscreen action");
+    page.evaluate(
+        "if (scrollY === 0 || window.scrollEvents === 0 || document.body.dataset.clicked !== 'yes') throw new Error('action did not scroll and click')",
+    )
+    .await
+    .expect("action scrolled and used post-scroll target");
+
+    drop(page);
+    browser.close().await.expect("close browser");
+}
+
+#[tokio::test]
+async fn obscured_click_dependent_actions_send_no_input_and_post_scroll_overlay_wins_when_available()
+ {
+    let host = ChromeHost::default();
+    if host.locate().is_none() {
+        return;
+    }
+    let Ok(listener) = tokio::net::TcpListener::bind("127.0.0.1:0").await else {
+        return;
+    };
+    let address = listener.local_addr().expect("fixture address");
+    let fixture = r#"<!doctype html><style>
+        #blocker, #sticky-overlay { position:fixed;inset:0;z-index:10;background:rgba(0,0,0,.1) }
+        #sticky-overlay { display:none }
+    </style><body>
+        <input id="fill-target" value="old-fill">
+        <input id="type-target" value="old-type">
+        <input id="press-target" value="old-press">
+        <div id="blocker"></div>
+        <div style="height:2400px"></div>
+        <button id="scroll-target" onclick="window.targetClicks++">Scroll target</button>
+        <div id="sticky-overlay"></div>
+        <script>
+            window.inputEvents = 0; window.targetClicks = 0;
+            for (const event of ['pointerdown','mousedown','keydown','beforeinput','input']) {
+                addEventListener(event, () => window.inputEvents++, true);
+            }
+            window.armStickyOverlay = () => {
+                document.getElementById('blocker')?.remove();
+                document.getElementById('sticky-overlay').style.display = 'none';
+                addEventListener('scroll', () => {
+                    document.getElementById('sticky-overlay').style.display = 'block';
+                }, {once:true});
+            };
+        </script>
+    </body>"#;
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept obscured fixture");
+        let mut request = [0u8; 1024];
+        let _ = stream.read(&mut request).await;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{fixture}",
+            fixture.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("serve obscured fixture");
+    });
+
+    let mut browser = host.start().await.expect("start Chrome");
+    let mut page = browser.new_page().await.expect("page");
+    page.open(&format!("http://{address}"))
+        .await
+        .expect("open fixture");
+
+    for action in [
+        Action::Fill {
+            locator: Locator::Id("fill-target".into()),
+            value: "new-fill".into(),
+        },
+        Action::Type {
+            locator: Locator::Id("type-target".into()),
+            value: "new-type".into(),
+        },
+        Action::Press {
+            locator: Locator::Id("press-target".into()),
+            key: "Enter".into(),
+        },
+    ] {
+        assert!(matches!(
+            page.perform(&action, Duration::from_millis(180)).await,
+            Err(BrowserError::ElementObscured { .. })
+        ));
+    }
+    page.evaluate(
+        "if (window.inputEvents !== 0 || document.getElementById('fill-target').value !== 'old-fill' || document.getElementById('type-target').value !== 'old-type' || document.getElementById('press-target').value !== 'old-press' || document.activeElement !== document.body) throw new Error('obscured input was dispatched')",
+    )
+    .await
+    .expect("no mouse, keyboard, text, value, or focus input");
+
+    page.evaluate("window.armStickyOverlay()")
+        .await
+        .expect("arm sticky overlay");
+    let click = Action::Click {
+        locator: Locator::Id("scroll-target".into()),
+    };
+    assert!(matches!(
+        page.perform(&click, Duration::from_millis(250)).await,
+        Err(BrowserError::ElementObscured { .. })
+    ));
+    page.evaluate(
+        "if (window.targetClicks !== 0 || document.getElementById('sticky-overlay').style.display !== 'block') throw new Error('post-scroll overlay was not authoritative')",
+    )
+    .await
+    .expect("post-scroll snapshot blocked click");
+
+    page.evaluate("setTimeout(() => document.getElementById('sticky-overlay').remove(), 120)")
+        .await
+        .expect("schedule overlay removal");
+    page.perform(&click, Duration::from_secs(1))
+        .await
+        .expect("bounded polling permits click after overlay removal");
+    page.evaluate(
+        "if (window.targetClicks !== 1) throw new Error('target was not clicked exactly once')",
+    )
+    .await
+    .expect("target clicked after overlay removal");
+
+    drop(page);
+    browser.close().await.expect("close browser");
+}
+
+#[tokio::test]
 async fn real_chrome_runs_semantic_form_flow_with_physical_input_when_available() {
     let host = ChromeHost::default();
     if host.locate().is_none() {

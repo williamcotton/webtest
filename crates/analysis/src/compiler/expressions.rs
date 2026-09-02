@@ -158,11 +158,13 @@ impl Compiler<'_> {
                 member_origin,
             } => {
                 let receiver = self.infer_expr(receiver, domain, None);
+                let missing_is_null = receiver.ty.member_missing_is_null(member);
                 if let Some(ty) = receiver.ty.member(member) {
                     TypedExpr {
                         expression: PlanExpr::Member {
                             receiver: Box::new(receiver.expression),
                             member: member.clone(),
+                            missing_is_null,
                         },
                         ty,
                         capability: receiver.capability,

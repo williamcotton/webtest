@@ -582,7 +582,7 @@ fn build_emits_a_versioned_typed_plan_deterministically() {
     let first_bytes = fs::read(&first).expect("first plan");
     assert_eq!(first_bytes, fs::read(&second).expect("second plan"));
     let plan: serde_json::Value = serde_json::from_slice(&first_bytes).expect("plan JSON");
-    assert_eq!(plan["format_version"], 2);
+    assert_eq!(plan["format_version"], 3);
     assert_eq!(plan["required_host_capabilities"][0], "server");
     assert_eq!(
         plan["tests"][0]["required_host_capabilities"],
@@ -591,6 +591,10 @@ fn build_emits_a_versioned_typed_plan_deterministically() {
     assert_eq!(
         plan["tests"][0]["steps"][0]["operation"]["kind"],
         "server_provider_call"
+    );
+    assert_eq!(
+        plan["tests"][0]["steps"][1]["operation"]["operation"]["actual"]["value"]["missing_is_null"],
+        false
     );
 
     write(

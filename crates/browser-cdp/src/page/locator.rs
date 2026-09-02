@@ -28,6 +28,14 @@ pub(super) async fn resolve(
     Ok(snapshot)
 }
 
+pub(super) async fn scroll_into_view(
+    page: &CdpPage,
+    locator: &Locator,
+) -> Result<(), BrowserError> {
+    let expression = scroll_expression(locator, &page.test_id_attribute)?;
+    evaluate_expression(page, expression).await.map(|_| ())
+}
+
 pub(super) async fn wait_for_locator(
     page: &CdpPage,
     locator: &Locator,
@@ -243,7 +251,6 @@ fn resolver_expression(locator: &Locator, test_id_attribute: &str) -> Result<Str
             }});
             if (elements.length !== 1) return {{matches: elements.length, candidates}};
             const element = elements[0];
-            element.scrollIntoView({{block:'center', inline:'center', behavior:'instant'}});
             const rect = element.getBoundingClientRect();
             const style = getComputedStyle(element);
             const visible = style.display !== 'none' && style.visibility !== 'hidden'
@@ -263,6 +270,47 @@ fn resolver_expression(locator: &Locator, test_id_attribute: &str) -> Result<Str
             return {{matches:1, candidates, visible, disabled, editable, checked, obscured, documentIndex,
                 tag: element.tagName.toLowerCase(), rect: {{x:rect.x,y:rect.y,width:rect.width,height:rect.height}}}};
         }} catch (error) {{ return {{matches:0, invalid:String(error)}}; }}
+    }})()"#
+    ))
+}
+
+fn scroll_expression(locator: &Locator, test_id_attribute: &str) -> Result<String, BrowserError> {
+    let elements = locator_array_expression(locator, test_id_attribute)?;
+    Ok(format!(
+        r#"(() => {{
+        const norm = value => String(value || '').replace(/\s+/g, ' ').trim();
+        const implicitRole = element => {{
+            const tag = element.tagName.toLowerCase();
+            if (tag === 'button') return 'button';
+            if (tag === 'a' && element.hasAttribute('href')) return 'link';
+            if (tag === 'textarea') return 'textbox';
+            if (tag === 'select') return 'combobox';
+            if (tag === 'input') {{
+                const type = (element.type || 'text').toLowerCase();
+                if (['button','submit','reset'].includes(type)) return 'button';
+                if (type === 'checkbox') return 'checkbox';
+                if (type === 'radio') return 'radio';
+                if (['text','email','password','search','tel','url'].includes(type)) return 'textbox';
+            }}
+            return null;
+        }};
+        const accessibleName = element => {{
+            const labelledby = element.getAttribute('aria-labelledby');
+            if (labelledby) return norm(labelledby.split(/\s+/).map(id => document.getElementById(id)?.innerText || '').join(' '));
+            if (element.hasAttribute('aria-label')) return norm(element.getAttribute('aria-label'));
+            if (element.labels?.length) return norm(Array.from(element.labels).map(label => {{
+                const copy = label.cloneNode(true);
+                copy.querySelectorAll('input,textarea,select,button').forEach(control => control.remove());
+                return copy.innerText || copy.textContent;
+            }}).join(' '));
+            if (element.tagName === 'IMG') return norm(element.alt);
+            if (element.tagName === 'INPUT' && ['button','submit','reset'].includes(element.type)) return norm(element.value);
+            return norm(element.innerText || element.textContent || element.title);
+        }};
+        const elements = {elements};
+        if (elements.length !== 1) return false;
+        elements[0].scrollIntoView({{block:'center', inline:'center', behavior:'instant'}});
+        return true;
     }})()"#
     ))
 }
@@ -362,6 +410,20 @@ mod tests {
         assert!(css_attribute("data-testid").is_ok());
         assert!(css_attribute("data testid").is_err());
         assert!(css_attribute("").is_err());
+    }
+
+    #[test]
+    fn shared_resolution_is_passive_and_scrolling_is_action_only() {
+        let resolver =
+            resolver_expression(&Locator::Id("target".into()), "data-testid").expect("resolver");
+        assert!(!resolver.contains("scrollIntoView"));
+        assert!(!resolver.contains(".focus("));
+        assert!(!resolver.contains(".click("));
+        assert!(!resolver.contains("dispatchEvent"));
+
+        let scroll =
+            scroll_expression(&Locator::Id("target".into()), "data-testid").expect("scroll helper");
+        assert!(scroll.contains("scrollIntoView"));
     }
 
     #[test]

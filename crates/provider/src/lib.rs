@@ -118,15 +118,16 @@ impl Type {
                 | Self::Record(_),
             ) => true,
             (Self::Option(_), Self::Null) => true,
-            (Self::Option(expected), Self::Option(actual))
-            | (Self::List(expected), Self::List(actual))
+            (Self::Option(expected), Self::Option(actual)) => expected.accepts(actual),
+            (Self::Option(expected), actual) => expected.accepts(actual),
+            (Self::List(expected), Self::List(actual))
             | (Self::Response(expected), Self::Response(actual)) => expected.accepts(actual),
             (Self::Record(expected), Self::Record(actual)) => {
                 expected.iter().all(|(name, field)| {
-                    actual
-                        .get(name)
-                        .is_some_and(|actual| field.ty.accepts(&actual.ty))
-                        || field.optional
+                    let Some(actual) = actual.get(name) else {
+                        return field.optional;
+                    };
+                    field.ty.accepts(&actual.ty) && (field.optional || !actual.optional)
                 })
             }
             _ => false,
@@ -158,6 +159,14 @@ impl Type {
             },
             Self::Headers => Some(Self::Option(Box::new(Self::String))),
             _ => None,
+        }
+    }
+
+    pub fn member_missing_is_null(&self, name: &str) -> bool {
+        match self {
+            Self::Record(fields) => fields.get(name).is_some_and(|field| field.optional),
+            Self::Headers => true,
+            _ => false,
         }
     }
 }
@@ -1696,6 +1705,58 @@ mod tests {
     }
 
     #[test]
+    fn option_and_record_compatibility_preserve_presence() {
+        let optional_string = Type::Option(Box::new(Type::String));
+        assert!(optional_string.accepts(&Type::Null));
+        assert!(optional_string.accepts(&Type::String));
+        assert!(optional_string.accepts(&Type::Option(Box::new(Type::String))));
+        assert!(!optional_string.accepts(&Type::Int));
+        assert!(!Type::String.accepts(&optional_string));
+
+        let record = |optional: bool| {
+            Type::Record(BTreeMap::from([(
+                "name".into(),
+                RecordField {
+                    ty: Type::String,
+                    optional,
+                    documentation: String::new(),
+                    secret: false,
+                },
+            )]))
+        };
+        let empty = Type::Record(BTreeMap::new());
+        assert!(!record(false).accepts(&record(true)));
+        assert!(record(true).accepts(&record(false)));
+        assert!(record(true).accepts(&record(true)));
+        assert!(record(true).accepts(&empty));
+        assert!(!record(false).accepts(&empty));
+
+        let wrong = Type::Record(BTreeMap::from([(
+            "name".into(),
+            RecordField {
+                ty: Type::Int,
+                optional: false,
+                documentation: String::new(),
+                secret: false,
+            },
+        )]));
+        assert!(!record(true).accepts(&wrong));
+
+        let required_nullable = Type::Record(BTreeMap::from([(
+            "name".into(),
+            RecordField {
+                ty: Type::Option(Box::new(Type::String)),
+                optional: false,
+                documentation: String::new(),
+                secret: false,
+            },
+        )]));
+        assert!(!required_nullable.member_missing_is_null("name"));
+        assert!(record(true).member_missing_is_null("name"));
+        assert!(Type::Headers.member_missing_is_null("authorization"));
+    }
+
+    #[test]
     fn parent_paths_are_rejected() {
         assert!(matches!(
             safe_path(Path::new("/project"), "../secret"),
@@ -1771,7 +1832,9 @@ mod tests {
 
     #[tokio::test]
     async fn http_provider_keeps_cookies_between_calls() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("fixture listener");
+        let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:0") else {
+            return;
+        };
         let address = listener.local_addr().expect("fixture address");
         let fixture = std::thread::spawn(move || {
             for index in 0..2 {

@@ -172,7 +172,7 @@ async fn inspectable_element(
     let preferred_locator = validated.remove(0);
     let interactive = raw.interactive || role.is_some();
     let mut supported_actions = Vec::new();
-    if raw.editable && raw.visible && !raw.disabled {
+    if raw.editable && raw.visible && !raw.disabled && !raw.obscured {
         supported_actions.extend([
             SupportedAction::Fill,
             SupportedAction::Type,
@@ -182,7 +182,7 @@ async fn inspectable_element(
     if raw.clickable && raw.visible && !raw.disabled && !raw.obscured {
         supported_actions.push(SupportedAction::Click);
     }
-    if raw.checkable && raw.visible && !raw.disabled {
+    if raw.checkable && raw.visible && !raw.disabled && !raw.obscured {
         supported_actions.extend([SupportedAction::Check, SupportedAction::Uncheck]);
     }
     if raw.selectable && raw.visible && !raw.disabled {

@@ -103,6 +103,8 @@ test "created user can sign in" {
 
 This example requires `server.base_url` and `browser.base_url`, plus an offline application manifest declaring `app.create_user` with the shown parameters and a transferable result containing `email`.
 
+Current runtime semantics are intentionally precise. Locator waits, assertions, evidence capture, and inspection are passive observations: they do not scroll or focus the page. Browser actions resolve uniquely, scroll, resolve again, and use post-scroll facts; click, hover, check, fill, type, and press all fail with `element_obscured` before sending input when the target cannot receive pointer input. `Int` negation/addition/subtraction/multiplication fail with `integer_overflow` instead of wrapping, numeric comparisons preserve exact integer distinctions, and a statically optional record member evaluates to its value or `null`. Query `browser.<operation>`, `type.Int`, `type.Option`, `type.Record`, or `assertion.value` for the machine-readable contract.
+
 ## Discover before authoring
 
 Start with a narrow query and use JSON when consuming results programmatically:

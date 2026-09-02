@@ -401,6 +401,9 @@ fn locator_constructs() -> Vec<ConstructDescription> {
             value.requires_capabilities = vec![Capability::Browser];
             value.allowed_contexts = vec!["scope.browser".into()];
             value.search_terms = terms.into_iter().map(str::to_owned).collect();
+            value
+                .search_terms
+                .extend(["passive locator observation".into(), "no scroll".into()]);
             value.failure_modes = vec!["locator_not_found".into(), "locator_ambiguous".into()];
             if matches!(name, "css" | "xpath") {
                 value.failure_modes.push("locator_invalid".into());
@@ -410,7 +413,7 @@ fn locator_constructs() -> Vec<ConstructDescription> {
                 "runtime",
                 "locator result",
                 "An operation that requires a present target rejects multiple matches; hidden and detached state checks may succeed with no match.",
-            )];
+            ), passive_locator_constraint()];
             value.examples = vec![
                 example(
                     "locator",
@@ -488,6 +491,8 @@ fn locator_constructs() -> Vec<ConstructDescription> {
         "accessible name".into(),
         "button".into(),
         "control".into(),
+        "passive locator observation".into(),
+        "no scroll".into(),
     ];
     role.failure_modes = vec!["locator_not_found".into(), "locator_ambiguous".into()];
     role.constraints = vec![
@@ -503,6 +508,7 @@ fn locator_constructs() -> Vec<ConstructDescription> {
             "locator result",
             "An operation that requires a present target rejects multiple matches; hidden and detached state checks may succeed with no match.",
         ),
+        passive_locator_constraint(),
     ];
     role.examples = vec![
         example(
@@ -580,7 +586,7 @@ fn browser_constructs() -> Vec<ConstructDescription> {
         (
             "fill",
             "fill <target> with <value>",
-            "Replace the value of one editable element.",
+            "Focus one unobscured editable element with pointer input and replace its value.",
             vec![
                 parameter(
                     "target",
@@ -608,7 +614,7 @@ fn browser_constructs() -> Vec<ConstructDescription> {
         (
             "type",
             "type <target> with <value>",
-            "Append text to one editable element using browser text input.",
+            "Focus one unobscured editable element with pointer input and append browser text input.",
             vec![
                 parameter(
                     "target",
@@ -636,7 +642,7 @@ fn browser_constructs() -> Vec<ConstructDescription> {
         (
             "press",
             "press <target> key <key>",
-            "Send a validated key or key chord after focusing one visible, enabled, stable element.",
+            "Send a validated key or key chord after pointer-focusing one visible, enabled, stable, unobscured element.",
             vec![
                 parameter(
                     "target",
@@ -819,6 +825,21 @@ fn browser_constructs() -> Vec<ConstructDescription> {
                 value.requires_capabilities = vec![Capability::Browser];
                 value.allowed_contexts = vec!["scope.browser".into()];
                 value.search_terms = search_terms.into_iter().map(str::to_owned).collect();
+                if matches!(
+                    suffix,
+                    "click" | "fill" | "type" | "press" | "check" | "uncheck" | "hover"
+                ) {
+                    value.search_terms.extend([
+                        "unobscured pointer target".into(),
+                        "element obscured".into(),
+                        "post scroll remeasure".into(),
+                    ]);
+                }
+                if suffix == "wait.locator" {
+                    value
+                        .search_terms
+                        .extend(["passive locator observation".into(), "no scroll".into()]);
+                }
                 value.effects = browser_effects(suffix);
                 value.failure_modes = browser_failure_modes(suffix);
                 value.constraints = browser_constraints(suffix);
@@ -895,6 +916,7 @@ fn browser_failure_modes(operation: &str) -> Vec<String> {
             "element_not_visible",
             "element_unstable",
             "element_disabled",
+            "element_obscured",
             "element_not_editable",
             "action_timeout",
             "browser_disconnected",
@@ -907,6 +929,7 @@ fn browser_failure_modes(operation: &str) -> Vec<String> {
             "element_not_visible",
             "element_unstable",
             "element_disabled",
+            "element_obscured",
             "invalid_key",
             "action_timeout",
             "browser_disconnected",
@@ -966,7 +989,7 @@ fn browser_constraints(operation: &str) -> Vec<ConstraintDescription> {
             "expression",
             "The JavaScript source is an explicit string literal; evaluate does not interpolate WebTest expressions and produces no binding value.",
         )],
-        "wait.locator" => vec![locator_state_constraint()],
+        "wait.locator" => vec![locator_state_constraint(), passive_locator_constraint()],
         _ => vec![constraint(
             "unique_target_before_deadline",
             "runtime",
@@ -1001,6 +1024,28 @@ fn browser_constraints(operation: &str) -> Vec<ConstraintDescription> {
         )),
         _ => {}
     }
+    if matches!(
+        operation,
+        "click" | "fill" | "type" | "press" | "check" | "uncheck" | "select" | "hover"
+    ) {
+        constraints.push(constraint(
+            "action_scroll_and_remeasure",
+            "runtime",
+            "target",
+            "After passive unique resolution, the action scrolls the target into view, resolves it again, and uses only post-scroll measurements for stability and input.",
+        ));
+    }
+    if matches!(
+        operation,
+        "click" | "fill" | "type" | "press" | "check" | "uncheck" | "hover"
+    ) {
+        constraints.push(constraint(
+            "physical_pointer_target",
+            "runtime",
+            "target",
+            "The post-scroll target must receive pointer input. A stable obscuring element fails with element_obscured before any mouse, keyboard, or text input is sent.",
+        ));
+    }
     constraints
 }
 
@@ -1014,6 +1059,15 @@ fn locator_state_constraint() -> ConstraintDescription {
         "syntax",
         "state",
         "The state is one of attached, detached, visible, hidden, enabled, disabled, checked, or unchecked.",
+    )
+}
+
+fn passive_locator_constraint() -> ConstraintDescription {
+    constraint(
+        "passive_locator_observation",
+        "runtime",
+        "locator observation",
+        "Resolving, waiting for, asserting, inspecting, or capturing evidence for a locator reads page state without scrolling, focusing, clicking, mutating the DOM, or dispatching input.",
     )
 }
 
@@ -1154,6 +1208,7 @@ fn assertion_constructs() -> Vec<ConstructDescription> {
     ];
     locator.constraints = vec![
         locator_state_constraint(),
+        passive_locator_constraint(),
         constraint(
             "state_before_deadline",
             "runtime",
@@ -1306,6 +1361,12 @@ fn assertion_constructs() -> Vec<ConstructDescription> {
             "matches right operand",
             "The matches operator decodes Json or record data against a type name, record shape, or one-element list shape; it does not interpret a regular expression.",
         ),
+        constraint(
+            "exact_numeric_relation",
+            "runtime",
+            "numeric operands",
+            "Int-to-Int comparison is exact. Mixed Int and Float comparison preserves the mathematical integer value across the full Int range without first rounding it to Float; NaN is unequal and makes ordered comparisons false.",
+        ),
     ];
     value.examples = vec![
         example(
@@ -1326,6 +1387,8 @@ fn assertion_constructs() -> Vec<ConstructDescription> {
         "equal".into(),
         "contains".into(),
         "matches".into(),
+        "exact numeric relation".into(),
+        "integer float comparison".into(),
     ];
     vec![locator, url, value]
 }
@@ -1453,6 +1516,41 @@ fn type_constructs() -> Vec<ConstructDescription> {
                         code: "record_member_access".into(),
                         summary: "An unknown record field produces `semantic.unknown_member`. When a known field name is close, the diagnostic includes a bounded `member_candidate` repair hint.".into(),
                     },
+                    GuidanceDescription {
+                        code: "optional_record_members".into(),
+                        summary: "A field declared as `name?: T` may be omitted. Access returns the present value or `Null`; an optional actual field cannot satisfy a required expected field, while a required compatible field can satisfy an optional expectation.".into(),
+                    },
+                ];
+                value.examples.push(example(
+                    "omitted optional member",
+                    "let value: { required: String, optional?: String } = { required: \"hello\" }\nexpect value.optional == null",
+                    "statement_fragment",
+                    "flow_block",
+                ));
+            }
+            if name == "Option" {
+                value.guidance = vec![GuidanceDescription {
+                    code: "option_assignment".into(),
+                    summary: "`Option<T>` accepts `Null`, a compatible `T`, or a compatible `Option<U>`. A required `T` does not accept `Option<U>` merely because it accepts `U`.".into(),
+                }];
+                value.examples.push(example(
+                    "present optional value",
+                    "let value: Option<String> = \"hello\"\nexpect value == \"hello\"",
+                    "statement_fragment",
+                    "flow_block",
+                ));
+            }
+            if name == "Int" {
+                value.failure_modes.push("integer_overflow".into());
+                value.guidance = vec![
+                    GuidanceDescription {
+                        code: "checked_integer_arithmetic".into(),
+                        summary: "Int negation, addition, subtraction, and multiplication use checked signed 64-bit arithmetic. Overflow is the structured test failure `integer_overflow`; it never wraps or depends on the build profile.".into(),
+                    },
+                    GuidanceDescription {
+                        code: "exact_integer_comparison".into(),
+                        summary: "Int equality and ordering are exact, including adjacent values above 2^53. Mixed Int/Float comparison does not first round the Int to Float.".into(),
+                    },
                 ];
             }
             if name == "Json" {
@@ -1497,6 +1595,23 @@ fn type_constructs() -> Vec<ConstructDescription> {
                 ];
             }
             value.search_terms = vec![ty.to_string(), "static type".into()];
+            match name {
+                "Int" => value.search_terms.extend([
+                    "integer overflow".into(),
+                    "checked arithmetic".into(),
+                    "exact numeric comparison".into(),
+                ]),
+                "Option" => value.search_terms.extend([
+                    "optional nullable assignment".into(),
+                    "present or null".into(),
+                ]),
+                "Record" => value.search_terms.extend([
+                    "optional member".into(),
+                    "missing field null".into(),
+                    "field presence".into(),
+                ]),
+                _ => {}
+            }
             value
         })
         .collect()
@@ -1529,6 +1644,12 @@ fn typed_json_decode() -> ConstructDescription {
             "runtime",
             "decoded value",
             "Execution validates the complete annotated shape. A missing field, wrong primitive, or wrong nested list/record member is a structured decode failure with the exact JSON path.",
+        ),
+        constraint(
+            "json_optional_member",
+            "runtime",
+            "optional record field",
+            "An omitted field declared with `?` is decoded as `Null`; required omitted fields remain structured decode failures.",
         ),
     ];
     value.guidance = vec![

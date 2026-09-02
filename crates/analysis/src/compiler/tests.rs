@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use crate::{AnalysisDatabase, Diagnostic};
 use webtest_feedback::RepairReplacement;
 use webtest_hir::{BinaryOperator, BindingId, StepId};
@@ -70,6 +72,113 @@ fn compiles_typed_server_to_browser_flow() {
         vec![Capability::Server, Capability::Browser, Capability::Test]
     );
     assert!(plan.validate_capabilities().is_ok());
+}
+
+#[test]
+fn optional_assignments_and_member_access_lower_the_runtime_presence_fact() {
+    let source = r#"test "optional values" {
+        let literal: { required: String, optional?: String, nullable: Option<String> } = {
+            required: "hello",
+            nullable: null,
+        }
+        expect literal.optional == null
+        expect literal.nullable == null
+        let present: Option<String> = "hello"
+        expect present == "hello"
+    }"#;
+    let (diagnostics, plan) = analyze(source);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+
+    let TestOperation::Assertion(assertion) = &plan.tests[0].steps[1].operation else {
+        panic!("optional member assertion")
+    };
+    let webtest_plan::AssertionOperation::Value { actual, .. } = assertion else {
+        panic!("value assertion")
+    };
+    assert!(matches!(
+        actual,
+        PlanExpr::Member {
+            member,
+            missing_is_null: true,
+            ..
+        } if member == "optional"
+    ));
+    let TestOperation::Assertion(assertion) = &plan.tests[0].steps[2].operation else {
+        panic!("required nullable member assertion")
+    };
+    let webtest_plan::AssertionOperation::Value { actual, .. } = assertion else {
+        panic!("value assertion")
+    };
+    assert!(matches!(
+        actual,
+        PlanExpr::Member {
+            member,
+            missing_is_null: false,
+            ..
+        } if member == "nullable"
+    ));
+}
+
+#[test]
+fn provider_optional_results_lower_presence_but_required_records_reject_optional_fields() {
+    let result = Type::Record(BTreeMap::from([(
+        "nickname".into(),
+        RecordField {
+            ty: Type::String,
+            optional: true,
+            documentation: String::new(),
+            secret: false,
+        },
+    )]));
+    let schema = ProviderSchema {
+        name: ProviderName("app".into()),
+        operations: BTreeMap::from([(
+            "fetch".into(),
+            OperationSchema {
+                name: OperationName("fetch".into()),
+                parameters: Vec::new(),
+                result,
+                capability: Capability::Server,
+                documentation: String::new(),
+                retry_safe: false,
+            },
+        )]),
+        schema_identity: Some("schema:optional".into()),
+    };
+    let mut providers = ProviderRegistry::built_in_schemas();
+    providers.register_schema(schema);
+    let (diagnostics, plan) = analyze_with_registry(
+        r#"test "provider optional" { server {
+            let user = app.fetch()
+            expect user.nickname == null
+        } }"#,
+        providers,
+    );
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    let TestOperation::Assertion(webtest_plan::AssertionOperation::Value { actual, .. }) =
+        &plan.tests[0].steps[1].operation
+    else {
+        panic!("provider optional assertion")
+    };
+    assert!(matches!(
+        actual,
+        PlanExpr::Member {
+            missing_is_null: true,
+            ..
+        }
+    ));
+
+    let (diagnostics, _) = analyze(
+        r#"test "presence mismatch" {
+            let optional: { name?: String } = {}
+            let required: { name: String } = optional
+        }"#,
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "semantic.type_mismatch")
+    );
 }
 
 #[test]

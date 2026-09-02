@@ -171,6 +171,7 @@ mod tests {
             PlanExpr::Member {
                 receiver: Box::new(leaf.clone()),
                 member: "value".into(),
+                missing_is_null: false,
             },
             PlanExpr::Unary {
                 operator: UnaryOperator::Not,

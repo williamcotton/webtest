@@ -453,7 +453,11 @@ mod tests {
     server { let response = http.get("http://example.test") }
 }
 test "pure" { let value = 1 }
-test "browser" { browser { open "/" } }"#;
+test "browser" { browser { open "/" } }
+test "optional" {
+    let value: { required: String, optional?: String } = { required: "yes" }
+    expect value.optional == null
+}"#;
         let portable = compile(source).plan.expect("portable plan");
         let mut database = AnalysisDatabase::default();
         let file = database.open_file("memory://document.webtest", source);
@@ -465,21 +469,51 @@ test "browser" { browser { open "/" } }"#;
                 .iter()
                 .map(|test| test.required_host_capabilities.clone())
                 .collect::<Vec<_>>(),
-            [vec![Capability::Server], vec![], vec![Capability::Browser]]
+            [
+                vec![Capability::Server],
+                vec![],
+                vec![Capability::Browser],
+                vec![Capability::Test]
+            ]
         );
+        let webtest_plan::TestOperation::Assertion(webtest_plan::AssertionOperation::Value {
+            actual,
+            ..
+        }) = &portable.tests[3].steps[1].operation
+        else {
+            panic!("optional assertion")
+        };
+        assert!(matches!(
+            actual,
+            webtest_plan::PlanExpr::Member {
+                missing_is_null: true,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn descriptions_and_static_repair_diagnostics_match_the_native_core() {
-        let portable = serde_json::to_value(describe(Some("locator.role"), None))
-            .expect("portable description");
-        let native = serde_json::to_value(AnalysisDatabase::default().describe(
-            webtest_analysis::DescriptionRequest::Query("locator.role".into()),
-            None,
-            webtest_analysis::DescriptionLimits::default(),
-        ))
-        .expect("native description");
-        assert_eq!(portable, native);
+        for query in [
+            "locator.role",
+            "browser.fill",
+            "browser.wait.locator",
+            "assertion.value",
+            "type.Int",
+            "type.Option",
+            "type.Record",
+            "json.typed_decode",
+        ] {
+            let portable =
+                serde_json::to_value(describe(Some(query), None)).expect("portable description");
+            let native = serde_json::to_value(AnalysisDatabase::default().describe(
+                webtest_analysis::DescriptionRequest::Query(query.into()),
+                None,
+                webtest_analysis::DescriptionLimits::default(),
+            ))
+            .expect("native description");
+            assert_eq!(portable, native, "{query}");
+        }
 
         let source = r#"test "x" {
     server {
