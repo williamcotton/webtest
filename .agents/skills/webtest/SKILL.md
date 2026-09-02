@@ -103,8 +103,6 @@ test "created user can sign in" {
 
 This example requires `server.base_url` and `browser.base_url`, plus an offline application manifest declaring `app.create_user` with the shown parameters and a transferable result containing `email`.
 
-Current runtime semantics are intentionally precise. Locator waits, assertions, evidence capture, and inspection are passive observations: they do not scroll or focus the page. Browser actions resolve uniquely, scroll, resolve again, and use post-scroll facts; click, hover, check, fill, type, and press all fail with `element_obscured` before sending input when the target cannot receive pointer input. `Int` negation/addition/subtraction/multiplication fail with `integer_overflow` instead of wrapping, numeric comparisons preserve exact integer distinctions, and a statically optional record member evaluates to its value or `null`. Query `browser.<operation>`, `type.Int`, `type.Option`, `type.Record`, or `assertion.value` for the machine-readable contract.
-
 ## Discover before authoring
 
 Start with a narrow query and use JSON when consuming results programmatically:
@@ -146,9 +144,5 @@ Run `webtest inspect [<url>] --reporter json` to obtain bounded semantic element
 5. Run `webtest test <path> --reporter json`; add `--headed` only when visible Chrome is useful.
 
 Diagnostics may contain canonical `reference_queries` and bounded `repair_hints`. Runtime failures may contain locator replacement candidates when WebTest has safe evidence. Treat both as advisory, preserve their source ranges, and rerun `check` or `test` after any edit; WebTest does not apply repairs automatically.
-
-## Understand timeout budgets
-
-`[timeouts].test` is one deadline for each test, measured from that test's start through browser resource acquisition and body execution. It is not a file or suite timeout. Browser action, assertion, navigation, and provider-call defaults are each capped by the remaining test time. `[timeouts].provider_call` is the distinct default for provider calls; an explicit typed provider `timeout` may shorten that call but cannot extend the per-test deadline. Debugger pause time currently counts toward the same deadline. Cleanup runs after the provisional body outcome under the owned backend bounds and cannot turn a timeout into a pass.
 
 Do not infer unavailable roadmap syntax from prose or model memory. If a query is unknown, search the installed reference or inspect `webtest describe language --reporter json` rather than inventing a construct.

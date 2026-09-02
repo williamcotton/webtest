@@ -210,10 +210,11 @@ async fn obscured_click_dependent_actions_send_no_input_and_post_scroll_overlay_
             key: "Enter".into(),
         },
     ] {
-        assert!(matches!(
-            page.perform(&action, Duration::from_millis(180)).await,
-            Err(BrowserError::ElementObscured { .. })
-        ));
+        let result = page.perform(&action, Duration::from_secs(1)).await;
+        assert!(
+            matches!(result, Err(BrowserError::ElementObscured { .. })),
+            "{action:?}: {result:?}"
+        );
     }
     page.evaluate(
         "if (window.inputEvents !== 0 || document.getElementById('fill-target').value !== 'old-fill' || document.getElementById('type-target').value !== 'old-type' || document.getElementById('press-target').value !== 'old-press' || document.activeElement !== document.body) throw new Error('obscured input was dispatched')",
@@ -227,10 +228,11 @@ async fn obscured_click_dependent_actions_send_no_input_and_post_scroll_overlay_
     let click = Action::Click {
         locator: Locator::Id("scroll-target".into()),
     };
-    assert!(matches!(
-        page.perform(&click, Duration::from_millis(250)).await,
-        Err(BrowserError::ElementObscured { .. })
-    ));
+    let result = page.perform(&click, Duration::from_secs(1)).await;
+    assert!(
+        matches!(result, Err(BrowserError::ElementObscured { .. })),
+        "post-scroll overlay: {result:?}"
+    );
     page.evaluate(
         "if (window.targetClicks !== 0 || document.getElementById('sticky-overlay').style.display !== 'block') throw new Error('post-scroll overlay was not authoritative')",
     )
@@ -240,7 +242,7 @@ async fn obscured_click_dependent_actions_send_no_input_and_post_scroll_overlay_
     page.evaluate("setTimeout(() => document.getElementById('sticky-overlay').remove(), 120)")
         .await
         .expect("schedule overlay removal");
-    page.perform(&click, Duration::from_secs(1))
+    page.perform(&click, Duration::from_secs(2))
         .await
         .expect("bounded polling permits click after overlay removal");
     page.evaluate(
@@ -699,13 +701,13 @@ async fn actionability_failures_are_distinct_and_candidate_evidence_is_bounded()
                         host.innerHTML =
                             '<button class="transient">one</button>' +
                             '<button class="transient">two</button>';
-                    }, 80);
+                    }, 500);
     
                     // Return to no matches. The action never becomes actionable,
                     // but multiple distinct failure reasons are observed.
                     setTimeout(() => {
                         host.innerHTML = '';
-                    }, 180);
+                    }, 1200);
                 };
             </script>
         </body>"#;
@@ -743,11 +745,15 @@ async fn actionability_failures_are_distinct_and_candidate_evidence_is_bounded()
         .expect("open fixture");
 
     let click = |locator| Action::Click { locator };
+    // These actions intentionally run until their deadline so the final stable
+    // failure wins. Leave enough time for CDP round trips when Chrome tests run
+    // concurrently on a loaded CI worker.
+    let stable_failure_timeout = Duration::from_secs(1);
 
     assert!(matches!(
         page.perform(
             &click(Locator::Id("missing".into())),
-            Duration::from_millis(100)
+            stable_failure_timeout
         )
         .await,
         Err(BrowserError::LocatorNotFound { .. })
@@ -756,7 +762,7 @@ async fn actionability_failures_are_distinct_and_candidate_evidence_is_bounded()
     assert!(matches!(
         page.perform(
             &click(Locator::Css(".duplicate".into())),
-            Duration::from_millis(100)
+            stable_failure_timeout
         )
         .await,
         Err(BrowserError::LocatorAmbiguous { .. })
@@ -765,7 +771,7 @@ async fn actionability_failures_are_distinct_and_candidate_evidence_is_bounded()
     assert!(matches!(
         page.perform(
             &click(Locator::Id("disabled".into())),
-            Duration::from_millis(100)
+            stable_failure_timeout
         )
         .await,
         Err(BrowserError::ElementDisabled { .. })
@@ -774,32 +780,29 @@ async fn actionability_failures_are_distinct_and_candidate_evidence_is_bounded()
     assert!(matches!(
         page.perform(
             &click(Locator::Id("covered".into())),
-            Duration::from_millis(100)
+            stable_failure_timeout
         )
         .await,
         Err(BrowserError::ElementObscured { .. })
     ));
 
     assert!(matches!(
-        page.perform(
-            &click(Locator::Id("hidden".into())),
-            Duration::from_millis(100)
-        )
-        .await,
+        page.perform(&click(Locator::Id("hidden".into())), stable_failure_timeout)
+            .await,
         Err(BrowserError::LocatorNotVisible { .. })
     ));
 
     assert!(matches!(
         page.perform(
             &click(Locator::Id("unstable".into())),
-            Duration::from_millis(140)
+            stable_failure_timeout
         )
         .await,
         Err(BrowserError::ElementUnstable { .. })
     ));
 
     assert!(matches!(
-        page.perform(&click(Locator::Css("[".into())), Duration::from_millis(100))
+        page.perform(&click(Locator::Css("[".into())), stable_failure_timeout)
             .await,
         Err(BrowserError::LocatorInvalid { .. })
     ));
@@ -811,7 +814,7 @@ async fn actionability_failures_are_distinct_and_candidate_evidence_is_bounded()
     assert!(matches!(
         page.perform(
             &click(Locator::Css(".transient".into())),
-            Duration::from_millis(300)
+            Duration::from_secs(1)
         )
         .await,
         Err(BrowserError::ActionTimeout { .. })
@@ -853,7 +856,7 @@ async fn actionability_failures_are_distinct_and_candidate_evidence_is_bounded()
         page.wait_for_locator(
             &Locator::Text("Inside shadow".into()),
             LocatorState::Visible,
-            Duration::from_millis(100)
+            stable_failure_timeout
         )
         .await,
         Err(BrowserError::LocatorNotFound { .. })
@@ -863,7 +866,7 @@ async fn actionability_failures_are_distinct_and_candidate_evidence_is_bounded()
         page.wait_for_locator(
             &Locator::Text("Inside frame".into()),
             LocatorState::Visible,
-            Duration::from_millis(100)
+            stable_failure_timeout
         )
         .await,
         Err(BrowserError::LocatorNotFound { .. })
