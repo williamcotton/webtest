@@ -660,7 +660,7 @@ fn lock_is_stale(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use std::{
-        io::{Cursor, Write as _},
+        io::Cursor,
         net::TcpListener,
         sync::{
             Mutex,

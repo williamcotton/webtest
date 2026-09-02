@@ -1,3 +1,5 @@
+![Test Suite](https://github.com/williamcotton/webtest/workflows/CI/badge.svg)
+
 # WebTest
 
 WebTest is a statically analyzable language for typed web-system tests. One lossless parser feeds checking, formatting, plan compilation, execution, debugging, and editor diagnostics. Native HTTP, process, filesystem, language-neutral application bridge, and direct Chrome DevTools Protocol backends run behind shared typed contracts.

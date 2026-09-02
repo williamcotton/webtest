@@ -1276,10 +1276,9 @@ fn parse_duration(value: &str) -> Option<Duration> {
         (number, 1u64)
     } else if let Some(number) = value.strip_suffix('s') {
         (number, 1_000)
-    } else if let Some(number) = value.strip_suffix('m') {
-        (number, 60_000)
     } else {
-        return None;
+        let number = value.strip_suffix("m")?;
+        (number, 60_000)
     };
     let number = number.parse::<u64>().ok()?;
     (number > 0).then(|| Duration::from_millis(number.saturating_mul(multiplier)))

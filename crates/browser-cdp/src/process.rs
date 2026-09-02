@@ -122,9 +122,10 @@ impl ChromeProcess {
 }
 
 fn chrome_arguments(profile: &Path, headless: bool) -> Vec<OsString> {
-    let mut arguments = Vec::with_capacity(10);
+    let mut arguments = Vec::with_capacity(12);
     if headless {
         arguments.push("--headless=new".into());
+        arguments.push("--disable-gpu".into());
     }
     arguments.extend([
         "--remote-debugging-address=127.0.0.1".into(),
@@ -132,8 +133,7 @@ fn chrome_arguments(profile: &Path, headless: bool) -> Vec<OsString> {
         format!("--user-data-dir={}", profile.display()).into(),
         "--no-first-run".into(),
         "--no-default-browser-check".into(),
-        // Debug sessions intentionally keep editor focus. Chrome must still run the owned
-        // test page at foreground speed while its window is unfocused or occluded.
+        "--disable-dev-shm-usage".into(),
         "--disable-background-timer-throttling".into(),
         "--disable-backgrounding-occluded-windows".into(),
         "--disable-renderer-backgrounding".into(),

@@ -2034,7 +2034,7 @@ fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read as _, Write as _};
+    use std::io::Write as _;
 
     use super::*;
     use crate::{FieldSchema, FunctionSchema};

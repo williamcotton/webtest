@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  quality-suite:
+    name: Complete Quality Suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup Chrome
+        uses: browser-actions/setup-chrome@v1
+        id: setup-chrome
+
+      - name: Allow downloaded Chrome sandbox
+        if: runner.os == 'Linux'
+        run: |
+          echo 0 | sudo tee /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run workspace tests
+        run: cargo test --workspace
+        env:
+          WEBTEST_CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
+
+      - name: Check WASM target
+        run: cargo check -p webtest-wasm --target wasm32-unknown-unknown
+
+      - name: Build webtest binary
+        run: cargo build
+
+      - name: Install VS Code extension dependencies
+        run: npm ci
+        working-directory: editors/vscode
+
+      - name: Run VS Code extension VSIX smoke test
+        run: npm run smoke
+        working-directory: editors/vscode
+
+      - name: Run VS Code extension activation smoke test
+        run: xvfb-run npm run smoke:activation
+        working-directory: editors/vscode
+        env:
+          WEBTEST_CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
