@@ -2,10 +2,10 @@
 
 This deterministic fixture proves the Milestone C.5 authoring and repair loop without a second browser driver or language implementation.
 
-From this directory, start the fixture and use only WebTest's public interfaces:
+From this directory, use only WebTest's public interfaces. `inspect` and `test` start and stop the
+configured fixture application; do not run `server.py` separately:
 
 ```sh
-python3 server.py
 webtest describe --reporter json
 webtest describe browser.fill --reporter json
 webtest describe --search "email form input" --reporter json
@@ -16,7 +16,9 @@ webtest test tests/login.webtest --reporter json
 
 For the repair proof, rename `tests/repair.webtest.disabled` to `tests/repair.webtest`, run it, and inspect the `locator_candidate` repair hint. Replacing `Log in` with the returned `Sign in` locator makes the flow pass. The fixture intentionally uses a fixed port for manual work; automated browser tests bind `127.0.0.1:0`.
 
-The normative deterministic harness starts the same application on a random loopback port and acts only through `describe`, `inspect`, `check`, and `test`:
+The normative deterministic harness configures the same application on a random loopback port and
+lets `inspect` and `test` own its lifecycle while acting only through `describe`, `inspect`,
+`check`, and `test`:
 
 ```sh
 cargo build

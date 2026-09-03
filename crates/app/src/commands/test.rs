@@ -10,7 +10,7 @@ use crate::{
     error::AppError,
     project_analysis::analyze_file,
     project_context::{display_path, nanos, project},
-    provider_composition::runtime_provider_registry,
+    provider_composition::{runtime_application, runtime_provider_registry},
     report::{
         ExecutionFailureReport, ExitClass, FailureReport, FileReport, RunReportOutcome, TestReport,
         TestReportOutcome, WarningReport, base_report, write_human_report_after_progress,
@@ -34,8 +34,8 @@ pub(crate) async fn run_test(
     let show_browser = headed || !project.config.browser.headless;
     let options = runner_options(&project);
     let runtime_providers = runtime_provider_registry(&project, &options)?;
+    let application = runtime_application(&project, runtime_providers.app.clone());
     let providers = runtime_providers.registry;
-    let app_provider = runtime_providers.app;
     let progress = (reporter == TestReporter::Human).then(|| Arc::new(HumanTestProgress::stdout()));
     let browser = LazyChromeHost::new(project.clone(), chrome_path, show_browser, progress.clone());
     let mut progress_error = None;
@@ -121,7 +121,7 @@ pub(crate) async fn run_test(
             execution_error: None,
             events: Vec::new(),
         };
-        if let Some(provider) = &app_provider {
+        if let Some(application) = &application {
             let first_attempt = !app_start_attempted;
             if first_attempt {
                 app_start_attempted = true;
@@ -132,7 +132,7 @@ pub(crate) async fn run_test(
                     );
                 }
             }
-            if let Err(error) = provider.start(&project.root).await {
+            if let Err(error) = application.start(&project).await {
                 if first_attempt && let Some(progress) = &progress {
                     record_progress_error(progress.application_started(false), &mut progress_error);
                 }
@@ -336,11 +336,11 @@ pub(crate) async fn run_test(
         }
         report.files.push(file_report);
     }
-    if let Some(provider) = app_provider {
+    if let Some(application) = application {
         if app_started && let Some(progress) = &progress {
             record_progress_error(progress.stopping_application(), &mut progress_error);
         }
-        let shutdown = provider.shutdown().await;
+        let shutdown = application.shutdown().await;
         if app_started && let Some(progress) = &progress {
             record_progress_error(
                 progress.application_stopped(shutdown.is_ok()),
@@ -351,7 +351,7 @@ pub(crate) async fn run_test(
             report.exit_class = report.exit_class.combine(ExitClass::Infrastructure);
             report.warnings.push(WarningReport {
                 code: "app.teardown".into(),
-                key: "server.app".into(),
+                key: application.configuration_key().into(),
                 message: error.to_string(),
             });
         }

@@ -10,12 +10,9 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
-import threading
-from http.server import ThreadingHTTPServer
+import socket
 
 sys.dont_write_bytecode = True
-
-from server import Handler
 
 
 REQUIRED_REFERENCES = (
@@ -82,18 +79,26 @@ class Client:
 
 
 def verify(executable: Path, chrome_path: str | None) -> None:
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    port = server.server_address[1]
-    try:
-        with tempfile.TemporaryDirectory(prefix="webtest-semantic-discovery-") as directory:
+    with socket.socket() as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        port = reservation.getsockname()[1]
+    server_path = Path(__file__).resolve().with_name("server.py")
+    with tempfile.TemporaryDirectory(prefix="webtest-semantic-discovery-") as directory:
             project = Path(directory)
             write(
                 project / "webtest.toml",
                 f"""[project]
 name = "semantic-discovery-acceptance"
 test_roots = ["tests"]
+
+[app]
+command = {json.dumps(sys.executable)}
+args = [{json.dumps(str(server_path))}, "--port", "{port}"]
+working_directory = "."
+
+[app.health]
+url = "http://127.0.0.1:{port}/"
+timeout = "10s"
 
 [browser]
 base_url = "http://127.0.0.1:{port}"
@@ -222,10 +227,6 @@ query_params = ["token", "code", "key"]
             write(wrong, corrected)
             passed = client.run("test", str(wrong), "--reporter", "json")
             assert passed["exit_class"] == "success"
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5)
 
 
 def main() -> None:

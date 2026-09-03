@@ -27,7 +27,7 @@ fn help_surface_is_byte_stable() {
     let cases: &[(&[&str], &str)] = &[
         (
             &["--help"],
-            "Statically analyzable web application tests\n\nUsage: webtest <COMMAND>\n\nCommands:\n  init      Create a minimal WebTest project, application schema, example, and agent skill\n  check     Parse and statically check WebTest files\n  fmt       Rewrite WebTest files using the canonical formatter\n  build     Analyze WebTest files and emit a versioned execution plan\n  test      Execute WebTest files in Chrome\n  inspect   Inspect the semantic interaction and assertion surface of one page\n  describe  Describe the installed language and project-visible provider surface\n  browser   Install and inspect managed Chrome for Testing versions\n  lsp       Run the language server over stdio\n  dap       Run the debug adapter protocol server over stdio\n  help      Print this message or the help of the given subcommand(s)\n\nOptions:\n  -h, --help     Print help\n  -V, --version  Print version\n",
+            "Statically analyzable web application tests\n\nUsage: webtest <COMMAND>\n\nCommands:\n  init      Create a minimal WebTest project, application schema, example, and agent skill\n  check     Parse and statically check WebTest files\n  fmt       Rewrite WebTest files using the canonical formatter\n  build     Analyze WebTest files and emit a versioned execution plan\n  test      Execute WebTest files in Chrome\n  inspect   Inspect one page, starting the configured app for project-relative URLs\n  describe  Describe the installed language and project-visible provider surface\n  browser   Install and inspect managed Chrome for Testing versions\n  lsp       Run the language server over stdio\n  dap       Run the debug adapter protocol server over stdio\n  help      Print this message or the help of the given subcommand(s)\n\nOptions:\n  -h, --help     Print help\n  -V, --version  Print version\n",
         ),
         (
             &["init", "--help"],
@@ -51,7 +51,7 @@ fn help_surface_is_byte_stable() {
         ),
         (
             &["inspect", "--help"],
-            "Inspect the semantic interaction and assertion surface of one page\n\nUsage: webtest inspect [OPTIONS] [URL]\n\nArguments:\n  [URL]  \n\nOptions:\n      --chrome-path <CHROME_PATH>  \n      --headed                     Show the Chrome window while inspecting\n      --reporter <REPORTER>        [default: human] [possible values: human, json]\n  -h, --help                       Print help\n",
+            "Inspect one page, starting the configured app for project-relative URLs\n\nUsage: webtest inspect [OPTIONS] [URL]\n\nArguments:\n  [URL]  \n\nOptions:\n      --chrome-path <CHROME_PATH>  \n      --headed                     Show the Chrome window while inspecting\n      --reporter <REPORTER>        [default: human] [possible values: human, json]\n  -h, --help                       Print help\n",
         ),
         (
             &["describe", "--help"],

@@ -40,6 +40,8 @@ pub struct ResolvedRuntimeConfiguration {
     pub resolved_arguments: Vec<String>,
     pub working_directory: Option<String>,
     pub schema_path: Option<String>,
+    pub application_owned: Option<bool>,
+    pub application_health_configured: bool,
     pub browser_base_url: Option<String>,
     pub server_base_url: Option<String>,
     pub test_timeout_ms: u64,
@@ -1512,10 +1514,34 @@ mod tests {
                     && guidance.summary.contains("server.app.startup_timeout")
                     && guidance.summary.contains("[app.health].timeout"))
         );
+        assert!(
+            core["app.configuration"]
+                .constraints
+                .iter()
+                .any(|constraint| {
+                    constraint.code == "app_configuration_inspect_lifecycle"
+                        && constraint.summary.contains("omitted or relative URL")
+                        && constraint.summary.contains("absolute HTTP(S) URL")
+                })
+        );
+        assert!(core["app.configuration"].guidance.iter().any(|guidance| {
+            guidance.code == "app_configuration_process_consumers"
+                && guidance.summary.contains("browser-only")
+                && guidance.summary.contains("project-mode `webtest inspect`")
+        }));
         assert!(core["app.configuration"].examples.iter().any(|example| {
             example.source.contains("startup_timeout = \"10s\"")
                 && example.source.contains("shutdown_timeout = \"2s\"")
         }));
+        assert!(
+            core["runtime.configuration"]
+                .guidance
+                .iter()
+                .any(|guidance| {
+                    guidance.code == "runtime_configuration_inspect_startup"
+                        && guidance.summary.contains("absolute HTTP(S) URL")
+                })
+        );
         assert!(
             core["app.diagnostics"]
                 .guidance
@@ -1575,6 +1601,8 @@ mod tests {
             resolved_arguments: vec!["bridge.js".into()],
             working_directory: Some("/project".into()),
             schema_path: Some("/project/.webtest/app-schema.json".into()),
+            application_owned: Some(true),
+            application_health_configured: true,
             browser_base_url: None,
             server_base_url: None,
             test_timeout_ms: 60_000,

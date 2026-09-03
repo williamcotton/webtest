@@ -152,6 +152,20 @@ struct ManagedProcess {
     stderr: Option<StderrCapture>,
 }
 
+/// Owns one configured application process independently of an application provider.
+pub struct ApplicationLifecycle {
+    config: AppProcessConfig,
+    shutdown_timeout: Duration,
+    max_stderr_bytes: usize,
+    state: Mutex<ApplicationState>,
+}
+
+enum ApplicationState {
+    Stopped,
+    Started(ProcessResources),
+    Failed(ProviderError),
+}
+
 struct StderrCapture {
     state: Arc<StdMutex<CapturedStderr>>,
     finished: Arc<Notify>,
@@ -162,6 +176,51 @@ struct CapturedStderr {
     bytes: Vec<u8>,
     total: usize,
     done: bool,
+}
+
+impl ApplicationLifecycle {
+    pub fn new(config: AppProcessConfig) -> Self {
+        Self {
+            config,
+            shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
+            max_stderr_bytes: DEFAULT_MAX_STDERR_BYTES,
+            state: Mutex::new(ApplicationState::Stopped),
+        }
+    }
+
+    pub async fn start(&self, project_root: &std::path::Path) -> Result<(), ProviderError> {
+        let mut state = self.state.lock().await;
+        match &*state {
+            ApplicationState::Started(_) => return Ok(()),
+            ApplicationState::Failed(error) => return Err(error.clone()),
+            ApplicationState::Stopped => {}
+        }
+        let started = start_application_process(
+            &self.config,
+            project_root,
+            self.max_stderr_bytes,
+            self.shutdown_timeout,
+        )
+        .await;
+        match started {
+            Ok(resources) => {
+                *state = ApplicationState::Started(resources);
+                Ok(())
+            }
+            Err(error) => {
+                *state = ApplicationState::Failed(error.clone());
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn shutdown(&self) -> Result<(), ProviderError> {
+        let state = std::mem::replace(&mut *self.state.lock().await, ApplicationState::Stopped);
+        if let ApplicationState::Started(mut resources) = state {
+            terminate_process(&mut resources, self.shutdown_timeout).await;
+        }
+        Ok(())
+    }
 }
 
 impl AppProvider {
@@ -427,21 +486,13 @@ impl AppProvider {
         let Some(application) = &self.config.application else {
             return Ok(ProcessResources::default());
         };
-        if !application.owned {
-            wait_for_health(application.health.as_ref()).await?;
-            return Ok(ProcessResources::default());
-        }
-        let child =
-            spawn_application(application, project_root, &[], self.config.max_stderr_bytes)?;
-        let mut resources = ProcessResources {
-            children: vec![child],
-            endpoint_directory: None,
-        };
-        if let Err(error) = wait_for_health(application.health.as_ref()).await {
-            terminate_process(&mut resources, self.config.shutdown_timeout).await;
-            return Err(error);
-        }
-        Ok(resources)
+        start_application_process(
+            application,
+            project_root,
+            self.config.max_stderr_bytes,
+            self.config.shutdown_timeout,
+        )
+        .await
     }
 
     #[cfg(unix)]
@@ -1700,6 +1751,33 @@ impl AsyncWrite for StdioIo {
     }
 }
 
+async fn start_application_process(
+    application: &AppProcessConfig,
+    project_root: &std::path::Path,
+    max_stderr_bytes: usize,
+    shutdown_timeout: Duration,
+) -> Result<ProcessResources, ProviderError> {
+    if !application.owned {
+        wait_for_health(application.health.as_ref()).await?;
+        return Ok(ProcessResources::default());
+    }
+    if application.command.is_empty() {
+        return Err(ProviderError::BridgeProcess {
+            message: "runner-owned [app] requires a non-empty command".into(),
+        });
+    }
+    let child = spawn_application(application, project_root, &[], max_stderr_bytes)?;
+    let mut resources = ProcessResources {
+        children: vec![child],
+        endpoint_directory: None,
+    };
+    if let Err(error) = wait_for_health(application.health.as_ref()).await {
+        terminate_process(&mut resources, shutdown_timeout).await;
+        return Err(error);
+    }
+    Ok(resources)
+}
+
 fn spawn_application(
     application: &AppProcessConfig,
     project_root: &std::path::Path,
@@ -2038,6 +2116,85 @@ mod tests {
 
     use super::*;
     use crate::{FieldSchema, FunctionSchema};
+
+    fn application_config(command: &str, owned: bool) -> AppProcessConfig {
+        AppProcessConfig {
+            command: command.into(),
+            args: Vec::new(),
+            working_directory: PathBuf::from("."),
+            environment: BTreeMap::new(),
+            owned,
+            health: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn standalone_application_lifecycle_rejects_an_owned_empty_command() {
+        let project = tempfile::tempdir().expect("project");
+        let lifecycle = ApplicationLifecycle::new(application_config("", true));
+        let error = lifecycle
+            .start(project.path())
+            .await
+            .expect_err("empty owned command");
+        assert!(matches!(
+            error,
+            ProviderError::BridgeProcess { message }
+                if message.contains("requires a non-empty command")
+        ));
+        lifecycle.shutdown().await.expect("shutdown failed state");
+    }
+
+    #[tokio::test]
+    async fn standalone_external_application_waits_for_health_without_spawning() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("health listener");
+        let address = listener.local_addr().expect("health address");
+        let response = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("health request");
+            let mut request = [0u8; 512];
+            let _ = stream.read(&mut request).expect("read health request");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .expect("write health response");
+        });
+        let mut config = application_config("", false);
+        config.health = Some(HealthCheck {
+            url: format!("http://{address}/health"),
+            timeout: Duration::from_secs(2),
+        });
+        let project = tempfile::tempdir().expect("project");
+        let lifecycle = ApplicationLifecycle::new(config);
+        lifecycle.start(project.path()).await.expect("health ready");
+        lifecycle
+            .start(project.path())
+            .await
+            .expect("idempotent start");
+        lifecycle.shutdown().await.expect("shutdown external app");
+        response.join().expect("health thread");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn standalone_owned_application_is_finalized() {
+        let project = tempfile::tempdir().expect("project");
+        let mut config = application_config("sh", true);
+        config.args = vec!["-c".into(), "while :; do sleep 1; done".into()];
+        let lifecycle = ApplicationLifecycle::new(config);
+        lifecycle.start(project.path()).await.expect("start app");
+        let process_id = {
+            let state = lifecycle.state.lock().await;
+            let ApplicationState::Started(resources) = &*state else {
+                panic!("started application state")
+            };
+            resources.children[0].child.id().expect("process id")
+        };
+        lifecycle.shutdown().await.expect("shutdown app");
+        let status = std::process::Command::new("kill")
+            .args(["-0", &process_id.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .expect("probe process");
+        assert!(!status.success(), "application process still exists");
+    }
 
     fn manifest() -> AppManifest {
         AppManifest {

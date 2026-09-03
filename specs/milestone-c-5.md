@@ -10,6 +10,10 @@ It does not depend on the application bridge in Milestone D. When Milestone D la
 
 **Implementation status (2026-08-28): implemented for the installed language, built-in providers, inspection, machine feedback, and project bootstrapping.** The shared Rust implementation exposes versioned description/search, semantic page inspection, deterministic validated locator candidates, structured static/runtime details and repair hints, bounded/redacted CLI and event output, editor/LSP/DAP transport, WASM static parity, and the deterministic `examples/semantic-discovery` acceptance fixture. `webtest init` creates a non-overwriting, statically checkable Protocol 1 starter project and installs the canonical agent skill plus its Claude compatibility link. The skill routes application-bridge work into the installed `app.configuration`, `runtime.configuration`, `app.bridge`, `app.schema`, `app.protocol`, `app.bridge.example`, `app.diagnostics`, and project-operation descriptions. Those topics now make configuration ownership and adapter requirements authoritative, expose redacted project-resolved runtime settings, present the complete lifecycle in one place, require exact request-ID correlation in the custom loop, and map bridge failure states to focused next inspections. `type.Response` documents its complete member surface and `json.typed_decode` documents the explicit annotation required before raw JSON member access. `inspect` remains an explicitly unsupported native capability in WASM. Protocol 1 project-provider schemas do not currently carry source examples, so project operation leaves explicitly omit examples instead of fabricating application-specific values; validated schema-supplied examples remain future work.
 
+**D.10 composition update (2026-09-03):** [`milestone-d-10.md`](./milestone-d-10.md) makes an
+omitted or relative `inspect` invocation start, await, and stop configured `[app]` while an absolute
+HTTP(S) target remains standalone. The C.5 inspection DTO and browser semantics are unchanged.
+
 [`future-functionality.md`](./future-functionality.md) places this milestone after C and before D.
 
 ## 1. Outcome

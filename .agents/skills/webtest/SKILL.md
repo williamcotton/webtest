@@ -32,6 +32,7 @@ transport = "auto"
 schema = ".webtest/app-schema.json"
 
 # Configure these sections before running application and browser tests.
+# WebTest launches [app]; [browser] points browser steps at that launched app.
 #
 # [app]
 # command = "your-application-command"
@@ -45,7 +46,9 @@ schema = ".webtest/app-schema.json"
 # base_url = "http://127.0.0.1:3000"
 ```
 
-`[server.app]` owns the provider adapter, transport, offline schema, limits, and compatibility-adapter command/HTTP settings. For the scaffolded socket bridge, `[app]` owns the runner-managed application command, arguments, working directory, environment, ownership, and health check. A stdio bridge instead puts its dedicated protocol command under `[server.app]`; query `app.configuration` before moving command settings between sections.
+These sections have distinct roles. `[app]` launches the application process that WebTest owns for test runs and project-mode inspection. `[server.app]` configures that application's bridge protocol, transport, and offline schema so server blocks can call typed `app.*` operations. `[browser]` tells browser steps and inspection where the runner-managed application is reachable; it does not launch an external development server.
+
+For the scaffolded socket bridge, `[app]` owns the command, arguments, working directory, environment, process ownership, and health check. Configure it to start the complete test application—for example, a command that serves the built frontend and its API—and have that application read the bridge environment variables. Expose deterministic setup through typed bridge operations (for example, SQLite setup) rather than public test-only HTTP routes. A stdio bridge instead puts its dedicated protocol command under `[server.app]`; query `app.configuration` before moving command settings between sections.
 
 The generated bridge smoke test is:
 
@@ -120,7 +123,7 @@ For a configured application provider, query a concrete project operation such a
 
 - `provider.app`: provider semantics and project requirements.
 - `app.configuration`: authoritative section ownership, required settings, validation, and examples for every adapter.
-- `runtime.configuration`: selected adapter/transport and redacted resolved paths, command, arguments, and base URLs for the discovered project.
+- `runtime.configuration`: selected adapter/transport and redacted resolved application lifecycle, paths, command, arguments, and base URLs for the discovered project.
 - `app.bridge`: runner/process/transport/handshake/call/shutdown lifecycle and environment/stdout rules.
 - `app.schema`: offline Protocol 1 manifest shape and hashing rules.
 - `app.protocol`: framing, handshake, correlation, transports, and required wire fields.
@@ -131,17 +134,18 @@ For HTTP responses, query `type.Response` for the `status`, `headers`, `body`, `
 
 Use `webtest <command> --help` for CLI flags and reporters. `describe` documents the language and project-visible provider surface; it is not a duplicate CLI manual.
 
-## Inspect a live page
+## Inspect the project application
 
-Run `webtest inspect [<url>] --reporter json` to obtain bounded semantic elements and validated locator candidates. When the URL is omitted, the project must provide `browser.base_url`. Inspection describes the current page state; candidates are evidence, not a guarantee against later page changes.
+Run `webtest inspect [<url>] --reporter json` to obtain bounded semantic elements and validated locator candidates. Do not start the configured application separately: an omitted or relative URL uses project mode, so WebTest starts `[app]`, waits for its health check, resolves against `browser.base_url`, inspects, and tears the application down. An absolute HTTP(S) URL is standalone and does not launch `[app]`. Inspection describes the current page state; candidates are evidence, not a guarantee against later page changes.
 
 ## Close the loop
 
-1. Query the smallest relevant `describe` topic or inspect the target page.
-2. Author the test using returned syntax, contexts, types, and prerequisites.
-3. Run `webtest fmt <path>` to apply the canonical formatter, or `webtest fmt --check <path>` for a non-mutating check.
-4. Run `webtest check <path> --reporter json` and fix every static error before execution.
-5. Run `webtest test <path> --reporter json`; add `--headed` only when visible Chrome is useful.
+1. Query the smallest relevant `webtest describe` topic.
+2. Run `webtest inspect [<url>] --reporter json` to discover the target page's semantic surface and validated locators.
+3. Author the test using returned syntax, contexts, types, and prerequisites.
+4. Run `webtest fmt <path>` to apply the canonical formatter, or `webtest fmt --check <path>` for a non-mutating check.
+5. Run `webtest check <path> --reporter json` and fix every static error before execution.
+6. Run `webtest test <path> --reporter json`; add `--headed` only when visible Chrome is useful.
 
 Diagnostics may contain canonical `reference_queries` and bounded `repair_hints`. Runtime failures may contain locator replacement candidates when WebTest has safe evidence. Treat both as advisory, preserve their source ranges, and rerun `check` or `test` after any edit; WebTest does not apply repairs automatically.
 

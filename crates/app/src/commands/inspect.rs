@@ -11,8 +11,9 @@ use crate::{
     cli::ReferenceReporter,
     error::AppError,
     project_context::project,
+    provider_composition::{runtime_application, runtime_provider_registry},
     report::ExitClass,
-    runtime_configuration::{browser_context_options, inspection_options},
+    runtime_configuration::{browser_context_options, inspection_options, runner_options},
 };
 
 pub(crate) async fn run_inspect(
@@ -22,6 +23,9 @@ pub(crate) async fn run_inspect(
     reporter: ReferenceReporter,
 ) -> Result<ExitClass, AppError> {
     let project = project(&[])?;
+    let project_mode = requested_url
+        .as_deref()
+        .is_none_or(|url| !is_absolute_http_url(url));
     let requested_url = requested_url
         .as_deref()
         .or(project.config.browser.base_url.as_deref())
@@ -31,7 +35,47 @@ pub(crate) async fn run_inspect(
         requested_url,
     )
     .map_err(AppError::usage)?;
-    let resolved = resolve_chrome(&project, chrome_path)?;
+    let application = if project_mode && project.config.app.is_some() {
+        let providers = runtime_provider_registry(&project, &runner_options(&project))?;
+        runtime_application(&project, providers.app)
+    } else {
+        None
+    };
+    if let Some(application) = &application
+        && let Err(error) = application.start(&project).await
+    {
+        let _ = application.shutdown().await;
+        return Err(AppError::infrastructure(error));
+    }
+    let inspected = inspect_page(&project, &url, chrome_path, headed).await;
+    let shutdown = match &application {
+        Some(application) => application.shutdown().await,
+        None => Ok(()),
+    };
+    let inspection = match inspected {
+        Ok(inspection) => inspection,
+        Err(error) => {
+            if let Err(shutdown) = shutdown {
+                tracing::warn!(%shutdown, "application teardown also failed after inspection failure");
+            }
+            return Err(error);
+        }
+    };
+    shutdown.map_err(AppError::infrastructure)?;
+
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    write_inspection(&inspection, reporter, &mut output)?;
+    Ok(ExitClass::Success)
+}
+
+async fn inspect_page(
+    project: &webtest_project::Project,
+    url: &str,
+    chrome_path: Option<PathBuf>,
+    headed: bool,
+) -> Result<PageInspection, AppError> {
+    let resolved = resolve_chrome(project, chrome_path)?;
     let host = ChromeHost::new(Some(resolved.path))
         .with_headed(headed || !project.config.browser.headless)
         .with_timeouts(
@@ -39,10 +83,7 @@ pub(crate) async fn run_inspect(
             project.config.timeouts.navigation,
         );
     let mut session = host.start().await.map_err(AppError::infrastructure)?;
-    let mut context = match session
-        .new_context(&browser_context_options(&project))
-        .await
-    {
+    let mut context = match session.new_context(&browser_context_options(project)).await {
         Ok(context) => context,
         Err(error) => {
             let _ = session.close().await;
@@ -57,8 +98,8 @@ pub(crate) async fn run_inspect(
             return Err(AppError::infrastructure(error));
         }
     };
-    let primary = match page.open(&url).await {
-        Ok(()) => page.inspect(&inspection_options(&project)).await,
+    let primary = match page.open(url).await {
+        Ok(()) => page.inspect(&inspection_options(project)).await,
         Err(error) => Err(error),
     };
     drop(page);
@@ -68,10 +109,12 @@ pub(crate) async fn run_inspect(
     context_cleanup.map_err(AppError::infrastructure)?;
     session_cleanup.map_err(AppError::infrastructure)?;
 
-    let stdout = io::stdout();
-    let mut output = stdout.lock();
-    write_inspection(&inspection, reporter, &mut output)?;
-    Ok(ExitClass::Success)
+    Ok(inspection)
+}
+
+fn is_absolute_http_url(value: &str) -> bool {
+    url::Url::parse(value)
+        .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.has_host())
 }
 
 fn write_inspection(
@@ -133,6 +176,15 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn absolute_http_urls_select_standalone_inspection() {
+        assert!(is_absolute_http_url("http://127.0.0.1:3000/login"));
+        assert!(is_absolute_http_url("https://example.test"));
+        assert!(!is_absolute_http_url("/login"));
+        assert!(!is_absolute_http_url("login"));
+        assert!(!is_absolute_http_url("file:///tmp/page.html"));
+    }
 
     #[test]
     fn human_inspection_columns_and_truncation_notice_are_stable() {

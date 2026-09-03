@@ -2,6 +2,15 @@
 name = "semantic-discovery"
 test_roots = ["tests"]
 
+[app]
+command = "python3"
+args = ["server.py", "--port", "3010"]
+working_directory = "."
+
+[app.health]
+url = "http://127.0.0.1:3010/"
+timeout = "10s"
+
 [browser]
 base_url = "http://127.0.0.1:3010"
 test_id_attribute = "data-testid"
@@ -16,4 +25,3 @@ include_hidden = false
 headers = ["authorization", "cookie", "set-cookie"]
 json_fields = ["password", "token", "secret"]
 query_params = ["token", "code", "key"]
-

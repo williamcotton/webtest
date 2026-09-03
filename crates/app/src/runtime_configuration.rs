@@ -120,6 +120,8 @@ pub(crate) fn resolved_runtime_configuration(project: &Project) -> ResolvedRunti
         resolved_arguments: arguments,
         working_directory,
         schema_path: provider.map(|app| normalized_path(&project.root.join(&app.schema))),
+        application_owned: application.map(|app| app.owned),
+        application_health_configured: application.is_some_and(|app| app.health.is_some()),
         browser_base_url: project.config.browser.base_url.clone(),
         server_base_url: project.config.server.base_url.clone(),
         test_timeout_ms: duration_millis(project.config.timeouts.test),

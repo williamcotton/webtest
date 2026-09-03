@@ -54,7 +54,7 @@ pub(crate) enum Command {
         #[arg(long, value_enum, default_value_t = TestReporter::Human)]
         reporter: TestReporter,
     },
-    /// Inspect the semantic interaction and assertion surface of one page.
+    /// Inspect one page, starting the configured app for project-relative URLs.
     Inspect {
         url: Option<String>,
         #[arg(long)]

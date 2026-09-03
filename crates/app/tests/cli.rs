@@ -114,6 +114,20 @@ fn describe_bootstraps_exact_alias_category_and_search_without_source_files() {
     let search: serde_json::Value = serde_json::from_slice(&search.stdout).expect("search JSON");
     assert_eq!(search["results"][0]["id"], "browser.click");
 
+    let lifecycle_search = webtest(directory.path())
+        .args([
+            "describe",
+            "--search",
+            "inspect start application lifecycle",
+            "--reporter",
+            "json",
+        ])
+        .output()
+        .expect("application lifecycle search");
+    let lifecycle_search: serde_json::Value =
+        serde_json::from_slice(&lifecycle_search.stdout).expect("lifecycle search JSON");
+    assert_eq!(lifecycle_search["results"][0]["id"], "app.configuration");
+
     let unknown = webtest(directory.path())
         .args(["describe", "locator.rol", "--reporter", "json"])
         .output()
@@ -178,6 +192,8 @@ fn describe_bootstraps_exact_alias_category_and_search_without_source_files() {
     );
     assert_eq!(resolved["browser_base_url"], "http://127.0.0.1:3000");
     assert_eq!(resolved["server_base_url"], "http://127.0.0.1:3001");
+    assert_eq!(resolved["application_owned"], true);
+    assert_eq!(resolved["application_health_configured"], false);
     assert!(!runtime_configuration.to_string().contains("do-not-report"));
 }
 
@@ -219,6 +235,8 @@ fn init_creates_a_checkable_idempotent_application_bridge_scaffold() {
     assert!(skill.contains("webtest describe app.bridge.example"));
     assert!(skill.contains("webtest describe app.diagnostics"));
     assert!(skill.contains("webtest describe app.echo"));
+    assert!(skill.contains("Do not start the configured application separately"));
+    assert!(skill.contains("webtest inspect [<url>] --reporter json"));
     assert!(!skill.contains("target/debug/webtest"));
     assert!(!skill.contains("cargo run"));
 

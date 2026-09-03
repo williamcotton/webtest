@@ -19,6 +19,7 @@ transport = "auto"
 schema = ".webtest/app-schema.json"
 
 # Configure these sections before running application and browser tests.
+# WebTest launches [app]; [browser] points browser steps at that launched app.
 #
 # [app]
 # command = "your-application-command"
@@ -649,6 +650,7 @@ mod tests {
         assert!(WEBTEST_SKILL.contains("webtest describe app.protocol"));
         assert!(WEBTEST_SKILL.contains("webtest describe app.bridge.example"));
         assert!(WEBTEST_SKILL.contains("webtest describe app.diagnostics"));
+        assert!(WEBTEST_SKILL.contains("webtest inspect [<url>] --reporter json"));
         assert!(WEBTEST_SKILL.contains("webtest describe app.echo"));
         assert!(!WEBTEST_SKILL.contains("target/debug/webtest"));
         assert!(!WEBTEST_SKILL.contains("cargo run"));

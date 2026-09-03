@@ -17,16 +17,17 @@ pub(super) fn constructs() -> Vec<ConstructDescription> {
 fn configuration_reference() -> ConstructDescription {
     let mut value = base_construct(
         "app.configuration",
-        "Application provider configuration",
+        "Application and provider configuration",
         "configuration_reference",
         "[server.app] plus adapter-specific [app] or [server.app.*] settings",
-        "Configure exactly one typed application-provider adapter and keep provider selection separate from runner-owned application lifecycle settings.",
+        "Configure runner-owned application lifecycle separately from the optional typed application-provider adapter.",
     );
     value.search_terms = vec![
         "webtest.toml app command".into(),
         "server.app command".into(),
         "bridge stdio http adapter".into(),
         "working directory".into(),
+        "inspect start application app lifecycle".into(),
     ];
     value.constraints = vec![
         constraint(
@@ -34,6 +35,12 @@ fn configuration_reference() -> ConstructDescription {
             "configuration",
             "sections",
             "`[server.app]` owns provider adapter, transport, schema, limits, and compatibility-adapter settings. `[app]` owns an optionally runner-managed application process, its arguments, working directory, environment, ownership, and health check.",
+        ),
+        constraint(
+            "app_configuration_inspect_lifecycle",
+            "inspection",
+            "URL mode",
+            "`webtest inspect` with an omitted or relative URL uses project mode: it starts `[app]` when configured, waits for its health check, inspects the resolved browser URL, and tears the application down. An explicit absolute HTTP(S) URL is standalone and does not launch `[app]`.",
         ),
         constraint(
             "app_configuration_no_duplicate_commands",
@@ -49,6 +56,10 @@ fn configuration_reference() -> ConstructDescription {
         ),
     ];
     value.guidance = vec![
+        guidance(
+            "app_configuration_process_consumers",
+            "`webtest test` and project-mode `webtest inspect` both use `[app]`. A project with browser-only tests or inspection may configure `[app]` without `[server.app]`; add `[server.app]` only when server blocks call typed `app.*` operations.",
+        ),
         guidance(
             "app_configuration_bridge_difference",
             "For `adapter = \"bridge\"` with `auto`, `unix`, `named_pipe`, or `tcp`, WebTest creates the local endpoint and launches or waits for the application described by `[app]`. With `transport = \"stdio\"`, WebTest launches `server.app.command` as the dedicated protocol peer and reserves its stdout for frames; `[app]`, when present, describes a separate web application process and health check.",
@@ -597,7 +608,7 @@ fn runtime_configuration_reference() -> ConstructDescription {
         "Resolved runtime configuration",
         "runtime_inspection",
         "webtest describe runtime.configuration [--project <path>] --reporter json",
-        "Inspect the project configuration that WebTest resolved for application-provider and browser/server startup without exposing environment values or unredacted secret-like arguments.",
+        "Inspect the project configuration that WebTest resolved for application lifecycle, application-provider, and browser/server startup without exposing environment values or unredacted secret-like arguments.",
     );
     value.search_terms = vec![
         "resolved adapter transport command arguments".into(),
@@ -605,6 +616,7 @@ fn runtime_configuration_reference() -> ConstructDescription {
         "browser base URL server base URL".into(),
         "per-test deadline provider call timeout".into(),
         "configuration debugging".into(),
+        "inspect project startup owned health".into(),
     ];
     value.constraints = vec![
         constraint(
@@ -623,7 +635,11 @@ fn runtime_configuration_reference() -> ConstructDescription {
     value.guidance = vec![
         guidance(
             "runtime_configuration_fields",
-            "The machine-readable `resolved_configuration` object reports selected adapter and transport, resolved command and arguments, working directory, schema path, browser and server base URLs, the per-test deadline, and the distinct provider-call default. Absent optional configuration is represented as null or an empty argument list; timeout values are integer milliseconds.",
+            "The machine-readable `resolved_configuration` object reports selected adapter and transport, resolved command and arguments, working directory, schema path, application ownership and whether health is configured, browser and server base URLs, the per-test deadline, and the distinct provider-call default. Absent optional configuration is represented as null or an empty argument list; timeout values are integer milliseconds.",
+        ),
+        guidance(
+            "runtime_configuration_inspect_startup",
+            "Project-mode `webtest inspect` uses the reported application command, ownership, health configuration, working directory, and browser base URL. Passing an absolute HTTP(S) URL selects standalone inspection and skips the project application lifecycle.",
         ),
         guidance(
             "runtime_configuration_transport",

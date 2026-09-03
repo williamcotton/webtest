@@ -12,7 +12,7 @@ pub use protocol::{DEFAULT_MAX_MESSAGE_BYTES, ProtocolError, read_frame, write_f
 #[cfg(feature = "native")]
 pub use provider::{
     AppAdapter, AppHttpConfig, AppProcessConfig, AppProvider, AppProviderConfig, AppTransport,
-    HealthCheck, HttpOperation,
+    ApplicationLifecycle, HealthCheck, HttpOperation,
 };
 pub use schema::{
     AppManifest, AppSchemaError, FieldSchema, FunctionSchema, SchemaLimits, TypeSchema,
