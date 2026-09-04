@@ -14,6 +14,8 @@ source -> lexer -> lossless Rowan CST -> typed AST -> HIR
 
 There is one Rust lexer, parser, CST, syntax-to-HIR lowering path, formatter, plan lowering path, runtime, and editor-service implementation. Never add an adapter-specific parser, formatter, semantic model, locator evaluator, or diagnostic engine. TypeScript is host glue only.
 
+Each boundary may translate representations, but ownership must flow in one direction: source → semantics → execution plan → execution → observations. No downstream layer may reconstruct or reinterpret an upstream representation.
+
 ## Current Implemented Slice
 
 The current DSL supports sequential test flows with `server` and `browser` capability blocks, local typed `let` bindings, primitive/list/record expressions, provider calls, JSON-to-record decoding, typed value assertions, browser actions, and the full locator/state surface. Static analysis resolves bindings to IDs, checks provider schemas and capabilities, and rejects non-transferable server-to-browser values. Plans distinguish pure evaluation, provider calls, browser operations, and assertions. Chrome can run headlessly or with `--headed`; value/decode failures and browser failures remain structured and source-mapped.
