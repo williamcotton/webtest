@@ -2,7 +2,15 @@
 
 ## 0. Status and dependencies
 
-This specification expands Milestone E in [`future-functionality.md`](./future-functionality.md). Milestone E is the next planned architectural milestone after the implemented A through D foundation; its syntax, plan nodes, scheduler, IPC, traces, and debugger behavior are not part of the current implemented slice merely because this document specifies them. It depends on the typed plan/provider model in [`milestone-c.md`](./milestone-c.md), the structured machine-feedback contracts in [`milestone-c-5.md`](./milestone-c-5.md), the application lifecycle/bridge in [`milestone-d.md`](./milestone-d.md), and the existing revision-safe observations and DAP `RunControl` hook.
+This specification expands Milestone E in [`future-functionality.md`](./future-functionality.md).
+Milestone E follows the implemented A through D foundation and the pre-E semantic-ownership and
+typed-failure hardening specified by [`milestone-d-11.md`](./milestone-d-11.md); its syntax, plan
+nodes, scheduler, IPC, traces, and debugger behavior are not part of the current implemented slice
+merely because this document specifies them. It depends on the typed plan and provider contracts in
+[`milestone-c.md`](./milestone-c.md), the structured machine-feedback contracts in
+[`milestone-c-5.md`](./milestone-c-5.md), the application lifecycle/bridge in
+[`milestone-d.md`](./milestone-d.md), D.11's corrected type ownership and typed runtime failure
+identity, and the existing revision-safe observations and DAP `RunControl` hook.
 
 Milestone E changes how operations are scheduled, owned, cancelled, and observed. It must preserve the same compiler, plan, runner, provider, browser, editor, and debugger paths used by sequential execution, while establishing generic execution-scope, resource-lifecycle, cancellation, deadline, wait, and event-journal abstractions that later milestones can extend without introducing another runtime architecture. [`milestone-f.md`](./milestone-f.md), [`milestone-h.md`](./milestone-h.md), and [`milestone-i.md`](./milestone-i.md) are forward-compatibility constraints, not dependencies and not authorization to implement their public features early.
 
