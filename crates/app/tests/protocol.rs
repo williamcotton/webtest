@@ -710,6 +710,59 @@ fn dap_stdio_covers_launch_breakpoint_continue_and_disconnect() {
     dap.wait_for_exit();
 }
 
+#[cfg(unix)]
+#[test]
+fn dap_starts_and_stops_the_project_application() {
+    let directory = tempfile::tempdir().expect("temp directory");
+    std::fs::write(
+        directory.path().join("webtest.toml"),
+        "[app]\ncommand = \"/bin/sh\"\nargs = [\"-c\", \"echo $$ > app-pid; echo started > app-started; exec sleep 60\"]\nworking_directory = \".\"\n",
+    )
+    .expect("write project configuration");
+    let project_argument = directory.path().to_string_lossy().into_owned();
+    let mut dap = ProtocolProcess::spawn(
+        &["dap", "--headless", "--project", &project_argument],
+        directory.path(),
+    );
+
+    dap.send(json!({
+        "seq":1,
+        "type":"request",
+        "command":"initialize",
+        "arguments":{"adapterID":"webtest"}
+    }));
+    let initialize =
+        dap.receive(|message| message["type"] == "response" && message["request_seq"] == 1);
+    assert_eq!(initialize["success"], true);
+    let marker = directory.path().join("app-started");
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !marker.is_file() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(marker.is_file());
+
+    dap.send(json!({
+        "seq":2,
+        "type":"request",
+        "command":"disconnect",
+        "arguments":{"terminateDebuggee":true}
+    }));
+    let disconnect =
+        dap.receive(|message| message["type"] == "response" && message["request_seq"] == 2);
+    assert_eq!(disconnect["success"], true);
+    dap.wait_for_exit();
+    let pid =
+        std::fs::read_to_string(directory.path().join("app-pid")).expect("read application pid");
+    assert!(
+        !Command::new("/bin/kill")
+            .args(["-0", pid.trim()])
+            .stderr(Stdio::null())
+            .status()
+            .expect("inspect application process")
+            .success()
+    );
+}
+
 #[test]
 fn dap_project_path_loads_the_test_files_nearest_configuration() {
     let _runtime_test = runtime_protocol_lock();

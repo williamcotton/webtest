@@ -1,8 +1,11 @@
 use std::{path::PathBuf, sync::Arc};
 
 use crate::{
-    chrome::LazyChromeHost, error::AppError, project_context::project,
-    provider_composition::runtime_provider_registry, report::ExitClass,
+    chrome::LazyChromeHost,
+    error::AppError,
+    project_context::project,
+    provider_composition::{runtime_application, runtime_provider_registry},
+    report::ExitClass,
     runtime_configuration::runner_options,
 };
 
@@ -17,15 +20,27 @@ pub(crate) async fn run_dap(
     };
     let browser = LazyChromeHost::new(project.clone(), chrome_path, !headless, None);
     let options = runner_options(&project);
-    let providers = runtime_provider_registry(&project, &options)?;
-    let serve_result =
-        webtest_dap::serve_with_configuration(Arc::new(browser), options, providers.registry).await;
-    if let Some(provider) = providers.app {
-        provider
-            .shutdown()
-            .await
-            .map_err(AppError::infrastructure)?;
+    let runtime_providers = runtime_provider_registry(&project, &options)?;
+    let application = runtime_application(&project, runtime_providers.app.clone());
+    let providers = runtime_providers.registry;
+    if let Some(application) = &application
+        && let Err(error) = application.start(&project).await
+    {
+        let _ = application.shutdown().await;
+        return Err(AppError::infrastructure(error));
     }
-    serve_result.map_err(AppError::infrastructure)?;
+    let serve_result =
+        webtest_dap::serve_with_configuration(Arc::new(browser), options, providers).await;
+    let shutdown_result = match &application {
+        Some(application) => application.shutdown().await,
+        None => Ok(()),
+    };
+    if let Err(error) = serve_result {
+        if let Err(shutdown) = shutdown_result {
+            tracing::warn!(%shutdown, "application teardown also failed after DAP failure");
+        }
+        return Err(AppError::infrastructure(error));
+    }
+    shutdown_result.map_err(AppError::infrastructure)?;
     Ok(ExitClass::Success)
 }
