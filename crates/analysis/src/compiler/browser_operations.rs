@@ -1,12 +1,15 @@
 //! Browser operation/assertion validation and plan lowering.
 
 use super::Compiler;
-use webtest_hir::{HirBrowserOp, HirExprKind, HirLiteral, HirValueAction};
-use webtest_plan::{
-    AssertionOperation, BrowserOperation, PlanExpr, PlannedStep, TestOperation, locator_from_hir,
-    locator_state_from_hir,
+use webtest_hir::{
+    HirBrowserOp, HirExprKind, HirLiteral, HirLocatorKind, HirValueAction,
+    LocatorState as HirLocatorState,
 };
-use webtest_provider::{Capability, Type, Value};
+use webtest_model::{Capability, Type, Value};
+use webtest_plan::{
+    AssertionOperation, BrowserOperation, Locator, LocatorState, PlanExpr, PlannedStep,
+    TestOperation,
+};
 use webtest_text::SyntaxOrigin;
 
 impl Compiler<'_> {
@@ -188,6 +191,35 @@ impl Compiler<'_> {
     }
 }
 
+fn locator_from_hir(locator: &HirLocatorKind) -> Locator {
+    match locator {
+        HirLocatorKind::Id(value) => Locator::Id(value.clone()),
+        HirLocatorKind::Role { role, name } => Locator::Role {
+            role: role.clone(),
+            name: name.clone(),
+        },
+        HirLocatorKind::Label(value) => Locator::Label(value.clone()),
+        HirLocatorKind::Text(value) => Locator::Text(value.clone()),
+        HirLocatorKind::Placeholder(value) => Locator::Placeholder(value.clone()),
+        HirLocatorKind::TestId(value) => Locator::TestId(value.clone()),
+        HirLocatorKind::Css(value) => Locator::Css(value.clone()),
+        HirLocatorKind::XPath(value) => Locator::XPath(value.clone()),
+    }
+}
+
+fn locator_state_from_hir(state: HirLocatorState) -> LocatorState {
+    match state {
+        HirLocatorState::Visible => LocatorState::Visible,
+        HirLocatorState::Hidden => LocatorState::Hidden,
+        HirLocatorState::Attached => LocatorState::Attached,
+        HirLocatorState::Detached => LocatorState::Detached,
+        HirLocatorState::Enabled => LocatorState::Enabled,
+        HirLocatorState::Disabled => LocatorState::Disabled,
+        HirLocatorState::Checked => LocatorState::Checked,
+        HirLocatorState::Unchecked => LocatorState::Unchecked,
+    }
+}
+
 fn browser_origin(operation: &HirBrowserOp) -> SyntaxOrigin {
     match operation {
         HirBrowserOp::Open(value) => value.origin,
@@ -241,7 +273,10 @@ fn valid_key_chord(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::valid_key_chord;
+    use super::{
+        HirLocatorKind, HirLocatorState, Locator, LocatorState, locator_from_hir,
+        locator_state_from_hir, valid_key_chord,
+    };
 
     #[test]
     fn key_chords_have_exactly_one_main_key() {
@@ -250,5 +285,63 @@ mod tests {
         assert!(!valid_key_chord("Control+Shift"));
         assert!(!valid_key_chord("Enter+Tab"));
         assert!(!valid_key_chord("Control+Unknown"));
+    }
+
+    #[test]
+    fn every_hir_locator_and_state_lowers_explicitly_to_plan() {
+        let locators = [
+            (HirLocatorKind::Id("id".into()), Locator::Id("id".into())),
+            (
+                HirLocatorKind::Role {
+                    role: "button".into(),
+                    name: Some("Save".into()),
+                },
+                Locator::Role {
+                    role: "button".into(),
+                    name: Some("Save".into()),
+                },
+            ),
+            (
+                HirLocatorKind::Label("Email".into()),
+                Locator::Label("Email".into()),
+            ),
+            (
+                HirLocatorKind::Text("Welcome".into()),
+                Locator::Text("Welcome".into()),
+            ),
+            (
+                HirLocatorKind::Placeholder("Search".into()),
+                Locator::Placeholder("Search".into()),
+            ),
+            (
+                HirLocatorKind::TestId("submit".into()),
+                Locator::TestId("submit".into()),
+            ),
+            (
+                HirLocatorKind::Css(".save".into()),
+                Locator::Css(".save".into()),
+            ),
+            (
+                HirLocatorKind::XPath("//button".into()),
+                Locator::XPath("//button".into()),
+            ),
+        ];
+        for (hir, expected) in locators {
+            assert_eq!(locator_from_hir(&hir), expected);
+        }
+
+        let states = [
+            (HirLocatorState::Visible, LocatorState::Visible),
+            (HirLocatorState::Hidden, LocatorState::Hidden),
+            (HirLocatorState::Attached, LocatorState::Attached),
+            (HirLocatorState::Detached, LocatorState::Detached),
+            (HirLocatorState::Enabled, LocatorState::Enabled),
+            (HirLocatorState::Disabled, LocatorState::Disabled),
+            (HirLocatorState::Checked, LocatorState::Checked),
+            (HirLocatorState::Unchecked, LocatorState::Unchecked),
+        ];
+        for (hir, expected) in states {
+            assert_eq!(locator_state_from_hir(hir), expected);
+        }
     }
 }

@@ -141,7 +141,9 @@ pub(crate) async fn run_test(
                     failure: FailureReport {
                         diagnostic_schema_version: webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
                         repair_hint_schema_version: webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
-                        code: format!("runtime.{}", error.code()),
+                        code: webtest_observation::RuntimeFailureCode::from(&error)
+                            .diagnostic_code()
+                            .into(),
                         message: error.to_string(),
                         span: None,
                         diff: None,
@@ -246,7 +248,9 @@ pub(crate) async fn run_test(
                                             webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
                                         repair_hint_schema_version:
                                             webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
-                                        code: "runtime.test_timeout".into(),
+                                        code: webtest_observation::RuntimeFailureCode::TestTimeout
+                                            .diagnostic_code()
+                                            .into(),
                                         message: format!(
                                             "test timed out after {}ms",
                                             timeout.as_millis()

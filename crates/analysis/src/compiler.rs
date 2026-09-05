@@ -16,9 +16,10 @@ use crate::{
     facts::TypeFact,
 };
 use webtest_feedback::RepairHint;
-use webtest_hir::{BindingId, HirFile};
+use webtest_hir::HirFile;
+use webtest_model::{BindingId, Capability, Type};
 use webtest_plan::{PlanExpr, TestPlan};
-use webtest_provider::{Capability, ProviderRegistry, Type};
+use webtest_provider::ProviderRegistry;
 use webtest_text::{FileId, SourceRevision, SyntaxOrigin, TextRange};
 
 pub(crate) struct CompileResult {

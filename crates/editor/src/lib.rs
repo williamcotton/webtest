@@ -8,7 +8,7 @@ use webtest_analysis::{
     Signature,
 };
 use webtest_browser::{BrowserError, BrowserHost, Locator};
-use webtest_observation::{ObservationStore, RuntimeObservationKind};
+use webtest_observation::{ObservationStore, RuntimeFailureCode, RuntimeObservationKind};
 use webtest_provider::ProviderRegistry;
 use webtest_runtime::{RunResult, Runner, RunnerOptions};
 use webtest_syntax::SyntaxKind;
@@ -145,7 +145,7 @@ impl EditorService {
                     } => Diagnostic {
                         range: observation.range,
                         severity: DiagnosticSeverity::Error,
-                        code: "runtime.test_timeout",
+                        code: RuntimeFailureCode::TestTimeout.diagnostic_code(),
                         message: format!("Test timed out after {timeout_ms}ms."),
                         source: DiagnosticSource::Runtime,
                         semantic_details: Some(serde_json::json!({
@@ -169,8 +169,8 @@ impl EditorService {
                     } => Diagnostic {
                         range: observation.range,
                         severity: DiagnosticSeverity::Error,
-                        code: runtime_diagnostic_code(&code),
-                        message: friendly_runtime_message(&code, locator.as_ref(), &message),
+                        code: code.diagnostic_code(),
+                        message: friendly_runtime_message(code, locator.as_ref(), &message),
                         source: DiagnosticSource::Runtime,
                         semantic_details: Some(serde_json::json!({
                             "requested_locator": locator.as_ref().map(ToString::to_string),
@@ -181,12 +181,15 @@ impl EditorService {
                             "elapsed_ms": elapsed_ms,
                         })),
                         repair_hints,
-                        reference_queries: locator
-                            .as_ref()
-                            .map(locator_reference_query)
-                            .into_iter()
-                            .map(str::to_owned)
-                            .collect(),
+                        reference_queries: locator.as_ref().map_or_else(
+                            || {
+                                code.default_reference_queries()
+                                    .iter()
+                                    .map(|query| (*query).to_owned())
+                                    .collect()
+                            },
+                            |locator| vec![locator_reference_query(locator).to_owned()],
+                        ),
                     },
                     RuntimeObservationKind::ValueFailure {
                         code,
@@ -206,7 +209,7 @@ impl EditorService {
                         Diagnostic {
                             range: observation.range,
                             severity: DiagnosticSeverity::Error,
-                            code: value_runtime_diagnostic_code(&code),
+                            code: code.diagnostic_code(),
                             message: details,
                             source: DiagnosticSource::Runtime,
                             semantic_details: Some(serde_json::json!({
@@ -215,13 +218,17 @@ impl EditorService {
                                 "actual": actual,
                             })),
                             repair_hints: Vec::new(),
-                            reference_queries: vec!["assertion.value".into()],
+                            reference_queries: code
+                                .default_reference_queries()
+                                .iter()
+                                .map(|query| (*query).to_owned())
+                                .collect(),
                         }
                     }
                     RuntimeObservationKind::LocatorNotFound { locator, .. } => Diagnostic {
                         range: observation.range,
                         severity: DiagnosticSeverity::Error,
-                        code: "runtime.locator_not_found",
+                        code: RuntimeFailureCode::LocatorNotFound.diagnostic_code(),
                         message: format!(
                             "No element with {} was found during the last test run.",
                             locator_description(&locator)
@@ -238,7 +245,7 @@ impl EditorService {
                     } => Diagnostic {
                         range: observation.range,
                         severity: DiagnosticSeverity::Error,
-                        code: "runtime.locator_ambiguous",
+                        code: RuntimeFailureCode::LocatorAmbiguous.diagnostic_code(),
                         message: format!(
                             "The locator {locator} matched {matches} elements during the last test run."
                         ),
@@ -253,7 +260,7 @@ impl EditorService {
                     RuntimeObservationKind::LocatorNotVisible { locator, .. } => Diagnostic {
                         range: observation.range,
                         severity: DiagnosticSeverity::Error,
-                        code: "runtime.locator_not_visible",
+                        code: RuntimeFailureCode::LocatorNotVisible.diagnostic_code(),
                         message: format!(
                             "The element with {} was not visible during the last test run.",
                             locator_description(&locator)
@@ -470,50 +477,21 @@ fn locator_reference_query(locator: &Locator) -> &'static str {
     }
 }
 
-fn friendly_runtime_message(code: &str, locator: Option<&Locator>, fallback: &str) -> String {
+fn friendly_runtime_message(
+    code: RuntimeFailureCode,
+    locator: Option<&Locator>,
+    fallback: &str,
+) -> String {
     match (code, locator) {
-        ("locator_not_found", Some(locator)) => format!(
+        (RuntimeFailureCode::LocatorNotFound, Some(locator)) => format!(
             "No element with {} was found during the last test run.",
             locator_description(locator)
         ),
-        ("element_not_visible", Some(locator)) => format!(
+        (RuntimeFailureCode::LocatorNotVisible, Some(locator)) => format!(
             "The element with {} was not visible during the last test run.",
             locator_description(locator)
         ),
         _ => fallback.into(),
-    }
-}
-
-fn runtime_diagnostic_code(code: &str) -> &'static str {
-    match code {
-        "locator_not_found" => "runtime.locator_not_found",
-        "locator_ambiguous" => "runtime.locator_ambiguous",
-        "locator_invalid" => "runtime.locator_invalid",
-        "element_detached" => "runtime.element_detached",
-        "element_not_visible" => "runtime.locator_not_visible",
-        "element_unstable" => "runtime.element_unstable",
-        "element_disabled" => "runtime.element_disabled",
-        "element_obscured" => "runtime.element_obscured",
-        "element_not_editable" => "runtime.element_not_editable",
-        "option_not_found" => "runtime.option_not_found",
-        "option_ambiguous" => "runtime.option_ambiguous",
-        "invalid_key" => "runtime.invalid_key",
-        "action_timeout" => "runtime.action_timeout",
-        "url_mismatch" => "runtime.url_mismatch",
-        _ => "runtime.assertion_failed",
-    }
-}
-
-fn value_runtime_diagnostic_code(code: &str) -> &'static str {
-    match code {
-        "json_decode_failed" => "runtime.json_decode_failed",
-        "assertion_failed" => "runtime.assertion_failed",
-        "provider_invalid_argument" => "runtime.provider_invalid_argument",
-        "path_escape" => "runtime.path_escape",
-        "division_by_zero" => "runtime.division_by_zero",
-        "response_decode_failed" => "runtime.response_decode_failed",
-        "internal_error" => "runtime.internal_error",
-        _ => "runtime.provider_failure",
     }
 }
 
@@ -524,9 +502,11 @@ mod tests {
     use async_trait::async_trait;
     use webtest_browser::{BrowserSession, Page};
     use webtest_browser_cdp::ChromeHost;
+    use webtest_model::{Capability, Type, Value};
+    use webtest_observation::{ExecutionId, RuntimeObservation};
     use webtest_provider::{
-        CallContext, Capability, OperationName, OperationSchema, ProviderCall, ProviderName,
-        ProviderResult, ProviderSchema, ServerProvider, Type, Value,
+        CallContext, OperationName, OperationSchema, ProviderCall, ProviderName, ProviderResult,
+        ProviderSchema, ServerProvider,
     };
     use webtest_runtime::RunOutcome;
 
@@ -539,6 +519,49 @@ mod tests {
 
     struct CountingProvider {
         calls: AtomicUsize,
+    }
+
+    #[test]
+    fn typed_runtime_codes_remove_generic_editor_fallbacks() {
+        let editor = EditorService::new();
+        let source = "test \"typed codes\" {}";
+        let file = editor.open_document("file:///typed-codes.webtest", source);
+        let revision = webtest_text::SourceRevision::of(source);
+        for (index, code) in [
+            RuntimeFailureCode::IntegerOverflow,
+            RuntimeFailureCode::AppProviderFailure,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            editor.observations().record(RuntimeObservation {
+                execution_id: ExecutionId(index as u64 + 1),
+                file,
+                source_revision: revision,
+                test_id: webtest_model::TestId(0),
+                step_id: Some(webtest_model::StepId(index as u32)),
+                range: TextRange::default(),
+                kind: RuntimeObservationKind::ValueFailure {
+                    code,
+                    message: "failure".into(),
+                    path: None,
+                    expected: None,
+                    actual: None,
+                    diff: None,
+                },
+            });
+        }
+        let codes = editor
+            .diagnostics(file)
+            .expect("diagnostics")
+            .into_iter()
+            .filter(|diagnostic| diagnostic.source == DiagnosticSource::Runtime)
+            .map(|diagnostic| diagnostic.code)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            codes,
+            ["runtime.integer_overflow", "runtime.app_provider_failure"]
+        );
     }
 
     #[async_trait]
@@ -760,7 +783,7 @@ mod tests {
                 execution_id: webtest_observation::ExecutionId::next(),
                 file,
                 source_revision: webtest_text::SourceRevision::of(source),
-                test_id: webtest_hir::TestId(0),
+                test_id: webtest_model::TestId(0),
                 step_id: None,
                 range: webtest_text::TextRange::new(
                     webtest_text::TextSize::new(0),

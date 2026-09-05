@@ -5,8 +5,9 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use webtest_model::{Capability, Type};
 use webtest_provider::{
-    Capability, OperationSchema, ParameterSchema, ProviderRegistry, ProviderSchemaProvenance, Type,
+    OperationSchema, ParameterSchema, ProviderRegistry, ProviderSchemaProvenance,
 };
 use webtest_syntax::{AuthorFacingLanguage, author_facing_language};
 
@@ -920,7 +921,8 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> String {
 mod tests {
     use super::*;
     use crate::{AnalysisDatabase, DiagnosticSeverity};
-    use webtest_provider::{OperationName, ProviderName, ProviderSchema, RecordField};
+    use webtest_model::RecordField;
+    use webtest_provider::{OperationName, ProviderName, ProviderSchema};
 
     fn response(request: DescriptionRequest) -> DescriptionResponse {
         describe(
@@ -1784,7 +1786,7 @@ mod tests {
                             positional: false,
                             secret: false,
                             documentation: String::new(),
-                            default: Some(webtest_provider::Value::Bool(false)),
+                            default: Some(webtest_model::Value::Bool(false)),
                         },
                     ],
                     result,

@@ -21,4 +21,4 @@ webtest-text.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 webtest-browser-cdp.workspace = true
-webtest-hir.workspace = true
+webtest-model.workspace = true

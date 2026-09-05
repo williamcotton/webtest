@@ -3,8 +3,9 @@
 use serde::Serialize;
 use webtest_analysis::{AnalysisDatabase, DiagnosticSeverity};
 use webtest_app_bridge::AppManifest;
+use webtest_model::Capability;
 use webtest_plan::TestPlan;
-use webtest_provider::{Capability, ProviderRegistry};
+use webtest_provider::ProviderRegistry;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct PortableDiagnostic {
@@ -525,7 +526,7 @@ test "optional" {
             .into_iter()
             .find(|diagnostic| diagnostic.code == "semantic.unknown_member")
             .expect("unknown member diagnostic");
-        assert_eq!(diagnostic.diagnostic_schema_version, 1);
+        assert_eq!(diagnostic.diagnostic_schema_version, 2);
         assert_eq!(diagnostic.repair_hint_schema_version, 1);
         assert_eq!(
             diagnostic.semantic_details.expect("details")["requested"],

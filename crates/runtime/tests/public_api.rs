@@ -1,18 +1,17 @@
 use std::{collections::BTreeMap, error::Error, path::PathBuf, sync::Arc, time::Duration};
 
 use webtest_browser::{BrowserError, PageEvidence};
-use webtest_hir::{StepId, TestId};
+use webtest_model::{StepId, TestId, Type, Value};
 use webtest_observation::{
     CancellationReason, ExecutionEvent, ExecutionId, ObservationStore, RunOutcomeKind, SkipReason,
     ValueDiff,
 };
 use webtest_plan::{PlannedStep, ValueMatcher};
-use webtest_provider::{Type, Value};
 use webtest_runtime::{
     Artifact, ArtifactKind, AssertionFailure, CleanupCause, CleanupFailure, CleanupResource,
-    DecodeFailure, EvaluationFailure, EvidenceOptions, RunControl, RunError, RunEventSink,
-    RunOutcome, RunResult, Runner, RunnerOptions, StepError, StepFailure, TestOutcome, TestResult,
-    resolve_browser_url,
+    DecodeFailure, EvaluationFailure, EvaluationFailureKind, EvidenceOptions, RunControl, RunError,
+    RunEventSink, RunOutcome, RunResult, Runner, RunnerOptions, StepError, StepFailure,
+    TestOutcome, TestResult, resolve_browser_url,
 };
 use webtest_text::{FileId, SyntaxOrigin, TextRange};
 
@@ -24,7 +23,7 @@ fn accepts_event_sink(_: Option<&dyn RunEventSink>) {}
 
 fn test_result(outcome: TestOutcome) -> TestResult {
     TestResult {
-        test_id: webtest_hir::TestId(0),
+        test_id: webtest_model::TestId(0),
         name: "test".into(),
         outcome,
         duration: Duration::ZERO,
@@ -89,7 +88,7 @@ fn root_public_api_remains_importable_and_constructible() {
         response_operation: Some("app.load".into()),
     };
     let evaluation = EvaluationFailure {
-        code: "division_by_zero",
+        kind: EvaluationFailureKind::DivisionByZero,
         message: "division by zero".into(),
     };
     let step_failure = StepFailure {
@@ -106,14 +105,26 @@ fn root_public_api_remains_importable_and_constructible() {
     assert_error::<RunError>();
     accepts_control(None);
     accepts_event_sink(None);
-    assert_eq!(StepError::Decode(decode).code(), "json_decode_failed");
-    assert_eq!(StepError::Evaluation(evaluation).code(), "division_by_zero");
-    assert_eq!(step_failure.error.code(), "assertion_failed");
+    assert_eq!(
+        StepError::Decode(decode).code(),
+        webtest_observation::RuntimeFailureCode::JsonDecodeFailed
+    );
+    assert_eq!(
+        StepError::Evaluation(evaluation).code(),
+        webtest_observation::RuntimeFailureCode::DivisionByZero
+    );
+    assert_eq!(
+        step_failure.error.code(),
+        webtest_observation::RuntimeFailureCode::AssertionFailed
+    );
     let cleanup = CleanupFailure {
         resource: CleanupResource::BrowserSession,
         cause: CleanupCause::Browser(BrowserError::BrowserDisconnected),
     };
-    assert_eq!(cleanup.code(), "cleanup_browser_session_failed");
+    assert_eq!(
+        cleanup.code(),
+        webtest_observation::RuntimeFailureCode::CleanupBrowserSessionFailed
+    );
     assert!(matches!(
         resolve_browser_url(None, "/relative"),
         Err(BrowserError::NavigationFailed { .. })
@@ -165,7 +176,7 @@ fn defaults_and_result_counts_are_exact() {
             test_result(failed_outcome()),
             test_result(TestOutcome::TimedOut {
                 timeout: Duration::from_secs(1),
-                active_step: Some(webtest_hir::StepId(0)),
+                active_step: Some(webtest_model::StepId(0)),
             }),
             test_result(TestOutcome::Cancelled {
                 reason: CancellationReason::Requested,

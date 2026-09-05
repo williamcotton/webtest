@@ -18,7 +18,7 @@
           "failure_class": "test",
           "duration_nanos": 10,
           "failure": {
-            "diagnostic_schema_version": 1,
+            "diagnostic_schema_version": 2,
             "repair_hint_schema_version": 1,
             "code": "runtime.locator_not_found",
             "message": "missing & gone",

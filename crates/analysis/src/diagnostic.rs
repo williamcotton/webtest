@@ -1,7 +1,7 @@
 //! Public diagnostics and shared deterministic repair/reference primitives.
 
 use webtest_feedback::{ByteRange, RepairHint, RepairHintKind};
-use webtest_provider::Type;
+use webtest_model::Type;
 use webtest_text::TextRange;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

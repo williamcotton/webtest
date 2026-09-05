@@ -8,7 +8,7 @@ license.workspace = true
 serde.workspace = true
 webtest-browser.workspace = true
 webtest-feedback.workspace = true
-webtest-hir.workspace = true
+webtest-model.workspace = true
 webtest-provider.workspace = true
 webtest-text.workspace = true
 

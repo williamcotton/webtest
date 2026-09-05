@@ -15,7 +15,9 @@ mod url;
 
 pub use artifacts::{Artifact, ArtifactKind};
 pub use control::RunControl;
-pub use error::{AssertionFailure, DecodeFailure, EvaluationFailure, RunError, StepError};
+pub use error::{
+    AssertionFailure, DecodeFailure, EvaluationFailure, EvaluationFailureKind, RunError, StepError,
+};
 pub use events::RunEventSink;
 pub use options::{EvidenceOptions, RunnerOptions};
 pub use result::{

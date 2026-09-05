@@ -1,8 +1,7 @@
-//! Shared types, values, schemas, and native server-provider contracts.
+//! Provider schemas, calls, results, errors, registry, and native server-provider contracts.
 
 use std::{
     collections::{BTreeMap, HashMap},
-    fmt,
     path::PathBuf,
     sync::Arc,
     time::Duration,
@@ -17,359 +16,10 @@ use std::{
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Capability {
-    Pure,
-    Server,
-    Browser,
-    Test,
-}
-
-impl fmt::Display for Capability {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::Pure => "Pure",
-            Self::Server => "Server",
-            Self::Browser => "Browser",
-            Self::Test => "Test",
-        })
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct RecordField {
-    pub ty: Type,
-    pub optional: bool,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub documentation: String,
-    #[serde(default)]
-    pub secret: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
-pub enum Type {
-    Unknown,
-    Null,
-    Bool,
-    Int,
-    Float,
-    String,
-    Duration,
-    Url,
-    Json,
-    List(Box<Type>),
-    Option(Box<Type>),
-    Record(BTreeMap<String, RecordField>),
-    StatusCode,
-    Headers,
-    Bytes,
-    Response(Box<Type>),
-    ProcessResult,
-    FilePath,
-    TempDirectory,
-    Locator,
-    BrowserPage,
-}
-
-impl Type {
-    pub fn is_transferable(&self) -> bool {
-        match self {
-            Self::Unknown => false,
-            Self::Null
-            | Self::Bool
-            | Self::Int
-            | Self::Float
-            | Self::String
-            | Self::Duration
-            | Self::Url
-            | Self::Json => true,
-            Self::List(inner) | Self::Option(inner) => inner.is_transferable(),
-            Self::Record(fields) => fields.values().all(|field| field.ty.is_transferable()),
-            Self::Response(_)
-            | Self::ProcessResult
-            | Self::StatusCode
-            | Self::Headers
-            | Self::Bytes
-            | Self::FilePath
-            | Self::TempDirectory
-            | Self::Locator
-            | Self::BrowserPage => false,
-        }
-    }
-
-    pub fn accepts(&self, actual: &Type) -> bool {
-        if matches!(self, Self::Unknown) || matches!(actual, Self::Unknown) || self == actual {
-            return true;
-        }
-        match (self, actual) {
-            (Self::Float, Self::Int) => true,
-            (Self::StatusCode, Self::Int) | (Self::Int, Self::StatusCode) => true,
-            (
-                Self::Json,
-                Self::Null
-                | Self::Bool
-                | Self::Int
-                | Self::Float
-                | Self::String
-                | Self::List(_)
-                | Self::Record(_),
-            ) => true,
-            (Self::Option(_), Self::Null) => true,
-            (Self::Option(expected), Self::Option(actual)) => expected.accepts(actual),
-            (Self::Option(expected), actual) => expected.accepts(actual),
-            (Self::List(expected), Self::List(actual))
-            | (Self::Response(expected), Self::Response(actual)) => expected.accepts(actual),
-            (Self::Record(expected), Self::Record(actual)) => {
-                expected.iter().all(|(name, field)| {
-                    let Some(actual) = actual.get(name) else {
-                        return field.optional;
-                    };
-                    field.ty.accepts(&actual.ty) && (field.optional || !actual.optional)
-                })
-            }
-            _ => false,
-        }
-    }
-
-    pub fn member(&self, name: &str) -> Option<Type> {
-        match self {
-            Self::Record(fields) => fields.get(name).map(|field| {
-                if field.optional {
-                    Type::Option(Box::new(field.ty.clone()))
-                } else {
-                    field.ty.clone()
-                }
-            }),
-            Self::Response(body) => match name {
-                "status" => Some(Self::StatusCode),
-                "headers" => Some(Self::Headers),
-                "body" => Some(Self::Bytes),
-                "text" => Some(Self::String),
-                "json" => Some((**body).clone()),
-                _ => None,
-            },
-            Self::ProcessResult => match name {
-                "exit_code" => Some(Self::Int),
-                "stdout" | "stderr" => Some(Self::String),
-                "stdout_bytes" | "stderr_bytes" => Some(Self::Bytes),
-                _ => None,
-            },
-            Self::Headers => Some(Self::Option(Box::new(Self::String))),
-            _ => None,
-        }
-    }
-
-    pub fn member_missing_is_null(&self, name: &str) -> bool {
-        match self {
-            Self::Record(fields) => fields.get(name).is_some_and(|field| field.optional),
-            Self::Headers => true,
-            _ => false,
-        }
-    }
-}
-
-impl fmt::Display for Type {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Unknown => formatter.write_str("unknown"),
-            Self::Null => formatter.write_str("Null"),
-            Self::Bool => formatter.write_str("Bool"),
-            Self::Int => formatter.write_str("Int"),
-            Self::Float => formatter.write_str("Float"),
-            Self::String => formatter.write_str("String"),
-            Self::Duration => formatter.write_str("Duration"),
-            Self::Url => formatter.write_str("Url"),
-            Self::Json => formatter.write_str("Json"),
-            Self::StatusCode => formatter.write_str("StatusCode"),
-            Self::Headers => formatter.write_str("Headers"),
-            Self::Bytes => formatter.write_str("Bytes"),
-            Self::ProcessResult => formatter.write_str("ProcessResult"),
-            Self::FilePath => formatter.write_str("FilePath"),
-            Self::TempDirectory => formatter.write_str("TempDirectory"),
-            Self::Locator => formatter.write_str("Locator"),
-            Self::BrowserPage => formatter.write_str("BrowserPage"),
-            Self::List(inner) => write!(formatter, "List<{inner}>"),
-            Self::Option(inner) => write!(formatter, "Option<{inner}>"),
-            Self::Response(inner) => write!(formatter, "Response<{inner}>"),
-            Self::Record(fields) => {
-                formatter.write_str("{ ")?;
-                for (index, (name, field)) in fields.iter().enumerate() {
-                    if index > 0 {
-                        formatter.write_str(", ")?;
-                    }
-                    write!(
-                        formatter,
-                        "{name}{}: {}",
-                        if field.optional { "?" } else { "" },
-                        field.ty
-                    )?;
-                }
-                formatter.write_str(" }")
-            }
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
-pub enum Value {
-    Null,
-    Bool(bool),
-    Int(i64),
-    Float(f64),
-    String(String),
-    DurationMillis(u64),
-    List(Vec<Value>),
-    Record(BTreeMap<String, Value>),
-    Headers(BTreeMap<String, String>),
-    Bytes(Vec<u8>),
-    Response(ResponseValue),
-    ProcessResult(ProcessResultValue),
-    FilePath(PathBuf),
-    TempDirectory(PathBuf),
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ResponseValue {
-    pub status: u16,
-    pub headers: BTreeMap<String, String>,
-    pub body: Vec<u8>,
-    pub json: Option<Box<Value>>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ProcessResultValue {
-    pub exit_code: i64,
-    pub stdout: String,
-    pub stderr: String,
-    pub stdout_bytes: Vec<u8>,
-    pub stderr_bytes: Vec<u8>,
-}
-
-impl Value {
-    pub fn type_name(&self) -> &'static str {
-        match self {
-            Self::Null => "null",
-            Self::Bool(_) => "boolean",
-            Self::Int(_) => "integer",
-            Self::Float(_) => "number",
-            Self::String(_) => "string",
-            Self::DurationMillis(_) => "duration",
-            Self::List(_) => "array",
-            Self::Record(_) => "object",
-            Self::Headers(_) => "headers",
-            Self::Bytes(_) => "bytes",
-            Self::Response(_) => "response",
-            Self::ProcessResult(_) => "process result",
-            Self::FilePath(_) => "file path",
-            Self::TempDirectory(_) => "temporary directory",
-        }
-    }
-
-    pub fn member(&self, name: &str) -> Option<Value> {
-        match self {
-            Self::Record(fields) => fields.get(name).cloned(),
-            Self::Response(response) => match name {
-                "status" => Some(Self::Int(i64::from(response.status))),
-                "headers" => Some(Self::Headers(response.headers.clone())),
-                "body" => Some(Self::Bytes(response.body.clone())),
-                "text" => String::from_utf8(response.body.clone())
-                    .ok()
-                    .map(Self::String),
-                "json" => response.json.as_deref().cloned(),
-                _ => None,
-            },
-            Self::ProcessResult(result) => match name {
-                "exit_code" => Some(Self::Int(result.exit_code)),
-                "stdout" => Some(Self::String(result.stdout.clone())),
-                "stderr" => Some(Self::String(result.stderr.clone())),
-                "stdout_bytes" => Some(Self::Bytes(result.stdout_bytes.clone())),
-                "stderr_bytes" => Some(Self::Bytes(result.stderr_bytes.clone())),
-                _ => None,
-            },
-            Self::Headers(headers) => Some(
-                headers
-                    .iter()
-                    .find(|(header, _)| header.eq_ignore_ascii_case(name))
-                    .map_or(Self::Null, |(_, value)| Self::String(value.clone())),
-            ),
-            _ => None,
-        }
-    }
-
-    pub fn redacted(&self, fields: &[String]) -> Value {
-        self.redacted_with_secrets(fields, &[])
-    }
-
-    pub fn redacted_with_secrets(&self, fields: &[String], secrets: &[String]) -> Value {
-        match self {
-            Self::Record(values) => Self::Record(
-                values
-                    .iter()
-                    .map(|(name, value)| {
-                        let value = if fields.iter().any(|field| field.eq_ignore_ascii_case(name)) {
-                            Self::String("[redacted]".into())
-                        } else {
-                            value.redacted_with_secrets(fields, secrets)
-                        };
-                        (name.clone(), value)
-                    })
-                    .collect(),
-            ),
-            Self::List(values) => Self::List(
-                values
-                    .iter()
-                    .map(|value| value.redacted_with_secrets(fields, secrets))
-                    .collect(),
-            ),
-            Self::Headers(values) => Self::Headers(
-                values
-                    .iter()
-                    .map(|(name, value)| {
-                        let value = if fields.iter().any(|field| field.eq_ignore_ascii_case(name)) {
-                            "[redacted]".into()
-                        } else {
-                            redact_text(value, secrets)
-                        };
-                        (name.clone(), value)
-                    })
-                    .collect(),
-            ),
-            Self::String(value) => Self::String(redact_text(value, secrets)),
-            Self::ProcessResult(value) => Self::ProcessResult(ProcessResultValue {
-                exit_code: value.exit_code,
-                stdout: redact_text(&value.stdout, secrets),
-                stderr: redact_text(&value.stderr, secrets),
-                stdout_bytes: redact_bytes(&value.stdout_bytes, secrets),
-                stderr_bytes: redact_bytes(&value.stderr_bytes, secrets),
-            }),
-            Self::Response(value) => Self::Response(ResponseValue {
-                status: value.status,
-                headers: value
-                    .headers
-                    .iter()
-                    .map(|(name, value)| {
-                        let value = if fields.iter().any(|field| field.eq_ignore_ascii_case(name)) {
-                            "[redacted]".into()
-                        } else {
-                            redact_text(value, secrets)
-                        };
-                        (name.clone(), value)
-                    })
-                    .collect(),
-                body: redact_bytes(&value.body, secrets),
-                json: value
-                    .json
-                    .as_deref()
-                    .map(|value| Box::new(value.redacted_with_secrets(fields, secrets))),
-            }),
-            value => value.clone(),
-        }
-    }
-}
+pub use webtest_model::{
+    Capability, ProcessResultValue, RecordField, ResponseValue, Type, Value, value_from_json,
+    value_to_json,
+};
 
 fn redact_text(value: &str, secrets: &[String]) -> String {
     secrets
@@ -378,56 +28,6 @@ fn redact_text(value: &str, secrets: &[String]) -> String {
         .fold(value.to_owned(), |value, secret| {
             value.replace(secret, "[redacted]")
         })
-}
-
-fn redact_bytes(value: &[u8], secrets: &[String]) -> Vec<u8> {
-    std::str::from_utf8(value)
-        .map(|value| redact_text(value, secrets).into_bytes())
-        .unwrap_or_else(|_| value.to_vec())
-}
-
-pub fn value_from_json(value: serde_json::Value) -> Value {
-    match value {
-        serde_json::Value::Null => Value::Null,
-        serde_json::Value::Bool(value) => Value::Bool(value),
-        serde_json::Value::Number(value) => value
-            .as_i64()
-            .map(Value::Int)
-            .or_else(|| value.as_f64().map(Value::Float))
-            .unwrap_or(Value::Null),
-        serde_json::Value::String(value) => Value::String(value),
-        serde_json::Value::Array(values) => {
-            Value::List(values.into_iter().map(value_from_json).collect())
-        }
-        serde_json::Value::Object(values) => Value::Record(
-            values
-                .into_iter()
-                .map(|(name, value)| (name, value_from_json(value)))
-                .collect(),
-        ),
-    }
-}
-
-pub fn value_to_json(value: &Value) -> Option<serde_json::Value> {
-    match value {
-        Value::Null => Some(serde_json::Value::Null),
-        Value::Bool(value) => Some((*value).into()),
-        Value::Int(value) => Some((*value).into()),
-        Value::Float(value) => serde_json::Number::from_f64(*value).map(Into::into),
-        Value::String(value) => Some(value.clone().into()),
-        Value::DurationMillis(value) => Some((*value).into()),
-        Value::List(values) => values
-            .iter()
-            .map(value_to_json)
-            .collect::<Option<Vec<_>>>()
-            .map(Into::into),
-        Value::Record(values) => values
-            .iter()
-            .map(|(name, value)| Some((name.clone(), value_to_json(value)?)))
-            .collect::<Option<serde_json::Map<_, _>>>()
-            .map(Into::into),
-        _ => None,
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1676,7 +1276,18 @@ mod tests {
             http_schema().operation("post").unwrap().result,
             Type::Response(Box::new(Type::Json))
         );
-        assert_eq!(http_schema().hash(), http_schema().hash());
+        assert_eq!(
+            http_schema().hash(),
+            "aa725b6e72cd1ff5e8239febe51443030de0d0727448e96573a9de16cc24c04f"
+        );
+        assert_eq!(
+            process_schema().hash(),
+            "2b2d1574f194fa8da3e010f980b42f9063a3b4d9bbf5e4b6e3293940f2084103"
+        );
+        assert_eq!(
+            fs_schema().hash(),
+            "93846ec4e047b0f9517805b6d58dd4822259b3b9ecf0d47eb2073c579c57f0e7"
+        );
         let fields = [(
             "page".into(),
             RecordField {
@@ -1702,58 +1313,6 @@ mod tests {
             registry.schema_provenance("project_fs"),
             Some(ProviderSchemaProvenance::ProjectSupplied)
         );
-    }
-
-    #[test]
-    fn option_and_record_compatibility_preserve_presence() {
-        let optional_string = Type::Option(Box::new(Type::String));
-        assert!(optional_string.accepts(&Type::Null));
-        assert!(optional_string.accepts(&Type::String));
-        assert!(optional_string.accepts(&Type::Option(Box::new(Type::String))));
-        assert!(!optional_string.accepts(&Type::Int));
-        assert!(!Type::String.accepts(&optional_string));
-
-        let record = |optional: bool| {
-            Type::Record(BTreeMap::from([(
-                "name".into(),
-                RecordField {
-                    ty: Type::String,
-                    optional,
-                    documentation: String::new(),
-                    secret: false,
-                },
-            )]))
-        };
-        let empty = Type::Record(BTreeMap::new());
-        assert!(!record(false).accepts(&record(true)));
-        assert!(record(true).accepts(&record(false)));
-        assert!(record(true).accepts(&record(true)));
-        assert!(record(true).accepts(&empty));
-        assert!(!record(false).accepts(&empty));
-
-        let wrong = Type::Record(BTreeMap::from([(
-            "name".into(),
-            RecordField {
-                ty: Type::Int,
-                optional: false,
-                documentation: String::new(),
-                secret: false,
-            },
-        )]));
-        assert!(!record(true).accepts(&wrong));
-
-        let required_nullable = Type::Record(BTreeMap::from([(
-            "name".into(),
-            RecordField {
-                ty: Type::Option(Box::new(Type::String)),
-                optional: false,
-                documentation: String::new(),
-                secret: false,
-            },
-        )]));
-        assert!(!required_nullable.member_missing_is_null("name"));
-        assert!(record(true).member_missing_is_null("name"));
-        assert!(Type::Headers.member_missing_is_null("authorization"));
     }
 
     #[test]
@@ -1784,50 +1343,6 @@ mod tests {
             effective_timeout(&shorter, Duration::from_secs(2)),
             Duration::from_millis(250)
         );
-    }
-
-    #[test]
-    fn nested_fields_and_known_secret_values_are_redacted() {
-        let value = Value::Record(
-            [
-                ("password".into(), Value::String("credential".into())),
-                (
-                    "message".into(),
-                    Value::String("failed for credential".into()),
-                ),
-            ]
-            .into_iter()
-            .collect(),
-        );
-        let redacted = value.redacted_with_secrets(&["password".into()], &["credential".into()]);
-        assert_eq!(
-            redacted,
-            Value::Record(
-                [
-                    ("password".into(), Value::String("[redacted]".into())),
-                    (
-                        "message".into(),
-                        Value::String("failed for [redacted]".into()),
-                    ),
-                ]
-                .into_iter()
-                .collect(),
-            )
-        );
-    }
-
-    #[test]
-    fn headers_are_case_insensitive_optional_members() {
-        let headers = Value::Headers(
-            [("Content-Type".into(), "application/json".into())]
-                .into_iter()
-                .collect(),
-        );
-        assert_eq!(
-            headers.member("content-type"),
-            Some(Value::String("application/json".into()))
-        );
-        assert_eq!(headers.member("x-missing"), Some(Value::Null));
     }
 
     #[tokio::test]

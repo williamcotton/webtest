@@ -2,9 +2,9 @@ use std::{collections::BTreeMap, fmt, path::Path};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use webtest_model::{Capability, RecordField, Type, Value, value_from_json, value_to_json};
 use webtest_provider::{
-    Capability, OperationName, OperationSchema, ParameterSchema, ProviderName, ProviderSchema,
-    RecordField, Type, Value, value_from_json, value_to_json,
+    OperationName, OperationSchema, ParameterSchema, ProviderName, ProviderSchema,
 };
 
 pub const MANIFEST_VERSION: u32 = 1;

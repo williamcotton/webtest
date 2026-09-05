@@ -3,7 +3,7 @@ use webtest_browser::{
     locator_repair_hints,
 };
 use webtest_feedback::ByteRange;
-use webtest_hir::TestId;
+use webtest_model::TestId;
 use webtest_observation::{
     ExecutionEvent, ExecutionId, ObservationStore, RuntimeFailure, RuntimeObservation,
     RuntimeObservationKind,
@@ -307,7 +307,7 @@ fn provider_failure_event(
         step_id: step.id,
         provider: call.provider.clone(),
         operation: call.operation.clone(),
-        code: error.code().into(),
+        code: error.code(),
         message: error.to_string(),
         failure_class: error.failure_class(),
         elapsed_ms,
@@ -330,7 +330,7 @@ fn record_observation(
 ) {
     let kind = match error {
         StepError::Browser(error) => RuntimeObservationKind::BrowserFailure {
-            code: error.code().into(),
+            code: error.into(),
             message: error.to_string(),
             locator: step_browser_locator(step),
             page_url: evidence.current_url.clone(),
@@ -344,7 +344,7 @@ fn record_observation(
             repair_hints: repair_hints.to_vec(),
         },
         StepError::Decode(error) => RuntimeObservationKind::ValueFailure {
-            code: "json_decode_failed".into(),
+            code: webtest_observation::RuntimeFailureCode::JsonDecodeFailed,
             message: error.to_string(),
             path: Some(error.path.clone()),
             expected: Some(error.expected.to_string()),
@@ -352,7 +352,7 @@ fn record_observation(
             diff: None,
         },
         StepError::Assertion(error) => RuntimeObservationKind::ValueFailure {
-            code: "assertion_failed".into(),
+            code: webtest_observation::RuntimeFailureCode::AssertionFailed,
             message: error.message.clone(),
             path: None,
             expected: error.expected.as_ref().map(display_value),
@@ -360,7 +360,7 @@ fn record_observation(
             diff: Some(error.diff.clone()),
         },
         StepError::Provider(error) => RuntimeObservationKind::ValueFailure {
-            code: error.code().into(),
+            code: error.into(),
             message: error.to_string(),
             path: None,
             expected: None,
@@ -368,7 +368,7 @@ fn record_observation(
             diff: None,
         },
         StepError::Evaluation(error) => RuntimeObservationKind::ValueFailure {
-            code: error.code.into(),
+            code: error.kind.code(),
             message: error.message.clone(),
             path: None,
             expected: None,
@@ -400,7 +400,7 @@ fn runtime_failure(error: &StepError) -> RuntimeFailure {
             message: error.to_string(),
         },
         StepError::Evaluation(error) => RuntimeFailure::Evaluation {
-            code: error.code.into(),
+            code: error.kind.code(),
             message: error.message.clone(),
         },
         StepError::Internal(message) => RuntimeFailure::Internal {
@@ -476,7 +476,7 @@ mod tests {
     use std::sync::Arc;
 
     use webtest_browser::Locator;
-    use webtest_hir::StepId;
+    use webtest_model::StepId;
     use webtest_plan::{BrowserOperation, PlannedStep, TestOperation};
     use webtest_text::{FileId, SourceRevision, SyntaxOrigin, TextRange, TextSize};
 

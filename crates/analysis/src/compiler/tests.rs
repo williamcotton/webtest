@@ -2,11 +2,10 @@ use std::collections::BTreeMap;
 
 use crate::{AnalysisDatabase, Diagnostic};
 use webtest_feedback::RepairReplacement;
-use webtest_hir::{BinaryOperator, BindingId, StepId};
+use webtest_model::{BinaryOperator, BindingId, Capability, RecordField, StepId, Type};
 use webtest_plan::{EvaluatePureOperation, PlanExpr, TestOperation, TestPlan};
 use webtest_provider::{
-    Capability, OperationName, OperationSchema, ParameterSchema, ProviderName, ProviderRegistry,
-    ProviderSchema, RecordField, Type,
+    OperationName, OperationSchema, ParameterSchema, ProviderName, ProviderRegistry, ProviderSchema,
 };
 
 fn analyze(source: &str) -> (Vec<Diagnostic>, TestPlan) {

@@ -2,12 +2,13 @@ use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
 use tracing::instrument;
 use webtest_browser::BrowserHost;
+use webtest_model::{Capability, Value};
 use webtest_observation::{
     CleanupCause, CleanupFailure, CleanupResource, ExecutionEvent, ExecutionId, ObservationStore,
     SkipReason,
 };
 use webtest_plan::{AssertionOperation, PlannedTest, TestOperation, TestPlan};
-use webtest_provider::{Capability, ProviderRegistry, Value};
+use webtest_provider::ProviderRegistry;
 
 use crate::{
     CancellationReason, FailureClass, PriorRunOutcome, RunControl, RunError, RunEventSink,

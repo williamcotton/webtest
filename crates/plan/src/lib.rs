@@ -6,8 +6,9 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use webtest_hir::{BinaryOperator, BindingId, StepId, TestId, UnaryOperator};
-use webtest_provider::{Capability, Type, Value};
+use webtest_model::{
+    BinaryOperator, BindingId, Capability, StepId, TestId, Type, UnaryOperator, Value,
+};
 use webtest_text::{FileId, SourceRevision, SyntaxOrigin};
 
 pub const PLAN_FORMAT_VERSION: u32 = 3;
@@ -365,35 +366,6 @@ impl std::fmt::Display for LocatorState {
             Self::Checked => "checked",
             Self::Unchecked => "unchecked",
         })
-    }
-}
-
-pub fn locator_from_hir(locator: &webtest_hir::HirLocatorKind) -> Locator {
-    match locator {
-        webtest_hir::HirLocatorKind::Id(value) => Locator::Id(value.clone()),
-        webtest_hir::HirLocatorKind::Role { role, name } => Locator::Role {
-            role: role.clone(),
-            name: name.clone(),
-        },
-        webtest_hir::HirLocatorKind::Label(value) => Locator::Label(value.clone()),
-        webtest_hir::HirLocatorKind::Text(value) => Locator::Text(value.clone()),
-        webtest_hir::HirLocatorKind::Placeholder(value) => Locator::Placeholder(value.clone()),
-        webtest_hir::HirLocatorKind::TestId(value) => Locator::TestId(value.clone()),
-        webtest_hir::HirLocatorKind::Css(value) => Locator::Css(value.clone()),
-        webtest_hir::HirLocatorKind::XPath(value) => Locator::XPath(value.clone()),
-    }
-}
-
-pub fn locator_state_from_hir(state: webtest_hir::LocatorState) -> LocatorState {
-    match state {
-        webtest_hir::LocatorState::Visible => LocatorState::Visible,
-        webtest_hir::LocatorState::Hidden => LocatorState::Hidden,
-        webtest_hir::LocatorState::Attached => LocatorState::Attached,
-        webtest_hir::LocatorState::Detached => LocatorState::Detached,
-        webtest_hir::LocatorState::Enabled => LocatorState::Enabled,
-        webtest_hir::LocatorState::Disabled => LocatorState::Disabled,
-        webtest_hir::LocatorState::Checked => LocatorState::Checked,
-        webtest_hir::LocatorState::Unchecked => LocatorState::Unchecked,
     }
 }
 

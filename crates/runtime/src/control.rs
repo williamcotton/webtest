@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
+use webtest_model::Value;
 use webtest_plan::{PlannedStep, PlannedTest};
-use webtest_provider::Value;
 
 use crate::StepError;
 

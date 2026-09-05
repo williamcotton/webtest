@@ -207,7 +207,8 @@ async fn wait_for_actionability(
             }
         };
         if let Some(previous) = last_failure.as_ref() {
-            failures_changed |= previous.code() != last_error.code();
+            failures_changed |=
+                std::mem::discriminant(previous) != std::mem::discriminant(&last_error);
         }
         if Instant::now() >= deadline {
             return terminal_actionability_failure(

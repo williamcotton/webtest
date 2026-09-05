@@ -1,7 +1,7 @@
 use webtest_browser::{BrowserError, Locator};
 use webtest_observation::{
-    CleanupCause, CleanupFailure, ExecutionEvent, RunOutcomeKind, RuntimeFailure, SkipReason,
-    TestOutcomeKind,
+    CleanupCause, CleanupFailure, ExecutionEvent, RunOutcomeKind, RuntimeFailure,
+    RuntimeFailureCode, SkipReason, TestOutcomeKind,
 };
 use webtest_provider::ProviderError;
 use webtest_runtime::{PriorRunOutcome, PriorTestOutcome, RunError, StepError, StepFailure};
@@ -11,36 +11,6 @@ use crate::{
     report::{EventReport, ExitClass, FailureReport, REPORT_SCHEMA_VERSION},
     source_output::source_span,
 };
-
-fn runtime_code(error: &BrowserError) -> &'static str {
-    match error {
-        BrowserError::LocatorNotFound { .. } => "runtime.locator_not_found",
-        BrowserError::LocatorAmbiguous { .. } => "runtime.locator_ambiguous",
-        BrowserError::LocatorInvalid { .. } => "runtime.locator_invalid",
-        BrowserError::ElementDetached { .. } => "runtime.element_detached",
-        BrowserError::LocatorNotVisible { .. } => "runtime.locator_not_visible",
-        BrowserError::ElementUnstable { .. } => "runtime.element_unstable",
-        BrowserError::ElementDisabled { .. } => "runtime.element_disabled",
-        BrowserError::ElementObscured { .. } => "runtime.element_obscured",
-        BrowserError::ElementNotEditable { .. } => "runtime.element_not_editable",
-        BrowserError::OptionNotFound { .. } => "runtime.option_not_found",
-        BrowserError::OptionAmbiguous { .. } => "runtime.option_ambiguous",
-        BrowserError::InvalidKey { .. } => "runtime.invalid_key",
-        BrowserError::ActionTimeout { .. } => "runtime.action_timeout",
-        BrowserError::AssertionFailed { .. } => "runtime.assertion_failed",
-        BrowserError::UrlMismatch { .. } => "runtime.url_mismatch",
-        BrowserError::NavigationFailed { .. } => "runtime.navigation_failed",
-        BrowserError::NavigationTimeout { .. } => "runtime.navigation_timeout",
-        BrowserError::CommandTimeout { .. } => "runtime.browser_command_timeout",
-        BrowserError::BrowserDisconnected => "runtime.browser_disconnected",
-        BrowserError::BrowserCrashed { .. } => "runtime.browser_crashed",
-        BrowserError::MalformedProtocol { .. } => "runtime.browser_malformed_protocol",
-        BrowserError::Protocol { .. } => "runtime.browser_protocol",
-        BrowserError::Launch(_) => "runtime.browser_launch",
-        BrowserError::EvaluationFailed { .. } => "runtime.evaluation_failed",
-        BrowserError::UnsupportedCapability { .. } => "runtime.unsupported_browser_capability",
-    }
-}
 
 fn runtime_message(error: &BrowserError) -> String {
     match error {
@@ -68,13 +38,7 @@ fn infrastructure_message(error: &BrowserError) -> String {
 }
 
 pub(crate) fn run_error_code(error: &RunError) -> String {
-    match error {
-        RunError::Browser(error) => runtime_code(error).into(),
-        RunError::Provider(error) => format!("runtime.{}", error.code()),
-        RunError::Cleanup(failure) => format!("runtime.{}", failure.code()),
-        RunError::Multiple { primary, .. } => run_error_code(primary),
-        RunError::Internal(_) => "runtime.internal_error".into(),
-    }
+    error.code().diagnostic_code().into()
 }
 
 pub(crate) fn run_error_message(error: &RunError) -> String {
@@ -178,7 +142,7 @@ fn cleanup_failure_details(failure: &CleanupFailure) -> serde_json::Value {
     let cause = match &failure.cause {
         CleanupCause::Browser(error) => serde_json::json!({
             "kind": "browser",
-            "code": error.code(),
+            "code": RuntimeFailureCode::from(error).short_code(),
             "message": error.to_string(),
         }),
         CleanupCause::Io(error) => serde_json::json!({
@@ -193,7 +157,7 @@ fn cleanup_failure_details(failure: &CleanupFailure) -> serde_json::Value {
         }),
     };
     serde_json::json!({
-        "code": format!("runtime.{}", failure.code()),
+        "code": failure.code().diagnostic_code(),
         "failure_class": failure.failure_class(),
         "resource": failure.resource,
         "cause": cause,
@@ -201,10 +165,7 @@ fn cleanup_failure_details(failure: &CleanupFailure) -> serde_json::Value {
 }
 
 fn step_error_code(error: &StepError) -> String {
-    match error {
-        StepError::Browser(error) => runtime_code(error).into(),
-        _ => format!("runtime.{}", error.code()),
-    }
+    error.code().diagnostic_code().into()
 }
 
 pub(crate) fn step_failure_report(mut failure: StepFailure, source: &str) -> FailureReport {
@@ -275,7 +236,7 @@ fn step_semantic_details(failure: &StepFailure) -> Option<serde_json::Value> {
                     })
             });
             Some(serde_json::json!({
-                "code": error.code(),
+                "code": RuntimeFailureCode::from(error).short_code(),
                 "requested": requested.map(|source| serde_json::json!({"source": source})),
                 "states": target.map(|target| &target.states),
                 "supported_actions": target.map(|target| &target.supported_actions),
@@ -297,15 +258,16 @@ fn step_semantic_details(failure: &StepFailure) -> Option<serde_json::Value> {
             "response_operation": error.response_operation,
         })),
         StepError::Evaluation(error) => Some(serde_json::json!({
-            "evaluation_code": error.code,
+            "evaluation_code": error.kind.code().short_code(),
         })),
         StepError::Internal(_) => None,
     }
 }
 
 fn provider_error_semantic_details(error: &ProviderError) -> serde_json::Value {
+    let runtime_code = RuntimeFailureCode::from(error);
     let mut details = serde_json::json!({
-        "provider_error_code": error.code(),
+        "provider_error_code": runtime_code.short_code(),
     });
     let Some(object) = details.as_object_mut() else {
         return details;
@@ -321,19 +283,10 @@ fn provider_error_semantic_details(error: &ProviderError) -> serde_json::Value {
         }
         _ => {}
     }
-    if matches!(
-        error,
-        ProviderError::BridgeHandshake { .. }
-            | ProviderError::BridgeProtocol { .. }
-            | ProviderError::BridgeTransport { .. }
-            | ProviderError::BridgeProcess { .. }
-            | ProviderError::BridgeSchemaDrift { .. }
-            | ProviderError::BridgeValidation { .. }
-            | ProviderError::BridgeTimeout { .. }
-    ) {
+    if !runtime_code.default_reference_queries().is_empty() {
         object.insert(
             "reference_queries".into(),
-            serde_json::json!(["app.diagnostics", "runtime.configuration"]),
+            serde_json::json!(runtime_code.default_reference_queries()),
         );
     }
     details
@@ -470,7 +423,7 @@ pub(crate) fn event_reports(path: &str, events: &[ExecutionEvent]) -> Vec<EventR
                     Some(step_id.0),
                 );
                 event.name = Some(format!("{provider}.{operation}"));
-                event.code = Some(format!("runtime.{code}"));
+                event.code = Some(code.diagnostic_code().into());
                 event.message = Some(format!("{message} (failed after {elapsed_ms}ms)"));
                 event.failure_class = Some(*failure_class);
                 event.exit_class = Some(ExitClass::from_failure_class(*failure_class));
@@ -522,7 +475,7 @@ pub(crate) fn event_reports(path: &str, events: &[ExecutionEvent]) -> Vec<EventR
                     active_step.map(|step| step.0),
                 );
                 event.outcome = Some("timed_out".into());
-                event.code = Some("runtime.test_timeout".into());
+                event.code = Some(RuntimeFailureCode::TestTimeout.diagnostic_code().into());
                 event.message = Some(format!("test timed out after {timeout_ms}ms"));
                 event.failure_class = Some(webtest_feedback::FailureClass::Test);
                 event.exit_class = Some(ExitClass::TestFailure);
@@ -544,7 +497,7 @@ pub(crate) fn event_reports(path: &str, events: &[ExecutionEvent]) -> Vec<EventR
                     None,
                 );
                 event.resource = Some(resource.clone());
-                event.code = Some(format!("runtime.{code}"));
+                event.code = Some(code.diagnostic_code().into());
                 event.message = Some(message.clone());
                 event.failure_class = Some(*failure_class);
                 event.exit_class = Some(ExitClass::from_failure_class(*failure_class));
@@ -626,24 +579,18 @@ pub(crate) fn event_reports(path: &str, events: &[ExecutionEvent]) -> Vec<EventR
 }
 
 fn runtime_failure_report(failure: &RuntimeFailure) -> (String, String) {
-    match failure {
-        RuntimeFailure::TestTimeout { timeout_ms, .. } => (
-            "runtime.test_timeout".into(),
-            format!("test timed out after {timeout_ms}ms"),
-        ),
-        RuntimeFailure::Browser(error) => (runtime_code(error).into(), runtime_message(error)),
-        RuntimeFailure::Provider(error) => (format!("runtime.{}", error.code()), error.to_string()),
-        RuntimeFailure::Assertion { message, .. } => {
-            ("runtime.assertion_failed".into(), message.clone())
+    let message = match failure {
+        RuntimeFailure::TestTimeout { timeout_ms, .. } => {
+            format!("test timed out after {timeout_ms}ms")
         }
-        RuntimeFailure::Decode { message } => {
-            ("runtime.json_decode_failed".into(), message.clone())
-        }
-        RuntimeFailure::Evaluation { code, message } => {
-            (format!("runtime.{code}"), message.clone())
-        }
-        RuntimeFailure::Internal { message } => ("runtime.internal_error".into(), message.clone()),
-    }
+        RuntimeFailure::Browser(error) => runtime_message(error),
+        RuntimeFailure::Provider(error) => error.to_string(),
+        RuntimeFailure::Assertion { message, .. }
+        | RuntimeFailure::Decode { message }
+        | RuntimeFailure::Evaluation { message, .. }
+        | RuntimeFailure::Internal { message } => message.clone(),
+    };
+    (failure.code().diagnostic_code().into(), message)
 }
 
 fn event_report(
@@ -709,7 +656,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use webtest_feedback::FailureClass;
-    use webtest_hir::{StepId, TestId};
+    use webtest_model::{StepId, TestId};
     use webtest_observation::ExecutionId;
 
     use super::*;
@@ -730,15 +677,32 @@ mod tests {
     #[test]
     fn browser_error_codes_remain_stable() {
         assert_eq!(
-            runtime_code(&BrowserError::BrowserDisconnected),
+            RuntimeFailureCode::from(&BrowserError::BrowserDisconnected).diagnostic_code(),
             "runtime.browser_disconnected"
         );
         assert_eq!(
-            runtime_code(&BrowserError::LocatorNotFound {
+            RuntimeFailureCode::from(&BrowserError::LocatorNotFound {
                 locator: Locator::Id("missing".into()),
-            }),
+            })
+            .diagnostic_code(),
             "runtime.locator_not_found"
         );
+    }
+
+    #[test]
+    fn typed_runtime_codes_remove_generic_cli_fallbacks() {
+        let application = RunError::Provider(ProviderError::Application {
+            code: "dynamic_application_code".into(),
+            message: "failed".into(),
+            retryable: false,
+            data: serde_json::Value::Null,
+        });
+        assert_eq!(run_error_code(&application), "runtime.app_provider_failure");
+        let evaluation = StepError::Evaluation(webtest_runtime::EvaluationFailure {
+            kind: webtest_runtime::EvaluationFailureKind::IntegerOverflow,
+            message: "overflow".into(),
+        });
+        assert_eq!(step_error_code(&evaluation), "runtime.integer_overflow");
     }
 
     #[test]
@@ -829,7 +793,7 @@ mod tests {
                 step_id,
                 provider: "app".into(),
                 operation: "echo".into(),
-                code: "app_provider_failure".into(),
+                code: RuntimeFailureCode::AppProviderFailure,
                 message: "failed".into(),
                 failure_class: FailureClass::Test,
                 elapsed_ms: 2,
@@ -857,7 +821,7 @@ mod tests {
                 test_id: Some(test_id),
                 resource: webtest_observation::CleanupResource::BrowserContext,
                 failure_class: FailureClass::Infrastructure,
-                code: "cleanup_browser_context_failed".into(),
+                code: RuntimeFailureCode::CleanupBrowserContextFailed,
                 message: "failed to clean up browser context".into(),
             },
             ExecutionEvent::TestFinished {

@@ -1,7 +1,7 @@
 use webtest_browser::{BrowserError, Locator, LocatorState};
+use webtest_model::Value;
 use webtest_observation::ValueDiff;
 use webtest_plan::ValueMatcher;
-use webtest_provider::Value;
 
 use crate::{AssertionFailure, StepError};
 

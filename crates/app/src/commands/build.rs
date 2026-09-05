@@ -48,10 +48,10 @@ fn build_project(project: &webtest_project::Project, emit: &Path) -> Result<Exit
         });
         capabilities.extend(plan.required_host_capabilities.iter().copied());
         for mut test in plan.tests.clone() {
-            test.id = webtest_hir::TestId(next_test);
+            test.id = webtest_model::TestId(next_test);
             next_test += 1;
             for step in &mut test.steps {
-                step.id = webtest_hir::StepId(next_step);
+                step.id = webtest_model::StepId(next_step);
                 next_step += 1;
             }
             tests.push(test);

@@ -1791,8 +1791,8 @@ dependencies = [
  "webtest-editor",
  "webtest-feedback",
  "webtest-format",
- "webtest-hir",
  "webtest-lsp",
+ "webtest-model",
  "webtest-observation",
  "webtest-plan",
  "webtest-project",
@@ -1811,6 +1811,7 @@ dependencies = [
  "thiserror",
  "webtest-feedback",
  "webtest-hir",
+ "webtest-model",
  "webtest-plan",
  "webtest-provider",
  "webtest-syntax",
@@ -1834,6 +1835,7 @@ dependencies = [
  "ureq",
  "url",
  "webtest-analysis",
+ "webtest-model",
  "webtest-plan",
  "webtest-provider",
  "webtest-text",
@@ -1894,6 +1896,7 @@ dependencies = [
  "webtest-analysis",
  "webtest-browser",
  "webtest-feedback",
+ "webtest-model",
  "webtest-observation",
  "webtest-plan",
  "webtest-provider",
@@ -1913,7 +1916,7 @@ dependencies = [
  "webtest-browser",
  "webtest-browser-cdp",
  "webtest-format",
- "webtest-hir",
+ "webtest-model",
  "webtest-observation",
  "webtest-plan",
  "webtest-provider",
@@ -1943,6 +1946,7 @@ version = "0.1.0"
 dependencies = [
  "rowan",
  "serde",
+ "webtest-model",
  "webtest-syntax",
  "webtest-text",
 ]
@@ -1964,6 +1968,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "webtest-model"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "webtest-observation"
 version = "0.1.0"
 dependencies = [
@@ -1971,7 +1983,7 @@ dependencies = [
  "serde_json",
  "webtest-browser",
  "webtest-feedback",
- "webtest-hir",
+ "webtest-model",
  "webtest-provider",
  "webtest-text",
 ]
@@ -1982,9 +1994,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
- "webtest-hir",
- "webtest-provider",
- "webtest-syntax",
+ "webtest-model",
  "webtest-text",
 ]
 
@@ -2013,6 +2023,7 @@ dependencies = [
  "tokio",
  "ureq",
  "url",
+ "webtest-model",
 ]
 
 [[package]]
@@ -2028,7 +2039,7 @@ dependencies = [
  "url",
  "webtest-browser",
  "webtest-feedback",
- "webtest-hir",
+ "webtest-model",
  "webtest-observation",
  "webtest-plan",
  "webtest-provider",
@@ -2064,6 +2075,7 @@ dependencies = [
  "webtest-app-bridge",
  "webtest-feedback",
  "webtest-format",
+ "webtest-model",
  "webtest-plan",
  "webtest-provider",
  "webtest-syntax",

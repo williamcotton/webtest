@@ -809,7 +809,7 @@ fn xml(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use webtest_hir::{StepId, TestId};
+    use webtest_model::{StepId, TestId};
     use webtest_observation::{
         ExecutionEvent, ExecutionId, RunOutcomeKind, SkipReason, TestOutcomeKind,
     };

@@ -18,7 +18,7 @@ use tokio::io::{AsyncWrite, AsyncWriteExt, BufWriter};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 use webtest_analysis::{AnalysisDatabase, DiagnosticSeverity};
 use webtest_browser::BrowserHost;
-use webtest_observation::ObservationStore;
+use webtest_observation::{ObservationStore, RuntimeFailureCode};
 use webtest_plan::{
     AssertionOperation, BrowserOperation, PlannedStep, PlannedTest, TestOperation, TestPlan,
 };
@@ -718,7 +718,7 @@ fn failure_output_data(failure: &webtest_runtime::StepFailure) -> Value {
     json!({
         "diagnostic_schema_version": webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
         "repair_hint_schema_version": webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
-        "code": failure.error.code(),
+        "code": failure.error.code().short_code(),
         "failure_class": failure.error.failure_class(),
         "repair_hints": failure.repair_hints,
         "page": failure.inspection.as_ref().map(|inspection| &inspection.page),
@@ -732,7 +732,7 @@ fn run_failure_output_data(failure: &webtest_runtime::RunError) -> Value {
             let cause = match &cleanup.cause {
                 webtest_runtime::CleanupCause::Browser(error) => json!({
                     "kind": "browser",
-                    "code": error.code(),
+                    "code": RuntimeFailureCode::from(error).short_code(),
                     "message": error.to_string(),
                 }),
                 webtest_runtime::CleanupCause::Io(error) => json!({
@@ -747,14 +747,14 @@ fn run_failure_output_data(failure: &webtest_runtime::RunError) -> Value {
                 }),
             };
             json!({
-                "code": cleanup.code(),
+                "code": cleanup.code().short_code(),
                 "failure_class": cleanup.failure_class(),
                 "resource": cleanup.resource,
                 "cause": cause,
             })
         }
         webtest_runtime::RunError::Multiple { primary, secondary } => json!({
-            "code": failure.code(),
+            "code": failure.code().short_code(),
             "failure_class": failure.failure_class(),
             "primary": run_failure_output_data(primary),
             "secondary": secondary.iter().map(run_failure_output_data).collect::<Vec<_>>(),
@@ -762,7 +762,7 @@ fn run_failure_output_data(failure: &webtest_runtime::RunError) -> Value {
         webtest_runtime::RunError::Browser(_)
         | webtest_runtime::RunError::Provider(_)
         | webtest_runtime::RunError::Internal(_) => json!({
-            "code": failure.code(),
+            "code": failure.code().short_code(),
             "failure_class": failure.failure_class(),
         }),
     }
@@ -839,7 +839,7 @@ impl DebugState {
         &self,
         test: &PlannedTest,
         step: &PlannedStep,
-        bindings: BTreeMap<String, webtest_provider::Value>,
+        bindings: BTreeMap<String, webtest_model::Value>,
     ) {
         if self.shutting_down.load(Ordering::Acquire) {
             return;
@@ -902,7 +902,7 @@ impl DebugState {
         test: &PlannedTest,
         step: &PlannedStep,
         error: &StepError,
-        bindings: BTreeMap<String, webtest_provider::Value>,
+        bindings: BTreeMap<String, webtest_model::Value>,
     ) {
         if self.shutting_down.load(Ordering::Acquire) {
             return;
@@ -963,7 +963,7 @@ impl DebugState {
                 json!({
                     "reason": "exception",
                     "description": provider_error.to_string(),
-                    "text": provider_error.code(),
+                    "text": RuntimeFailureCode::from(provider_error).short_code(),
                     "threadId": THREAD_ID,
                     "allThreadsStopped": true,
                 }),
@@ -1011,7 +1011,7 @@ impl RunControl for DebugState {
         &self,
         test: &PlannedTest,
         step: &PlannedStep,
-        bindings: BTreeMap<String, webtest_provider::Value>,
+        bindings: BTreeMap<String, webtest_model::Value>,
     ) {
         self.pause_before_step(test, step, bindings).await;
     }
@@ -1021,7 +1021,7 @@ impl RunControl for DebugState {
         test: &PlannedTest,
         step: &PlannedStep,
         error: &StepError,
-        bindings: &BTreeMap<String, webtest_provider::Value>,
+        bindings: &BTreeMap<String, webtest_model::Value>,
     ) {
         self.pause_after_app_failure(test, step, error, bindings.clone())
             .await;
@@ -1149,13 +1149,13 @@ fn unverified_breakpoints(requested: &[SourceBreakpoint], message: &str) -> Vec<
 
 struct DapVariableStore {
     variables: HashMap<i64, Vec<Value>>,
-    targets: HashMap<i64, Arc<webtest_provider::Value>>,
-    root: Vec<(String, Arc<webtest_provider::Value>)>,
+    targets: HashMap<i64, Arc<webtest_model::Value>>,
+    root: Vec<(String, Arc<webtest_model::Value>)>,
     next_reference: i64,
 }
 
 impl DapVariableStore {
-    fn new(bindings: BTreeMap<String, webtest_provider::Value>) -> Self {
+    fn new(bindings: BTreeMap<String, webtest_model::Value>) -> Self {
         Self {
             variables: HashMap::new(),
             targets: HashMap::new(),
@@ -1187,7 +1187,7 @@ impl DapVariableStore {
         variables
     }
 
-    fn provider_variable(&mut self, name: &str, value: Arc<webtest_provider::Value>) -> Value {
+    fn provider_variable(&mut self, name: &str, value: Arc<webtest_model::Value>) -> Value {
         let child_shape = dap_child_shape(&value);
         let reference = if child_shape.is_some() {
             let reference = self.next_reference;
@@ -1210,8 +1210,8 @@ struct DapChildShape {
     count: Option<(&'static str, usize)>,
 }
 
-fn dap_child_shape(value: &webtest_provider::Value) -> Option<DapChildShape> {
-    use webtest_provider::Value as ProviderValue;
+fn dap_child_shape(value: &webtest_model::Value) -> Option<DapChildShape> {
+    use webtest_model::Value as ProviderValue;
 
     match value {
         ProviderValue::List(values) if !values.is_empty() => Some(DapChildShape {
@@ -1244,8 +1244,8 @@ fn dap_variable(name: &str, value: &str, kind: &str, variables_reference: i64) -
     })
 }
 
-fn dap_children(value: &webtest_provider::Value) -> Vec<(String, Arc<webtest_provider::Value>)> {
-    use webtest_provider::Value as ProviderValue;
+fn dap_children(value: &webtest_model::Value) -> Vec<(String, Arc<webtest_model::Value>)> {
+    use webtest_model::Value as ProviderValue;
 
     match value {
         ProviderValue::List(values) => values
@@ -1325,7 +1325,7 @@ fn dap_children(value: &webtest_provider::Value) -> Vec<(String, Arc<webtest_pro
     }
 }
 
-fn dap_value(value: &webtest_provider::Value) -> String {
+fn dap_value(value: &webtest_model::Value) -> String {
     let mut preview = DapValuePreview::new();
     preview.value(value);
     preview.finish()
@@ -1382,7 +1382,7 @@ impl DapValuePreview {
 
     fn fields<'a>(
         &mut self,
-        values: impl IntoIterator<Item = (&'a str, &'a webtest_provider::Value)>,
+        values: impl IntoIterator<Item = (&'a str, &'a webtest_model::Value)>,
     ) {
         self.push("{");
         for (index, (name, value)) in values.into_iter().enumerate() {
@@ -1415,8 +1415,8 @@ impl DapValuePreview {
         self.push("}");
     }
 
-    fn value(&mut self, value: &webtest_provider::Value) {
-        use webtest_provider::Value as ProviderValue;
+    fn value(&mut self, value: &webtest_model::Value) {
+        use webtest_model::Value as ProviderValue;
 
         match value {
             ProviderValue::Null => self.push("null"),
@@ -1498,17 +1498,17 @@ fn bounded_debug_text(value: &str) -> String {
     value[..end].to_owned()
 }
 
-fn debug_bytes_value(bytes: &[u8]) -> webtest_provider::Value {
+fn debug_bytes_value(bytes: &[u8]) -> webtest_model::Value {
     let sample = &bytes[..bytes.len().min(DAP_VALUE_PREVIEW_BYTES)];
     match std::str::from_utf8(sample) {
-        Ok(text) => webtest_provider::Value::String(text.to_owned()),
+        Ok(text) => webtest_model::Value::String(text.to_owned()),
         Err(error) if error.error_len().is_none() && error.valid_up_to() > 0 => {
             let text = std::str::from_utf8(&sample[..error.valid_up_to()])
                 .unwrap_or_default()
                 .to_owned();
-            webtest_provider::Value::String(text)
+            webtest_model::Value::String(text)
         }
-        Err(_) => webtest_provider::Value::String(format!("<{} bytes>", bytes.len())),
+        Err(_) => webtest_model::Value::String(format!("<{} bytes>", bytes.len())),
     }
 }
 
@@ -1579,7 +1579,7 @@ fn operation_name(operation: &TestOperation) -> String {
 
 fn expression_name(expression: &webtest_plan::PlanExpr) -> String {
     match expression {
-        webtest_plan::PlanExpr::Literal(webtest_provider::Value::String(value)) => {
+        webtest_plan::PlanExpr::Literal(webtest_model::Value::String(value)) => {
             format!("{value:?}")
         }
         webtest_plan::PlanExpr::Binding(binding) => format!("binding_{}", binding.0),
@@ -1835,19 +1835,19 @@ mod tests {
 
     #[test]
     fn response_bindings_have_a_useful_debugger_preview() {
-        let value = webtest_provider::Value::Response(webtest_provider::ResponseValue {
+        let value = webtest_model::Value::Response(webtest_model::ResponseValue {
             status: 201,
             headers: [("content-type".into(), "application/json".into())]
                 .into_iter()
                 .collect(),
             body: br#"{"id":7,"email":"alice@example.test"}"#.to_vec(),
-            json: Some(Box::new(webtest_provider::Value::Record(
+            json: Some(Box::new(webtest_model::Value::Record(
                 [
                     (
                         "email".into(),
-                        webtest_provider::Value::String("alice@example.test".into()),
+                        webtest_model::Value::String("alice@example.test".into()),
                     ),
-                    ("id".into(), webtest_provider::Value::Int(7)),
+                    ("id".into(), webtest_model::Value::Int(7)),
                 ]
                 .into_iter()
                 .collect(),
@@ -1915,15 +1915,15 @@ mod tests {
 
         let bindings = BTreeMap::from([(
             "user".into(),
-            webtest_provider::Value::Record(
+            webtest_model::Value::Record(
                 [
                     (
                         "email".into(),
-                        webtest_provider::Value::String("alice@example.test".into()),
+                        webtest_model::Value::String("alice@example.test".into()),
                     ),
                     (
                         "token".into(),
-                        webtest_provider::Value::String("private".into()),
+                        webtest_model::Value::String("private".into()),
                     ),
                 ]
                 .into_iter()

@@ -2,7 +2,7 @@
 
 ## 0. Status and dependencies
 
-**Status: proposed.**
+**Status: implemented.**
 
 This maintenance milestone follows the implemented application bridge and D-series hardening,
 including [`milestone-d-9-1.md`](./milestone-d-9-1.md) and

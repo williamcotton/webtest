@@ -1,9 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use webtest_browser::{BrowserError, Locator as BrowserLocator};
-use webtest_hir::BindingId;
+use webtest_model::{BindingId, ProcessResultValue, ResponseValue, Value};
 use webtest_plan::{PlannedStep, ServerProviderCall, TestOperation};
-use webtest_provider::Value;
 
 use crate::{
     AssertionFailure, StepError,
@@ -287,7 +286,7 @@ fn debugger_snapshot(value: &Value, budget: &mut DebuggerSnapshotBudget) -> Valu
                 .map(|(name, value)| (name.clone(), debugger_text(value, budget)))
                 .collect(),
         ),
-        Value::Response(value) => Value::Response(webtest_provider::ResponseValue {
+        Value::Response(value) => Value::Response(ResponseValue {
             status: value.status,
             headers: value
                 .headers
@@ -301,7 +300,7 @@ fn debugger_snapshot(value: &Value, budget: &mut DebuggerSnapshotBudget) -> Valu
                 .as_deref()
                 .map(|value| Box::new(debugger_snapshot(value, budget))),
         }),
-        Value::ProcessResult(value) => Value::ProcessResult(webtest_provider::ProcessResultValue {
+        Value::ProcessResult(value) => Value::ProcessResult(ProcessResultValue {
             exit_code: value.exit_code,
             stdout: debugger_text(&value.stdout, budget),
             stderr: debugger_text(&value.stderr, budget),

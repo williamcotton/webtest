@@ -2,12 +2,11 @@ use std::{collections::BTreeMap, time::Duration};
 
 use webtest_browser::{PageEvidence, PageInspection, RepairHint};
 use webtest_feedback::FailureClass;
-use webtest_hir::{StepId, TestId};
+use webtest_model::{StepId, TestId, Value};
 use webtest_observation::{
     CancellationReason, ExecutionEvent, ExecutionId, RunOutcomeKind, SkipReason, TestOutcomeKind,
 };
 use webtest_plan::PlannedStep;
-use webtest_provider::Value;
 
 use crate::{Artifact, RunError, StepError};
 

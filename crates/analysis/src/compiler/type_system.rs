@@ -2,9 +2,9 @@
 
 use super::{Compiler, TypedExpr};
 use crate::diagnostic::type_reference_name;
-use webtest_hir::{BinaryOperator, HirExpr, HirExprKind, HirNameRef, HirType, HirTypeKind};
+use webtest_hir::{HirExpr, HirExprKind, HirNameRef, HirType, HirTypeKind};
+use webtest_model::{BinaryOperator, Capability, RecordField, Type, Value};
 use webtest_plan::{PlanExpr, ValueMatcher};
-use webtest_provider::{Capability, RecordField, Type, Value};
 use webtest_text::TextRange;
 
 impl Compiler<'_> {

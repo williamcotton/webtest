@@ -1990,7 +1990,7 @@ fn provider_parameter(schema: &ParameterSchema, index: usize) -> ParameterDescri
         default: schema
             .default
             .as_ref()
-            .and_then(webtest_provider::value_to_json),
+            .and_then(webtest_model::value_to_json),
         secret: schema.secret,
         documentation: sanitize_documentation(&schema.documentation),
         syntax_role: "argument".into(),

@@ -2,10 +2,9 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use webtest_browser::Page;
-use webtest_hir::BindingId;
+use webtest_model::{BindingId, Value};
 use webtest_observation::ValueDiff;
 use webtest_plan::{AssertionOperation, PlanExpr, ValueMatcher};
-use webtest_provider::Value;
 
 use crate::{
     AssertionFailure, RunnerOptions, StepError,

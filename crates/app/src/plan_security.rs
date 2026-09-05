@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use webtest_hir::BindingId;
+use webtest_model::BindingId;
 use webtest_plan::{PlanEnvelope, PlanExpr, TestOperation};
 use webtest_project::Project;
 
@@ -153,8 +153,7 @@ fn has_sensitive_record_literal_inner(
 mod tests {
     use std::collections::BTreeMap;
 
-    use webtest_hir::{BinaryOperator, UnaryOperator};
-    use webtest_provider::{Type, Value};
+    use webtest_model::{BinaryOperator, Type, UnaryOperator, Value};
 
     use super::*;
 

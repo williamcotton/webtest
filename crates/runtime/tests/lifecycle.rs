@@ -11,7 +11,7 @@ use webtest_browser::{
     Action, BrowserContext, BrowserContextOptions, BrowserError, BrowserHost, BrowserSession,
     EvidenceRequest, InspectionOptions, Locator, LocatorState, Page, PageEvidence, PageInspection,
 };
-use webtest_hir::{BindingId, StepId, TestId};
+use webtest_model::{BindingId, Capability, StepId, TestId, Type, Value};
 use webtest_observation::{
     ExecutionEvent, ExecutionId, ObservationStore, RuntimeFailure, RuntimeObservation,
     RuntimeObservationKind,
@@ -21,9 +21,9 @@ use webtest_plan::{
     ServerProviderCall, TestOperation, TestPlan,
 };
 use webtest_provider::{
-    CallContext, Capability, FsProviderConfig, HttpProviderConfig, NativeProviderConfig,
-    OperationName, OperationSchema, ProcessProviderConfig, ProviderCall, ProviderError,
-    ProviderName, ProviderRegistry, ProviderResult, ProviderSchema, ServerProvider, Type, Value,
+    CallContext, FsProviderConfig, HttpProviderConfig, NativeProviderConfig, OperationName,
+    OperationSchema, ProcessProviderConfig, ProviderCall, ProviderError, ProviderName,
+    ProviderRegistry, ProviderResult, ProviderSchema, ServerProvider,
 };
 use webtest_runtime::{
     CancellationReason, CleanupCause, CleanupFailure, CleanupResource, FailureClass,
@@ -519,7 +519,7 @@ async fn omitted_optional_provider_member_evaluates_to_null_through_the_shared_p
     providers.register(provider);
     let result_type = Type::Record(BTreeMap::from([(
         "nickname".into(),
-        webtest_provider::RecordField {
+        webtest_model::RecordField {
             ty: Type::String,
             optional: true,
             documentation: String::new(),
@@ -1117,7 +1117,7 @@ async fn observations_are_cleared_before_lazy_browser_start_can_fail() {
         step_id: Some(StepId(0)),
         range: TextRange::default(),
         kind: RuntimeObservationKind::ValueFailure {
-            code: "stale".into(),
+            code: webtest_observation::RuntimeFailureCode::AssertionFailed,
             message: "stale".into(),
             path: None,
             expected: None,
@@ -1253,7 +1253,7 @@ async fn internal_step_failure_aborts_with_typed_events_and_no_user_observation(
         step_id: Some(StepId(0)),
         range: TextRange::default(),
         kind: RuntimeObservationKind::ValueFailure {
-            code: "stale".into(),
+            code: webtest_observation::RuntimeFailureCode::AssertionFailed,
             message: "stale".into(),
             path: None,
             expected: None,
@@ -1328,7 +1328,7 @@ async fn internal_step_failure_aborts_with_typed_events_and_no_user_observation(
         step_id: Some(StepId(0)),
         range: TextRange::default(),
         kind: RuntimeObservationKind::ValueFailure {
-            code: "old_internal_run".into(),
+            code: webtest_observation::RuntimeFailureCode::InternalError,
             message: "old".into(),
             path: None,
             expected: None,

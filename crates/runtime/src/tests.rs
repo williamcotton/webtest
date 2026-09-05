@@ -9,13 +9,12 @@ use webtest_browser::{
     BrowserError, BrowserHost, BrowserSession, InspectionOptions, Locator as BrowserLocator, Page,
     PageInspection, RepairHintKind,
 };
-use webtest_hir::{BindingId, StepId, TestId};
+use webtest_model::{BindingId, Capability, StepId, TestId, Type, Value};
 use webtest_observation::ObservationStore;
 use webtest_plan::{
     BrowserOperation, Locator, PlanExpr, PlannedStep, PlannedTest, ServerProviderCall,
     TestOperation, TestPlan,
 };
-use webtest_provider::{Capability, Type, Value};
 use webtest_text::{FileId, SourceRevision, SyntaxOrigin, TextRange, TextSize};
 
 use crate::{
@@ -209,7 +208,7 @@ fn debugger_step_bindings_keep_server_values_visible_in_later_steps() {
     let environment = HashMap::from([
         (
             response_id,
-            Value::Response(webtest_provider::ResponseValue {
+            Value::Response(webtest_model::ResponseValue {
                 status: 201,
                 headers: [("authorization".into(), "Bearer private".into())]
                     .into_iter()

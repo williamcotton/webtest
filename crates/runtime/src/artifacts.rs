@@ -6,7 +6,7 @@ use std::{
 use async_trait::async_trait;
 use tokio::time::Instant;
 use webtest_browser::PageEvidence;
-use webtest_hir::{StepId, TestId};
+use webtest_model::{StepId, TestId};
 use webtest_observation::ExecutionId;
 
 const MAX_CAPTURE_FAILURE_CHARS: usize = 1_024;
@@ -215,7 +215,7 @@ mod tests {
     };
 
     use tokio::sync::Notify;
-    use webtest_hir::{StepId, TestId};
+    use webtest_model::{StepId, TestId};
     use webtest_observation::ExecutionId;
 
     use super::*;

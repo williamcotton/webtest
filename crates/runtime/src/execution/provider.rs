@@ -3,11 +3,9 @@ use std::{
     time::Duration,
 };
 
-use webtest_hir::BindingId;
+use webtest_model::{BindingId, Value};
 use webtest_plan::ServerProviderCall;
-use webtest_provider::{
-    CallContext, OperationName, ProviderCall, ProviderName, ProviderRegistry, Value,
-};
+use webtest_provider::{CallContext, OperationName, ProviderCall, ProviderName, ProviderRegistry};
 
 use crate::{RunnerOptions, StepError, evaluation::evaluate};
 

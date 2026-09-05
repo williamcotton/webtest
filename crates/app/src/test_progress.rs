@@ -251,7 +251,7 @@ const fn plural(count: usize) -> &'static str {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use webtest_hir::TestId;
+    use webtest_model::TestId;
     use webtest_observation::ExecutionId;
 
     use super::*;

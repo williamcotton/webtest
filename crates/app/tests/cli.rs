@@ -420,7 +420,7 @@ fn check_json_contains_versioned_source_identity_semantic_details_and_repairs() 
         .iter()
         .find(|diagnostic| diagnostic["code"] == "semantic.unknown_member")
         .expect("unknown member");
-    assert_eq!(diagnostic["diagnostic_schema_version"], 1);
+    assert_eq!(diagnostic["diagnostic_schema_version"], 2);
     assert_eq!(diagnostic["repair_hint_schema_version"], 1);
     assert_eq!(diagnostic["semantic_details"]["requested"], "emial");
     assert_eq!(diagnostic["repair_hints"][0]["replacement"], "email");

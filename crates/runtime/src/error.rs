@@ -1,10 +1,10 @@
 use thiserror::Error;
 use webtest_browser::BrowserError;
 use webtest_feedback::FailureClass;
-use webtest_observation::CleanupFailure;
-use webtest_observation::ValueDiff;
+use webtest_model::{Type, Value};
+use webtest_observation::{CleanupFailure, RuntimeFailureCode, ValueDiff};
 use webtest_plan::ValueMatcher;
-use webtest_provider::{ProviderError, Type, Value};
+use webtest_provider::ProviderError;
 
 #[derive(Clone, Debug)]
 pub enum StepError {
@@ -17,14 +17,14 @@ pub enum StepError {
 }
 
 impl StepError {
-    pub fn code(&self) -> &'static str {
+    pub fn code(&self) -> RuntimeFailureCode {
         match self {
-            Self::Browser(error) => error.code(),
-            Self::Provider(error) => error.code(),
-            Self::Assertion(_) => "assertion_failed",
-            Self::Decode(_) => "json_decode_failed",
-            Self::Evaluation(error) => error.code,
-            Self::Internal(_) => "internal_error",
+            Self::Browser(error) => error.into(),
+            Self::Provider(error) => error.into(),
+            Self::Assertion(_) => RuntimeFailureCode::AssertionFailed,
+            Self::Decode(_) => RuntimeFailureCode::JsonDecodeFailed,
+            Self::Evaluation(error) => error.kind.code(),
+            Self::Internal(_) => RuntimeFailureCode::InternalError,
         }
     }
 
@@ -92,8 +92,25 @@ impl std::fmt::Display for DecodeFailure {
 
 #[derive(Clone, Debug)]
 pub struct EvaluationFailure {
-    pub code: &'static str,
+    pub kind: EvaluationFailureKind,
     pub message: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EvaluationFailureKind {
+    DivisionByZero,
+    IntegerOverflow,
+    ResponseDecodeFailed,
+}
+
+impl EvaluationFailureKind {
+    pub const fn code(self) -> RuntimeFailureCode {
+        match self {
+            Self::DivisionByZero => RuntimeFailureCode::DivisionByZero,
+            Self::IntegerOverflow => RuntimeFailureCode::IntegerOverflow,
+            Self::ResponseDecodeFailed => RuntimeFailureCode::ResponseDecodeFailed,
+        }
+    }
 }
 
 impl std::fmt::Display for EvaluationFailure {
@@ -120,13 +137,13 @@ pub enum RunError {
 }
 
 impl RunError {
-    pub fn code(&self) -> &'static str {
+    pub fn code(&self) -> RuntimeFailureCode {
         match self {
-            Self::Browser(error) => error.code(),
-            Self::Provider(error) => error.code(),
+            Self::Browser(error) => error.into(),
+            Self::Provider(error) => error.into(),
             Self::Cleanup(failure) => failure.code(),
             Self::Multiple { primary, .. } => primary.code(),
-            Self::Internal(_) => "internal_error",
+            Self::Internal(_) => RuntimeFailureCode::InternalError,
         }
     }
 
@@ -227,10 +244,12 @@ mod tests {
                     locator: Locator::Id("missing".into()),
                 }),
                 FailureClass::Test,
+                RuntimeFailureCode::LocatorNotFound,
             ),
             (
                 StepError::Browser(BrowserError::BrowserDisconnected),
                 FailureClass::Infrastructure,
+                RuntimeFailureCode::BrowserDisconnected,
             ),
             (
                 StepError::Provider(ProviderError::Application {
@@ -240,14 +259,20 @@ mod tests {
                     data: serde_json::Value::Null,
                 }),
                 FailureClass::Test,
+                RuntimeFailureCode::AppProviderFailure,
             ),
             (
                 StepError::Provider(ProviderError::BridgeTransport {
                     message: "disconnected".into(),
                 }),
                 FailureClass::Infrastructure,
+                RuntimeFailureCode::AppBridgeTransport,
             ),
-            (assertion_failure(), FailureClass::Test),
+            (
+                assertion_failure(),
+                FailureClass::Test,
+                RuntimeFailureCode::AssertionFailed,
+            ),
             (
                 StepError::Decode(DecodeFailure {
                     path: "$.id".into(),
@@ -256,23 +281,36 @@ mod tests {
                     response_operation: None,
                 }),
                 FailureClass::Test,
+                RuntimeFailureCode::JsonDecodeFailed,
             ),
             (
                 StepError::Evaluation(EvaluationFailure {
-                    code: "division_by_zero",
+                    kind: EvaluationFailureKind::DivisionByZero,
                     message: "division by zero".into(),
                 }),
                 FailureClass::Test,
+                RuntimeFailureCode::DivisionByZero,
             ),
             (
                 StepError::Internal("missing runtime binding".into()),
                 FailureClass::Internal,
+                RuntimeFailureCode::InternalError,
             ),
         ];
 
-        for (error, expected) in cases {
-            assert_eq!(error.failure_class(), expected, "{error:?}");
+        for (error, expected_class, expected_code) in cases {
+            assert_eq!(error.failure_class(), expected_class, "{error:?}");
+            assert_eq!(error.code(), expected_code, "{error:?}");
         }
+
+        assert_eq!(
+            EvaluationFailureKind::IntegerOverflow.code(),
+            RuntimeFailureCode::IntegerOverflow
+        );
+        assert_eq!(
+            EvaluationFailureKind::ResponseDecodeFailed.code(),
+            RuntimeFailureCode::ResponseDecodeFailed
+        );
     }
 
     #[test]
@@ -293,20 +331,24 @@ mod tests {
             (
                 RunError::Browser(BrowserError::BrowserDisconnected),
                 FailureClass::Infrastructure,
+                RuntimeFailureCode::BrowserDisconnected,
             ),
             (
                 RunError::Provider(ProviderError::BridgeTransport {
                     message: "disconnected".into(),
                 }),
                 FailureClass::Infrastructure,
+                RuntimeFailureCode::AppBridgeTransport,
             ),
             (
                 RunError::Cleanup(infrastructure_cleanup.clone()),
                 FailureClass::Infrastructure,
+                RuntimeFailureCode::CleanupBrowserContextFailed,
             ),
             (
                 RunError::Cleanup(internal_cleanup.clone()),
                 FailureClass::Internal,
+                RuntimeFailureCode::CleanupTemporaryDirectoryFailed,
             ),
             (
                 RunError::Multiple {
@@ -314,15 +356,18 @@ mod tests {
                     secondary: vec![RunError::Cleanup(infrastructure_cleanup.clone())],
                 },
                 FailureClass::Internal,
+                RuntimeFailureCode::InternalError,
             ),
             (
                 RunError::Internal("violated invariant".into()),
                 FailureClass::Internal,
+                RuntimeFailureCode::InternalError,
             ),
         ];
 
-        for (error, expected) in cases {
-            assert_eq!(error.failure_class(), expected, "{error:?}");
+        for (error, expected_class, expected_code) in cases {
+            assert_eq!(error.failure_class(), expected_class, "{error:?}");
+            assert_eq!(error.code(), expected_code, "{error:?}");
         }
     }
 

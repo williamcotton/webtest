@@ -5,7 +5,8 @@ use std::collections::HashSet;
 use crate::facts::{
     Completion, CompletionKind, DocumentationFact, Signature, SignatureParameter, TypeFact,
 };
-use webtest_provider::{OperationSchema, ProviderRegistry, Type};
+use webtest_model::Type;
+use webtest_provider::{OperationSchema, ProviderRegistry};
 use webtest_syntax::{Parse, SyntaxKind, SyntaxNode, SyntaxToken};
 use webtest_text::TextSize;
 
@@ -251,9 +252,8 @@ fn provider_signature(provider: &str, operation: &OperationSchema) -> String {
 mod tests {
     use super::*;
     use crate::AnalysisDatabase;
-    use webtest_provider::{
-        Capability, OperationName, ParameterSchema, ProviderName, ProviderSchema, Type, Value,
-    };
+    use webtest_model::{Capability, Value};
+    use webtest_provider::{OperationName, ParameterSchema, ProviderName, ProviderSchema};
 
     fn offset(source: &str, needle: &str) -> TextSize {
         TextSize::from(u32::try_from(source.find(needle).expect("needle")).expect("offset"))

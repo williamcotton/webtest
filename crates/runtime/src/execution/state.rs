@@ -3,9 +3,8 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use webtest_hir::BindingId;
+use webtest_model::{BindingId, Value};
 use webtest_plan::{PlannedStep, ServerProviderCall};
-use webtest_provider::Value;
 
 use crate::{
     evaluation::runtime_transferable,

@@ -6,8 +6,9 @@ use super::{CompiledProviderCall, Compiler};
 use crate::diagnostic::{nearest_strings, text_hints};
 use webtest_feedback::RepairHintKind;
 use webtest_hir::{HirCallArgument, HirExpr, HirExprKind, HirNameRef};
+use webtest_model::{Capability, Type};
 use webtest_plan::PlanExpr;
-use webtest_provider::{Capability, OperationSchema, Type};
+use webtest_provider::OperationSchema;
 use webtest_text::TextRange;
 
 impl Compiler<'_> {

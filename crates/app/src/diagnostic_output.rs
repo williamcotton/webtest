@@ -1,7 +1,7 @@
 use webtest_analysis::{Diagnostic, DiagnosticSeverity};
+use webtest_model::Value;
 use webtest_plan::{AssertionOperation, BrowserOperation, PlanExpr, TestOperation, TestPlan};
 use webtest_project::Project;
-use webtest_provider::Value;
 
 use crate::{
     report::DiagnosticReport,

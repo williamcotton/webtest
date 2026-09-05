@@ -1,4 +1,4 @@
-use webtest_provider::RecordField;
+use webtest_model::RecordField;
 
 use super::*;
 
@@ -40,7 +40,10 @@ fn dynamic_expression_errors_are_test_failures_not_internal_invariants() {
         right: Box::new(PlanExpr::Literal(Value::Int(0))),
     };
     let error = evaluate(&expression, &HashMap::new()).expect_err("division should fail");
-    assert_eq!(error.code(), "division_by_zero");
+    assert_eq!(
+        error.code(),
+        webtest_observation::RuntimeFailureCode::DivisionByZero
+    );
     assert_eq!(error.failure_class(), crate::FailureClass::Test);
     assert!(matches!(error, StepError::Evaluation(_)));
 }
@@ -87,7 +90,10 @@ fn all_integer_overflow_boundaries_are_structured_test_failures() {
         ),
     ];
     for error in operations.map(|result| result.expect_err("integer operation must overflow")) {
-        assert_eq!(error.code(), "integer_overflow");
+        assert_eq!(
+            error.code(),
+            webtest_observation::RuntimeFailureCode::IntegerOverflow
+        );
         assert_eq!(error.failure_class(), crate::FailureClass::Test);
         assert!(matches!(error, StepError::Evaluation(_)));
         assert!(error.to_string().starts_with("integer "));
@@ -381,7 +387,7 @@ fn nested_typed_json_populates_optional_members_and_response_decode_failures_sta
     };
     assert_eq!(item.get("nickname"), Some(&Value::Null));
 
-    let response = Value::Response(webtest_provider::ResponseValue {
+    let response = Value::Response(webtest_model::ResponseValue {
         status: 204,
         headers: BTreeMap::new(),
         body: vec![0xff],
@@ -397,7 +403,10 @@ fn nested_typed_json_populates_optional_members_and_response_decode_failures_sta
             &HashMap::new(),
         )
         .expect_err("unavailable response decoding");
-        assert_eq!(error.code(), "response_decode_failed");
+        assert_eq!(
+            error.code(),
+            webtest_observation::RuntimeFailureCode::ResponseDecodeFailed
+        );
         assert!(matches!(error, StepError::Evaluation(_)));
     }
 }

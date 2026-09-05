@@ -14,6 +14,7 @@ webtest-analysis.workspace = true
 webtest-app-bridge = { path = "../app-bridge", default-features = false }
 webtest-format.workspace = true
 webtest-feedback.workspace = true
+webtest-model.workspace = true
 webtest-plan.workspace = true
 webtest-provider.workspace = true
 webtest-syntax.workspace = true

@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use webtest_browser::{
     Action, BrowserError, Locator as BrowserLocator, LocatorState as BrowserLocatorState, Page,
 };
+use webtest_model::Value;
 use webtest_plan::{BrowserOperation, Locator, LocatorState, PlanExpr};
-use webtest_provider::Value;
 
 use crate::RunnerOptions;
 

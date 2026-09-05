@@ -3,11 +3,10 @@ use std::{
     collections::{BTreeMap, HashMap},
 };
 
-use webtest_hir::{BinaryOperator, BindingId, UnaryOperator};
+use webtest_model::{BinaryOperator, BindingId, Type, UnaryOperator, Value, value_to_json};
 use webtest_plan::PlanExpr;
-use webtest_provider::{Type, Value};
 
-use crate::{DecodeFailure, EvaluationFailure, StepError};
+use crate::{DecodeFailure, EvaluationFailure, EvaluationFailureKind, StepError};
 
 pub(crate) fn evaluate(
     expression: &PlanExpr,
@@ -43,7 +42,7 @@ pub(crate) fn evaluate(
                         && matches!(member.as_str(), "json" | "text")
                     {
                         Err(StepError::Evaluation(EvaluationFailure {
-                            code: "response_decode_failed",
+                            kind: EvaluationFailureKind::ResponseDecodeFailed,
                             message: format!(
                                 "response body is not available as `{member}` for this operation"
                             ),
@@ -174,7 +173,7 @@ fn numeric_binary(operator: BinaryOperator, left: Value, right: Value) -> Result
     let right = number(&right).ok_or_else(|| StepError::Internal("expected number".into()))?;
     if operator == BinaryOperator::Divide && right == 0.0 {
         return Err(StepError::Evaluation(EvaluationFailure {
-            code: "division_by_zero",
+            kind: EvaluationFailureKind::DivisionByZero,
             message: "division by zero".into(),
         }));
     }
@@ -276,7 +275,7 @@ pub(crate) fn decode_value(
 
 fn integer_overflow(operation: &str) -> StepError {
     StepError::Evaluation(EvaluationFailure {
-        code: "integer_overflow",
+        kind: EvaluationFailureKind::IntegerOverflow,
         message: format!("integer {operation} overflow"),
     })
 }
@@ -345,7 +344,7 @@ pub(crate) fn value_contains(container: &Value, value: &Value) -> bool {
 }
 
 pub(crate) fn display_value(value: &Value) -> String {
-    webtest_provider::value_to_json(value)
+    value_to_json(value)
         .and_then(|value| serde_json::to_string(&value).ok())
         .unwrap_or_else(|| format!("<{:?}>", value.type_name()))
 }

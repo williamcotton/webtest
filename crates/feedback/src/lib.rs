@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-pub const DIAGNOSTIC_SCHEMA_VERSION: u32 = 1;
+pub const DIAGNOSTIC_SCHEMA_VERSION: u32 = 2;
 pub const REPAIR_HINT_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,5 +118,11 @@ mod tests {
             serde_json::to_value(FailureClass::Internal).expect("serialize class"),
             "internal"
         );
+    }
+
+    #[test]
+    fn typed_runtime_code_normalization_only_advances_diagnostic_schema() {
+        assert_eq!(DIAGNOSTIC_SCHEMA_VERSION, 2);
+        assert_eq!(REPAIR_HINT_SCHEMA_VERSION, 1);
     }
 }

@@ -20,9 +20,9 @@ use tokio::{
     sync::{Mutex, Notify, oneshot},
 };
 use tracing::{info, warn};
+use webtest_model::{Value, value_to_json};
 use webtest_provider::{
     CallContext, ProviderCall, ProviderError, ProviderResult, ProviderSchema, ServerProvider,
-    Value, value_to_json,
 };
 
 use crate::{

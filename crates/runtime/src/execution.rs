@@ -5,13 +5,13 @@ use std::{
 
 use tokio::time::Instant;
 use webtest_browser::{BrowserContext, BrowserHost, BrowserSession, Page};
-use webtest_hir::StepId;
+use webtest_model::{Capability, StepId, TestId};
 use webtest_observation::{
     CleanupCause, CleanupFailure, CleanupResource, ExecutionEvent, ExecutionId, ObservationStore,
     RuntimeFailure, RuntimeObservation, RuntimeObservationKind,
 };
 use webtest_plan::{PlannedStep, PlannedTest, TestOperation, TestPlan};
-use webtest_provider::{Capability, ProviderRegistry};
+use webtest_provider::ProviderRegistry;
 
 use crate::{
     CancellationReason, FailureClass, PriorTestOutcome, RunControl, RunError, RunEventSink,
@@ -453,7 +453,7 @@ fn emit_test_timeout(
                     step_id: step.id,
                     provider: call.provider.clone(),
                     operation: call.operation.clone(),
-                    code: "test_timeout".into(),
+                    code: webtest_observation::RuntimeFailureCode::TestTimeout,
                     message: format!("test timed out after {timeout_ms}ms"),
                     failure_class: FailureClass::Test,
                     elapsed_ms: timeout_ms,
@@ -558,7 +558,7 @@ pub(crate) fn emit_cleanup_failed(
     events: &mut Vec<ExecutionEvent>,
     event_sink: Option<&dyn RunEventSink>,
     execution_id: ExecutionId,
-    test_id: Option<webtest_hir::TestId>,
+    test_id: Option<TestId>,
     failure: &CleanupFailure,
 ) {
     emit_event(
@@ -569,7 +569,7 @@ pub(crate) fn emit_cleanup_failed(
             test_id,
             resource: failure.resource.clone(),
             failure_class: failure.failure_class(),
-            code: failure.code().into(),
+            code: failure.code(),
             message: failure.message(),
         },
     );

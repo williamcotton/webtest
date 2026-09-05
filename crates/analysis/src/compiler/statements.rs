@@ -3,12 +3,12 @@
 use std::collections::HashSet;
 
 use super::{BindingState, Compiler};
-use webtest_hir::{BinaryOperator, HirExpr, HirExprKind, HirNameRef, HirStmt, StepId};
+use webtest_hir::{HirExpr, HirExprKind, HirNameRef, HirStmt};
+use webtest_model::{BinaryOperator, Capability, StepId, Type};
 use webtest_plan::{
     AssertionOperation, EvaluatePureOperation, PlanExpr, PlannedStep, ServerProviderCall,
     TestOperation, ValueMatcher,
 };
-use webtest_provider::{Capability, Type};
 use webtest_text::SyntaxOrigin;
 
 impl Compiler<'_> {

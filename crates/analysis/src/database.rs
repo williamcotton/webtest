@@ -282,9 +282,8 @@ impl AnalysisDatabase {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use webtest_provider::{
-        Capability, OperationName, OperationSchema, ProviderName, ProviderSchema, Type,
-    };
+    use webtest_model::{Capability, Type};
+    use webtest_provider::{OperationName, OperationSchema, ProviderName, ProviderSchema};
 
     fn app_registry(operation: &str, result: Type) -> ProviderRegistry {
         let mut registry = ProviderRegistry::built_in_schemas();

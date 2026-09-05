@@ -5,9 +5,9 @@ use std::collections::BTreeMap;
 use super::{Compiler, TypedExpr};
 use crate::diagnostic::{nearest_strings, text_hints, type_reference_name};
 use webtest_feedback::RepairHintKind;
-use webtest_hir::{HirExpr, HirExprKind, HirLiteral, HirNameRef, UnaryOperator};
+use webtest_hir::{HirExpr, HirExprKind, HirLiteral, HirNameRef};
+use webtest_model::{Capability, RecordField, Type, UnaryOperator, Value};
 use webtest_plan::PlanExpr;
-use webtest_provider::{Capability, RecordField, Type, Value};
 
 impl Compiler<'_> {
     pub(super) fn infer_expr(

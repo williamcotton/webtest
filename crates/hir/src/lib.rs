@@ -4,20 +4,12 @@ use std::{collections::HashMap, time::Duration};
 
 use rowan::ast::AstNode;
 use serde::{Deserialize, Serialize};
+pub use webtest_model::{BinaryOperator, BindingId, StepId, TestId, UnaryOperator};
 use webtest_syntax::{
     SyntaxKind,
     ast::{self, BrowserOperation, DomainStatement, FlowStatement},
 };
 use webtest_text::{FileId, SyntaxOrigin};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct TestId(pub u32);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct StepId(pub u32);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct BindingId(pub u32);
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct HirFile {
@@ -246,30 +238,6 @@ pub struct HirCallArgument {
     pub name: Option<String>,
     pub value: HirExpr,
     pub origin: SyntaxOrigin,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum UnaryOperator {
-    Not,
-    Negate,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum BinaryOperator {
-    Equal,
-    NotEqual,
-    Less,
-    LessEqual,
-    Greater,
-    GreaterEqual,
-    Add,
-    Subtract,
-    Multiply,
-    Divide,
-    And,
-    Or,
-    Contains,
-    Matches,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

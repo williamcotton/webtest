@@ -1,6 +1,6 @@
 //! Public data-only results returned by semantic and editor queries.
 
-use webtest_provider::{Capability, Type};
+use webtest_model::{Capability, Type};
 use webtest_text::TextRange;
 
 #[derive(Clone, Debug, PartialEq, Eq)]

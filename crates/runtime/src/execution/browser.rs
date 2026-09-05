@@ -3,11 +3,10 @@ use std::{collections::HashMap, time::Duration};
 use webtest_browser::{
     Action, Locator as BrowserLocator, LocatorState as BrowserLocatorState, Page,
 };
-use webtest_hir::BindingId;
+use webtest_model::{BindingId, Value};
 use webtest_plan::{
     AssertionOperation, BrowserOperation, Locator, LocatorState, PlannedStep, TestOperation,
 };
-use webtest_provider::Value;
 
 use crate::{
     RunnerOptions, StepError,
