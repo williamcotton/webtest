@@ -464,7 +464,7 @@ fn check_without_paths_discovers_configured_tests_in_order() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON report");
-    assert_eq!(report["schema_version"], 3);
+    assert_eq!(report["schema_version"], 4);
     let paths = report["files"]
         .as_array()
         .expect("files")
@@ -600,18 +600,21 @@ fn build_emits_a_versioned_typed_plan_deterministically() {
     let first_bytes = fs::read(&first).expect("first plan");
     assert_eq!(first_bytes, fs::read(&second).expect("second plan"));
     let plan: serde_json::Value = serde_json::from_slice(&first_bytes).expect("plan JSON");
-    assert_eq!(plan["format_version"], 3);
+    assert_eq!(plan["format_version"], 4);
+    assert_eq!(plan["runtime_semantics_version"], 1);
     assert_eq!(plan["required_host_capabilities"][0], "server");
     assert_eq!(
         plan["tests"][0]["required_host_capabilities"],
         serde_json::json!(["server", "test"])
     );
     assert_eq!(
-        plan["tests"][0]["steps"][0]["operation"]["kind"],
+        plan["tests"][0]["body"]["kind"]["children"][0]["kind"]["children"][0]["kind"]["step"]["operation"]
+            ["kind"],
         "server_provider_call"
     );
     assert_eq!(
-        plan["tests"][0]["steps"][1]["operation"]["operation"]["actual"]["value"]["missing_is_null"],
+        plan["tests"][0]["body"]["kind"]["children"][0]["kind"]["children"][1]["kind"]["step"]["operation"]
+            ["operation"]["actual"]["value"]["missing_is_null"],
         false
     );
 
@@ -631,7 +634,11 @@ fn build_emits_a_versioned_typed_plan_deterministically() {
     let configured: serde_json::Value =
         serde_json::from_slice(&fs::read(configured).expect("configured plan"))
             .expect("configured plan JSON");
-    assert_ne!(plan["project_identity"], configured["project_identity"]);
+    assert_eq!(plan["project_identity"], configured["project_identity"]);
+    assert_ne!(
+        plan["project_input_fingerprint"],
+        configured["project_input_fingerprint"]
+    );
 }
 
 #[test]

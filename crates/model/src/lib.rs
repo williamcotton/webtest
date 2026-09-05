@@ -13,6 +13,29 @@ pub struct StepId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct BindingId(pub u32);
 
+/// Static structural identity. Runtime occurrences never reuse this as an execution ID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct PlanNodeId(pub [u8; 32]);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct PlanDeclarationId(pub [u8; 32]);
+
+macro_rules! execution_identity {
+    ($($name:ident),* $(,)?) => {$(
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+        pub struct $name(pub u64);
+    )*};
+}
+execution_identity!(
+    TestExecutionId,
+    ExecutionScopeId,
+    AttemptId,
+    OperationExecutionId,
+    RuntimeResourceId,
+    ResourceGenerationId,
+    WaitRegistrationId
+);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UnaryOperator {
     Not,

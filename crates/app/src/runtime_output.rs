@@ -319,6 +319,20 @@ pub(crate) fn event_reports(path: &str, events: &[ExecutionEvent]) -> Vec<EventR
     events
         .iter()
         .map(|event| match event {
+            ExecutionEvent::Scope {
+                execution_id,
+                event: scope,
+            } => {
+                let mut event = event_report(
+                    path,
+                    scope.kind(),
+                    Some(execution_id.0),
+                    Some(scope.execution_context.test_id.0),
+                    None,
+                );
+                event.scope = Some(scope.clone());
+                event
+            }
             ExecutionEvent::RunStarted { execution_id } => {
                 event_report(path, "run_started", Some(execution_id.0), None, None)
             }
@@ -601,6 +615,7 @@ fn event_report(
     step_id: Option<u32>,
 ) -> EventReport {
     EventReport {
+        scope: None,
         schema_version: REPORT_SCHEMA_VERSION,
         kind: kind.into(),
         file: path.into(),

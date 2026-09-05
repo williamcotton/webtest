@@ -172,8 +172,8 @@ impl LoadedProgram {
             .tests
             .iter()
             .flat_map(|test| {
-                test.steps
-                    .iter()
+                test.steps()
+                    .into_iter()
                     .map(|step| StepLocation::new(&self.source, step.origin.range))
             })
             .collect()
@@ -1725,7 +1725,7 @@ mod tests {
         assert_eq!(locations[0].line, 3);
         assert_eq!(locations[1].line, 4);
         assert_eq!(
-            operation_name(&program.plan.tests[0].steps[1].operation),
+            operation_name(&program.plan.tests[0].steps()[1].operation),
             "click id(\"submit\")"
         );
     }
@@ -1756,7 +1756,7 @@ mod tests {
                 .expect("program");
         assert_eq!(program.locations().len(), 13);
         let names = program.plan.tests[0]
-            .steps
+            .steps()
             .iter()
             .map(|step| operation_name(&step.operation))
             .collect::<Vec<_>>();
@@ -1783,7 +1783,7 @@ mod tests {
             Some(source.into()),
         )
         .expect("program");
-        let step = program.plan.tests[0].steps[0].clone();
+        let step = program.plan.tests[0].steps()[0].clone();
         let locator = Locator::Role {
             role: "button".into(),
             name: Some("Log in".into()),
@@ -1898,7 +1898,7 @@ mod tests {
         let path = directory.path().join("debug.webtest");
         let program = LoadedProgram::load(path, Some(source.into())).expect("program");
         let test = program.plan.tests[0].clone();
-        let step = test.steps[1].clone();
+        let step = test.steps()[1].clone();
         let state = DebugState::new_with_options(
             ProtocolWriter::new(tokio::io::sink()),
             Arc::new(UnusedBrowserHost),
@@ -1986,7 +1986,7 @@ mod tests {
         let path = directory.path().join("timeout.webtest");
         let program = LoadedProgram::load(path, Some(source.into())).expect("program");
         let test = program.plan.tests[0].clone();
-        let step = test.steps[0].clone();
+        let step = test.steps()[0].clone();
         let state = DebugState::new_with_options(
             ProtocolWriter::new(tokio::io::sink()),
             Arc::new(UnusedBrowserHost),

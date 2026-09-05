@@ -30,6 +30,7 @@ use self::{
 mod browser;
 mod failure;
 mod provider;
+pub(crate) mod scopes;
 mod state;
 mod steps;
 
@@ -76,7 +77,9 @@ pub(crate) async fn execute_test(
     options: &RunnerOptions,
     providers: &ProviderRegistry,
     observations: &ObservationStore,
+    ids: scopes::ExecutionIds,
 ) -> ExecutedTest {
+    let mut scope_tree = scopes::ScopeTree::new(ids, execution_id, test.id);
     let test_started = StdInstant::now();
     let deadline = TestDeadline::new(options.test_timeout);
     emit_event(
@@ -88,6 +91,7 @@ pub(crate) async fn execute_test(
             name: test.name.clone(),
         },
     );
+    scope_tree.enter(&test.body, events, event_sink);
     let mut state = TestExecutionState::new(
         options.redacted_json_fields.clone(),
         options.project_root.clone(),
@@ -117,6 +121,7 @@ pub(crate) async fn execute_test(
             &mut context,
             &mut page,
             &mut active_step,
+            &mut scope_tree,
         ),
     )
     .await;
@@ -142,7 +147,9 @@ pub(crate) async fn execute_test(
         }
         Some(TestBodyOutcome::Provisional(provisional)) => provisional,
         None => {
-            let active = active_step.and_then(|id| test.steps.iter().find(|step| step.id == id));
+            scope_tree.interrupt(events, event_sink);
+            let active =
+                active_step.and_then(|id| test.steps().into_iter().find(|step| step.id == id));
             if let Some(control) = control {
                 control.after_test_timeout(test, active);
             }
@@ -197,6 +204,16 @@ pub(crate) async fn execute_test(
         emit_cleanup_failed(events, event_sink, execution_id, Some(test.id), failure);
     }
     let outcome = combine_test_outcome(outcome, cleanup_failures);
+    let scope_outcome = match &outcome {
+        TestOutcome::Passed => webtest_observation::ScopeOutcome::Passed,
+        TestOutcome::Failed(_) => webtest_observation::ScopeOutcome::Failed,
+        TestOutcome::TimedOut { .. } => webtest_observation::ScopeOutcome::TimedOut,
+        TestOutcome::Cancelled { .. } | TestOutcome::Skipped { .. } => {
+            webtest_observation::ScopeOutcome::Cancelled
+        }
+        TestOutcome::Aborted { .. } => webtest_observation::ScopeOutcome::Aborted,
+    };
+    scope_tree.leave(scope_outcome, events, event_sink);
     let outcome_kind = outcome.finished_kind();
     let failure_class = outcome.failure_class();
     emit_event(
@@ -265,6 +282,7 @@ async fn execute_test_body(
     context: &mut Option<Box<dyn BrowserContext>>,
     page: &mut Option<Box<dyn Page>>,
     active_step: &mut Option<StepId>,
+    scope_tree: &mut scopes::ScopeTree,
 ) -> TestBodyOutcome {
     if uses_browser {
         if session.is_none() {
@@ -309,7 +327,107 @@ async fn execute_test_body(
         }
     }
 
-    for step in &test.steps {
+    TreeExecution {
+        test,
+        execution_id,
+        events,
+        event_sink,
+        control,
+        options,
+        providers,
+        deadline,
+        state,
+        page,
+        active_step,
+        scope_tree,
+    }
+    .node(&test.body)
+    .await
+}
+
+struct TreeExecution<'a> {
+    test: &'a PlannedTest,
+    execution_id: ExecutionId,
+    events: &'a mut Vec<ExecutionEvent>,
+    event_sink: Option<&'a dyn RunEventSink>,
+    control: Option<&'a dyn RunControl>,
+    options: &'a RunnerOptions,
+    providers: &'a ProviderRegistry,
+    deadline: &'a TestDeadline,
+    state: &'a mut TestExecutionState,
+    page: &'a mut Option<Box<dyn Page>>,
+    active_step: &'a mut Option<StepId>,
+    scope_tree: &'a mut scopes::ScopeTree,
+}
+
+impl TreeExecution<'_> {
+    fn node<'a>(
+        &'a mut self,
+        node: &'a webtest_plan::PlanNode,
+    ) -> std::pin::Pin<Box<dyn Future<Output = TestBodyOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            let is_root = node.path.is_empty();
+            if !is_root {
+                self.scope_tree.enter(node, self.events, self.event_sink);
+            }
+            let outcome = match &node.kind {
+                webtest_plan::PlanNodeKind::Sequence { children } => {
+                    let mut outcome = TestBodyOutcome::Provisional(ProvisionalTestOutcome::Passed);
+                    for child in children {
+                        outcome = self.node(child).await;
+                        if !matches!(
+                            outcome,
+                            TestBodyOutcome::Provisional(ProvisionalTestOutcome::Passed)
+                        ) {
+                            break;
+                        }
+                    }
+                    outcome
+                }
+                webtest_plan::PlanNodeKind::Operation { step } => self.leaf(step).await,
+            };
+            use webtest_observation::ScopeOutcome;
+            let terminal = match &outcome {
+                TestBodyOutcome::Provisional(ProvisionalTestOutcome::Passed) => {
+                    ScopeOutcome::Passed
+                }
+                TestBodyOutcome::Provisional(ProvisionalTestOutcome::Cancelled { .. }) => {
+                    ScopeOutcome::Cancelled
+                }
+                TestBodyOutcome::Provisional(ProvisionalTestOutcome::TimedOut { .. }) => {
+                    ScopeOutcome::TimedOut
+                }
+                TestBodyOutcome::Provisional(ProvisionalTestOutcome::Aborted { .. }) => {
+                    ScopeOutcome::Aborted
+                }
+                TestBodyOutcome::PendingFailure(pending)
+                    if pending.failure_class() != FailureClass::Test =>
+                {
+                    ScopeOutcome::Aborted
+                }
+                _ => ScopeOutcome::Failed,
+            };
+            if !is_root {
+                self.scope_tree
+                    .leave(terminal, self.events, self.event_sink);
+            }
+            outcome
+        })
+    }
+
+    async fn leaf(&mut self, step: &PlannedStep) -> TestBodyOutcome {
+        let test = self.test;
+        let execution_id = self.execution_id;
+        let events = &mut *self.events;
+        let event_sink = self.event_sink;
+        let control = self.control;
+        let options = self.options;
+        let providers = self.providers;
+        let deadline = self.deadline;
+        let state = &mut *self.state;
+        let page = &mut *self.page;
+        let active_step = &mut *self.active_step;
+
         *active_step = Some(step.id);
         if control.is_some_and(RunControl::is_cancelled) {
             return TestBodyOutcome::Provisional(ProvisionalTestOutcome::Cancelled {
@@ -414,9 +532,10 @@ async fn execute_test_body(
                 return TestBodyOutcome::PendingFailure(Box::new(pending));
             }
         }
+
+        *active_step = None;
+        TestBodyOutcome::Provisional(ProvisionalTestOutcome::Passed)
     }
-    *active_step = None;
-    TestBodyOutcome::Provisional(ProvisionalTestOutcome::Passed)
 }
 
 #[allow(clippy::too_many_arguments)]

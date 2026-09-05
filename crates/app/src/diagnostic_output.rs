@@ -44,7 +44,7 @@ pub(crate) fn config_diagnostics(
 ) -> Vec<DiagnosticReport> {
     let mut diagnostics = Vec::new();
     for test in &plan.tests {
-        for step in &test.steps {
+        for step in test.steps() {
             let (url, timeout) = match &step.operation {
                 TestOperation::Browser(BrowserOperation::Navigate { url }) => {
                     (literal_string(url), None)

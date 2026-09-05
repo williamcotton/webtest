@@ -85,9 +85,11 @@ impl Runner {
             }
             ProviderSelection::Explicit(providers) => providers.clone(),
         };
-        self.observations.clear_for_file(plan.file);
         let run_started = Instant::now();
         let execution_id = ExecutionId::next();
+        self.observations.begin_execution(plan.file, execution_id);
+        let pending_observations = ObservationStore::default();
+        let ids = crate::execution::scopes::ExecutionIds::default();
         let mut events = Vec::new();
         emit_event(
             &mut events,
@@ -96,7 +98,7 @@ impl Runner {
         );
         let mut tests = Vec::with_capacity(plan.tests.len());
         let mut outcome = RunOutcome::Completed;
-        if let Err(error) = validate_plan(plan) {
+        let result = if let Err(error) = validate_plan(plan) {
             outcome = RunOutcome::Aborted {
                 failure: RunError::Internal(error),
                 prior_outcome: None,
@@ -169,7 +171,8 @@ impl Runner {
                     control,
                     &self.options,
                     &providers,
-                    &self.observations,
+                    &pending_observations,
+                    ids.clone(),
                 )
                 .await;
                 let terminal = match &result.outcome {
@@ -231,16 +234,24 @@ impl Runner {
                 run_started,
                 self.event_sink.as_deref(),
             )
-        }
+        };
+        self.observations.complete_execution(
+            plan.file,
+            plan.source_revision,
+            execution_id,
+            pending_observations.observations_for(plan.file, plan.source_revision),
+        );
+        result
     }
 }
 
 fn validate_plan(plan: &TestPlan) -> Result<(), String> {
+    plan.validate_tree().map_err(|error| error.to_string())?;
     plan.validate_capabilities()
         .map_err(|error| format!("invalid plan capability metadata: {error}"))?;
     for test in &plan.tests {
         if test
-            .steps
+            .steps()
             .iter()
             .any(|step| operation_requires_browser(&step.operation))
             && !test

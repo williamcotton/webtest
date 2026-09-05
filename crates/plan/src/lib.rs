@@ -11,11 +11,19 @@ use webtest_model::{
 };
 use webtest_text::{FileId, SourceRevision, SyntaxOrigin};
 
-pub const PLAN_FORMAT_VERSION: u32 = 3;
+mod tree;
+pub use tree::{PlanNode, PlanNodeKind, PlanTreeError, declaration_identity};
+mod compatibility;
+pub use compatibility::{PlanCompatibilityError, PlanExecutionInputs};
+
+pub const PLAN_FORMAT_VERSION: u32 = 4;
+pub const RUNTIME_SEMANTICS_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PlanEnvelope {
     pub format_version: u32,
+    pub runtime_semantics_version: u32,
+    pub project_input_fingerprint: SourceRevision,
     pub compiler_version: String,
     pub project_identity: String,
     pub source_files: Vec<PlanSourceFile>,
@@ -40,6 +48,8 @@ impl PlanEnvelope {
     ) -> Self {
         Self {
             format_version: PLAN_FORMAT_VERSION,
+            runtime_semantics_version: RUNTIME_SEMANTICS_VERSION,
+            project_input_fingerprint: SourceRevision::of("webtest-inputs/v1/portable"),
             compiler_version: env!("CARGO_PKG_VERSION").into(),
             project_identity: project_identity.into(),
             source_files: vec![PlanSourceFile {
@@ -54,12 +64,19 @@ impl PlanEnvelope {
     }
 
     pub fn validate_version(&self) -> Result<(), UnsupportedPlanVersion> {
-        if self.format_version == PLAN_FORMAT_VERSION {
+        if self.format_version != PLAN_FORMAT_VERSION {
+            Err(UnsupportedPlanVersion {
+                component: "format",
+                found: self.format_version,
+                supported: PLAN_FORMAT_VERSION,
+            })
+        } else if self.runtime_semantics_version == RUNTIME_SEMANTICS_VERSION {
             Ok(())
         } else {
             Err(UnsupportedPlanVersion {
-                found: self.format_version,
-                supported: PLAN_FORMAT_VERSION,
+                component: "runtime semantics",
+                found: self.runtime_semantics_version,
+                supported: RUNTIME_SEMANTICS_VERSION,
             })
         }
     }
@@ -71,6 +88,7 @@ impl PlanEnvelope {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnsupportedPlanVersion {
+    pub component: &'static str,
     pub found: u32,
     pub supported: u32,
 }
@@ -79,8 +97,8 @@ impl std::fmt::Display for UnsupportedPlanVersion {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "unsupported plan format version {}; this executable supports version {}",
-            self.found, self.supported
+            "unsupported plan {} version {}; this executable supports version {}",
+            self.component, self.found, self.supported
         )
     }
 }
@@ -113,9 +131,10 @@ impl TestPlan {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PlannedTest {
     pub id: TestId,
+    pub declaration_id: webtest_model::PlanDeclarationId,
     pub name: String,
     pub required_host_capabilities: Vec<Capability>,
-    pub steps: Vec<PlannedStep>,
+    pub body: PlanNode,
     pub origin: SyntaxOrigin,
 }
 
@@ -382,11 +401,14 @@ mod tests {
             file,
             source_revision: revision,
             required_host_capabilities: vec![Capability::Server],
-            tests: vec![PlannedTest {
-                id: TestId(0),
-                name: "x".into(),
-                required_host_capabilities: vec![Capability::Server],
-                steps: vec![PlannedStep {
+            tests: vec![PlannedTest::sequential(
+                TestId(0),
+                declaration_identity("x.webtest", "x", 0),
+                "x".into(),
+                vec![Capability::Server],
+                SyntaxOrigin::new(file, TextRange::default()),
+                revision,
+                vec![PlannedStep {
                     id: StepId(0),
                     operation: TestOperation::EvaluatePure(EvaluatePureOperation {
                         expression: PlanExpr::Literal(Value::Int(1)),
@@ -396,11 +418,10 @@ mod tests {
                     }),
                     origin: SyntaxOrigin::new(file, TextRange::default()),
                 }],
-                origin: SyntaxOrigin::new(file, TextRange::default()),
-            }],
+            )],
         };
         let envelope = PlanEnvelope::from_plan(&plan, "x.webtest", "project", BTreeMap::new());
-        assert_eq!(envelope.format_version, 3);
+        assert_eq!(envelope.format_version, PLAN_FORMAT_VERSION);
         assert_eq!(
             envelope.tests[0].required_host_capabilities,
             [Capability::Server]
@@ -409,7 +430,7 @@ mod tests {
         let encoded = serde_json::to_string(&envelope).expect("serialize plan");
         let decoded: PlanEnvelope = serde_json::from_str(&encoded).expect("deserialize plan");
         assert_eq!(decoded, envelope);
-        for version in [1, PLAN_FORMAT_VERSION + 1] {
+        for version in [1, 2, 3, PLAN_FORMAT_VERSION + 1] {
             let mut unsupported = decoded.clone();
             unsupported.format_version = version;
             assert!(unsupported.validate_version().is_err());
@@ -451,12 +472,16 @@ mod tests {
     #[test]
     fn capability_contract_requires_sorted_exact_test_union() {
         let file = FileId::new(7);
-        let planned_test = |id, capabilities| PlannedTest {
-            id: TestId(id),
-            name: format!("test-{id}"),
-            required_host_capabilities: capabilities,
-            steps: Vec::new(),
-            origin: SyntaxOrigin::new(file, TextRange::default()),
+        let planned_test = |id, capabilities| {
+            PlannedTest::sequential(
+                TestId(id),
+                declaration_identity("tests.webtest", &format!("test-{id}"), 0),
+                format!("test-{id}"),
+                capabilities,
+                SyntaxOrigin::new(file, TextRange::default()),
+                SourceRevision::of("tests"),
+                Vec::new(),
+            )
         };
         let mut plan = TestPlan {
             file,

@@ -52,11 +52,11 @@ fn compiles_typed_server_to_browser_flow() {
     let (diagnostics, plan) = analyze(source);
     assert!(diagnostics.is_empty(), "{diagnostics:#?}");
     assert!(matches!(
-        plan.tests[0].steps[0].operation,
+        plan.tests[0].steps()[0].operation,
         TestOperation::ServerProviderCall(_)
     ));
     assert!(matches!(
-        plan.tests[0].steps[2].operation,
+        plan.tests[0].steps()[2].operation,
         TestOperation::EvaluatePure(EvaluatePureOperation {
             expression: PlanExpr::Decode { .. },
             ..
@@ -88,7 +88,7 @@ fn optional_assignments_and_member_access_lower_the_runtime_presence_fact() {
     let (diagnostics, plan) = analyze(source);
     assert!(diagnostics.is_empty(), "{diagnostics:#?}");
 
-    let TestOperation::Assertion(assertion) = &plan.tests[0].steps[1].operation else {
+    let TestOperation::Assertion(assertion) = &plan.tests[0].steps()[1].operation else {
         panic!("optional member assertion")
     };
     let webtest_plan::AssertionOperation::Value { actual, .. } = assertion else {
@@ -102,7 +102,7 @@ fn optional_assignments_and_member_access_lower_the_runtime_presence_fact() {
             ..
         } if member == "optional"
     ));
-    let TestOperation::Assertion(assertion) = &plan.tests[0].steps[2].operation else {
+    let TestOperation::Assertion(assertion) = &plan.tests[0].steps()[2].operation else {
         panic!("required nullable member assertion")
     };
     let webtest_plan::AssertionOperation::Value { actual, .. } = assertion else {
@@ -155,7 +155,7 @@ fn provider_optional_results_lower_presence_but_required_records_reject_optional
     );
     assert!(diagnostics.is_empty(), "{diagnostics:#?}");
     let TestOperation::Assertion(webtest_plan::AssertionOperation::Value { actual, .. }) =
-        &plan.tests[0].steps[1].operation
+        &plan.tests[0].steps()[1].operation
     else {
         panic!("provider optional assertion")
     };
@@ -280,7 +280,7 @@ fn distinguishes_use_before_definition_from_unknown_names() {
 fn expression_precedence_is_preserved_in_the_typed_plan() {
     let (diagnostics, plan) = analyze(r#"test "math" { let value = 1 + 2 * 3 }"#);
     assert!(diagnostics.is_empty(), "{diagnostics:#?}");
-    let TestOperation::EvaluatePure(operation) = &plan.tests[0].steps[0].operation else {
+    let TestOperation::EvaluatePure(operation) = &plan.tests[0].steps()[0].operation else {
         panic!("pure evaluation")
     };
     assert!(matches!(
@@ -373,14 +373,15 @@ test "second" { browser { open "/" click id("submit") } }"#;
     assert!(first_diagnostics.is_empty(), "{first_diagnostics:#?}");
     assert!(second_diagnostics.is_empty(), "{second_diagnostics:#?}");
     assert_eq!(first, second);
-    assert_eq!(first.tests[0].steps[0].id, StepId(0));
-    assert_eq!(first.tests[0].steps[1].id, StepId(1));
-    assert_eq!(first.tests[1].steps[0].id, StepId(2));
-    assert_eq!(first.tests[1].steps[1].id, StepId(3));
+    assert_eq!(first.tests[0].steps()[0].id, StepId(0));
+    assert_eq!(first.tests[0].steps()[1].id, StepId(1));
+    assert_eq!(first.tests[1].steps()[0].id, StepId(2));
+    assert_eq!(first.tests[1].steps()[1].id, StepId(3));
     assert_eq!(first.tests[0].id.0, 0);
     assert_eq!(first.tests[1].id.0, 1);
     assert!(
-        first.tests[0].steps[0].origin.range.start() < first.tests[1].steps[0].origin.range.start()
+        first.tests[0].steps()[0].origin.range.start()
+            < first.tests[1].steps()[0].origin.range.start()
     );
 }
 
@@ -478,8 +479,8 @@ fn provider_plan_metadata_and_direct_or_bound_results_are_preserved_exactly() {
         providers,
     );
     assert!(diagnostics.is_empty(), "{diagnostics:#?}");
-    assert_eq!(plan.tests[0].steps.len(), 2);
-    for (index, step) in plan.tests[0].steps.iter().enumerate() {
+    assert_eq!(plan.tests[0].steps().len(), 2);
+    for (index, step) in plan.tests[0].steps().iter().enumerate() {
         let TestOperation::ServerProviderCall(call) = &step.operation else {
             panic!("provider call")
         };
@@ -501,4 +502,85 @@ fn provider_plan_metadata_and_direct_or_bound_results_are_preserved_exactly() {
             assert_eq!(call.result_name.as_deref(), Some("created"));
         }
     }
+}
+#[test]
+fn execution_tree_preserves_blocks_ranges_paths_and_revision() {
+    let source = "test \"tree\" { server { let x = 1 expect x == 1 } browser { open \"/\" } }";
+    let mut database = crate::AnalysisDatabase::default();
+    let file = database.open_file("tree.webtest", source);
+    let plan = database.test_plan(file).expect("plan");
+    plan.validate_tree().expect("valid tree");
+    let root = &plan.tests[0].body;
+    let webtest_plan::PlanNodeKind::Sequence { children } = &root.kind else {
+        panic!("root sequence")
+    };
+    assert!(root.path.is_empty());
+    assert_eq!(children.len(), 2);
+    let webtest_plan::PlanNodeKind::Sequence { children: server } = &children[0].kind else {
+        panic!("server sequence")
+    };
+    assert_eq!(server[0].path, [0, 0]);
+    assert_eq!(server[1].path, [0, 1]);
+    assert_eq!(
+        server[1].source_revision,
+        webtest_text::SourceRevision::of(source)
+    );
+    let range = server[1].origin.range;
+    assert_eq!(
+        &source[usize::from(range.start())..usize::from(range.end())],
+        "x == 1 "
+    );
+    let range = children[0].origin.range;
+    assert_eq!(
+        &source[usize::from(range.start())..usize::from(range.end())],
+        "server { let x = 1 expect x == 1 }"
+    );
+    assert_ne!(server[0].id, server[1].id);
+    assert_eq!(plan.tests[0].steps().len(), 3);
+    assert_eq!(root.source_revision, plan.source_revision);
+}
+
+#[test]
+fn empty_bodies_also_have_explicit_sequences_and_deterministic_identity() {
+    let mut database = crate::AnalysisDatabase::default();
+    let file = database.open_file(
+        "empty.webtest",
+        "test \"empty\" {} test \"blocks\" { server {} browser {} }",
+    );
+    let first = database.test_plan(file).expect("first");
+    let second = database.test_plan(file).expect("second");
+    assert_eq!(first, second);
+    first.validate_tree().expect("valid empty tree");
+    for test in &first.tests {
+        assert!(matches!(
+            test.body.kind,
+            webtest_plan::PlanNodeKind::Sequence { .. }
+        ));
+        assert!(test.steps().is_empty());
+    }
+    assert_ne!(first.tests[0].body.id, first.tests[1].body.id);
+}
+
+#[test]
+fn node_identity_survives_file_open_order_and_unrelated_declarations() {
+    let source = "test \"target\" { expect 1 == 1 }";
+    let mut first = AnalysisDatabase::default();
+    let file = first.open_file("target.webtest", source);
+    let a = first.test_plan(file).expect("first");
+    let mut second = AnalysisDatabase::default();
+    second.open_file("unrelated.webtest", "test \"unrelated\" {}");
+    let file = second.open_file("target.webtest", format!("test \"earlier\" {{}} {source}"));
+    let b = second.test_plan(file).expect("second");
+    assert_ne!(a.file, b.file);
+    assert_ne!(a.tests[0].id, b.tests[1].id);
+    assert_eq!(a.tests[0].declaration_id, b.tests[1].declaration_id);
+    assert_eq!(a.tests[0].body.id, b.tests[1].body.id);
+    let webtest_plan::PlanNodeKind::Sequence { children: a } = &a.tests[0].body.kind else {
+        panic!("sequence")
+    };
+    let webtest_plan::PlanNodeKind::Sequence { children: b } = &b.tests[1].body.kind else {
+        panic!("sequence")
+    };
+    assert_eq!(a[0].id, b[0].id);
+    assert_ne!(a[0].source_revision, b[0].source_revision);
 }

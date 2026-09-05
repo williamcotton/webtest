@@ -12,6 +12,47 @@ use webtest_plan::{
 use webtest_text::SyntaxOrigin;
 
 impl Compiler<'_> {
+    pub(super) fn compile_sequence(
+        &mut self,
+        test: webtest_model::PlanDeclarationId,
+        origin: SyntaxOrigin,
+        statements: &[HirStmt],
+        domain: Capability,
+        path: Vec<u32>,
+    ) -> webtest_plan::PlanNode {
+        let mut children = Vec::new();
+        for (ordinal, statement) in statements.iter().enumerate() {
+            let mut child_path = path.clone();
+            child_path.push(ordinal as u32);
+            let node = match statement {
+                HirStmt::Server(block) => self.compile_sequence(
+                    test,
+                    block.origin,
+                    &block.statements,
+                    Capability::Server,
+                    child_path,
+                ),
+                HirStmt::Browser(block) => self.compile_sequence(
+                    test,
+                    block.origin,
+                    &block.statements,
+                    Capability::Browser,
+                    child_path,
+                ),
+                _ => {
+                    let mut steps = Vec::new();
+                    self.compile_statement(statement, domain, &mut steps);
+                    let Some(step) = steps.into_iter().next() else {
+                        continue;
+                    };
+                    webtest_plan::PlanNode::operation(test, self.revision, child_path, step)
+                }
+            };
+            children.push(node);
+        }
+        webtest_plan::PlanNode::sequence(test, origin, self.revision, path, children)
+    }
+
     pub(super) fn compile_statement(
         &mut self,
         statement: &HirStmt,

@@ -129,7 +129,7 @@ fn check_reporters_preserve_output_and_exit_class() {
     assert_eq!(json.status.code(), Some(0));
     assert!(json.stderr.is_empty());
     let json: serde_json::Value = serde_json::from_slice(&json.stdout).expect("JSON report");
-    assert_eq!(json["schema_version"], 3);
+    assert_eq!(json["schema_version"], 4);
     assert_eq!(json["command"], "check");
     assert_eq!(json["exit_class"], "success");
     assert_eq!(json["files"][0]["path"], "tests/example.webtest");
@@ -242,13 +242,17 @@ fn build_is_deterministic_and_description_json_remains_machine_clean() {
     );
     let plan: serde_json::Value =
         serde_json::from_slice(&fs::read(first).expect("plan")).expect("plan JSON");
-    assert_eq!(plan["format_version"], 3);
+    assert_eq!(plan["format_version"], 4);
+    assert_eq!(plan["runtime_semantics_version"], 1);
     assert_eq!(plan["tests"][0]["id"], 0);
     assert_eq!(
         plan["tests"][0]["required_host_capabilities"],
         serde_json::json!(["test"])
     );
-    assert_eq!(plan["tests"][0]["steps"][0]["id"], 0);
+    assert_eq!(
+        plan["tests"][0]["body"]["kind"]["children"][0]["kind"]["children"][0]["kind"]["step"]["id"],
+        0
+    );
 
     for arguments in [
         &["describe", "--reporter", "json"][..],

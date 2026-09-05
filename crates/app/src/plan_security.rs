@@ -12,7 +12,7 @@ pub(crate) fn reject_literal_secrets(
 ) -> Result<(), AppError> {
     for test in &envelope.tests {
         let mut bindings = HashMap::new();
-        for step in &test.steps {
+        for step in test.steps() {
             if let TestOperation::EvaluatePure(operation) = &step.operation
                 && let Some(binding) = operation.result_binding
             {

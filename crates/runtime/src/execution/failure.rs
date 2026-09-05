@@ -36,6 +36,12 @@ pub(super) struct PendingFailure {
     elapsed_ms: u64,
 }
 
+impl PendingFailure {
+    pub(super) fn failure_class(&self) -> FailureClass {
+        self.error.failure_class()
+    }
+}
+
 pub(super) struct FailureInput<'a> {
     pub(super) plan: &'a TestPlan,
     pub(super) test_id: TestId,

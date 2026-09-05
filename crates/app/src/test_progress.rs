@@ -222,7 +222,8 @@ impl HumanTestProgress {
                     writeln!(state.output, "test {name:?} ... SKIPPED")?;
                 }
                 ExecutionEvent::RunFinished { .. } => {}
-                ExecutionEvent::RunStarted { .. }
+                ExecutionEvent::Scope { .. }
+                | ExecutionEvent::RunStarted { .. }
                 | ExecutionEvent::StepStarted { .. }
                 | ExecutionEvent::StepPassed { .. }
                 | ExecutionEvent::ProviderCallStarted { .. }

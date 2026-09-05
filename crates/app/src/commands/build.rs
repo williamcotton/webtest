@@ -50,7 +50,7 @@ fn build_project(project: &webtest_project::Project, emit: &Path) -> Result<Exit
         for mut test in plan.tests.clone() {
             test.id = webtest_model::TestId(next_test);
             next_test += 1;
-            for step in &mut test.steps {
+            for step in test.body.steps_mut() {
                 step.id = webtest_model::StepId(next_step);
                 next_step += 1;
             }
@@ -63,18 +63,17 @@ fn build_project(project: &webtest_project::Project, emit: &Path) -> Result<Exit
         .name
         .clone()
         .unwrap_or_else(|| normalized_path(&project.root));
-    let config_source = project
-        .config_path
-        .as_deref()
-        .map(read_source)
-        .transpose()?
-        .unwrap_or_default();
+    let semantic_inputs = serde_json::to_string(&project.config).map_err(AppError::internal)?;
     let envelope = PlanEnvelope {
         format_version: PLAN_FORMAT_VERSION,
+        runtime_semantics_version: webtest_plan::RUNTIME_SEMANTICS_VERSION,
+        project_input_fingerprint: SourceRevision::of(&format!(
+            "webtest-inputs/v1/{semantic_inputs}"
+        )),
         compiler_version: env!("CARGO_PKG_VERSION").into(),
         project_identity: format!(
             "{project_name}@{}",
-            revision_hex(SourceRevision::of(&config_source))
+            revision_hex(SourceRevision::of(&normalized_path(&project.root)))
         ),
         source_files,
         required_host_capabilities: capabilities.into_iter().collect(),
@@ -84,6 +83,7 @@ fn build_project(project: &webtest_project::Project, emit: &Path) -> Result<Exit
     envelope
         .validate_capabilities()
         .map_err(AppError::internal)?;
+    envelope.validate_tree().map_err(AppError::internal)?;
     reject_literal_secrets(&envelope, project)?;
     let encoded = serde_json::to_vec_pretty(&envelope).map_err(AppError::internal)?;
     if let Some(parent) = emit.parent()

@@ -73,8 +73,9 @@ pub(crate) fn compile(
     providers: &ProviderRegistry,
     diagnostics: Vec<Diagnostic>,
     hir: &HirFile,
+    source_identity: &str,
 ) -> CompileResult {
-    Compiler::new(file, revision, providers, diagnostics).compile(hir)
+    Compiler::new(file, revision, providers, diagnostics).compile(hir, source_identity)
 }
 
 impl<'a> Compiler<'a> {
@@ -99,7 +100,8 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    fn compile(mut self, hir: &HirFile) -> CompileResult {
+    fn compile(mut self, hir: &HirFile, source_identity: &str) -> CompileResult {
+        let mut occurrences = HashMap::<String, u32>::new();
         let tests = hir
             .tests
             .iter()
@@ -111,17 +113,25 @@ impl<'a> Compiler<'a> {
                 for statement in &test.body {
                     statements::collect_binding_names(statement, &mut self.declared_names);
                 }
-                let mut steps = Vec::new();
-                for statement in &test.body {
-                    self.compile_statement(statement, Capability::Pure, &mut steps);
-                }
+                let occurrence = occurrences.entry(test.name.clone()).or_default();
+                let declaration_id =
+                    webtest_plan::declaration_identity(source_identity, &test.name, *occurrence);
+                *occurrence += 1;
+                let body = self.compile_sequence(
+                    declaration_id,
+                    test.origin,
+                    &test.body,
+                    Capability::Pure,
+                    Vec::new(),
+                );
                 webtest_plan::PlannedTest {
                     id: test.id,
+                    declaration_id,
                     name: test.name.clone(),
                     required_host_capabilities: std::mem::take(&mut self.test_required)
                         .into_iter()
                         .collect(),
-                    steps,
+                    body,
                     origin: test.origin,
                 }
             })

@@ -480,7 +480,7 @@ test "optional" {
         let webtest_plan::TestOperation::Assertion(webtest_plan::AssertionOperation::Value {
             actual,
             ..
-        }) = &portable.tests[3].steps[1].operation
+        }) = &portable.tests[3].steps()[1].operation
         else {
             panic!("optional assertion")
         };
@@ -559,7 +559,7 @@ test "optional" {
         let compilation = compile_with_manifest(source, manifest).expect("compilation");
         let plan = compilation.plan.expect("portable plan");
         let webtest_plan::TestOperation::ServerProviderCall(call) =
-            &plan.tests[0].steps[0].operation
+            &plan.tests[0].steps()[0].operation
         else {
             panic!("app call")
         };

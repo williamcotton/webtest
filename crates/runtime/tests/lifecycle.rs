@@ -313,12 +313,18 @@ fn plan_with_tests(
         .enumerate()
         .map(|(test_index, operations)| {
             let required_host_capabilities = test_capabilities(&capabilities, &operations);
-            PlannedTest {
-                id: TestId(test_index as u32),
-                name: format!("test-{test_index}"),
+            PlannedTest::sequential(
+                TestId(test_index as u32),
+                webtest_plan::declaration_identity(
+                    "lifecycle.webtest",
+                    &format!("test-{test_index}"),
+                    0,
+                ),
+                format!("test-{test_index}"),
                 required_host_capabilities,
-                origin: origin(file, test_index as u32),
-                steps: operations
+                origin(file, test_index as u32),
+                SourceRevision::of("lifecycle"),
+                operations
                     .into_iter()
                     .map(|operation| {
                         let step_id = StepId(next_step);
@@ -330,7 +336,7 @@ fn plan_with_tests(
                         }
                     })
                     .collect(),
-            }
+            )
         })
         .collect();
     TestPlan {
@@ -385,6 +391,137 @@ fn pure(value: Value) -> TestOperation {
     })
 }
 
+#[tokio::test]
+async fn execution_scope_occurrences_are_parented_unique_and_closed_after_children() {
+    let plan = plan_with_tests(
+        vec![Capability::Pure],
+        vec![vec![pure(Value::Null), pure(Value::Null)], vec![]],
+    );
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .run(&plan, &LifecycleHost(Arc::new(LifecycleState::default())))
+        .await;
+    let mut active = Vec::new();
+    let mut scopes = BTreeSet::new();
+    let mut operations = BTreeSet::new();
+    let mut tests = BTreeSet::new();
+    for event in &result.events {
+        let ExecutionEvent::Scope {
+            execution_id,
+            event,
+        } = event
+        else {
+            continue;
+        };
+        assert_eq!(*execution_id, result.execution_id);
+        assert_eq!(event.source_revision, plan.source_revision);
+        let context = &event.execution_context;
+        if event.outcome.is_none() {
+            assert_eq!(context.parent_scope_id, active.last().copied());
+            assert!(scopes.insert(context.scope_id));
+            if let Some(operation) = context.operation_execution_id {
+                assert!(operations.insert(operation));
+            }
+            if context.parent_scope_id.is_none() {
+                assert!(tests.insert(context.test_execution_id));
+            }
+            active.push(context.scope_id);
+        } else {
+            assert_eq!(active.pop(), Some(context.scope_id));
+            assert_eq!(
+                event.outcome,
+                Some(webtest_observation::ScopeOutcome::Passed)
+            );
+        }
+        let json = serde_json::to_string(event).expect("scope JSON");
+        assert_eq!(
+            serde_json::from_str::<webtest_observation::ScopeEvent>(&json)
+                .expect("scope roundtrip"),
+            *event
+        );
+    }
+    assert!(active.is_empty());
+    assert_eq!(scopes.len(), 4);
+    assert_eq!(operations.len(), 2);
+    assert_eq!(tests.len(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn scope_timeout_cancels_descendants_with_the_causing_scope_identity() {
+    let state = Arc::new(LifecycleState::default());
+    state
+        .page_delays
+        .lock()
+        .expect("delays")
+        .insert("slow".into(), Duration::from_secs(5));
+    let plan = plan_with_tests(
+        vec![Capability::Browser],
+        vec![vec![browser_evaluate("slow")]],
+    );
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .with_options(RunnerOptions {
+            test_timeout: Duration::from_secs(1),
+            ..RunnerOptions::default()
+        })
+        .run(&plan, &LifecycleHost(state))
+        .await;
+    let terminal = result
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            ExecutionEvent::Scope { event, .. } if event.outcome.is_some() => Some(event),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(terminal.len(), 2);
+    assert_eq!(
+        terminal[0].outcome,
+        Some(webtest_observation::ScopeOutcome::Cancelled)
+    );
+    assert_eq!(
+        terminal[1].outcome,
+        Some(webtest_observation::ScopeOutcome::TimedOut)
+    );
+    assert_eq!(
+        terminal[0].cancellation,
+        Some(webtest_observation::ScopeCancellation::Timeout {
+            causing_scope_id: terminal[1].execution_context.scope_id,
+        })
+    );
+}
+
+struct ScopeLifecycleSink(Arc<LifecycleState>);
+impl RunEventSink for ScopeLifecycleSink {
+    fn publish(&self, event: &ExecutionEvent) {
+        if let ExecutionEvent::Scope { event, .. } = event
+            && event.execution_context.parent_scope_id.is_none()
+        {
+            self.0.push(event.kind());
+        }
+    }
+}
+
+#[tokio::test]
+async fn root_scope_includes_browser_acquisition_and_context_teardown() {
+    let state = Arc::new(LifecycleState::default());
+    let plan = plan_with_tests(
+        vec![Capability::Browser],
+        vec![vec![browser_evaluate("ok")]],
+    );
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .with_event_sink(Arc::new(ScopeLifecycleSink(Arc::clone(&state))))
+        .run(&plan, &LifecycleHost(Arc::clone(&state)))
+        .await;
+    assert!(matches!(result.tests[0].outcome, TestOutcome::Passed));
+    let log = state.log();
+    let at = |name| {
+        log.iter()
+            .position(|event| event == name)
+            .expect("lifecycle event")
+    };
+    assert!(at("scope_started") < at("session_start:0"));
+    assert!(at("context_close:0") < at("scope_finished"));
+}
+
 fn pure_binding(value: Value, binding: BindingId) -> TestOperation {
     TestOperation::EvaluatePure(EvaluatePureOperation {
         expression: PlanExpr::Literal(value),
@@ -406,7 +543,9 @@ fn missing_binding() -> TestOperation {
 fn event_names(events: &[ExecutionEvent]) -> Vec<&'static str> {
     events
         .iter()
+        .filter(|event| !matches!(event, ExecutionEvent::Scope { .. }))
         .map(|event| match event {
+            ExecutionEvent::Scope { .. } => unreachable!("scope events are tested separately"),
             ExecutionEvent::RunStarted { .. } => "run_started",
             ExecutionEvent::TestStarted { .. } => "test_started",
             ExecutionEvent::StepStarted { .. } => "step_started",
@@ -1968,7 +2107,11 @@ async fn provider_context_events_binding_and_builder_precedence_are_preserved() 
         arguments,
         transport_kind,
         ..
-    } = &result.events[5]
+    } = result
+        .events
+        .iter()
+        .find(|event| matches!(event, ExecutionEvent::ProviderCallStarted { .. }))
+        .expect("provider start event")
     else {
         panic!("provider start event")
     };

@@ -132,12 +132,14 @@ fn plan(revision: SourceRevision) -> TestPlan {
         file,
         source_revision: revision,
         required_host_capabilities: vec![Capability::Browser],
-        tests: vec![PlannedTest {
-            id: TestId(0),
-            name: "x".into(),
-            required_host_capabilities: vec![Capability::Browser],
-            origin: SyntaxOrigin::new(file, TextRange::empty(TextSize::new(0))),
-            steps: vec![PlannedStep {
+        tests: vec![PlannedTest::sequential(
+            TestId(0),
+            webtest_plan::declaration_identity("runtime.webtest", "x", 0),
+            "x".into(),
+            vec![Capability::Browser],
+            SyntaxOrigin::new(file, TextRange::empty(TextSize::new(0))),
+            revision,
+            vec![PlannedStep {
                 id: StepId(0),
                 origin: SyntaxOrigin::new(
                     file,
@@ -147,7 +149,7 @@ fn plan(revision: SourceRevision) -> TestPlan {
                     locator: Locator::Id("missing".into()),
                 }),
             }],
-        }],
+        )],
     }
 }
 

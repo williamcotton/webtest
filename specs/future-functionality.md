@@ -1167,6 +1167,12 @@ Acceptance: the same WebTest source calls `app.create_user` against applications
 
 ### [Milestone E — Structured execution and observability](./milestone-e.md)
 
+Status: in progress. The sequential execution-tree foundation, structural node identities,
+parented scope/operation events, plan format 4 compatibility metadata, and atomic runtime
+observation commits are implemented. General structured concurrency, resource/cancellation
+ownership, jobs, the authoritative journal, traces, observation IPC, and concurrent DAP remain
+pending; see the milestone's implementation-progress section for the exact boundary.
+
 - sequence/parallel/race/retry/timeout plan nodes;
 - cancellation-safe resource lifecycles;
 - deadline/wait registration substrate compatible with Milestone H reactive event selection;

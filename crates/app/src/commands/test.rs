@@ -237,7 +237,7 @@ pub(crate) async fn run_test(
                                     let origin = active_step
                                         .and_then(|id| {
                                             planned
-                                                .steps
+                                                .steps()
                                                 .iter()
                                                 .find(|step| step.id == id)
                                                 .map(|step| step.origin)

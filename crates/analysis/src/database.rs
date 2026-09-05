@@ -263,7 +263,14 @@ impl AnalysisDatabase {
         let parse = webtest_syntax::parse(&text);
         let diagnostics = syntax_diagnostics::collect(&parse);
         let hir = Arc::new(webtest_hir::lower(file, &parse));
-        let compiled = compiler::compile(file, revision, &self.providers, diagnostics, &hir);
+        let compiled = compiler::compile(
+            file,
+            revision,
+            &self.providers,
+            diagnostics,
+            &hir,
+            &source.path,
+        );
         self.cache.insert(
             file,
             CachedQueries {

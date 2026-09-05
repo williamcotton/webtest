@@ -1,5 +1,8 @@
 //! Structured execution events and revision-safe source observations.
 
+mod scope;
+pub use scope::{ExecutionContext, ScopeCancellation, ScopeEvent, ScopeOutcome};
+
 use std::{
     collections::BTreeMap,
     collections::HashMap,
@@ -628,6 +631,10 @@ impl RuntimeFailure {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExecutionEvent {
+    Scope {
+        execution_id: ExecutionId,
+        event: ScopeEvent,
+    },
     RunStarted {
         execution_id: ExecutionId,
     },
@@ -726,7 +733,8 @@ impl ExecutionEvent {
             Self::ProviderCallFailed { code, .. } | Self::CleanupFailed { code, .. } => Some(*code),
             Self::StepFailed { failure, .. } => Some(failure.code()),
             Self::TestTimedOut { .. } => Some(RuntimeFailureCode::TestTimeout),
-            Self::RunStarted { .. }
+            Self::Scope { .. }
+            | Self::RunStarted { .. }
             | Self::TestStarted { .. }
             | Self::StepStarted { .. }
             | Self::StepPassed { .. }
@@ -805,10 +813,16 @@ impl RuntimeObservationKind {
 #[derive(Default)]
 pub struct ObservationStore {
     observations: Mutex<HashMap<(FileId, SourceRevision), Vec<RuntimeObservation>>>,
+    latest_executions: Mutex<HashMap<FileId, ExecutionId>>,
 }
 
 impl ObservationStore {
     pub fn clear(&self) {
+        let mut latest = self
+            .latest_executions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        latest.clear();
         self.observations
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -816,11 +830,57 @@ impl ObservationStore {
     }
 
     pub fn clear_for_file(&self, file: FileId) {
+        let mut latest = self
+            .latest_executions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        latest.remove(&file);
         let mut observations = self
             .observations
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         observations.retain(|(stored_file, _), _| *stored_file != file);
+    }
+
+    /// Starting a run invalidates earlier runs immediately, including in-flight publishers.
+    pub fn begin_execution(&self, file: FileId, execution: ExecutionId) {
+        let mut latest = self
+            .latest_executions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        latest.insert(file, execution);
+        self.observations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|(stored_file, _), _| *stored_file != file);
+    }
+
+    /// Commits one complete batch only if this is still the most recently started run.
+    pub fn complete_execution(
+        &self,
+        file: FileId,
+        revision: SourceRevision,
+        execution: ExecutionId,
+        values: Vec<RuntimeObservation>,
+    ) -> bool {
+        let latest = self
+            .latest_executions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if latest.get(&file) != Some(&execution)
+            || values.iter().any(|value| {
+                value.file != file
+                    || value.source_revision != revision
+                    || value.execution_id != execution
+            })
+        {
+            return false;
+        }
+        self.observations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert((file, revision), values);
+        true
     }
 
     pub fn clear_for_execution(&self, execution_id: ExecutionId) {
@@ -873,6 +933,38 @@ mod tests {
     use webtest_text::TextSize;
 
     use super::*;
+
+    #[test]
+    fn completed_batches_are_atomic_and_last_started_run_wins() {
+        let store = ObservationStore::default();
+        let file = FileId::new(1);
+        let revision = SourceRevision::of("same source");
+        let old = ExecutionId::next();
+        let new = ExecutionId::next();
+        let observation = |execution_id| RuntimeObservation {
+            execution_id,
+            file,
+            source_revision: revision,
+            test_id: TestId(0),
+            step_id: None,
+            range: TextRange::default(),
+            kind: RuntimeObservationKind::TestTimeout {
+                timeout_ms: 10,
+                active_step: None,
+            },
+        };
+        store.begin_execution(file, old);
+        assert!(store.complete_execution(file, revision, old, vec![observation(old)]));
+        assert_eq!(store.observations_for(file, revision).len(), 1);
+        store.begin_execution(file, new);
+        assert!(store.observations_for(file, revision).is_empty());
+        assert!(!store.complete_execution(file, revision, old, vec![observation(old)]));
+        assert!(!store.complete_execution(file, revision, new, vec![observation(old)]));
+        assert!(store.complete_execution(file, revision, new, vec![]));
+        assert!(store.observations_for(file, revision).is_empty());
+        store.clear_for_file(file);
+        assert!(!store.complete_execution(file, revision, new, vec![observation(new)]));
+    }
 
     #[test]
     fn observations_are_partitioned_by_source_revision() {

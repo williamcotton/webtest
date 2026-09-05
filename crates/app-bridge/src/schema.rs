@@ -807,7 +807,7 @@ mod tests {
         );
         let plan = database.test_plan(file).expect("plan");
         let webtest_plan::TestOperation::ServerProviderCall(call) =
-            &plan.tests[0].steps[0].operation
+            &plan.tests[0].steps()[0].operation
         else {
             panic!("provider call")
         };

@@ -34,7 +34,7 @@ pub struct ConfigWarning {
     pub message: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(serde::Serialize, Clone, Debug)]
 pub struct ProjectConfig {
     pub project: ProjectSection,
     pub browser: BrowserSection,
@@ -48,14 +48,14 @@ pub struct ProjectConfig {
     pub description: DescriptionSection,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(serde::Serialize, Clone, Debug, Default)]
 pub struct ProjectSection {
     pub name: Option<String>,
     pub test_roots: Vec<PathBuf>,
     pub exclude: Vec<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(serde::Serialize, Clone, Debug)]
 pub struct BrowserSection {
     pub headless: bool,
     pub channel: BrowserChannel,
@@ -65,20 +65,20 @@ pub struct BrowserSection {
     pub test_id_attribute: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ViewportSection {
     pub width: u32,
     pub height: u32,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(serde::Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BrowserChannel {
     #[default]
     Managed,
     System,
 }
 
-#[derive(Clone, Debug)]
+#[derive(serde::Serialize, Clone, Debug)]
 pub struct TimeoutSection {
     pub browser_command: Duration,
     pub action: Duration,
@@ -88,25 +88,25 @@ pub struct TimeoutSection {
     pub test: Duration,
 }
 
-#[derive(Clone, Debug)]
+#[derive(serde::Serialize, Clone, Debug)]
 pub struct ArtifactSection {
     pub directory: PathBuf,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EvidenceMode {
     Off,
     OnFailure,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct EvidenceSection {
     pub screenshot: EvidenceMode,
     pub dom_snapshot: EvidenceMode,
     pub max_dom_bytes: usize,
 }
 
-#[derive(Clone, Debug)]
+#[derive(serde::Serialize, Clone, Debug)]
 pub struct ServerSection {
     pub base_url: Option<String>,
     pub http: ServerHttpSection,
@@ -115,7 +115,7 @@ pub struct ServerSection {
     pub app: Option<ServerAppSection>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(serde::Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ServerAppAdapter {
     #[default]
     Bridge,
@@ -123,7 +123,7 @@ pub enum ServerAppAdapter {
     Http,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(serde::Serialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ServerAppTransport {
     #[default]
     Auto,
@@ -133,7 +133,7 @@ pub enum ServerAppTransport {
     Stdio,
 }
 
-#[derive(Clone, Debug)]
+#[derive(serde::Serialize, Clone, Debug)]
 pub struct ServerAppSection {
     pub adapter: ServerAppAdapter,
     pub transport: ServerAppTransport,
@@ -148,13 +148,13 @@ pub struct ServerAppSection {
     pub max_pending_calls: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct ServerAppHttpOperation {
     pub method: String,
     pub path: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(serde::Serialize, Clone, Debug)]
 pub struct ApplicationSection {
     pub command: Option<String>,
     pub args: Vec<String>,
@@ -164,38 +164,38 @@ pub struct ApplicationSection {
     pub health: Option<AppHealthSection>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(serde::Serialize, Clone, Debug)]
 pub struct AppHealthSection {
     pub url: String,
     pub timeout: Duration,
 }
 
-#[derive(Clone, Debug)]
+#[derive(serde::Serialize, Clone, Debug)]
 pub struct ServerHttpSection {
     pub follow_redirects: bool,
     pub max_response_bytes: usize,
 }
 
-#[derive(Clone, Debug)]
+#[derive(serde::Serialize, Clone, Debug)]
 pub struct ServerProcessSection {
     pub allowed_working_roots: Vec<PathBuf>,
     pub max_output_bytes: usize,
 }
 
-#[derive(Clone, Debug)]
+#[derive(serde::Serialize, Clone, Debug)]
 pub struct ServerFsSection {
     pub read_roots: Vec<PathBuf>,
     pub write_root: PathBuf,
 }
 
-#[derive(Clone, Debug)]
+#[derive(serde::Serialize, Clone, Debug)]
 pub struct RedactionSection {
     pub headers: Vec<String>,
     pub json_fields: Vec<String>,
     pub query_params: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct InspectionSection {
     pub max_elements: usize,
     pub max_candidates_per_element: usize,
@@ -203,7 +203,7 @@ pub struct InspectionSection {
     pub include_hidden: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
 pub struct DescriptionSection {
     pub max_category_children: usize,
     pub max_search_results: usize,

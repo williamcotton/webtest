@@ -14,6 +14,35 @@ identity, and the existing revision-safe observations and DAP `RunControl` hook.
 
 Milestone E changes how operations are scheduled, owned, cancelled, and observed. It must preserve the same compiler, plan, runner, provider, browser, editor, and debugger paths used by sequential execution, while establishing generic execution-scope, resource-lifecycle, cancellation, deadline, wait, and event-journal abstractions that later milestones can extend without introducing another runtime architecture. [`milestone-f.md`](./milestone-f.md), [`milestone-h.md`](./milestone-h.md), and [`milestone-i.md`](./milestone-i.md) are forward-compatibility constraints, not dependencies and not authorization to implement their public features early.
 
+### Implementation progress — 2026-09-05
+
+Milestone E is **not complete**. The initial sequential execution-tree foundation is implemented:
+
+- Tests and capability blocks lower through explicit `Sequence` nodes. Leaf operations exist only
+  in that tree; diagnostic, debugger, and secret-checking traversal is a read-only projection.
+- Declaration identities use explicit source identity, name, and duplicate-name ordinal. Node
+  identities add structural child path and versioned node kind, independently of file-opening
+  order, unrelated declarations, step allocation, and runtime occurrence allocation.
+- The sequential runner dispatches the tree recursively and emits parented scope and operation
+  occurrences. A test root includes browser acquisition and test cleanup. Descendants interrupted
+  by the existing test deadline record cancellation and its causing scope; the root records its
+  final outcome after cleanup. This is not yet the general cancellation/resource scheduler.
+- Plan format 4 separates format and runtime-semantics versions. Native builds fingerprint
+  resolved configuration, keeping configuration values out of the artifact. Shared validation
+  checks tree structure, identities, revisions, capability requirements, and explicit execution
+  inputs for detectable drift. There is still no CLI command to execute an emitted plan.
+- CLI report/event schema 4 includes typed scope facts. This remains the existing event stream,
+  not yet E's authoritative bounded journal with replay-safe event identity.
+- Runtime observations accumulate privately and commit as a complete batch. Starting another
+  run clears prior observations and prevents an older in-flight run from overwriting the newer
+  batch. Cross-process publication remains unimplemented.
+
+Remaining work includes the general resource registry and leases; acknowledged acquisition and
+bounded teardown; cancellation-aware host contracts and wait registrations; parallel/race/retry/
+timeout syntax, semantics, and scheduling; isolated `--jobs`; the authoritative event journal;
+trace artifacts/viewer; observation IPC; concurrent DAP behavior; and their conformance/stress
+coverage. The acceptance criteria below remain normative and unsatisfied as a whole.
+
 ## 1. Outcome
 
 Tests can express bounded parallelism, races, retries, and timeouts without leaking child work or losing cleanup. Every attempt and cancellation remains source-mapped in terminal output, traces, editor observations, DAP, and versioned machine output.
