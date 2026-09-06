@@ -32,7 +32,7 @@ pub use resource_scope::{
 };
 pub use resources::{ResourceInvariant, ResourceLease, ResourceRegistry};
 pub use result::{
-    PriorRunOutcome, PriorTestOutcome, RunOutcome, RunResult, StepFailure, TestOutcome, TestResult,
+    BranchResult, PriorRunOutcome, PriorTestOutcome, RunOutcome, RunResult, StepFailure, TestOutcome, TestResult,
 };
 pub use runner::Runner;
 pub use url::resolve_browser_url;

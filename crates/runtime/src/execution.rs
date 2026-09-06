@@ -5,7 +5,7 @@ use std::{
 };
 
 use tokio::time::Instant;
-use webtest_browser::{BrowserHost, BrowserSession, Page};
+use webtest_browser::{BrowserHost, BrowserSession};
 use webtest_host::OperationContext as _;
 use webtest_model::{Capability, StepId, TestId};
 use webtest_observation::{
@@ -25,19 +25,24 @@ use self::{
     failure::{
         FailureInput, PendingFailure, PrepareFailureInput, prepare_failure, process_failure,
     },
-    state::TestExecutionState,
     steps::execute_step,
 };
 
+mod branch;
+mod concurrent;
 mod browser;
 mod failure;
 mod provider;
 mod resource;
+mod scheduler;
 pub(crate) mod scopes;
 mod state;
 mod steps;
 mod temporary;
 mod wait;
+
+#[cfg(test)]
+mod tests;
 
 pub(crate) use browser::{bounded_timeout, browser_locator, browser_state};
 
@@ -50,6 +55,7 @@ pub(crate) struct ExecutedTest {
 
 #[allow(dead_code)]
 enum ProvisionalTestOutcome {
+    Finalized(Box<TestOutcome>),
     Passed,
     Failed(Box<StepFailure>),
     TimedOut {
@@ -89,7 +95,7 @@ pub(crate) async fn execute_test(
 ) -> ExecutedTest {
     let test_started = StdInstant::now();
     let deadline = TestDeadline::new(options.test_timeout);
-    let mut scope_tree = scopes::ScopeTree::new(ids, execution_id, test.id, deadline.at);
+    let scope_factory = scopes::ScopeFactory::new(ids, test.id);
     emit_event(
         events,
         event_sink,
@@ -99,73 +105,44 @@ pub(crate) async fn execute_test(
             name: test.name.clone(),
         },
     );
-    let (root_scope, root_context) = scope_tree.enter(&test.body, events, event_sink);
-    let mut state = TestExecutionState::new(
-        options.redacted_json_fields.clone(),
-        options.project_root.clone(),
-    );
-    let mut page: Option<Box<dyn Page>> = None;
-    let mut active_step = None;
-    let mut temporary = temporary::TemporaryResources::default();
+    let root = scope_factory.root(&test.body, deadline.at);
+    let root_scope = root.event.clone();
+    let root_context = root.context.clone();
+    let mut branch = branch::BranchState::new(options);
+    branch.session = session.take();
+    branch.scopes.start(&root, execution_id, events, event_sink);
+    let services = ExecutionServices {
+        plan,
+        observations,
+        test,
+        execution_id,
+        events,
+        event_sink,
+        control,
+        options,
+        providers,
+        deadline: &deadline,
+        waits,
+        resources,
+        scopes: &scope_factory,
+        browser,
+    };
     let uses_browser = test
         .required_host_capabilities
         .contains(&Capability::Browser);
 
-    let mut cleanup_failures = Vec::new();
     let mut resource_cleanup_deadline = None;
-    let mut interrupted_body_cleanup = None;
     let body_outcome = wait::with_control(control, &root_context, async {
-        if uses_browser {
-            let result = crate::ResourceScope {
-                registry: resources,
-                waits,
-                context: &root_context,
-                kind: webtest_observation::ResourceKind::BrowserContext,
-                access: webtest_observation::ResourceAccess::Exclusive,
-                cleanup_timeout: options.cleanup_timeout,
-            }
-            .run(
-                resource::BrowserResource {
-                    host: browser,
-                    session,
-                    options: &options.browser_context,
-                    context: None,
-                },
-                |created| async {
-                    page = Some(created);
-                    let result = execute_test_body(
-                        test,
-                        execution_id,
-                        events,
-                        event_sink,
-                        control,
-                        options,
-                        providers,
-                        &deadline,
-                        &mut state,
-                        &mut page,
-                        &mut active_step,
-                        &mut scope_tree,
-                        waits,
-                        &mut cleanup_failures,
-                        resources,
-                        &mut temporary,
-                    )
-                    .await;
-                    if root_context.cancellation.cause().is_some()
-                        && let TestBodyOutcome::PendingFailure(pending) = &result
-                        && let Err(cause) = pending.interruption_cleanup()
-                    {
-                        interrupted_body_cleanup = Some(cause);
-                    }
-                    drop(page.take());
-                    Ok(result)
-                },
-                |event| match event {
-                    crate::ResourceScopeEvent::Resource(event) => {
-                        emit_resource_event(events, event_sink, execution_id, &root_scope, event)
-                    }
-                    crate::ResourceScopeEvent::Wait(event) => emit_event(
+        let mut source = wait::TestBodyWait {
+            future: Some(Box::pin(execute_test_body(&services, &mut branch, &root))),
+        };
+        let result = waits
+            .wait(
+                &root_context,
+                &mut source,
+                options.cleanup_timeout,
+                |event| {
+                    emit_event(
                         events,
                         event_sink,
                         ExecutionEvent::Wait {
@@ -173,80 +150,15 @@ pub(crate) async fn execute_test(
                             scope: root_scope.clone(),
                             event,
                         },
-                    ),
+                    )
                 },
             )
             .await;
-            resource_cleanup_deadline = Some(result.cleanup_deadline);
-            cleanup_failures.extend(
-                result
-                    .secondary
-                    .into_iter()
-                    .map(|failure| browser_resource_cleanup(failure, options.cleanup_timeout)),
-            );
-            match result.primary {
-                crate::WaitCompletion::Ready(body) => Some(body),
-                crate::WaitCompletion::Cancelled(_) => None,
-                crate::WaitCompletion::Failed(crate::ResourceFailure::Host(error)) => Some(
-                    TestBodyOutcome::Provisional(ProvisionalTestOutcome::Aborted {
-                        failure: RunError::Browser(error),
-                    }),
-                ),
-                crate::WaitCompletion::Failed(crate::ResourceFailure::Invariant(error)) => Some(
-                    TestBodyOutcome::Provisional(ProvisionalTestOutcome::Aborted {
-                        failure: resource_invariant(error),
-                    }),
-                ),
-                crate::WaitCompletion::Rejected(error) => Some(TestBodyOutcome::Provisional(
-                    ProvisionalTestOutcome::Aborted {
-                        failure: RunError::Internal(format!(
-                            "wait registration invariant: {error:?}"
-                        )),
-                    },
-                )),
-            }
-        } else {
-            let mut source = wait::TestBodyWait {
-                future: Some(Box::pin(execute_test_body(
-                    test,
-                    execution_id,
-                    events,
-                    event_sink,
-                    control,
-                    options,
-                    providers,
-                    &deadline,
-                    &mut state,
-                    &mut page,
-                    &mut active_step,
-                    &mut scope_tree,
-                    waits,
-                    &mut cleanup_failures,
-                    resources,
-                    &mut temporary,
-                ))),
-            };
-            let result = waits
-                .wait(
-                    &root_context,
-                    &mut source,
-                    options.cleanup_timeout,
-                    |event| {
-                        emit_event(
-                            events,
-                            event_sink,
-                            ExecutionEvent::Wait {
-                                execution_id,
-                                scope: root_scope.clone(),
-                                event,
-                            },
-                        )
-                    },
-                )
-                .await;
-            drop(source);
-            resource_cleanup_deadline = Some(result.cleanup_deadline);
-            cleanup_failures.extend(result.secondary.into_iter().map(|failure| CleanupFailure {
+        drop(source);
+        resource_cleanup_deadline = Some(result.cleanup_deadline);
+        branch
+            .cleanup_failures
+            .extend(result.secondary.into_iter().map(|failure| CleanupFailure {
                 resource: CleanupResource::ExecutionScope {
                     scope_id: root_context.scope_id,
                 },
@@ -257,37 +169,26 @@ pub(crate) async fn execute_test(
                     },
                 },
             }));
-            match result.primary {
-                crate::WaitCompletion::Ready(body) => Some(body),
-                crate::WaitCompletion::Cancelled(_) => None,
-                crate::WaitCompletion::Failed(error) => {
-                    cleanup_failures.push(CleanupFailure {
-                        resource: CleanupResource::ExecutionScope {
-                            scope_id: root_context.scope_id,
-                        },
-                        cause: error,
-                    });
-                    None
-                }
-                crate::WaitCompletion::Rejected(error) => Some(TestBodyOutcome::Provisional(
-                    ProvisionalTestOutcome::Aborted {
-                        failure: RunError::Internal(format!(
-                            "wait registration invariant: {error:?}"
-                        )),
+        match result.primary {
+            crate::WaitCompletion::Ready(body) => Some(body),
+            crate::WaitCompletion::Cancelled(_) => None,
+            crate::WaitCompletion::Failed(error) => {
+                branch.cleanup_failures.push(CleanupFailure {
+                    resource: CleanupResource::ExecutionScope {
+                        scope_id: root_context.scope_id,
                     },
-                )),
+                    cause: error,
+                });
+                None
             }
+            crate::WaitCompletion::Rejected(error) => Some(TestBodyOutcome::Provisional(
+                ProvisionalTestOutcome::Aborted {
+                    failure: RunError::Internal(format!("wait registration invariant: {error:?}")),
+                },
+            )),
         }
     })
     .await;
-    if let Some(cause) = interrupted_body_cleanup {
-        cleanup_failures.push(CleanupFailure {
-            resource: CleanupResource::ExecutionScope {
-                scope_id: root_context.scope_id,
-            },
-            cause,
-        });
-    }
     let outcome = match body_outcome {
         Some(TestBodyOutcome::PendingFailure(pending)) => {
             let failure_result = process_failure(FailureInput {
@@ -339,24 +240,20 @@ pub(crate) async fn execute_test(
             .cause()
             .is_some_and(|cause| cause.reason != webtest_host::CancellationReason::Timeout) =>
         {
-            if let Some(cause) = root_context.cancellation.cause() {
-                scope_tree.interrupt(cause, events, event_sink);
-            }
             ProvisionalTestOutcome::Cancelled {
                 reason: CancellationReason::Requested,
             }
         }
         None => {
-            scope_tree.interrupt(
-                webtest_host::Cancellation {
+            root_context
+                .cancellation
+                .cancel(webtest_host::Cancellation {
                     reason: webtest_host::CancellationReason::Timeout,
                     causing_scope_id: root_context.scope_id,
-                },
-                events,
-                event_sink,
-            );
-            let active =
-                active_step.and_then(|id| test.steps().into_iter().find(|step| step.id == id));
+                });
+            let active = branch
+                .active_step
+                .and_then(|id| test.steps().into_iter().find(|step| step.id == id));
             if let Some(control) = control {
                 control.after_test_timeout(test, active);
             }
@@ -374,32 +271,30 @@ pub(crate) async fn execute_test(
             );
             ProvisionalTestOutcome::TimedOut {
                 timeout: options.test_timeout,
-                active_step,
+                active_step: branch.active_step,
                 origin: None,
             }
         }
     };
 
     if matches!(outcome, ProvisionalTestOutcome::Cancelled { .. }) {
-        scope_tree.interrupt(
-            webtest_host::Cancellation {
+        root_context
+            .cancellation
+            .cancel(webtest_host::Cancellation {
                 reason: control.map_or(
                     webtest_host::CancellationReason::UserCancelled,
                     RunControl::cancellation_reason,
                 ),
                 causing_scope_id: root_context.scope_id,
-            },
-            events,
-            event_sink,
-        );
+            });
     }
-    drop(page.take());
+    drop(branch.page.take());
     let cleanup_deadline = resource_cleanup_deadline.map_or_else(
         || crate::cleanup::CleanupDeadline::new(options.cleanup_timeout),
         |at| crate::cleanup::CleanupDeadline::at(at, options.cleanup_timeout),
     );
     if let Err(error) = waits.validate_owner_finished(root_context.scope_id) {
-        cleanup_failures.push(CleanupFailure {
+        branch.cleanup_failures.push(CleanupFailure {
             resource: CleanupResource::ExecutionScope {
                 scope_id: root_context.scope_id,
             },
@@ -408,11 +303,12 @@ pub(crate) async fn execute_test(
             },
         });
     }
-    cleanup_failures.extend(
-        temporary
+    branch.cleanup_failures.extend(
+        branch
+            .temporary
             .release(
                 None,
-                &mut state,
+                &mut branch.bindings,
                 cleanup_deadline,
                 &temporary::ResourceEvents {
                     registry: resources,
@@ -427,7 +323,7 @@ pub(crate) async fn execute_test(
         outcome,
         ProvisionalTestOutcome::TimedOut { .. } | ProvisionalTestOutcome::Cancelled { .. }
     ) && uses_browser
-        && let Some(mut tainted) = session.take()
+        && let Some(mut tainted) = branch.session.take()
         && let Err(error) = cleanup_deadline
             .run(
                 CleanupResource::BrowserSession,
@@ -436,16 +332,21 @@ pub(crate) async fn execute_test(
             )
             .await
     {
-        cleanup_failures.push(error);
+        branch.cleanup_failures.push(error);
     }
     if let Err(error) = resources.validate_owner_finished(root_scope.execution_context.scope_id) {
-        cleanup_failures.push(resource_cleanup_invariant(error));
+        branch
+            .cleanup_failures
+            .push(resource_cleanup_invariant(error));
     }
-    let bindings = state.final_transferable_bindings(&options.redacted_json_fields);
-    for failure in &cleanup_failures {
+    *session = branch.session.take();
+    let bindings = branch
+        .bindings
+        .final_transferable_bindings(&options.redacted_json_fields);
+    for failure in &branch.cleanup_failures {
         emit_cleanup_failed(events, event_sink, execution_id, Some(test.id), failure);
     }
-    let outcome = combine_test_outcome(outcome, cleanup_failures);
+    let outcome = combine_test_outcome(outcome, branch.cleanup_failures);
     let scope_outcome = match &outcome {
         TestOutcome::Passed => webtest_observation::ScopeOutcome::Passed,
         TestOutcome::Failed(_) => webtest_observation::ScopeOutcome::Failed,
@@ -455,7 +356,12 @@ pub(crate) async fn execute_test(
         }
         TestOutcome::Aborted { .. } => webtest_observation::ScopeOutcome::Aborted,
     };
-    scope_tree.leave(scope_outcome, events, event_sink);
+    branch
+        .scopes
+        .finish_descendants(&root, execution_id, events, event_sink);
+    branch
+        .scopes
+        .finish(&root, scope_outcome, execution_id, events, event_sink);
     let outcome_kind = outcome.finished_kind();
     let failure_class = outcome.failure_class();
     emit_event(
@@ -475,6 +381,7 @@ pub(crate) async fn execute_test(
             outcome,
             duration: test_started.elapsed(),
             bindings,
+            branches: branch.completed_branches,
         },
     }
 }
@@ -495,48 +402,21 @@ impl TestDeadline {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn execute_test_body(
-    test: &PlannedTest,
-    execution_id: ExecutionId,
-    events: &EventBuffer,
-    event_sink: Option<&dyn RunEventSink>,
-    control: Option<&dyn RunControl>,
-    options: &RunnerOptions,
-    providers: &ProviderRegistry,
-    deadline: &TestDeadline,
-    state: &mut TestExecutionState,
-    page: &mut Option<Box<dyn Page>>,
-    active_step: &mut Option<StepId>,
-    scope_tree: &mut scopes::ScopeTree,
-    waits: &crate::WaitRegistry,
-    cleanup_failures: &mut Vec<CleanupFailure>,
-    resources: &crate::ResourceRegistry,
-    temporary: &mut temporary::TemporaryResources,
+    services: &ExecutionServices<'_>,
+    branch: &mut branch::BranchState,
+    root: &scopes::ExecutionScope,
 ) -> TestBodyOutcome {
-    TreeExecution {
-        test,
-        execution_id,
-        events,
-        event_sink,
-        control,
-        options,
-        providers,
-        deadline,
-        state,
-        page,
-        active_step,
-        scope_tree,
-        waits,
-        cleanup_failures,
-        resources,
-        temporary,
-    }
-    .node(&test.body)
-    .await
+    TreeExecution { services, branch }
+        .body(&services.test.body, root)
+        .await
 }
 
-struct TreeExecution<'a> {
+/// Shared immutable inputs and run services. No bindings, page handles, active
+/// operation, or mutable scope cursor is stored here.
+struct ExecutionServices<'a> {
+    plan: &'a TestPlan,
+    observations: &'a ObservationStore,
     test: &'a PlannedTest,
     execution_id: ExecutionId,
     events: &'a EventBuffer,
@@ -545,54 +425,36 @@ struct TreeExecution<'a> {
     options: &'a RunnerOptions,
     providers: &'a ProviderRegistry,
     deadline: &'a TestDeadline,
-    state: &'a mut TestExecutionState,
-    page: &'a mut Option<Box<dyn Page>>,
-    active_step: &'a mut Option<StepId>,
-    scope_tree: &'a mut scopes::ScopeTree,
     waits: &'a crate::WaitRegistry,
-    cleanup_failures: &'a mut Vec<CleanupFailure>,
     resources: &'a crate::ResourceRegistry,
-    temporary: &'a mut temporary::TemporaryResources,
+    scopes: &'a scopes::ScopeFactory,
+    browser: &'a dyn BrowserHost,
 }
 
-impl TreeExecution<'_> {
+struct TreeExecution<'a, 'b> {
+    services: &'a ExecutionServices<'a>,
+    branch: &'b mut branch::BranchState,
+}
+
+impl TreeExecution<'_, '_> {
     fn node<'a>(
         &'a mut self,
         node: &'a webtest_plan::PlanNode,
+        parent: &'a scopes::ExecutionScope,
     ) -> std::pin::Pin<Box<dyn Future<Output = TestBodyOutcome> + Send + 'a>> {
         Box::pin(async move {
-            let is_root = node.path.is_empty();
-            if !is_root {
-                self.scope_tree.enter(node, self.events, self.event_sink);
-            }
-            let outcome = match &node.kind {
-                webtest_plan::PlanNodeKind::Sequence { children } => {
-                    let mut outcome = TestBodyOutcome::Provisional(ProvisionalTestOutcome::Passed);
-                    for child in children {
-                        outcome = self.node(child).await;
-                        if !matches!(
-                            outcome,
-                            TestBodyOutcome::Provisional(ProvisionalTestOutcome::Passed)
-                        ) || !self.cleanup_failures.is_empty()
-                        {
-                            break;
-                        }
-                    }
-                    outcome
-                }
-                webtest_plan::PlanNodeKind::Operation { step } => self.leaf(step).await,
-                webtest_plan::PlanNodeKind::Timeout {
-                    child,
-                    duration,
-                    cleanup_timeout,
-                } => {
-                    self.timeout_node(node, child, *duration, *cleanup_timeout)
-                        .await
-                }
-            };
+            let scope = self.services.scopes.child(parent, node);
+            self.branch.scopes.start(
+                &scope,
+                self.services.execution_id,
+                self.services.events,
+                self.services.event_sink,
+            );
+            let outcome = self.body(node, &scope).await;
             use webtest_observation::ScopeOutcome;
             let terminal = match &outcome {
-                _ if !self.cleanup_failures.is_empty() => ScopeOutcome::Aborted,
+                TestBodyOutcome::Provisional(ProvisionalTestOutcome::Finalized(outcome)) if self.branch.cleanup_failures.is_empty() => scope_outcome(outcome),
+                _ if !self.branch.cleanup_failures.is_empty() => ScopeOutcome::Aborted,
                 TestBodyOutcome::Provisional(ProvisionalTestOutcome::Passed) => {
                     ScopeOutcome::Passed
                 }
@@ -600,12 +462,12 @@ impl TreeExecution<'_> {
                     ScopeOutcome::Cancelled
                 }
                 TestBodyOutcome::Provisional(ProvisionalTestOutcome::TimedOut { .. }) => {
-                    if self.scope_tree.current_context().is_some_and(|context| {
-                        context
-                            .cancellation
-                            .cause()
-                            .is_some_and(|cause| cause.causing_scope_id == context.scope_id)
-                    }) {
+                    if scope
+                        .context
+                        .cancellation
+                        .cause()
+                        .is_some_and(|cause| cause.causing_scope_id == scope.id())
+                    {
                         ScopeOutcome::TimedOut
                     } else {
                         ScopeOutcome::Failed
@@ -621,12 +483,198 @@ impl TreeExecution<'_> {
                 }
                 _ => ScopeOutcome::Failed,
             };
-            if !is_root {
-                self.scope_tree
-                    .leave(terminal, self.events, self.event_sink);
-            }
+            self.branch.scopes.finish(
+                &scope,
+                terminal,
+                self.services.execution_id,
+                self.services.events,
+                self.services.event_sink,
+            );
             outcome
         })
+    }
+
+    fn body<'a>(
+        &'a mut self,
+        node: &'a webtest_plan::PlanNode,
+        scope: &'a scopes::ExecutionScope,
+    ) -> std::pin::Pin<Box<dyn Future<Output = TestBodyOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            match &node.kind {
+                webtest_plan::PlanNodeKind::Parallel { children, .. } => {
+                    self.parallel_node(children, scope).await
+                }
+                webtest_plan::PlanNodeKind::ResourceScope { resource, body } => {
+                    self.resource_node(*resource, body, scope).await
+                }
+                webtest_plan::PlanNodeKind::Sequence { children } => {
+                    let mut outcome = TestBodyOutcome::Provisional(ProvisionalTestOutcome::Passed);
+                    for child in children {
+                        outcome = self.node(child, scope).await;
+                        if !matches!(
+                            outcome,
+                            TestBodyOutcome::Provisional(ProvisionalTestOutcome::Passed)
+                        ) || !self.branch.cleanup_failures.is_empty()
+                        {
+                            break;
+                        }
+                    }
+                    outcome
+                }
+                webtest_plan::PlanNodeKind::Operation { step } => self.leaf(step, scope).await,
+                webtest_plan::PlanNodeKind::Timeout {
+                    child,
+                    duration,
+                    cleanup_timeout,
+                } => {
+                    self.timeout_node(node, child, *duration, *cleanup_timeout, scope)
+                        .await
+                }
+            }
+        })
+    }
+
+    async fn resource_node(
+        &mut self,
+        resource: webtest_plan::ResourcePlan,
+        body: &webtest_plan::PlanNode,
+        owner: &scopes::ExecutionScope,
+    ) -> TestBodyOutcome {
+        match resource {
+            webtest_plan::ResourcePlan::BrowserContext => {
+                self.browser_resource_node(body, owner).await
+            }
+        }
+    }
+
+    async fn browser_resource_node(
+        &mut self,
+        body: &webtest_plan::PlanNode,
+        owner: &scopes::ExecutionScope,
+    ) -> TestBodyOutcome {
+        if self.branch.page.is_some() {
+            return TestBodyOutcome::Provisional(ProvisionalTestOutcome::Aborted {
+                failure: resource_invariant(crate::ResourceInvariant::AccessConflict),
+            });
+        }
+        let services = self.services;
+        let context = owner.context.clone();
+        let scope = owner.event.clone();
+        let mut session = self.branch.session.take();
+        let mut interrupted_body_cleanup = None;
+        let result = crate::ResourceScope {
+            registry: services.resources,
+            waits: services.waits,
+            context: &context,
+            kind: webtest_observation::ResourceKind::BrowserContext,
+            access: webtest_observation::ResourceAccess::Exclusive,
+            cleanup_timeout: services.options.cleanup_timeout,
+        }
+        .run(
+            resource::BrowserResource {
+                host: services.browser,
+                session: &mut session,
+                options: &services.options.browser_context,
+                context: None,
+            },
+            |created| async {
+                self.branch.page = Some(created);
+                let result = self.node(body, owner).await;
+                if context.cancellation.cause().is_some()
+                    && let TestBodyOutcome::PendingFailure(pending) = &result
+                    && let Err(cause) = pending.interruption_cleanup()
+                {
+                    interrupted_body_cleanup = Some(cause);
+                }
+                drop(self.branch.page.take());
+                Ok(result)
+            },
+            |event| match event {
+                crate::ResourceScopeEvent::Resource(event) => emit_resource_event(
+                    services.events,
+                    services.event_sink,
+                    services.execution_id,
+                    &scope,
+                    event,
+                ),
+                crate::ResourceScopeEvent::Wait(event) => emit_event(
+                    services.events,
+                    services.event_sink,
+                    ExecutionEvent::Wait {
+                        execution_id: services.execution_id,
+                        scope: scope.clone(),
+                        event,
+                    },
+                ),
+            },
+        )
+        .await;
+        self.branch.session = session;
+        self.branch.cleanup_failures.extend(
+            result
+                .secondary
+                .into_iter()
+                .map(|failure| browser_resource_cleanup(failure, services.options.cleanup_timeout)),
+        );
+        if let Some(cause) = interrupted_body_cleanup {
+            self.branch.cleanup_failures.push(CleanupFailure {
+                resource: CleanupResource::ExecutionScope {
+                    scope_id: context.scope_id,
+                },
+                cause,
+            });
+        }
+        // Temporary handles transferred during the body belong to this explicit
+        // resource scope and finish before its terminal scope event.
+        let owned_scopes = self.branch.scopes.subtree_ids(owner);
+        self.branch.cleanup_failures.extend(
+            self.branch
+                .temporary
+                .release(
+                    Some(&owned_scopes),
+                    &mut self.branch.bindings,
+                    crate::cleanup::CleanupDeadline::at(
+                        result.cleanup_deadline,
+                        services.options.cleanup_timeout,
+                    ),
+                    &temporary::ResourceEvents {
+                        registry: services.resources,
+                        execution_id: services.execution_id,
+                        events: services.events,
+                        sink: services.event_sink,
+                    },
+                )
+                .await,
+        );
+        self.branch.scopes.finish_descendants(
+            owner,
+            services.execution_id,
+            services.events,
+            services.event_sink,
+        );
+        match result.primary {
+            crate::WaitCompletion::Ready(body) => body,
+            crate::WaitCompletion::Cancelled(_) => {
+                TestBodyOutcome::Provisional(ProvisionalTestOutcome::Cancelled {
+                    reason: CancellationReason::Requested,
+                })
+            }
+            crate::WaitCompletion::Failed(crate::ResourceFailure::Host(error)) => {
+                TestBodyOutcome::Provisional(ProvisionalTestOutcome::Aborted {
+                    failure: RunError::Browser(error),
+                })
+            }
+            crate::WaitCompletion::Failed(crate::ResourceFailure::Invariant(error)) => {
+                TestBodyOutcome::Provisional(ProvisionalTestOutcome::Aborted {
+                    failure: resource_invariant(error),
+                })
+            }
+            crate::WaitCompletion::Rejected(error) => {
+                TestBodyOutcome::Provisional(ProvisionalTestOutcome::Aborted {
+                    failure: RunError::Internal(format!("wait registration invariant: {error:?}")),
+                })
+            }
+        }
     }
 
     async fn timeout_node(
@@ -635,26 +683,21 @@ impl TreeExecution<'_> {
         child: &webtest_plan::PlanNode,
         duration: Duration,
         cleanup_timeout: Option<Duration>,
+        owner: &scopes::ExecutionScope,
     ) -> TestBodyOutcome {
-        let (Some(context), Some(scope)) = (
-            self.scope_tree.current_context(),
-            self.scope_tree.current_event(),
-        ) else {
-            return TestBodyOutcome::Provisional(ProvisionalTestOutcome::Aborted {
-                failure: RunError::Internal("timeout node has no owning scope".into()),
-            });
-        };
+        let context = owner.context.clone();
+        let scope = owner.event.clone();
         let cleanup_timeout = cleanup_timeout
-            .unwrap_or(self.options.cleanup_timeout)
-            .min(self.options.cleanup_timeout);
-        let waits = self.waits;
-        let events = self.events;
-        let sink = self.event_sink;
-        let execution_id = self.execution_id;
-        let visible = self.state.binding_checkpoint();
+            .unwrap_or(self.services.options.cleanup_timeout)
+            .min(self.services.options.cleanup_timeout);
+        let waits = self.services.waits;
+        let events = self.services.events;
+        let sink = self.services.event_sink;
+        let execution_id = self.services.execution_id;
+        let visible = self.branch.bindings.binding_checkpoint();
         let result = {
             let mut source = wait::TestBodyWait {
-                future: Some(Box::pin(self.node(child))),
+                future: Some(Box::pin(self.node(child, owner))),
             };
             waits
                 .wait(&context, &mut source, cleanup_timeout, |event| {
@@ -670,16 +713,17 @@ impl TreeExecution<'_> {
                 })
                 .await
         };
-        self.scope_tree.unwind_to(context.scope_id, events, sink);
-        self.state.restore_bindings(&visible);
-        self.cleanup_failures.extend(
-            self.temporary
+        let owned_scopes = self.branch.scopes.subtree_ids(owner);
+        self.branch.bindings.restore_bindings(&visible);
+        self.branch.cleanup_failures.extend(
+            self.branch
+                .temporary
                 .release(
-                    Some(context.scope_id),
-                    self.state,
+                    Some(&owned_scopes),
+                    &mut self.branch.bindings,
                     crate::cleanup::CleanupDeadline::at(result.cleanup_deadline, cleanup_timeout),
                     &temporary::ResourceEvents {
-                        registry: self.resources,
+                        registry: self.services.resources,
                         execution_id,
                         events,
                         sink,
@@ -687,11 +731,20 @@ impl TreeExecution<'_> {
                 )
                 .await,
         );
-        if let Err(error) = self.resources.validate_owner_finished(context.scope_id) {
-            self.cleanup_failures
+        self.branch
+            .scopes
+            .finish_descendants(owner, execution_id, events, sink);
+        if let Err(error) = self
+            .services
+            .resources
+            .validate_owner_finished(context.scope_id)
+        {
+            self.branch
+                .cleanup_failures
                 .push(resource_cleanup_invariant(error));
         }
-        self.cleanup_failures
+        self.branch
+            .cleanup_failures
             .extend(result.secondary.into_iter().map(|failure| CleanupFailure {
                 resource: CleanupResource::ExecutionScope {
                     scope_id: context.scope_id,
@@ -711,7 +764,7 @@ impl TreeExecution<'_> {
             {
                 TestBodyOutcome::Provisional(ProvisionalTestOutcome::TimedOut {
                     timeout: duration,
-                    active_step: *self.active_step,
+                    active_step: self.branch.active_step,
                     origin: Some(node.origin),
                 })
             }
@@ -721,7 +774,7 @@ impl TreeExecution<'_> {
                 })
             }
             crate::WaitCompletion::Failed(cause) => {
-                self.cleanup_failures.push(CleanupFailure {
+                self.branch.cleanup_failures.push(CleanupFailure {
                     resource: CleanupResource::ExecutionScope {
                         scope_id: context.scope_id,
                     },
@@ -739,24 +792,23 @@ impl TreeExecution<'_> {
         }
     }
 
-    async fn leaf(&mut self, step: &PlannedStep) -> TestBodyOutcome {
-        let Some(context) = self.scope_tree.current_context() else {
-            return TestBodyOutcome::Provisional(ProvisionalTestOutcome::Aborted {
-                failure: RunError::Internal("operation has no owning execution scope".into()),
-            });
-        };
-        let host_context = std::sync::Arc::new(context);
-        let test = self.test;
-        let execution_id = self.execution_id;
-        let events = self.events;
-        let event_sink = self.event_sink;
-        let control = self.control;
-        let options = self.options;
-        let providers = self.providers;
-        let deadline = self.deadline;
-        let state = &mut *self.state;
-        let page = &mut *self.page;
-        let active_step = &mut *self.active_step;
+    async fn leaf(
+        &mut self,
+        step: &PlannedStep,
+        scope: &scopes::ExecutionScope,
+    ) -> TestBodyOutcome {
+        let host_context = std::sync::Arc::new(scope.context.clone());
+        let test = self.services.test;
+        let execution_id = self.services.execution_id;
+        let events = self.services.events;
+        let event_sink = self.services.event_sink;
+        let control = self.services.control;
+        let options = self.services.options;
+        let providers = self.services.providers;
+        let deadline = self.services.deadline;
+        let state = &mut self.branch.bindings;
+        let page = &mut self.branch.page;
+        let active_step = &mut self.branch.active_step;
 
         *active_step = Some(step.id);
         if host_context.cancellation.cause().is_some()
@@ -828,19 +880,17 @@ impl TreeExecution<'_> {
             host_context.clone(),
         )
         .await;
-        if let Some((owner, context)) = self.scope_tree.resource_owner()
-            && let Err(error) = self.temporary.adopt(
-                state,
-                &owner,
-                &context,
-                &temporary::ResourceEvents {
-                    registry: self.resources,
-                    execution_id,
-                    events,
-                    sink: event_sink,
-                },
-            )
-        {
+        if let Err(error) = self.branch.temporary.adopt(
+            state,
+            &scope.resource_owner.event,
+            &scope.resource_owner.context,
+            &temporary::ResourceEvents {
+                registry: self.services.resources,
+                execution_id,
+                events,
+                sink: event_sink,
+            },
+        ) {
             return TestBodyOutcome::Provisional(ProvisionalTestOutcome::Aborted {
                 failure: resource_invariant(error),
             });
@@ -1016,54 +1066,35 @@ fn combine_test_outcome(
     provisional: ProvisionalTestOutcome,
     cleanup_failures: Vec<CleanupFailure>,
 ) -> TestOutcome {
-    if cleanup_failures.is_empty() {
-        return match provisional {
-            ProvisionalTestOutcome::Passed => TestOutcome::Passed,
-            ProvisionalTestOutcome::Failed(failure) => TestOutcome::Failed(failure),
-            ProvisionalTestOutcome::TimedOut {
-                timeout,
-                active_step,
-                ..
-            } => TestOutcome::TimedOut {
-                timeout,
-                active_step,
-            },
-            ProvisionalTestOutcome::Cancelled { reason } => TestOutcome::Cancelled { reason },
-            ProvisionalTestOutcome::Aborted { failure } => TestOutcome::Aborted {
-                failure,
-                prior_outcome: None,
-            },
-        };
-    }
+    let outcome = match provisional {
+        ProvisionalTestOutcome::Finalized(outcome) => *outcome,
+        ProvisionalTestOutcome::Passed => TestOutcome::Passed,
+        ProvisionalTestOutcome::Failed(failure) => TestOutcome::Failed(failure),
+        ProvisionalTestOutcome::TimedOut { timeout, active_step, .. } => TestOutcome::TimedOut { timeout, active_step },
+        ProvisionalTestOutcome::Cancelled { reason } => TestOutcome::Cancelled { reason },
+        ProvisionalTestOutcome::Aborted { failure } => TestOutcome::Aborted { failure, prior_outcome: None },
+    };
+    if cleanup_failures.is_empty() { return outcome; }
+    let prior_outcome = match outcome {
+        TestOutcome::Aborted { failure, prior_outcome } => return TestOutcome::Aborted {
+            failure: failure.combine_with_cleanup(cleanup_failures), prior_outcome,
+        },
+        TestOutcome::Passed | TestOutcome::Skipped { .. } => None,
+        TestOutcome::Failed(failure) => Some(Box::new(PriorTestOutcome::Failed(failure))),
+        TestOutcome::TimedOut { timeout, active_step } => Some(Box::new(PriorTestOutcome::TimedOut { timeout, active_step })),
+        TestOutcome::Cancelled { reason } => Some(Box::new(PriorTestOutcome::Cancelled { reason })),
+    };
+    TestOutcome::Aborted { failure: cleanup_run_error(cleanup_failures), prior_outcome }
+}
 
-    match provisional {
-        ProvisionalTestOutcome::Aborted { failure } => TestOutcome::Aborted {
-            failure: failure.combine_with_cleanup(cleanup_failures),
-            prior_outcome: None,
-        },
-        ProvisionalTestOutcome::Passed => TestOutcome::Aborted {
-            failure: cleanup_run_error(cleanup_failures),
-            prior_outcome: None,
-        },
-        ProvisionalTestOutcome::Failed(failure) => TestOutcome::Aborted {
-            failure: cleanup_run_error(cleanup_failures),
-            prior_outcome: Some(Box::new(PriorTestOutcome::Failed(failure))),
-        },
-        ProvisionalTestOutcome::TimedOut {
-            timeout,
-            active_step,
-            ..
-        } => TestOutcome::Aborted {
-            failure: cleanup_run_error(cleanup_failures),
-            prior_outcome: Some(Box::new(PriorTestOutcome::TimedOut {
-                timeout,
-                active_step,
-            })),
-        },
-        ProvisionalTestOutcome::Cancelled { reason } => TestOutcome::Aborted {
-            failure: cleanup_run_error(cleanup_failures),
-            prior_outcome: Some(Box::new(PriorTestOutcome::Cancelled { reason })),
-        },
+fn scope_outcome(outcome: &TestOutcome) -> webtest_observation::ScopeOutcome {
+    use webtest_observation::ScopeOutcome;
+    match outcome {
+        TestOutcome::Passed => ScopeOutcome::Passed,
+        TestOutcome::Failed(_) => ScopeOutcome::Failed,
+        TestOutcome::TimedOut { .. } => ScopeOutcome::TimedOut,
+        TestOutcome::Cancelled { .. } | TestOutcome::Skipped { .. } => ScopeOutcome::Cancelled,
+        TestOutcome::Aborted { .. } => ScopeOutcome::Aborted,
     }
 }
 

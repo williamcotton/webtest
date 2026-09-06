@@ -28,6 +28,17 @@ pub struct TestResult {
     pub outcome: TestOutcome,
     pub duration: Duration,
     pub bindings: BTreeMap<String, Value>,
+    /// Ordered child results, including successes and cancellation/cleanup facts.
+    /// `outcome` summarizes this aggregate; it never replaces the child results.
+    pub branches: Vec<BranchResult>,
+}
+
+#[derive(Clone, Debug)]
+pub struct BranchResult {
+    pub scope: webtest_observation::ScopeEvent,
+    pub outcome: TestOutcome,
+    pub duration: Duration,
+    pub branches: Vec<BranchResult>,
 }
 
 #[derive(Clone, Debug)]

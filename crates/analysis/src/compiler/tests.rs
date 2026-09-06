@@ -573,12 +573,27 @@ fn execution_tree_preserves_blocks_ranges_paths_and_revision() {
         panic!("root sequence")
     };
     assert!(root.path.is_empty());
+    assert_eq!(children.len(), 1);
+    let resource = &children[0];
+    assert_eq!(resource.path, [0]);
+    assert_eq!(resource.origin, root.origin);
+    let webtest_plan::PlanNodeKind::ResourceScope {
+        resource: webtest_plan::ResourcePlan::BrowserContext,
+        body,
+    } = &resource.kind
+    else {
+        panic!("explicit browser resource lifetime")
+    };
+    assert_eq!(body.path, [0, 0]);
+    let webtest_plan::PlanNodeKind::Sequence { children } = &body.kind else {
+        panic!("resource body sequence")
+    };
     assert_eq!(children.len(), 2);
     let webtest_plan::PlanNodeKind::Sequence { children: server } = &children[0].kind else {
         panic!("server sequence")
     };
-    assert_eq!(server[0].path, [0, 0]);
-    assert_eq!(server[1].path, [0, 1]);
+    assert_eq!(server[0].path, [0, 0, 0, 0]);
+    assert_eq!(server[1].path, [0, 0, 0, 1]);
     assert_eq!(
         server[1].source_revision,
         webtest_text::SourceRevision::of(source)

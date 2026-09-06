@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+};
 use webtest_model::ExecutionScopeId;
 use webtest_observation::{
     CleanupCause, CleanupFailure, CleanupResource, ExecutionId, ResourceAccess, ResourceKey,
@@ -85,7 +88,7 @@ impl TemporaryResources {
 
     pub async fn release(
         &mut self,
-        owner: Option<ExecutionScopeId>,
+        owner: Option<&BTreeSet<ExecutionScopeId>>,
         state: &mut TestExecutionState,
         deadline: CleanupDeadline,
         output: &ResourceEvents<'_>,
@@ -93,7 +96,7 @@ impl TemporaryResources {
         let paths: Vec<_> = self
             .owned
             .iter()
-            .filter(|(_, entry)| owner.is_none_or(|owner| entry.context.scope_id == owner))
+            .filter(|(_, entry)| owner.is_none_or(|owner| owner.contains(&entry.context.scope_id)))
             .map(|(path, _)| path.clone())
             .collect();
         let mut failures = Vec::new();

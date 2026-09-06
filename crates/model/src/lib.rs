@@ -20,6 +20,15 @@ pub struct PlanNodeId(pub [u8; 32]);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PlanDeclarationId(pub [u8; 32]);
 
+/// Shared static/runtime access policy. Mutable or order-sensitive resources are
+/// exclusive; overlapping shared access requires an explicit resource contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceAccess {
+    Shared,
+    Exclusive,
+}
+
 macro_rules! execution_identity {
     ($($name:ident),* $(,)?) => {$(
         #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

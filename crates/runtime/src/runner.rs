@@ -345,6 +345,7 @@ fn skip_tests(
             },
             duration: std::time::Duration::ZERO,
             bindings: BTreeMap::<String, Value>::new(),
+            branches: Vec::new(),
         });
     }
 }

@@ -124,6 +124,14 @@ impl<'a> Compiler<'a> {
                     Capability::Pure,
                     Vec::new(),
                 );
+                let body =
+                    if body.required_resources().iter().any(|usage| {
+                        usage.resource == webtest_plan::ResourceReference::BrowserContext
+                    }) {
+                        body.with_browser_resource(declaration_id)
+                    } else {
+                        body
+                    };
                 webtest_plan::PlannedTest {
                     id: test.id,
                     declaration_id,

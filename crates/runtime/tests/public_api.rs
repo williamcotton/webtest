@@ -28,6 +28,7 @@ fn test_result(outcome: TestOutcome) -> TestResult {
         outcome,
         duration: Duration::ZERO,
         bindings: BTreeMap::new(),
+        branches: Vec::new(),
     }
 }
 

@@ -12,12 +12,7 @@ pub enum ResourceKind {
     Conformance,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ResourceAccess {
-    Shared,
-    Exclusive,
-}
+pub use webtest_model::ResourceAccess;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -700,22 +700,29 @@ async fn scope_timeout_cancels_descendants_with_the_causing_scope_identity() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(terminal.len(), 2);
     assert_eq!(
-        terminal[0].outcome,
-        Some(webtest_observation::ScopeOutcome::Cancelled)
+        terminal.len(),
+        4,
+        "operation, body, resource scope, and root"
     );
+    let root = terminal.last().unwrap();
     assert_eq!(
-        terminal[1].outcome,
+        root.outcome,
         Some(webtest_observation::ScopeOutcome::TimedOut)
     );
-    assert_eq!(
-        terminal[0].cancellation,
-        Some(webtest_observation::ScopeCancellation {
-            reason: webtest_host::CancellationReason::Timeout,
-            causing_scope_id: terminal[1].execution_context.scope_id,
-        })
-    );
+    for descendant in &terminal[..3] {
+        assert_eq!(
+            descendant.outcome,
+            Some(webtest_observation::ScopeOutcome::Cancelled)
+        );
+        assert_eq!(
+            descendant.cancellation,
+            Some(webtest_observation::ScopeCancellation {
+                reason: webtest_host::CancellationReason::Timeout,
+                causing_scope_id: root.execution_context.scope_id,
+            })
+        );
+    }
 }
 
 struct ScopeLifecycleSink(Arc<LifecycleState>);

@@ -39,6 +39,31 @@ impl TestExecutionState {
         &self.environment
     }
 
+    /// Transfer only immutable values into a sibling. Resource handles and their
+    /// ownership stay in the source branch; local writes remain independently owned.
+    pub(super) fn transferable_snapshot(&self) -> Self {
+        let environment: HashMap<_, _> = self
+            .environment
+            .iter()
+            .filter(|(_, value)| runtime_transferable(value))
+            .map(|(id, value)| (*id, value.clone()))
+            .collect();
+        let binding_names = self
+            .binding_names
+            .iter()
+            .filter(|(id, _)| environment.contains_key(id))
+            .map(|(id, name)| (*id, name.clone()))
+            .collect();
+        Self {
+            environment,
+            binding_names,
+            secrets: self.secrets.clone(),
+            redacted_fields: self.redacted_fields.clone(),
+            project_root: self.project_root.clone(),
+            owned_temporary_directories: BTreeSet::new(),
+        }
+    }
+
     pub(super) fn binding_checkpoint(&self) -> BTreeSet<BindingId> {
         self.environment.keys().copied().collect()
     }

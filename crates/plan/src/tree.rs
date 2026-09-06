@@ -18,6 +18,14 @@ pub struct PlanNode {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PlanNodeKind {
+    Parallel {
+        children: Vec<PlanNode>,
+        failure_policy: ParallelFailurePolicy,
+    },
+    ResourceScope {
+        resource: ResourcePlan,
+        body: Box<PlanNode>,
+    },
     Timeout {
         child: Box<PlanNode>,
         duration: std::time::Duration,
@@ -31,9 +39,125 @@ pub enum PlanNodeKind {
     },
 }
 
+/// A portable acquisition/ready/teardown recipe. Backend handles and runtime
+/// resource generations are injected by the host and never serialized here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourcePlan {
+    /// Acquire one exclusive browser context, acknowledge a ready page, execute
+    /// the body, and explicitly close the context exactly once on every outcome.
+    BrowserContext,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParallelFailurePolicy {
+    CollectTestFailures,
+}
+pub const MAX_PARALLEL_BRANCHES: usize = 64;
+
 pub const MAX_CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 impl PlanNode {
+    pub fn parallel(
+        test: PlanDeclarationId,
+        origin: SyntaxOrigin,
+        revision: SourceRevision,
+        path: Vec<u32>,
+        children: Vec<Self>,
+    ) -> Self {
+        let required_capabilities = children
+            .iter()
+            .flat_map(|child| child.required_capabilities.iter().copied())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let mut node = Self {
+            id: PlanNodeId([0; 32]),
+            path,
+            origin,
+            source_revision: revision,
+            required_capabilities,
+            kind: PlanNodeKind::Parallel {
+                children,
+                failure_policy: ParallelFailurePolicy::CollectTestFailures,
+            },
+        };
+        node.assign_identity(test);
+        node
+    }
+
+    pub fn resource_scope(
+        test: PlanDeclarationId,
+        origin: SyntaxOrigin,
+        revision: SourceRevision,
+        path: Vec<u32>,
+        resource: ResourcePlan,
+        body: Self,
+    ) -> Self {
+        let mut node = Self {
+            id: PlanNodeId([0; 32]),
+            path,
+            origin,
+            source_revision: revision,
+            required_capabilities: body.required_capabilities.clone(),
+            kind: PlanNodeKind::ResourceScope {
+                resource,
+                body: Box::new(body),
+            },
+        };
+        if !node.required_capabilities.contains(&Capability::Browser) {
+            node.required_capabilities.push(Capability::Browser);
+            node.required_capabilities.sort();
+        }
+        node.assign_identity(test);
+        node
+    }
+
+    /// Lower a lexical browser lifetime while preserving the mandatory root
+    /// sequence. The caller decides ownership; this does not inspect source.
+    pub fn with_browser_resource(self, test: PlanDeclarationId) -> Self {
+        let mut body_path = self.path.clone();
+        body_path.extend([0, 0]);
+        let origin = self.origin;
+        let revision = self.source_revision;
+        let path = self.path.clone();
+        let mut body = self;
+        body.rebase(test, body_path);
+        let mut resource_path = path.clone();
+        resource_path.push(0);
+        let resource = Self::resource_scope(
+            test,
+            origin,
+            revision,
+            resource_path,
+            ResourcePlan::BrowserContext,
+            body,
+        );
+        Self::sequence(test, origin, revision, path, vec![resource])
+    }
+
+    fn rebase(&mut self, test: PlanDeclarationId, path: Vec<u32>) {
+        self.path = path;
+        match &mut self.kind {
+            PlanNodeKind::Sequence { children } | PlanNodeKind::Parallel { children, .. } => {
+                for (ordinal, child) in children.iter_mut().enumerate() {
+                    let mut path = self.path.clone();
+                    path.push(ordinal as u32);
+                    child.rebase(test, path);
+                }
+            }
+            PlanNodeKind::Timeout { child, .. }
+            | PlanNodeKind::ResourceScope { body: child, .. } => {
+                let mut path = self.path.clone();
+                path.push(0);
+                child.rebase(test, path);
+            }
+            PlanNodeKind::Operation { .. } => {}
+        }
+        self.assign_identity(test);
+    }
+
     pub fn timeout(
         test: PlanDeclarationId,
         origin: SyntaxOrigin,
@@ -110,6 +234,8 @@ impl PlanNode {
 
     fn kind_identity(&self) -> &'static str {
         match &self.kind {
+            PlanNodeKind::ResourceScope { .. } => "resource/browser-context/v1",
+            PlanNodeKind::Parallel { .. } => "parallel/v1",
             PlanNodeKind::Sequence { .. } => "sequence/v1",
             PlanNodeKind::Timeout { .. } => "timeout/v1",
             PlanNodeKind::Operation { step } => match &step.operation {
@@ -134,16 +260,20 @@ impl PlanNode {
 
     pub fn steps(&self) -> Vec<&PlannedStep> {
         match &self.kind {
+            PlanNodeKind::ResourceScope { body, .. } => body.steps(),
             PlanNodeKind::Timeout { child, .. } => child.steps(),
-            PlanNodeKind::Sequence { children } => children.iter().flat_map(Self::steps).collect(),
+            PlanNodeKind::Sequence { children } | PlanNodeKind::Parallel { children, .. } => {
+                children.iter().flat_map(Self::steps).collect()
+            }
             PlanNodeKind::Operation { step } => vec![step],
         }
     }
 
     pub fn steps_mut(&mut self) -> Vec<&mut PlannedStep> {
         match &mut self.kind {
+            PlanNodeKind::ResourceScope { body, .. } => body.steps_mut(),
             PlanNodeKind::Timeout { child, .. } => child.steps_mut(),
-            PlanNodeKind::Sequence { children } => {
+            PlanNodeKind::Sequence { children } | PlanNodeKind::Parallel { children, .. } => {
                 children.iter_mut().flat_map(Self::steps_mut).collect()
             }
             PlanNodeKind::Operation { step } => vec![step],
@@ -174,6 +304,8 @@ pub enum PlanTreeError {
     DuplicateStep,
     DuplicateTest,
     MissingSourceFile,
+    MissingResourceScope,
+    ResourceAccessConflict,
     TooDeep,
 }
 impl std::fmt::Display for PlanTreeError {
@@ -203,7 +335,34 @@ impl PlanNode {
         if self.id != self.derived_identity(test) {
             return Err(PlanTreeError::InvalidIdentity);
         }
+        if let PlanNodeKind::Parallel { children, .. } = &self.kind {
+            if children.is_empty() || children.len() > MAX_PARALLEL_BRANCHES {
+                return Err(PlanTreeError::InvalidControlSetting);
+            }
+            let accesses: Vec<_> = children.iter().map(Self::required_resources).collect();
+            if !crate::conflicting_resource_accesses(&accesses).is_empty() {
+                return Err(PlanTreeError::ResourceAccessConflict);
+            }
+        }
         let capabilities = match &self.kind {
+            PlanNodeKind::ResourceScope {
+                resource: ResourcePlan::BrowserContext,
+                body,
+            } => {
+                if body.origin.file != self.origin.file {
+                    return Err(PlanTreeError::OriginMismatch);
+                }
+                let mut child_path = path.to_vec();
+                child_path.push(0);
+                body.validate(test, revision, &child_path, steps)?;
+                let mut capabilities = body.required_capabilities.clone();
+                if !capabilities.contains(&Capability::Browser) {
+                    capabilities.push(Capability::Browser);
+                    capabilities.sort();
+                }
+                capabilities
+            }
+
             PlanNodeKind::Timeout {
                 child,
                 duration,
@@ -224,7 +383,7 @@ impl PlanNode {
                 child.validate(test, revision, &child_path, steps)?;
                 child.required_capabilities.clone()
             }
-            PlanNodeKind::Sequence { children } => {
+            PlanNodeKind::Sequence { children } | PlanNodeKind::Parallel { children, .. } => {
                 for (ordinal, child) in children.iter().enumerate() {
                     if child.origin.file != self.origin.file {
                         return Err(PlanTreeError::OriginMismatch);
@@ -274,6 +433,9 @@ impl crate::TestPlan {
             }
             test.body
                 .validate(test.declaration_id, self.source_revision, &[], &mut steps)?;
+            if !test.body.required_resources().is_empty() {
+                return Err(PlanTreeError::MissingResourceScope);
+            }
             if test
                 .body
                 .required_capabilities
@@ -311,6 +473,9 @@ impl crate::PlanEnvelope {
             }
             test.body
                 .validate(test.declaration_id, source.revision, &[], &mut steps)?;
+            if !test.body.required_resources().is_empty() {
+                return Err(PlanTreeError::MissingResourceScope);
+            }
             if test
                 .body
                 .required_capabilities
@@ -347,12 +512,18 @@ impl PlannedTest {
                 PlanNode::operation(declaration_id, revision, vec![index as u32], step)
             })
             .collect();
+        let body = PlanNode::sequence(declaration_id, origin, revision, Vec::new(), children);
+        let body = if required_host_capabilities.contains(&Capability::Browser) {
+            body.with_browser_resource(declaration_id)
+        } else {
+            body
+        };
         Self {
             id,
             declaration_id,
             name,
             required_host_capabilities,
-            body: PlanNode::sequence(declaration_id, origin, revision, Vec::new(), children),
+            body,
             origin,
         }
     }
