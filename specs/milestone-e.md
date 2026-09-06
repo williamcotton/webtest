@@ -14,9 +14,9 @@ identity, and the existing revision-safe observations and DAP `RunControl` hook.
 
 Milestone E changes how operations are scheduled, owned, cancelled, and observed. It must preserve the same compiler, plan, runner, provider, browser, editor, and debugger paths used by sequential execution, while establishing generic execution-scope, resource-lifecycle, cancellation, deadline, wait, and event-journal abstractions that later milestones can extend without introducing another runtime architecture. [`milestone-f.md`](./milestone-f.md), [`milestone-h.md`](./milestone-h.md), and [`milestone-i.md`](./milestone-i.md) are forward-compatibility constraints, not dependencies and not authorization to implement their public features early.
 
-### Implementation progress — 2026-09-05
+### Implementation progress — 2026-09-06
 
-Milestone E is **not complete**. The sequential execution-tree and resource/wait foundations are implemented:
+Milestone E is **not complete**. The execution-tree, resource/wait foundations, timeout, and public parallel path are implemented:
 
 - Tests and capability blocks lower through explicit `Sequence` nodes. Leaf operations exist only
   in that tree; diagnostic, debugger, and secret-checking traversal is a read-only projection.
@@ -24,14 +24,14 @@ Milestone E is **not complete**. The sequential execution-tree and resource/wait
   identities add structural child path and versioned node kind, independently of file-opening
   order, unrelated declarations, step allocation, and runtime occurrence allocation.
 - The sequential runner dispatches the tree recursively and emits parented scope and operation
-  occurrences. A test root includes browser acquisition and test cleanup. Descendants interrupted
+  occurrences. Browser acquisition is an explicit lexical `ResourceScope` in the plan; a test root includes test cleanup. Descendants interrupted
   by the existing test deadline record cancellation and its causing scope; the root records its
   final outcome after cleanup. Cancellation facts retain their typed reason and causing scope.
-- Plan format 5 and runtime semantics 2 version the tree and timeout behavior independently. Native builds fingerprint
+- Plan format 6 and runtime semantics 3 version the tree and timeout behavior independently. Native builds fingerprint
   resolved configuration, keeping configuration values out of the artifact. Shared validation
   checks tree structure, identities, revisions, capability requirements, and explicit execution
   inputs for detectable drift. There is still no CLI command to execute an emitted plan.
-- CLI report/event schema 4 includes typed scope facts. This remains the existing event stream,
+- CLI report/event schema 5 includes typed scope facts, shared typed cancellation reasons, and ordered branch aggregates. This remains the existing event stream,
   not yet E's authoritative bounded journal with replay-safe event identity.
 - Runtime observations accumulate privately and commit as a complete batch. Starting another
   run clears prior observations and prevents an older in-flight run from overwriting the newer
@@ -71,7 +71,7 @@ Milestone E is **not complete**. The sequential execution-tree and resource/wait
 
 Remaining work includes complete resource ownership and explicit host interruption across HTTP,
 bridge/application startup and lifecycle, non-Unix process trees, and browser sessions;
-parallel/race/retry syntax, semantics, and scheduling; isolated `--jobs`; the authoritative event journal;
+race/retry syntax, semantics, and scheduling; isolated `--jobs`; the authoritative event journal;
 trace artifacts/viewer; observation IPC; concurrent DAP behavior; and their conformance/stress
 coverage. The acceptance criteria below remain normative and unsatisfied as a whole.
 
@@ -94,6 +94,62 @@ and concurrent DAP have not been implemented.
 Checkpoint verification: full workspace tests (including Chrome and LSP/DAP protocol tests), Rust
 formatting, warning-free workspace Clippy, portable WASM check, Node/Ruby SDK tests and protocol
 conformance, extension compilation/package smoke, and the structured-execution CLI example.
+
+### Checkpoint 3 and parallel continuation — 2026-09-06
+
+Checkpoint 3 (`8cf33801dd7bc3136fb4dd23f11c3cd8f667e877`) is accepted. Its execution-tree
+model, immutable `ExecutionServices`, branch-owned `BranchState`, explicit scope parentage,
+and structured sibling ownership remain the foundation. Siblings never share a mutable binding
+environment, active operation, page/session handle, or resource-ownership stack.
+
+The continuation implements public `parallel` through contextual tokens, typed AST, independently
+scoped HIR, static analysis, portable plans, and the shared runner. Direct branches must be capability
+or control blocks (1–64). Transferable outer bindings are snapshotted, captures of native handles are
+rejected, and branch-local declarations do not escape. Flow-domain browser blocks inside branches acquire their
+own lexical context inside any enclosing timeout; analysis rejects concurrent use of an inherited exclusive browser context.
+The generic typed resource-access checker remains the shared conflict contract.
+
+The scheduler owns every sibling future and receives bounded, coalescing primary-failure signals.
+Infrastructure/internal failures signal before evidence gathering, failure debugger hooks, or slow
+resource teardown; failed resource acquisition/readiness uses the same primary-observation hook.
+Signals propagate to enclosing schedulers. Test failures allow healthy siblings to continue, while
+teardown remains structurally awaited even after cancellation or cleanup timeout. Cancellation
+also establishes one monotonic cleanup epoch for existing and late descendants; delayed polling
+cannot grant a new cleanup window, and smaller lexical cleanup budgets are inherited.
+
+Runtime outcomes and observations now use the host cancellation vocabulary (`ParentFailed`,
+`RaceLost`, `Timeout`, `FailFast`, `DebugDisconnect`, and the other defined reasons); scope facts retain
+the causing scope. A primary failure known before cancellation is retained through slow failure
+observation and cleanup. `TestResult.branches` recursively preserves every completed child outcome,
+including success, failure, cancellation, and typed secondary cleanup failure, in source order.
+The top-level outcome is its deterministic severity summary, not a replacement for the aggregate.
+An enclosing timeout retains completed child results. JSON and event reports expose the aggregate;
+human/concise reporters print branch failures, JUnit retains structured branch data, and DAP output
+includes recursive results. Concurrent debugger threads/frames/stepping remain pending.
+
+Focused paused-clock tests cover sibling overlap, independent bindings and resources, prompt primary
+failure signalling before slow teardown, acquisition failure, multiple test failures completing out
+of order, every typed cancellation reason, enclosing timeout, and terminal events after bounded
+cleanup expiry and inherited smaller cleanup budgets. A real Chrome test proves sibling storage
+isolation. Syntax/HIR/plan ranges, recovery, invalid captures/resources/bounds, canonical
+descriptions, native/WASM parity, and CLI reporter coverage accompany the public feature.
+
+Validation for this continuation: `cargo test --workspace` passed with default test threading, including
+Chrome and LSP/DAP tests. Focused runtime/lifecycle, language/description, editor/formatter, and
+native/WASM parity suites passed after the final refinements, as did workspace Clippy with
+`-D warnings`, Rust formatting, the `wasm32-unknown-unknown` check, and all three tests in
+`examples/structured-execution`. A follow-up to intermittent protocol failures reproduced premature
+HTTP fixture responses to incomplete request headers. The fixtures now handle connections
+independently, wait for complete headers, drain responses, and cancel and join all connection work
+on shutdown. Regression tests cover fragmented headers, idle browser preconnections, and shutdown;
+protocol timeout diagnostics now retain bounded subprocess stderr. This replaces the earlier
+serialized workspace validation workaround. Five consecutive `cargo test --workspace --test protocol`
+runs also passed with default threading. The paused-clock sibling concurrency tests still run concurrent
+futures within each test.
+
+Race, retry, jobs, full host-resource coverage, the bounded authoritative journal, traces, observation
+IPC, and concurrent DAP control remain unimplemented. The acceptance criteria below are still
+unsatisfied as a whole.
 
 ## 1. Outcome
 

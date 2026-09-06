@@ -32,6 +32,7 @@ ast_node!(ServerBlock, ServerBlock);
 ast_node!(BrowserBlock, BrowserBlock);
 ast_node!(LetStmt, LetStmt);
 ast_node!(TimeoutStmt, TimeoutStmt);
+ast_node!(ParallelStmt, ParallelStmt);
 ast_node!(ExprStmt, ExprStmt);
 ast_node!(ExpectExprStmt, ExpectExprStmt);
 ast_node!(OpenStmt, OpenStmt);
@@ -197,12 +198,39 @@ impl TimeoutStmt {
     }
 }
 
+impl ParallelStmt {
+    pub fn body(&self) -> Option<Block> {
+        self.syntax.children().find_map(Block::cast)
+    }
+    pub fn flow_statements(&self) -> impl Iterator<Item = FlowStatement> {
+        self.body().into_iter().flat_map(|body| {
+            body.syntax
+                .children()
+                .filter_map(FlowStatement::cast)
+                .collect::<Vec<_>>()
+        })
+    }
+    pub fn domain_statements(&self) -> impl Iterator<Item = DomainStatement> {
+        self.body().into_iter().flat_map(|body| {
+            body.syntax
+                .children()
+                .filter_map(DomainStatement::cast)
+                .collect::<Vec<_>>()
+        })
+    }
+}
+
 impl LetStmt {
     pub fn name(&self) -> Option<SyntaxToken> {
         self.syntax
             .children_with_tokens()
             .filter_map(|element| element.into_token())
-            .find(|token| matches!(token.kind(), SyntaxKind::Ident | SyntaxKind::TimeoutKw))
+            .find(|token| {
+                matches!(
+                    token.kind(),
+                    SyntaxKind::Ident | SyntaxKind::TimeoutKw | SyntaxKind::ParallelKw
+                )
+            })
     }
     pub fn annotation(&self) -> Option<TypeExpr> {
         self.syntax.children().find_map(TypeExpr::cast)
@@ -356,6 +384,7 @@ pub enum BrowserOperation {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum FlowStatement {
     Timeout(TimeoutStmt),
+    Parallel(ParallelStmt),
     Server(ServerBlock),
     Browser(BrowserBlock),
     Let(LetStmt),
@@ -367,6 +396,7 @@ impl FlowStatement {
     fn cast(node: SyntaxNode) -> Option<Self> {
         match node.kind() {
             SyntaxKind::TimeoutStmt => TimeoutStmt::cast(node).map(Self::Timeout),
+            SyntaxKind::ParallelStmt => ParallelStmt::cast(node).map(Self::Parallel),
             SyntaxKind::ServerBlock => ServerBlock::cast(node).map(Self::Server),
             SyntaxKind::BrowserBlock => BrowserBlock::cast(node).map(Self::Browser),
             SyntaxKind::LetStmt => LetStmt::cast(node).map(Self::Let),
@@ -380,6 +410,7 @@ impl FlowStatement {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum DomainStatement {
     Timeout(TimeoutStmt),
+    Parallel(ParallelStmt),
     Let(LetStmt),
     Expression(ExprStmt),
     Expect(ExpectExprStmt),
@@ -390,6 +421,7 @@ impl DomainStatement {
     fn cast(node: SyntaxNode) -> Option<Self> {
         match node.kind() {
             SyntaxKind::TimeoutStmt => TimeoutStmt::cast(node).map(Self::Timeout),
+            SyntaxKind::ParallelStmt => ParallelStmt::cast(node).map(Self::Parallel),
             SyntaxKind::LetStmt => LetStmt::cast(node).map(Self::Let),
             SyntaxKind::ExprStmt => ExprStmt::cast(node).map(Self::Expression),
             SyntaxKind::ExpectExprStmt => ExpectExprStmt::cast(node).map(Self::Expect),

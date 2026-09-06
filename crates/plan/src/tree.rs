@@ -343,6 +343,12 @@ impl PlanNode {
             if !crate::conflicting_resource_accesses(&accesses).is_empty() {
                 return Err(PlanTreeError::ResourceAccessConflict);
             }
+            if children
+                .iter()
+                .any(|child| !child.required_resources().is_empty())
+            {
+                return Err(PlanTreeError::MissingResourceScope);
+            }
         }
         let capabilities = match &self.kind {
             PlanNodeKind::ResourceScope {

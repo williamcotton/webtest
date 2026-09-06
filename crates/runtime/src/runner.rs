@@ -125,7 +125,10 @@ impl Runner {
             )
         } else if control.is_some_and(RunControl::is_cancelled) {
             outcome = RunOutcome::Cancelled {
-                reason: CancellationReason::Requested,
+                reason: control.map_or(
+                    CancellationReason::UserCancelled,
+                    RunControl::cancellation_reason,
+                ),
             };
             skip_tests(
                 &plan.tests,
@@ -150,7 +153,10 @@ impl Runner {
             for (index, test) in plan.tests.iter().enumerate() {
                 if control.is_some_and(RunControl::is_cancelled) {
                     outcome = RunOutcome::Cancelled {
-                        reason: CancellationReason::Requested,
+                        reason: control.map_or(
+                            CancellationReason::UserCancelled,
+                            RunControl::cancellation_reason,
+                        ),
                     };
                     skip_tests(
                         &plan.tests[index..],

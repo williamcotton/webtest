@@ -7,41 +7,91 @@ use std::future::Future;
 use webtest_feedback::FailureClass;
 use webtest_host::{Cancellation, CancellationReason};
 
+/// A bounded, coalescing primary-failure notification. This is a runtime service,
+/// not a container for mutable branch state. Ancestor schedulers can observe the
+/// same failure before nested scopes finish tearing down.
+#[derive(Clone)]
+pub(super) struct FailureSignal(tokio::sync::watch::Sender<Option<FailureClass>>);
+impl FailureSignal {
+    pub fn channel() -> (Self, tokio::sync::watch::Receiver<Option<FailureClass>>) {
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        (Self(sender), receiver)
+    }
+    pub fn report(&self, class: FailureClass) {
+        if matches!(class, FailureClass::Infrastructure | FailureClass::Internal) {
+            self.0.send_if_modified(|value| {
+                if value.is_some() {
+                    false
+                } else {
+                    *value = Some(class);
+                    true
+                }
+            });
+        }
+    }
+}
+
 pub(super) async fn parallel<F, T>(
     parent: &ScopeContext,
-    children: Vec<(ScopeContext, F)>,
+    children: Vec<(
+        ScopeContext,
+        tokio::sync::watch::Receiver<Option<FailureClass>>,
+        F,
+    )>,
     classify: impl Fn(&T) -> Option<FailureClass>,
     mut on_completion: impl FnMut(usize, T),
-)
-where
+) where
     F: Future<Output = T>,
 {
     let contexts: Vec<_> = children
         .iter()
-        .map(|(context, _)| context.clone())
+        .map(|(context, _, _)| context.clone())
         .collect();
-    let mut pending: FuturesUnordered<_> = children
-        .into_iter()
-        .enumerate()
-        .map(|(ordinal, (_, future))| async move { (ordinal, future.await) })
-        .collect();
+    let mut notices = FuturesUnordered::new();
+    let mut pending = FuturesUnordered::new();
+    for (ordinal, (_, mut receiver, future)) in children.into_iter().enumerate() {
+        notices.push(async move {
+            let class = receiver
+                .wait_for(Option::is_some)
+                .await
+                .ok()
+                .and_then(|value| *value);
+            (ordinal, class)
+        });
+        pending.push(async move { (ordinal, future.await) });
+    }
     let mut completed = vec![false; contexts.len()];
-    while let Some((ordinal, outcome)) = pending.next().await {
-        if matches!(
-            classify(&outcome),
-            Some(FailureClass::Infrastructure | FailureClass::Internal)
-        ) {
-            for (sibling, context) in contexts.iter().enumerate() {
-                if sibling != ordinal && !completed[sibling] {
-                    context.cancellation.cancel(Cancellation {
-                        reason: CancellationReason::ParentFailed,
-                        causing_scope_id: parent.scope_id,
-                    });
+    while !pending.is_empty() {
+        tokio::select! {
+            biased;
+            Some((ordinal, class)) = notices.next(), if !notices.is_empty() => {
+                if class.is_some() { cancel_siblings(parent, &contexts, &completed, ordinal); }
+            }
+            Some((ordinal, outcome)) = pending.next() => {
+                // Also catches infrastructure failures discovered during cleanup.
+                if matches!(classify(&outcome), Some(FailureClass::Infrastructure | FailureClass::Internal)) {
+                    cancel_siblings(parent, &contexts, &completed, ordinal);
                 }
+                completed[ordinal] = true;
+                on_completion(ordinal, outcome);
             }
         }
-        completed[ordinal] = true;
-        on_completion(ordinal, outcome);
+    }
+}
+
+fn cancel_siblings(
+    parent: &ScopeContext,
+    contexts: &[ScopeContext],
+    completed: &[bool],
+    failed: usize,
+) {
+    for (ordinal, context) in contexts.iter().enumerate() {
+        if ordinal != failed && !completed[ordinal] {
+            context.cancellation.cancel(Cancellation {
+                reason: CancellationReason::ParentFailed,
+                causing_scope_id: parent.scope_id,
+            });
+        }
     }
 }
 
@@ -109,11 +159,20 @@ mod tests {
                         (ordinal == 2).then_some(failure),
                         cleanup.clone(),
                     );
-                    (context, future)
+                    {
+                        let (_signal, receiver) = FailureSignal::channel();
+                        (context, receiver, future)
+                    }
                 })
                 .collect();
             let mut outcomes = Vec::new();
-            parallel(&parent, children, |outcome| outcome.failure, |_, outcome| outcomes.push(outcome)).await;
+            parallel(
+                &parent,
+                children,
+                |outcome| outcome.failure,
+                |_, outcome| outcomes.push(outcome),
+            )
+            .await;
             outcomes.sort_by_key(|outcome| outcome.ordinal);
             assert_eq!(
                 outcomes

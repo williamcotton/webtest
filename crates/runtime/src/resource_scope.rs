@@ -80,9 +80,27 @@ pub struct ResourceScope<'a> {
 impl ResourceScope<'_> {
     pub async fn run<A, B, F, T>(
         &self,
+        adapter: A,
+        body: B,
+        emit: impl FnMut(ResourceScopeEvent) + Send,
+    ) -> ResourceScopeOutcome<T, A::Error>
+    where
+        A: ResourceAdapter,
+        B: FnOnce(A::Handle) -> F,
+        F: Future<Output = Result<T, A::Error>> + Send,
+        T: Send,
+    {
+        self.run_observed(adapter, body, emit, |_| {}).await
+    }
+
+    /// Reports the primary execution result before resource teardown. The observer
+    /// may signal a structured scheduler but does not own or detach cleanup.
+    pub async fn run_observed<A, B, F, T>(
+        &self,
         mut adapter: A,
         body: B,
         mut emit: impl FnMut(ResourceScopeEvent) + Send,
+        primary_known: impl FnOnce(&WaitCompletion<T, ResourceFailure<A::Error>>) + Send,
     ) -> ResourceScopeOutcome<T, A::Error>
     where
         A: ResourceAdapter,
@@ -160,6 +178,7 @@ impl ResourceScope<'_> {
             WaitCompletion::Cancelled(cause) => WaitCompletion::Cancelled(cause),
             WaitCompletion::Rejected(error) => WaitCompletion::Rejected(error),
         };
+        primary_known(&primary);
         if let WaitCompletion::Cancelled(cause) = &primary
             && let Err(error) = self.registry.cancel(key, *cause)
         {

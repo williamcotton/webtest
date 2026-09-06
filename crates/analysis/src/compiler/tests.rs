@@ -657,3 +657,105 @@ fn node_identity_survives_file_open_order_and_unrelated_declarations() {
     assert_eq!(a[0].id, b[0].id);
     assert_ne!(a[0].source_revision, b[0].source_revision);
 }
+
+#[test]
+fn parallel_lowering_is_deterministic_isolated_and_owns_browser_resources_lexically() {
+    let source = "test \"é\" { let seed = 7 parallel { server { let value = seed expect value == 7 } browser { open \"/\" } browser { open \"/other\" } } expect seed == 7 }";
+    let mut database = AnalysisDatabase::default();
+    let file = database.open_file("parallel.webtest", source);
+    assert!(database.diagnostics(file).unwrap().is_empty());
+    let plan = database.test_plan(file).unwrap();
+    assert_eq!(plan, database.test_plan(file).unwrap());
+    plan.validate_tree().unwrap();
+    let webtest_plan::PlanNodeKind::Sequence { children } = &plan.tests[0].body.kind else {
+        panic!("root")
+    };
+    assert_eq!(children.len(), 3, "no test-wide browser acquisition");
+    let parallel = &children[1];
+    let webtest_plan::PlanNodeKind::Parallel { children, .. } = &parallel.kind else {
+        panic!("parallel")
+    };
+    assert_eq!(parallel.path, [1]);
+    assert_eq!(children.len(), 3);
+    for (ordinal, child) in children.iter().enumerate() {
+        assert_eq!(child.path, [1, ordinal as u32]);
+        assert!(child.required_resources().is_empty());
+        let webtest_plan::PlanNodeKind::Sequence { children } = &child.kind else {
+            panic!("branch")
+        };
+        if ordinal > 0 {
+            let webtest_plan::PlanNodeKind::Sequence { children } = &children[0].kind else {
+                panic!("lexical browser block")
+            };
+            assert!(matches!(
+                children[0].kind,
+                webtest_plan::PlanNodeKind::ResourceScope { .. }
+            ));
+        }
+    }
+    let steps = plan.tests[0].steps();
+    assert_eq!(
+        steps.iter().map(|step| step.id.0).collect::<Vec<_>>(),
+        [0, 1, 2, 3, 4, 5]
+    );
+    let range = steps[2].origin.range;
+    assert_eq!(
+        &source[usize::from(range.start())..usize::from(range.end())],
+        "value == 7 "
+    );
+    let parsed = webtest_syntax::parse(source);
+    let hir = webtest_hir::lower(file, &parsed);
+    let webtest_hir::HirStmt::Parallel(hir_parallel) = &hir.tests[0].body[1] else {
+        panic!("HIR parallel")
+    };
+    assert_eq!(hir_parallel.origin, parallel.origin);
+    assert_eq!(hir_parallel.branches.len(), 3);
+}
+
+#[test]
+fn parallel_rejects_invalid_children_escaping_locals_native_captures_and_shared_contexts() {
+    for (source, code) in [
+        ("test \"x\" { parallel {} }", "semantic.invalid_parallel"),
+        (
+            "test \"x\" { parallel { expect 1 == 1 } }",
+            "semantic.expected_parallel_block",
+        ),
+        (
+            "test \"x\" { parallel { server { let local = 1 } server { expect local == 1 } } }",
+            "semantic.use_before_definition",
+        ),
+        (
+            "test \"x\" { parallel { server { let local = 1 } } expect local == 1 }",
+            "semantic.use_before_definition",
+        ),
+        (
+            "test \"x\" { server { let temp = fs.temp_dir() parallel { timeout 1s { fs.read_text(temp.path) } } } }",
+            "semantic.non_transferable_capture",
+        ),
+        (
+            "test \"x\" { browser { parallel { timeout 1s { open \"/\" } timeout 1s { open \"/\" } } } }",
+            "semantic.concurrent_resource_conflict",
+        ),
+    ] {
+        let mut database = AnalysisDatabase::default();
+        let file = database.open_file("parallel.webtest", source);
+        let diagnostics = database.diagnostics(file).unwrap();
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic.code == code),
+            "{source}: {diagnostics:?}"
+        );
+    }
+    let mut database = AnalysisDatabase::default();
+    let source = format!(
+        "test \"x\" {{ parallel {{ {} }} }}",
+        "server {} ".repeat(65)
+    );
+    let file = database.open_file("many.webtest", source);
+    assert!(
+        database
+            .diagnostics(file)
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic.code == "semantic.invalid_parallel")
+    );
+}

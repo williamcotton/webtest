@@ -659,7 +659,7 @@ impl DebugState {
                     json!({
                         "category": category,
                         "output": format!("test {:?} ... {status}\n", test.name),
-                        "data": data,
+                        "data": if test.branches.is_empty() { data } else { json!({ "summary": data, "branches": branch_output_data(&test.branches) }) },
                     }),
                 )
                 .await;
@@ -712,6 +712,20 @@ impl DebugState {
         let _ = self.writer.event("terminated", json!({})).await;
         self.completion.send_replace(true);
     }
+}
+
+fn branch_output_data(branches: &[webtest_runtime::BranchResult]) -> Value {
+    Value::Array(branches.iter().map(|branch| {
+        let (outcome, data) = match &branch.outcome {
+            TestOutcome::Passed => ("passed", Value::Null),
+            TestOutcome::Failed(failure) => ("failed", failure_output_data(failure)),
+            TestOutcome::TimedOut { timeout, active_step } => ("timed_out", json!({"timeout_ms": timeout.as_millis(), "active_step_id": active_step.map(|id| id.0)})),
+            TestOutcome::Cancelled { reason } => ("cancelled", json!({"reason": reason})),
+            TestOutcome::Skipped { reason, failure_class } => ("skipped", json!({"reason": reason, "failure_class": failure_class})),
+            TestOutcome::Aborted { failure, prior_outcome } => ("aborted", aborted_failure_output_data(failure, prior_outcome.as_deref())),
+        };
+        json!({ "scope": branch.scope, "outcome": outcome, "data": data, "duration_ms": branch.duration.as_millis(), "branches": branch_output_data(&branch.branches) })
+    }).collect())
 }
 
 fn failure_output_data(failure: &webtest_runtime::StepFailure) -> Value {
@@ -794,7 +808,7 @@ fn aborted_failure_output_data(
         }),
         Some(webtest_runtime::PriorTestOutcome::Cancelled { reason }) => json!({
             "kind": "cancelled",
-            "reason": format!("{reason:?}").to_ascii_lowercase(),
+            "reason": reason,
         }),
         None => return data,
     };
@@ -817,7 +831,7 @@ fn aborted_run_failure_output_data(
             "prior_outcome".into(),
             json!({
                 "kind": "cancelled",
-                "reason": format!("{reason:?}").to_ascii_lowercase(),
+                "reason": reason,
             }),
         );
     }
@@ -1705,11 +1719,14 @@ mod tests {
         let after_cancellation = aborted_run_failure_output_data(
             &cleanup,
             Some(webtest_runtime::PriorRunOutcome::Cancelled {
-                reason: webtest_runtime::CancellationReason::Requested,
+                reason: webtest_runtime::CancellationReason::UserCancelled,
             }),
         );
         assert_eq!(after_cancellation["prior_outcome"]["kind"], "cancelled");
-        assert_eq!(after_cancellation["prior_outcome"]["reason"], "requested");
+        assert_eq!(
+            after_cancellation["prior_outcome"]["reason"],
+            "user_cancelled"
+        );
     }
 
     #[test]
@@ -2068,13 +2085,13 @@ mod tests {
         assert!(matches!(
             result.outcome,
             RunOutcome::Cancelled {
-                reason: webtest_runtime::CancellationReason::Requested
+                reason: webtest_runtime::CancellationReason::DebugDisconnect
             }
         ));
         assert!(matches!(
             result.tests[0].outcome,
             TestOutcome::Cancelled {
-                reason: webtest_runtime::CancellationReason::Requested
+                reason: webtest_runtime::CancellationReason::DebugDisconnect
             }
         ));
         assert_eq!(

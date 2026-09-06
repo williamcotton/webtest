@@ -107,6 +107,10 @@ pub(crate) fn type_reference_name(ty: &Type) -> &'static str {
 
 pub(crate) fn default_reference_queries(code: &str) -> Vec<String> {
     match code {
+        "semantic.invalid_parallel"
+        | "semantic.expected_parallel_block"
+        | "semantic.non_transferable_capture"
+        | "semantic.concurrent_resource_conflict" => vec!["control.parallel".into()],
         "semantic.invalid_timeout" => vec!["control.timeout".into()],
         "semantic.unknown_provider" | "semantic.reserved_provider" => vec!["provider".into()],
         "semantic.unknown_provider_operation"

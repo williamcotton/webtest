@@ -1,0 +1,16 @@
+test "independent branch snapshots" {
+    let seed = 7
+    timeout 2s {
+        parallel {
+            server {
+                let left = seed + 1
+                expect left == 8
+            }
+            server {
+                let right = seed + 2
+                expect right == 9
+            }
+        }
+    }
+    expect seed == 7
+}

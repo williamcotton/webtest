@@ -37,9 +37,14 @@ pub(super) struct ExecutionScope {
     pub context: ScopeContext,
     pub resource_owner: ResourceOwner,
     ancestors: Vec<ExecutionScopeId>,
+    cleanup_timeout: Option<std::time::Duration>,
 }
 
 impl ExecutionScope {
+    pub fn cleanup_timeout(&self, default: std::time::Duration) -> std::time::Duration {
+        self.cleanup_timeout
+            .map_or(default, |timeout| timeout.min(default))
+    }
     pub fn id(&self) -> ExecutionScopeId {
         self.context.scope_id
     }
@@ -137,7 +142,21 @@ impl ScopeFactory {
         if let Some(parent) = parent {
             ancestors.push(parent.id());
         }
+        let local_cleanup = match &node.kind {
+            PlanNodeKind::Timeout {
+                cleanup_timeout, ..
+            } => *cleanup_timeout,
+            _ => None,
+        };
+        let cleanup_timeout = match (
+            parent.and_then(|parent| parent.cleanup_timeout),
+            local_cleanup,
+        ) {
+            (Some(inherited), Some(local)) => Some(inherited.min(local)),
+            (inherited, local) => inherited.or(local),
+        };
         ExecutionScope {
+            cleanup_timeout,
             event,
             context,
             resource_owner,
@@ -189,6 +208,7 @@ impl BranchScopes {
             if event
                 .cancellation
                 .is_some_and(|cause| cause.causing_scope_id != scope.id())
+                && !matches!(outcome, ScopeOutcome::Failed | ScopeOutcome::Aborted)
             {
                 ScopeOutcome::Cancelled
             } else {

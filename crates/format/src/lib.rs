@@ -151,7 +151,11 @@ pub fn format_file(parse: &Parse) -> String {
                 ) || (kind == SyntaxKind::TimeoutKw
                     && token
                         .parent()
-                        .is_some_and(|parent| parent.kind() == SyntaxKind::TimeoutStmt));
+                        .is_some_and(|parent| parent.kind() == SyntaxKind::TimeoutStmt))
+                    || (kind == SyntaxKind::ParallelKw
+                        && token
+                            .parent()
+                            .is_some_and(|parent| parent.kind() == SyntaxKind::ParallelStmt));
                 if starts_statement && !line_start {
                     output.push('\n');
                     line_start = true;
@@ -201,6 +205,16 @@ fn needs_space(previous: Option<SyntaxKind>, current: SyntaxKind) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn formats_parallel_and_contextual_names_without_losing_comments() {
+        let source = "test \"é\"{let parallel=7 parallel{// siblings\nserver{expect parallel==7}timeout 1s{expect parallel==7}}}";
+        let expected = "test \"é\" {\n    let parallel = 7\n    parallel {\n        // siblings\n        server {\n            expect parallel == 7\n        }\n        timeout 1s {\n            expect parallel == 7\n        }\n    }\n}\n";
+        let formatted = format_file(&webtest_syntax::parse(source));
+        assert_eq!(formatted, expected);
+        assert!(webtest_syntax::parse(&formatted).errors().is_empty());
+        assert_eq!(format_file(&webtest_syntax::parse(&formatted)), expected);
+    }
 
     #[test]
     fn formats_and_preserves_comments() {

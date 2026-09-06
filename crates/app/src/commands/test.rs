@@ -200,130 +200,7 @@ pub(crate) async fn run_test(
         file_report.tests = result
             .tests
             .into_iter()
-            .map(|test| {
-                let test_id = test.test_id;
-                let (outcome, failure_class, reason, timeout_nanos, failure, exit_class) =
-                    match test.outcome {
-                        TestOutcome::Passed => (
-                            TestReportOutcome::Passed,
-                            None,
-                            None,
-                            None,
-                            None,
-                            ExitClass::Success,
-                        ),
-                        TestOutcome::Failed(failure) => (
-                            TestReportOutcome::Failed,
-                            Some(FailureClass::Test),
-                            None,
-                            None,
-                            Some(step_failure_report(*failure, &analyzed.source)),
-                            ExitClass::TestFailure,
-                        ),
-                        TestOutcome::TimedOut {
-                            timeout,
-                            active_step,
-                        } => (
-                            TestReportOutcome::TimedOut,
-                            Some(FailureClass::Test),
-                            Some(format!("timed out after {}ms", timeout.as_millis())),
-                            Some(nanos(timeout)),
-                            analyzed
-                                .plan
-                                .tests
-                                .iter()
-                                .find(|planned| planned.id == test_id)
-                                .map(|planned| {
-                                    let origin = active_step
-                                        .and_then(|id| {
-                                            planned
-                                                .steps()
-                                                .iter()
-                                                .find(|step| step.id == id)
-                                                .map(|step| step.origin)
-                                        })
-                                        .unwrap_or(planned.origin);
-                                    FailureReport {
-                                        diagnostic_schema_version:
-                                            webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
-                                        repair_hint_schema_version:
-                                            webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
-                                        code: webtest_observation::RuntimeFailureCode::TestTimeout
-                                            .diagnostic_code()
-                                            .into(),
-                                        message: format!(
-                                            "test timed out after {}ms",
-                                            timeout.as_millis()
-                                        ),
-                                        span: Some(crate::source_output::source_span(
-                                            &analyzed.source,
-                                            origin.range,
-                                        )),
-                                        diff: None,
-                                        artifacts: Vec::new(),
-                                        semantic_details: Some(serde_json::json!({
-                                            "test_id": test_id.0,
-                                            "active_step_id": active_step.map(|step| step.0),
-                                            "timeout_ms": timeout.as_millis(),
-                                        })),
-                                        repair_hints: Vec::new(),
-                                        page: None,
-                                        secondary: Vec::new(),
-                                    }
-                                }),
-                            ExitClass::TestFailure,
-                        ),
-                        TestOutcome::Cancelled { reason } => (
-                            TestReportOutcome::Cancelled,
-                            None,
-                            Some(cancellation_reason_name(reason).into()),
-                            None,
-                            None,
-                            ExitClass::TestFailure,
-                        ),
-                        TestOutcome::Skipped {
-                            reason,
-                            failure_class,
-                        } => (
-                            TestReportOutcome::Skipped,
-                            failure_class,
-                            Some(skip_reason_name(reason).into()),
-                            None,
-                            None,
-                            failure_class.map_or(ExitClass::TestFailure, |class| {
-                                ExitClass::from_failure_class(class)
-                            }),
-                        ),
-                        TestOutcome::Aborted {
-                            failure,
-                            prior_outcome,
-                        } => {
-                            let exit_class = run_error_exit_class(&failure);
-                            (
-                                TestReportOutcome::Aborted,
-                                Some(failure.failure_class()),
-                                Some(failure.to_string()),
-                                None,
-                                Some(aborted_test_failure_report(
-                                    &failure,
-                                    prior_outcome,
-                                    &analyzed.source,
-                                )),
-                                exit_class,
-                            )
-                        }
-                    };
-                TestReport {
-                    name: test.name,
-                    exit_class,
-                    outcome,
-                    failure_class,
-                    reason,
-                    timeout_nanos,
-                    duration_nanos: nanos(test.duration),
-                    failure,
-                }
-            })
+            .map(|test| test_report(test, &analyzed.source, &analyzed.plan))
             .collect();
         let tests_exit_class = file_report
             .tests
@@ -381,7 +258,13 @@ fn run_error_exit_class(error: &RunError) -> ExitClass {
 
 fn cancellation_reason_name(reason: webtest_runtime::CancellationReason) -> &'static str {
     match reason {
-        webtest_runtime::CancellationReason::Requested => "requested",
+        webtest_runtime::CancellationReason::UserCancelled => "user_cancelled",
+        webtest_runtime::CancellationReason::ParentFailed => "parent_failed",
+        webtest_runtime::CancellationReason::RaceLost => "race_lost",
+        webtest_runtime::CancellationReason::Timeout => "timeout",
+        webtest_runtime::CancellationReason::DebugDisconnect => "debug_disconnect",
+        webtest_runtime::CancellationReason::FailFast => "fail_fast",
+        webtest_runtime::CancellationReason::RunnerShutdown => "runner_shutdown",
     }
 }
 
@@ -429,5 +312,141 @@ fn application_progress_message(project: &webtest_project::Project) -> &'static 
         (false, true, false) => "starting application",
         (false, false, true) => "waiting for application health check",
         (false, false, false) => "preparing application provider",
+    }
+}
+
+fn test_report(
+    test: webtest_runtime::TestResult,
+    source: &str,
+    plan: &webtest_plan::TestPlan,
+) -> TestReport {
+    let test_id = test.test_id;
+    let (outcome, failure_class, reason, timeout_nanos, failure, exit_class) = match test.outcome {
+        TestOutcome::Passed => (
+            TestReportOutcome::Passed,
+            None,
+            None,
+            None,
+            None,
+            ExitClass::Success,
+        ),
+        TestOutcome::Failed(failure) => (
+            TestReportOutcome::Failed,
+            Some(FailureClass::Test),
+            None,
+            None,
+            Some(step_failure_report(*failure, source)),
+            ExitClass::TestFailure,
+        ),
+        TestOutcome::TimedOut {
+            timeout,
+            active_step,
+        } => (
+            TestReportOutcome::TimedOut,
+            Some(FailureClass::Test),
+            Some(format!("timed out after {}ms", timeout.as_millis())),
+            Some(nanos(timeout)),
+            plan.tests
+                .iter()
+                .find(|planned| planned.id == test_id)
+                .map(|planned| {
+                    let origin = active_step
+                        .and_then(|id| {
+                            planned
+                                .steps()
+                                .iter()
+                                .find(|step| step.id == id)
+                                .map(|step| step.origin)
+                        })
+                        .unwrap_or(planned.origin);
+                    FailureReport {
+                        diagnostic_schema_version: webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
+                        repair_hint_schema_version: webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
+                        code: webtest_observation::RuntimeFailureCode::TestTimeout
+                            .diagnostic_code()
+                            .into(),
+                        message: format!("test timed out after {}ms", timeout.as_millis()),
+                        span: Some(crate::source_output::source_span(source, origin.range)),
+                        diff: None,
+                        artifacts: Vec::new(),
+                        semantic_details: Some(serde_json::json!({
+                            "test_id": test_id.0,
+                            "active_step_id": active_step.map(|step| step.0),
+                            "timeout_ms": timeout.as_millis(),
+                        })),
+                        repair_hints: Vec::new(),
+                        page: None,
+                        secondary: Vec::new(),
+                    }
+                }),
+            ExitClass::TestFailure,
+        ),
+        TestOutcome::Cancelled { reason } => (
+            TestReportOutcome::Cancelled,
+            None,
+            Some(cancellation_reason_name(reason).into()),
+            None,
+            None,
+            ExitClass::TestFailure,
+        ),
+        TestOutcome::Skipped {
+            reason,
+            failure_class,
+        } => (
+            TestReportOutcome::Skipped,
+            failure_class,
+            Some(skip_reason_name(reason).into()),
+            None,
+            None,
+            failure_class.map_or(ExitClass::TestFailure, |class| {
+                ExitClass::from_failure_class(class)
+            }),
+        ),
+        TestOutcome::Aborted {
+            failure,
+            prior_outcome,
+        } => {
+            let exit_class = run_error_exit_class(&failure);
+            (
+                TestReportOutcome::Aborted,
+                Some(failure.failure_class()),
+                Some(failure.to_string()),
+                None,
+                Some(aborted_test_failure_report(&failure, prior_outcome, source)),
+                exit_class,
+            )
+        }
+    };
+    TestReport {
+        branches: test
+            .branches
+            .into_iter()
+            .map(|branch| {
+                let name = format!("branch {:?}", branch.scope.execution_context.task_path);
+                crate::report::BranchReport {
+                    scope: branch.scope,
+                    result: test_report(
+                        webtest_runtime::TestResult {
+                            test_id,
+                            name,
+                            outcome: branch.outcome,
+                            duration: branch.duration,
+                            bindings: Default::default(),
+                            branches: branch.branches,
+                        },
+                        source,
+                        plan,
+                    ),
+                }
+            })
+            .collect(),
+        name: test.name,
+        exit_class,
+        outcome,
+        failure_class,
+        reason,
+        timeout_nanos,
+        duration_nanos: nanos(test.duration),
+        failure,
     }
 }

@@ -326,6 +326,9 @@ impl EditorService {
             .filter_map(|token| {
                 let parent = token.parent().map(|node| node.kind());
                 let kind = match token.kind() {
+                    SyntaxKind::ParallelKw if parent == Some(SyntaxKind::ParallelStmt) => {
+                        SemanticTokenKind::Keyword
+                    }
                     SyntaxKind::TimeoutKw if parent == Some(SyntaxKind::TimeoutStmt) => {
                         SemanticTokenKind::Keyword
                     }
@@ -372,12 +375,12 @@ impl EditorService {
                     | SyntaxKind::UrlKw => SemanticTokenKind::Function,
                     SyntaxKind::String => SemanticTokenKind::String,
                     SyntaxKind::LineComment => SemanticTokenKind::Comment,
-                    SyntaxKind::Ident | SyntaxKind::TimeoutKw
+                    SyntaxKind::Ident | SyntaxKind::TimeoutKw | SyntaxKind::ParallelKw
                         if matches!(parent, Some(SyntaxKind::LetStmt | SyntaxKind::NameExpr)) =>
                     {
                         SemanticTokenKind::Variable
                     }
-                    SyntaxKind::Ident | SyntaxKind::TimeoutKw
+                    SyntaxKind::Ident | SyntaxKind::TimeoutKw | SyntaxKind::ParallelKw
                         if parent == Some(SyntaxKind::MemberExpr) =>
                     {
                         SemanticTokenKind::Property
@@ -901,7 +904,7 @@ mod tests {
     #[test]
     fn semantic_tokens_are_views_over_cst_tokens() {
         let editor = EditorService::new();
-        let source = "test \"x\" { // note\n browser { open \"about:blank\" click id(\"submit\") expect text(\"submitted\").visible } }";
+        let source = "test \"x\" { // note\n parallel { server { let parallel = 7 expect parallel == 7 } } browser { open \"about:blank\" click id(\"submit\") expect text(\"submitted\").visible } }";
         let file = editor.open_document("file:///tokens.webtest", source);
         let tokens = editor.semantic_tokens(file).expect("semantic tokens");
         let rendered: Vec<_> = tokens
@@ -913,6 +916,8 @@ mod tests {
             })
             .collect();
         assert!(rendered.contains(&("test", SemanticTokenKind::Keyword)));
+        assert!(rendered.contains(&("parallel", SemanticTokenKind::Keyword)));
+        assert!(rendered.contains(&("parallel", SemanticTokenKind::Variable)));
         assert!(rendered.contains(&("// note", SemanticTokenKind::Comment)));
         assert!(rendered.contains(&("id", SemanticTokenKind::Function)));
         assert!(rendered.contains(&("expect", SemanticTokenKind::Keyword)));

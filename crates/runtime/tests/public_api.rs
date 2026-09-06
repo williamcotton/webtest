@@ -180,7 +180,7 @@ fn defaults_and_result_counts_are_exact() {
                 active_step: Some(webtest_model::StepId(0)),
             }),
             test_result(TestOutcome::Cancelled {
-                reason: CancellationReason::Requested,
+                reason: CancellationReason::UserCancelled,
             }),
             test_result(TestOutcome::Skipped {
                 reason: SkipReason::RunCancelled,

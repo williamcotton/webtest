@@ -25,6 +25,7 @@ impl Compiler<'_> {
             let mut child_path = path.clone();
             child_path.push(ordinal as u32);
             let node = match statement {
+                HirStmt::Parallel(block) => self.compile_parallel(test, block, domain, child_path),
                 HirStmt::Timeout(block) => {
                     self.type_fact(
                         block.duration_origin.range,
@@ -70,13 +71,20 @@ impl Compiler<'_> {
                     Capability::Server,
                     child_path,
                 ),
-                HirStmt::Browser(block) => self.compile_sequence(
-                    test,
-                    block.origin,
-                    &block.statements,
-                    Capability::Browser,
-                    child_path,
-                ),
+                HirStmt::Browser(block) => {
+                    let body = self.compile_sequence(
+                        test,
+                        block.origin,
+                        &block.statements,
+                        Capability::Browser,
+                        child_path,
+                    );
+                    if self.concurrent_depth > 0 && !body.required_resources().is_empty() {
+                        body.with_browser_resource(test)
+                    } else {
+                        body
+                    }
+                }
                 _ => {
                     let mut steps = Vec::new();
                     self.compile_statement(statement, domain, &mut steps);
@@ -91,6 +99,82 @@ impl Compiler<'_> {
         webtest_plan::PlanNode::sequence(test, origin, self.revision, path, children)
     }
 
+    fn compile_parallel(
+        &mut self,
+        test: webtest_model::PlanDeclarationId,
+        block: &webtest_hir::HirParallel,
+        domain: Capability,
+        path: Vec<u32>,
+    ) -> webtest_plan::PlanNode {
+        if block.branches.is_empty() || block.branches.len() > webtest_plan::MAX_PARALLEL_BRANCHES {
+            self.error(
+                block.origin.range,
+                "semantic.invalid_parallel",
+                format!(
+                    "parallel requires 1 to {} direct child blocks",
+                    webtest_plan::MAX_PARALLEL_BRANCHES
+                ),
+            );
+        }
+        let bindings = self.bindings.clone();
+        let names = self.names.clone();
+        let outer_captures = self.concurrent_captures.clone();
+        self.concurrent_captures.extend(
+            bindings
+                .iter()
+                .filter_map(|(id, binding)| (!binding.ty.is_transferable()).then_some(*id)),
+        );
+        self.concurrent_depth += 1;
+        let mut children = Vec::new();
+        for (ordinal, branch) in block.branches.iter().enumerate() {
+            self.bindings = bindings.clone();
+            self.names = names.clone();
+            let origin = match branch {
+                HirStmt::Server(block) => block.origin,
+                HirStmt::Browser(block) => block.origin,
+                HirStmt::Timeout(block) => block.origin,
+                HirStmt::Parallel(block) => block.origin,
+                _ => {
+                    self.error(
+                        block.origin.range,
+                        "semantic.expected_parallel_block",
+                        "each parallel branch must be a capability or control block".into(),
+                    );
+                    continue;
+                }
+            };
+            let mut child_path = path.clone();
+            child_path.push(ordinal as u32);
+            let child = self.compile_sequence(
+                test,
+                origin,
+                std::slice::from_ref(branch),
+                domain,
+                child_path,
+            );
+            if !child.required_resources().is_empty() && domain == Capability::Browser {
+                self.error(origin.range, "semantic.concurrent_resource_conflict", "concurrent browser operations require a lexical browser block in a flow domain; the enclosing browser context is exclusive".into());
+            }
+            children.push(child);
+        }
+        self.bindings = bindings;
+        self.names = names;
+        self.concurrent_captures = outer_captures;
+        self.concurrent_depth -= 1;
+        let uses = children
+            .iter()
+            .map(webtest_plan::PlanNode::required_resources)
+            .collect::<Vec<_>>();
+        if !webtest_plan::conflicting_resource_accesses(&uses).is_empty() {
+            self.error(
+                block.origin.range,
+                "semantic.concurrent_resource_conflict",
+                "parallel branches cannot share an exclusive resource".into(),
+            );
+        }
+        webtest_plan::PlanNode::parallel(test, block.origin, self.revision, path, children)
+    }
+
     pub(super) fn compile_statement(
         &mut self,
         statement: &HirStmt,
@@ -98,7 +182,9 @@ impl Compiler<'_> {
         steps: &mut Vec<PlannedStep>,
     ) {
         match statement {
-            HirStmt::Timeout(_) => unreachable!("control nodes compile through the execution tree"),
+            HirStmt::Timeout(_) | HirStmt::Parallel(_) => {
+                unreachable!("control nodes compile through the execution tree")
+            }
             HirStmt::Server(block) => {
                 for statement in &block.statements {
                     self.compile_statement(statement, Capability::Server, steps);
@@ -352,6 +438,11 @@ impl Compiler<'_> {
 
 pub(super) fn collect_binding_names(statement: &HirStmt, names: &mut HashSet<String>) {
     match statement {
+        HirStmt::Parallel(block) => {
+            for statement in &block.branches {
+                collect_binding_names(statement, names);
+            }
+        }
         HirStmt::Timeout(block) => {
             for statement in &block.statements {
                 collect_binding_names(statement, names);

@@ -18,6 +18,41 @@ mod timeout_tests {
     use rowan::ast::AstNode;
 
     #[test]
+    fn parallel_is_lossless_contextual_and_recovers_partial_input() {
+        for source in [
+            "test \"é\" { parallel { server {} browser {} } }",
+            "test \"x\" { server { parallel { timeout 1s {} timeout 2s {} } } }",
+            "test \"x\" { let parallel = 1 expect parallel == 1 }",
+        ] {
+            let parsed = parse(source);
+            assert!(parsed.errors().is_empty(), "{:?}", parsed.errors());
+            assert_eq!(parsed.syntax().text().to_string(), source);
+        }
+        let source = "test \"é\" { parallel { server {} browser {} } }";
+        let parsed = parse(source);
+        let parallel = parsed
+            .syntax()
+            .descendants()
+            .find_map(ast::ParallelStmt::cast)
+            .unwrap();
+        assert_eq!(parallel.flow_statements().count(), 2);
+        let range = parallel.syntax().text_range();
+        assert_eq!(
+            &source[usize::from(range.start())..usize::from(range.end())],
+            "parallel { server {} browser {} }"
+        );
+        for source in [
+            "test \"x\" { parallel",
+            "test \"x\" { parallel { browser {",
+            "test \"x\" { parallel { @ } }",
+        ] {
+            let parsed = parse(source);
+            assert!(!parsed.errors().is_empty());
+            assert_eq!(parsed.syntax().text().to_string(), source);
+        }
+    }
+
+    #[test]
     fn timeout_blocks_are_lossless_in_every_domain_and_recover_when_half_typed() {
         for source in [
             "test \"é\" { timeout 2s { server { let x = 1 } } }",

@@ -1,10 +1,9 @@
 use std::{
     collections::VecDeque,
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufRead, BufReader, Read, Seek, Write},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
-        Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        Mutex, OnceLock,
         mpsc::{self, Receiver},
     },
     thread,
@@ -14,11 +13,16 @@ use std::{
 use serde_json::{Value, json};
 use webtest_app_bridge::{AppManifest, FieldSchema, FunctionSchema, TypeSchema};
 
+#[path = "support/http_fixture.rs"]
+mod http_fixture;
+use http_fixture::HttpFixture;
+
 struct ProtocolProcess {
     child: Child,
     input: ChildStdin,
     messages: Receiver<Value>,
     pending: Mutex<VecDeque<Value>>,
+    stderr: tempfile::NamedTempFile,
 }
 
 impl ProtocolProcess {
@@ -40,10 +44,11 @@ impl ProtocolProcess {
         if let Some(chrome) = chrome {
             command.env("WEBTEST_CHROME_PATH", chrome);
         }
+        let stderr = tempfile::NamedTempFile::new().expect("protocol stderr log");
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(stderr.reopen().expect("protocol stderr handle"))
             .spawn()
             .expect("spawn protocol server");
         let input = child.stdin.take().expect("protocol stdin");
@@ -62,6 +67,7 @@ impl ProtocolProcess {
             input,
             messages,
             pending: Mutex::new(VecDeque::new()),
+            stderr,
         }
     }
 
@@ -87,7 +93,10 @@ impl ProtocolProcess {
                 .recv_timeout(remaining)
                 .unwrap_or_else(|error| {
                     let pending = self.pending.lock().expect("pending protocol messages");
-                    panic!("timed out waiting for protocol response: {error}; pending={pending:#?}")
+                    panic!(
+                        "failed waiting for protocol response: {error}; pending={pending:#?}; stderr={}",
+                        self.stderr_tail()
+                    )
                 });
             if predicate(&message) {
                 return message;
@@ -97,6 +106,18 @@ impl ProtocolProcess {
                 .expect("pending protocol messages")
                 .push_back(message);
         }
+    }
+
+    fn stderr_tail(&self) -> String {
+        let mut bytes = Vec::new();
+        if let Ok(mut file) = self.stderr.reopen() {
+            let offset = file
+                .metadata()
+                .map_or(0, |metadata| metadata.len().saturating_sub(16 * 1024));
+            let _ = file.seek(std::io::SeekFrom::Start(offset));
+            let _ = file.take(16 * 1024).read_to_end(&mut bytes);
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
     }
 
     fn wait_for_exit(&mut self) {
@@ -138,65 +159,101 @@ fn runtime_protocol_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn fixture_server() -> Option<(std::net::SocketAddr, Arc<AtomicBool>)> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
-    listener.set_nonblocking(true).ok()?;
-    let address = listener.local_addr().ok()?;
-    let stop = Arc::new(AtomicBool::new(false));
-    let server_stop = Arc::clone(&stop);
-    thread::spawn(move || {
-        while !server_stop.load(Ordering::Acquire) {
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    let mut request = [0u8; 2048];
-                    let _ = stream.read(&mut request);
-                    let body = "<!doctype html><button id=\"submit\">Submit</button>";
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    let _ = stream.write_all(response.as_bytes());
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(5));
-                }
-                Err(_) => break,
-            }
-        }
-    });
-    Some((address, stop))
+fn fixture_server() -> Option<HttpFixture> {
+    HttpFixture::start(
+        "200 OK",
+        "text/html",
+        "<!doctype html><button id=\"submit\">Submit</button>",
+    )
 }
 
-fn json_fixture_server() -> Option<(std::net::SocketAddr, Arc<AtomicBool>)> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
-    listener.set_nonblocking(true).ok()?;
-    let address = listener.local_addr().ok()?;
-    let stop = Arc::new(AtomicBool::new(false));
-    let server_stop = Arc::clone(&stop);
-    thread::spawn(move || {
-        while !server_stop.load(Ordering::Acquire) {
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    let mut request = [0u8; 2048];
-                    let _ = stream.read(&mut request);
-                    let body = r#"{"id":7,"email":"alice@example.test"}"#;
-                    let response = format!(
-                        "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    let _ = stream.write_all(response.as_bytes());
-                    let _ = stream.flush();
-                    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
-                    while stream.read(&mut request).is_ok_and(|read| read != 0) {}
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(5));
-                }
-                Err(_) => break,
-            }
-        }
-    });
-    Some((address, stop))
+fn json_fixture_server() -> Option<HttpFixture> {
+    HttpFixture::start(
+        "201 Created",
+        "application/json",
+        r#"{"id":7,"email":"alice@example.test"}"#,
+    )
+}
+
+#[test]
+fn http_fixture_waits_for_complete_request_headers() {
+    let Some(server) = fixture_server() else {
+        return;
+    };
+    let address = server.address;
+    let mut stream = std::net::TcpStream::connect(address).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    stream.write_all(b"GET / HTTP/1.1\r\nHost:").unwrap();
+    let result = stream.read(&mut [0]);
+    assert!(
+        result.as_ref().is_err_and(|error| matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        )),
+        "fixture replied before receiving complete headers: {result:?}"
+    );
+    stream.write_all(b" localhost\r\n\r\n").unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(response.ends_with("<button id=\"submit\">Submit</button>"));
+}
+
+#[test]
+fn http_fixture_serves_requests_while_another_connection_is_idle() {
+    let Some(server) = fixture_server() else {
+        return;
+    };
+    let address = server.address;
+    let idle = std::net::TcpStream::connect(address).expect("idle connection");
+    let mut active = std::net::TcpStream::connect(address).expect("active connection");
+    active
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    active
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    let mut response = [0; 1024];
+    let result = active.read(&mut response);
+    drop(idle);
+    assert!(
+        result.as_ref().is_ok_and(|count| *count > 0),
+        "response: {result:?}"
+    );
+}
+
+#[test]
+fn http_fixture_shutdown_closes_idle_connections_and_joins_server() {
+    let Some(server) = fixture_server() else {
+        return;
+    };
+    let mut stream = std::net::TcpStream::connect(server.address).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    // A response proves this connection was accepted; leave it open on the client side.
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    let mut idle = std::net::TcpStream::connect(server.address).unwrap();
+    idle.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    drop(server);
+    let result = idle.read(&mut [0]);
+    assert!(
+        matches!(&result, Ok(0))
+            || result.as_ref().is_err_and(|error| matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+            )),
+        "fixture left an idle connection open: {result:?}"
+    );
 }
 
 impl Drop for ProtocolProcess {
@@ -766,9 +823,10 @@ fn dap_starts_and_stops_the_project_application() {
 #[test]
 fn dap_project_path_loads_the_test_files_nearest_configuration() {
     let _runtime_test = runtime_protocol_lock();
-    let Some((address, stop_server)) = fixture_server() else {
+    let Some(server) = fixture_server() else {
         return;
     };
+    let address = server.address;
     let directory = tempfile::tempdir().expect("temp directory");
     let project = directory.path().join("nested-project");
     std::fs::create_dir(&project).expect("create nested project");
@@ -826,21 +884,18 @@ fn dap_project_path_loads_the_test_files_nearest_configuration() {
     assert_eq!(output["body"]["category"], "stdout");
     dap.receive(|message| message["type"] == "event" && message["event"] == "terminated");
     dap.wait_for_exit();
-    stop_server.store(true, Ordering::Release);
 }
 
-//
-// flaky unless single threaded
-//
 #[test]
 fn dap_variables_keep_server_bindings_visible_at_a_browser_step() {
     let _runtime_test = runtime_protocol_lock();
     let Some(chrome) = available_chrome() else {
         return;
     };
-    let Some((address, stop_server)) = json_fixture_server() else {
+    let Some(server) = json_fixture_server() else {
         return;
     };
+    let address = server.address;
     let directory = tempfile::tempdir().expect("temp directory");
     let project = directory.path().join("nested-project");
     std::fs::create_dir(&project).expect("create nested project");
@@ -980,7 +1035,6 @@ fn dap_variables_keep_server_bindings_visible_at_a_browser_step() {
         true
     );
     dap.wait_for_exit();
-    stop_server.store(true, Ordering::Release);
 }
 
 #[test]
@@ -989,9 +1043,10 @@ fn lsp_real_run_publishes_and_then_clears_runtime_diagnostic() {
     let Some(chrome) = available_chrome() else {
         return;
     };
-    let Some((address, stop_server)) = fixture_server() else {
+    let Some(server) = fixture_server() else {
         return;
     };
+    let address = server.address;
     let directory = tempfile::tempdir().expect("temp directory");
     let path = directory.path().join("runtime.webtest");
     std::fs::write(&path, "on-disk text is not the synchronized test")
@@ -1080,7 +1135,6 @@ fn lsp_real_run_publishes_and_then_clears_runtime_diagnostic() {
     lsp.receive(|message| message["id"] == 4);
     lsp.send(json!({"jsonrpc":"2.0","method":"exit","params":null}));
     lsp.wait_for_exit();
-    stop_server.store(true, Ordering::Release);
 }
 
 #[test]
@@ -1149,4 +1203,58 @@ fn dap_headed_session_stops_at_a_real_source_breakpoint() {
     request(&mut dap, "continue", json!({"threadId":1}));
     dap.receive(|message| message["type"] == "event" && message["event"] == "terminated");
     dap.wait_for_exit();
+}
+
+#[test]
+fn parallel_browser_branches_use_isolated_native_contexts() {
+    let _runtime_test = runtime_protocol_lock();
+    let Some(chrome) = available_chrome() else {
+        return;
+    };
+    let Some(server) = fixture_server() else {
+        return;
+    };
+    let address = server.address;
+    let directory = tempfile::tempdir().unwrap();
+    let source = format!(
+        r#"test "isolated siblings" {{
+        parallel {{
+            browser {{
+                open "http://{address}"
+                evaluate "if (localStorage.getItem('branch')) throw new Error('shared context'); localStorage.setItem('branch', 'left')"
+            }}
+            browser {{
+                open "http://{address}"
+                evaluate "if (localStorage.getItem('branch')) throw new Error('shared context'); localStorage.setItem('branch', 'right')"
+            }}
+        }}
+    }}"#
+    );
+    std::fs::write(directory.path().join("parallel.webtest"), source).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_webtest"))
+        .current_dir(directory.path())
+        .env("WEBTEST_CHROME_PATH", chrome)
+        .args(["test", "parallel.webtest", "--reporter", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let branches = report["files"][0]["tests"][0]["branches"]
+        .as_array()
+        .unwrap();
+    assert_eq!(branches.len(), 2);
+    assert!(
+        branches
+            .iter()
+            .all(|branch| branch["result"]["outcome"] == "passed")
+    );
+    assert_ne!(
+        branches[0]["scope"]["execution_context"]["scope_id"],
+        branches[1]["scope"]["execution_context"]["scope_id"]
+    );
 }

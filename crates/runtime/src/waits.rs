@@ -101,7 +101,10 @@ impl WaitRegistry {
             }
         };
         let Some(registration_id) = registration_id else {
-            let cleanup = CleanupDeadline::new(cleanup_timeout);
+            let cleanup = CleanupDeadline::at(
+                context.cancellation.cleanup_deadline(cleanup_timeout),
+                cleanup_timeout,
+            );
             let mut secondary = Vec::new();
             record_cleanup(
                 cleanup.bound(source.cleanup()).await,
@@ -150,7 +153,10 @@ impl WaitRegistry {
             },
             cancellation,
         });
-        let cleanup = CleanupDeadline::new(cleanup_timeout);
+        let cleanup = CleanupDeadline::at(
+            context.cancellation.cleanup_deadline(cleanup_timeout),
+            cleanup_timeout,
+        );
         let mut secondary = Vec::new();
         if let Some(cause) = cancellation {
             record_cleanup(
@@ -286,6 +292,57 @@ mod tests {
                 .expect("no surviving waits");
         }
     }
+    #[tokio::test(start_paused = true)]
+    async fn late_descendants_share_the_ancestors_absolute_cleanup_deadline() {
+        struct SlowInterrupt;
+        #[async_trait]
+        impl WaitSource for SlowInterrupt {
+            type Output = ();
+            type Error = ();
+            async fn ready(&mut self) -> Result<(), ()> {
+                std::future::pending().await
+            }
+            async fn interrupt(&mut self, _: Cancellation) -> Result<(), ()> {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                Ok(())
+            }
+            async fn cleanup(&mut self) -> Result<(), ()> {
+                Ok(())
+            }
+        }
+        let parent = context();
+        let started = Instant::now();
+        let cause = Cancellation {
+            reason: CancellationReason::ParentFailed,
+            causing_scope_id: parent.scope_id,
+        };
+        parent.cancellation.cancel(cause);
+        tokio::time::advance(Duration::from_millis(50)).await;
+        let child = parent.child(ExecutionScopeId(2), None);
+        let registry = WaitRegistry::default();
+        let result = registry
+            .wait(
+                &child,
+                &mut SlowInterrupt,
+                Duration::from_millis(100),
+                |_| {},
+            )
+            .await;
+        assert_eq!(started.elapsed(), Duration::from_millis(100));
+        assert_eq!(
+            result.cleanup_deadline,
+            started + Duration::from_millis(100)
+        );
+        assert_eq!(result.primary, WaitCompletion::Cancelled(cause));
+        assert_eq!(
+            result.secondary,
+            [WaitCleanupFailure::TimedOut {
+                phase: WaitCleanupPhase::Interrupt
+            }]
+        );
+        registry.validate_owner_finished(child.scope_id).unwrap();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn cancellation_cause_and_cleanup_failure_do_not_erase_each_other() {
         let context = context();

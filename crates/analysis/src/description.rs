@@ -1035,6 +1035,7 @@ mod tests {
 
         for (query, expected) in [
             ("timeout", "control.timeout"),
+            ("parallel", "control.parallel"),
             ("integer overflow", "type.Int"),
             ("optional member", "type.Record"),
             ("passive locator observation", "browser.wait.locator"),
@@ -1224,6 +1225,7 @@ mod tests {
         let expected = [
             "declaration.test",
             "control.timeout",
+            "control.parallel",
             "scope.server",
             "scope.browser",
             "statement.let",

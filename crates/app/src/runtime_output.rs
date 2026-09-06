@@ -75,7 +75,7 @@ pub(crate) fn aborted_run_failure_report(
             &mut report,
             serde_json::json!({
                 "kind": "cancelled",
-                "reason": format!("{reason:?}").to_ascii_lowercase(),
+                "reason": reason,
             }),
         );
     }
@@ -103,7 +103,7 @@ pub(crate) fn aborted_test_failure_report(
         }),
         Some(PriorTestOutcome::Cancelled { reason }) => serde_json::json!({
             "kind": "cancelled",
-            "reason": format!("{reason:?}").to_ascii_lowercase(),
+            "reason": reason,
         }),
         None => return report,
     };
@@ -780,7 +780,7 @@ mod tests {
         let cleanup_report = aborted_test_failure_report(
             &cleanup,
             Some(Box::new(PriorTestOutcome::Cancelled {
-                reason: webtest_observation::CancellationReason::Requested,
+                reason: webtest_observation::CancellationReason::UserCancelled,
             })),
             "",
         );

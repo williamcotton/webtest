@@ -65,6 +65,8 @@ struct Compiler<'a> {
     required: BTreeSet<Capability>,
     test_required: BTreeSet<Capability>,
     next_step: u32,
+    concurrent_captures: HashSet<BindingId>,
+    concurrent_depth: usize,
 }
 
 pub(crate) fn compile(
@@ -97,6 +99,8 @@ impl<'a> Compiler<'a> {
             required: BTreeSet::new(),
             test_required: BTreeSet::new(),
             next_step: 0,
+            concurrent_captures: HashSet::new(),
+            concurrent_depth: 0,
         }
     }
 

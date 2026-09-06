@@ -1,4 +1,4 @@
-use super::TestBodyOutcome;
+use super::{ProvisionalTestOutcome, TestBodyOutcome};
 use crate::{RunControl, ScopeContext, WaitSource};
 use async_trait::async_trait;
 use std::{future::Future, pin::Pin};
@@ -9,6 +9,19 @@ use webtest_observation::CleanupCause;
 /// explicit interruption. The wait driver separately bounds this cleanup phase.
 pub(super) struct TestBodyWait<F> {
     pub future: Option<Pin<Box<F>>>,
+    /// A resource may already have failed before an enclosing cancellation is
+    /// delivered during its teardown. Its eventual primary failure must survive
+    /// the wait's cancellation result.
+    pub interrupted_failure: Option<TestBodyOutcome>,
+}
+
+impl<F> TestBodyWait<F> {
+    pub fn new(future: F) -> Self {
+        Self {
+            future: Some(Box::pin(future)),
+            interrupted_failure: None,
+        }
+    }
 }
 #[async_trait]
 impl<F> WaitSource for TestBodyWait<F>
@@ -26,8 +39,19 @@ where
     async fn interrupt(&mut self, _: Cancellation) -> Result<(), Self::Error> {
         if let Some(future) = self.future.as_mut() {
             let result = future.await;
-            if let TestBodyOutcome::PendingFailure(pending) = result {
-                pending.interruption_cleanup()?;
+            match result {
+                TestBodyOutcome::PendingFailure(pending) => pending.interruption_cleanup()?,
+                result @ TestBodyOutcome::Provisional(ProvisionalTestOutcome::Aborted {
+                    ..
+                }) => self.interrupted_failure = Some(result),
+                result @ TestBodyOutcome::Provisional(ProvisionalTestOutcome::Finalized(_))
+                    if result
+                        .failure_class()
+                        .is_some_and(|class| class != crate::FailureClass::Test) =>
+                {
+                    self.interrupted_failure = Some(result)
+                }
+                _ => {}
             }
         }
         Ok(())

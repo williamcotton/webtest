@@ -8,6 +8,7 @@ pub(super) fn core_constructs() -> BTreeMap<String, ConstructDescription> {
         scope_construct("browser", Capability::Browser),
         let_construct(),
         timeout_construct(),
+        parallel_construct(),
         typed_json_decode(),
     ] {
         constructs.insert(construct.id.clone(), construct);
@@ -132,7 +133,7 @@ fn declaration_test() -> ConstructDescription {
         "test",
         "declaration",
         "test <name> { <flow_statement>* }",
-        "Declare a named sequential test flow.",
+        "Declare a named test with an ordered root flow.",
     );
     value.parameters = vec![
         parameter(
@@ -161,7 +162,7 @@ fn declaration_test() -> ConstructDescription {
         "sequential_test_flow",
         "runtime",
         "body",
-        "Statements execute in source order and stop after the first failed step.",
+        "Root statements execute in source order and stop after a failed subtree. Explicit parallel blocks schedule their child branches concurrently.",
     )];
     value.examples = vec![
         example(
@@ -180,13 +181,94 @@ fn declaration_test() -> ConstructDescription {
     value
 }
 
+fn parallel_construct() -> ConstructDescription {
+    let mut value = base_construct(
+        "control.parallel",
+        "parallel",
+        "control",
+        "parallel { <capability_or_control_block>+ }",
+        "Run bounded sibling branches concurrently, await every teardown, and preserve ordered branch outcomes.",
+    );
+    value.search_terms = vec![
+        "concurrency".into(),
+        "siblings".into(),
+        "parallel".into(),
+        "multiple failures".into(),
+        "cancellation".into(),
+    ];
+    value.produces_value = Some(false);
+    value.allowed_contexts = vec![
+        "flow_block".into(),
+        "scope.server".into(),
+        "scope.browser".into(),
+    ];
+    value.effects = vec!["Start direct child blocks as siblings; ordinary operations within each branch remain sequential.".into(), "Collect test failures while healthy siblings continue; infrastructure or internal primary failures promptly cancel unfinished siblings with ParentFailed before teardown completes.".into(), "Await every child and its bounded resource cleanup. Report all branch results in source order regardless of completion order.".into()];
+    value.failure_modes = vec![
+        "Child test, infrastructure, and internal failures retain their original typed codes and failure classes.".into(),
+        "cleanup_scope_failed".into(),
+    ];
+    value.constraints = vec![
+        constraint(
+            "bounded_branches",
+            "analysis",
+            "body",
+            "Provide 1 to 64 direct capability or control blocks. Direct leaf statements are not branches.",
+        ),
+        constraint(
+            "transferable_snapshots",
+            "analysis",
+            "body",
+            "Branches read immutable snapshots of outer transferable bindings. Non-transferable captures are rejected; branch-local values do not merge.",
+        ),
+        constraint(
+            "exclusive_resources",
+            "analysis",
+            "body",
+            "Browser branches declared in a flow domain acquire separate lexical browser contexts. A parallel subtree inside an existing browser block cannot use the enclosing exclusive context. Shared typed resources require a shared-access contract.",
+        ),
+        constraint(
+            "structured_cleanup",
+            "runtime",
+            "body",
+            "Cancellation propagates downwards with its typed reason and causing scope. The parent waits for bounded cleanup and retains completed child failures even when interrupted.",
+        ),
+    ];
+    value.examples = vec![
+        example(
+            "independent values",
+            "let seed = 7 parallel { server { let left = seed expect left == 7 } server { let right = seed expect right == 7 } }",
+            "statement_fragment",
+            "flow_block",
+        ),
+        example(
+            "isolated browser branches",
+            "parallel { browser { open \"/left\" } browser { open \"/right\" } }",
+            "statement_fragment",
+            "flow_block",
+        ),
+        example(
+            "bounded server branches",
+            "parallel { timeout 1s { expect 1 == 1 } timeout 1s { expect 2 == 2 } }",
+            "statement_fragment",
+            "scope.server",
+        ),
+    ];
+    value.related = vec![
+        "control.timeout".into(),
+        "scope.server".into(),
+        "scope.browser".into(),
+        "runtime.configuration".into(),
+    ];
+    value
+}
+
 fn timeout_construct() -> ConstructDescription {
     let mut value = base_construct(
         "control.timeout",
         "timeout",
         "control",
         "timeout <Duration> { <inherited_statement>* }",
-        "Run a sequential child scope under a positive deadline, then await bounded cleanup before returning a timeout failure.",
+        "Run a child subtree under a positive deadline, then await bounded cleanup before returning a timeout failure.",
     );
     value.search_terms = vec![
         "deadline".into(),
@@ -287,6 +369,10 @@ fn scope_construct(name: &str, capability: Capability) -> ConstructDescription {
         "body",
         "Every statement in the body must be legal in this capability domain.",
     )];
+    if capability == Capability::Browser {
+        value.constraints.push(constraint("lexical_concurrent_context", "runtime", "body", "Inside a concurrent branch, each browser block with page operations owns a fresh context. Its acquisition is inside any enclosing timeout. Sequential browser blocks outside concurrency continue to use the test context."));
+        value.related.push("control.parallel".into());
+    }
     value.examples = match capability {
         Capability::Server => vec![
             example(

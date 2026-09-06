@@ -1170,13 +1170,17 @@ Acceptance: the same WebTest source calls `app.create_user` against applications
 `timeout` now lowers and executes through the shared control tree, with local bindings, inherited
 deadlines, and lexical temporary-directory cleanup, including discarded provider results.
 
-Status: in progress. The sequential execution-tree foundation, structural node identities,
-parented scope/operation events, plan format 5/runtime semantics 2 compatibility metadata, and atomic runtime
+`parallel` now lowers through the same path with transferable snapshots, branch-local state,
+lexical browser contexts, prompt infrastructure-failure cancellation, bounded teardown, and ordered
+typed child results. Descriptions, native/WASM plans, and CLI/DAP result projections share that path.
+
+Status: in progress. The execution-tree foundation, structural node identities,
+parented scope/operation events, plan format 6/runtime semantics 3 compatibility metadata, and atomic runtime
 observation commits are implemented. Generic resource/lease/wait contracts, browser-context
 lifecycle integration, inherited cancellation/deadline contexts, and bounded cleanup now have
 conformance coverage. Direct processes and command adapters share cancellation-aware capture;
 active bridge calls await terminal cancellation acknowledgement. Complete host/resource ownership,
-parallel/race/retry constructs, jobs,
+race/retry constructs, jobs,
 the authoritative journal, traces, observation IPC, and concurrent DAP remain
 pending; see the milestone's implementation-progress section for the exact boundary.
 

@@ -10,6 +10,7 @@ use webtest_model::ExecutionScopeId;
 #[derive(Debug, Default)]
 struct CancellationState {
     cause: Option<Cancellation>,
+    cancelled_at: Option<Instant>,
     children: Vec<Weak<CancellationInner>>,
 }
 #[derive(Debug, Default)]
@@ -32,14 +33,18 @@ impl CancellationToken {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.children.retain(|child| child.strong_count() != 0);
         state.children.push(Arc::downgrade(&child.0));
-        if let Some(cause) = state.cause {
-            child.cancel(cause);
+        if let (Some(cause), Some(at)) = (state.cause, state.cancelled_at) {
+            child.cancel_at(cause, at);
         }
         child
     }
 
     /// First cause wins. Cancelling a child never changes an ancestor or sibling.
     pub fn cancel(&self, cause: Cancellation) {
+        self.cancel_at(cause, Instant::now());
+    }
+
+    fn cancel_at(&self, cause: Cancellation, at: Instant) {
         let children = {
             let mut state = self
                 .0
@@ -50,12 +55,25 @@ impl CancellationToken {
                 return;
             }
             state.cause = Some(cause);
+            state.cancelled_at = Some(at);
             std::mem::take(&mut state.children)
         };
         self.0.wake.notify_waiters();
         for child in children.into_iter().filter_map(|child| child.upgrade()) {
-            Self(child).cancel(cause);
+            Self(child).cancel_at(cause, at);
         }
+    }
+
+    /// Cancellation establishes one monotonic cleanup epoch, including for
+    /// descendants polled or created later. Scheduling delays cannot reset it.
+    pub(crate) fn cleanup_deadline(&self, timeout: Duration) -> Instant {
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .cancelled_at
+            .unwrap_or_else(Instant::now)
+            + timeout
     }
 
     pub fn cause(&self) -> Option<Cancellation> {

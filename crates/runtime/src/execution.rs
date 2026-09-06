@@ -29,8 +29,8 @@ use self::{
 };
 
 mod branch;
-mod concurrent;
 mod browser;
+mod concurrent;
 mod failure;
 mod provider;
 mod resource;
@@ -53,7 +53,7 @@ pub(crate) struct ExecutedTest {
     pub(crate) result: TestResult,
 }
 
-#[allow(dead_code)]
+#[derive(Clone)]
 enum ProvisionalTestOutcome {
     Finalized(Box<TestOutcome>),
     Passed,
@@ -71,9 +71,28 @@ enum ProvisionalTestOutcome {
     },
 }
 
+#[derive(Clone)]
 enum TestBodyOutcome {
     Provisional(ProvisionalTestOutcome),
     PendingFailure(Box<PendingFailure>),
+}
+
+impl TestBodyOutcome {
+    fn failure_class(&self) -> Option<FailureClass> {
+        match self {
+            Self::PendingFailure(pending) => Some(pending.failure_class()),
+            Self::Provisional(ProvisionalTestOutcome::Aborted { failure }) => {
+                Some(failure.failure_class())
+            }
+            Self::Provisional(ProvisionalTestOutcome::Finalized(outcome)) => {
+                outcome.failure_class()
+            }
+            Self::Provisional(
+                ProvisionalTestOutcome::Failed(_) | ProvisionalTestOutcome::TimedOut { .. },
+            ) => Some(FailureClass::Test),
+            _ => None,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -133,10 +152,8 @@ pub(crate) async fn execute_test(
 
     let mut resource_cleanup_deadline = None;
     let body_outcome = wait::with_control(control, &root_context, async {
-        let mut source = wait::TestBodyWait {
-            future: Some(Box::pin(execute_test_body(&services, &mut branch, &root))),
-        };
-        let result = waits
+        let mut source = wait::TestBodyWait::new(execute_test_body(&services, &mut branch, &root));
+        let mut result = waits
             .wait(
                 &root_context,
                 &mut source,
@@ -154,6 +171,9 @@ pub(crate) async fn execute_test(
                 },
             )
             .await;
+        if let Some(primary) = source.interrupted_failure.take() {
+            result.primary = crate::WaitCompletion::Ready(primary);
+        }
         drop(source);
         resource_cleanup_deadline = Some(result.cleanup_deadline);
         branch
@@ -189,6 +209,7 @@ pub(crate) async fn execute_test(
         }
     })
     .await;
+    let body_outcome = branch.primary_failure.take().or(body_outcome);
     let outcome = match body_outcome {
         Some(TestBodyOutcome::PendingFailure(pending)) => {
             let failure_result = process_failure(FailureInput {
@@ -241,7 +262,10 @@ pub(crate) async fn execute_test(
             .is_some_and(|cause| cause.reason != webtest_host::CancellationReason::Timeout) =>
         {
             ProvisionalTestOutcome::Cancelled {
-                reason: CancellationReason::Requested,
+                reason: root_context
+                    .cancellation
+                    .cause()
+                    .map_or(CancellationReason::UserCancelled, |cause| cause.reason),
             }
         }
         None => {
@@ -347,15 +371,7 @@ pub(crate) async fn execute_test(
         emit_cleanup_failed(events, event_sink, execution_id, Some(test.id), failure);
     }
     let outcome = combine_test_outcome(outcome, branch.cleanup_failures);
-    let scope_outcome = match &outcome {
-        TestOutcome::Passed => webtest_observation::ScopeOutcome::Passed,
-        TestOutcome::Failed(_) => webtest_observation::ScopeOutcome::Failed,
-        TestOutcome::TimedOut { .. } => webtest_observation::ScopeOutcome::TimedOut,
-        TestOutcome::Cancelled { .. } | TestOutcome::Skipped { .. } => {
-            webtest_observation::ScopeOutcome::Cancelled
-        }
-        TestOutcome::Aborted { .. } => webtest_observation::ScopeOutcome::Aborted,
-    };
+    let scope_outcome = scope_outcome(&outcome);
     branch
         .scopes
         .finish_descendants(&root, execution_id, events, event_sink);
@@ -381,7 +397,15 @@ pub(crate) async fn execute_test(
             outcome,
             duration: test_started.elapsed(),
             bindings,
-            branches: branch.completed_branches,
+            branches: {
+                branch.completed_branches.sort_by(|a, b| {
+                    a.scope
+                        .execution_context
+                        .task_path
+                        .cmp(&b.scope.execution_context.task_path)
+                });
+                branch.completed_branches
+            },
         },
     }
 }
@@ -451,9 +475,23 @@ impl TreeExecution<'_, '_> {
                 self.services.event_sink,
             );
             let outcome = self.body(node, &scope).await;
+            if let Some(class) = outcome.failure_class() {
+                if scope.context.cancellation.cause().is_none() {
+                    self.branch
+                        .primary_failure
+                        .get_or_insert_with(|| outcome.clone());
+                }
+                for signal in &self.branch.failure_signals {
+                    signal.report(class);
+                }
+            }
             use webtest_observation::ScopeOutcome;
             let terminal = match &outcome {
-                TestBodyOutcome::Provisional(ProvisionalTestOutcome::Finalized(outcome)) if self.branch.cleanup_failures.is_empty() => scope_outcome(outcome),
+                TestBodyOutcome::Provisional(ProvisionalTestOutcome::Finalized(outcome))
+                    if self.branch.cleanup_failures.is_empty() =>
+                {
+                    scope_outcome(outcome)
+                }
                 _ if !self.branch.cleanup_failures.is_empty() => ScopeOutcome::Aborted,
                 TestBodyOutcome::Provisional(ProvisionalTestOutcome::Passed) => {
                     ScopeOutcome::Passed
@@ -558,19 +596,21 @@ impl TreeExecution<'_, '_> {
             });
         }
         let services = self.services;
+        let cleanup_timeout = owner.cleanup_timeout(services.options.cleanup_timeout);
         let context = owner.context.clone();
         let scope = owner.event.clone();
         let mut session = self.branch.session.take();
         let mut interrupted_body_cleanup = None;
+        let signals = self.branch.failure_signals.clone();
         let result = crate::ResourceScope {
             registry: services.resources,
             waits: services.waits,
             context: &context,
             kind: webtest_observation::ResourceKind::BrowserContext,
             access: webtest_observation::ResourceAccess::Exclusive,
-            cleanup_timeout: services.options.cleanup_timeout,
+            cleanup_timeout,
         }
-        .run(
+        .run_observed(
             resource::BrowserResource {
                 host: services.browser,
                 session: &mut session,
@@ -607,6 +647,22 @@ impl TreeExecution<'_, '_> {
                     },
                 ),
             },
+            |primary| {
+                let class = match primary {
+                    crate::WaitCompletion::Ready(body) => body.failure_class(),
+                    crate::WaitCompletion::Failed(crate::ResourceFailure::Host(_)) => {
+                        Some(FailureClass::Infrastructure)
+                    }
+                    crate::WaitCompletion::Failed(crate::ResourceFailure::Invariant(_))
+                    | crate::WaitCompletion::Rejected(_) => Some(FailureClass::Internal),
+                    _ => None,
+                };
+                if let Some(class) = class {
+                    for signal in &signals {
+                        signal.report(class);
+                    }
+                }
+            },
         )
         .await;
         self.branch.session = session;
@@ -614,7 +670,7 @@ impl TreeExecution<'_, '_> {
             result
                 .secondary
                 .into_iter()
-                .map(|failure| browser_resource_cleanup(failure, services.options.cleanup_timeout)),
+                .map(|failure| browser_resource_cleanup(failure, cleanup_timeout)),
         );
         if let Some(cause) = interrupted_body_cleanup {
             self.branch.cleanup_failures.push(CleanupFailure {
@@ -633,10 +689,7 @@ impl TreeExecution<'_, '_> {
                 .release(
                     Some(&owned_scopes),
                     &mut self.branch.bindings,
-                    crate::cleanup::CleanupDeadline::at(
-                        result.cleanup_deadline,
-                        services.options.cleanup_timeout,
-                    ),
+                    crate::cleanup::CleanupDeadline::at(result.cleanup_deadline, cleanup_timeout),
                     &temporary::ResourceEvents {
                         registry: services.resources,
                         execution_id: services.execution_id,
@@ -646,6 +699,11 @@ impl TreeExecution<'_, '_> {
                 )
                 .await,
         );
+        if let Err(error) = services.resources.validate_owner_finished(owner.id()) {
+            self.branch
+                .cleanup_failures
+                .push(resource_cleanup_invariant(error));
+        }
         self.branch.scopes.finish_descendants(
             owner,
             services.execution_id,
@@ -654,9 +712,9 @@ impl TreeExecution<'_, '_> {
         );
         match result.primary {
             crate::WaitCompletion::Ready(body) => body,
-            crate::WaitCompletion::Cancelled(_) => {
+            crate::WaitCompletion::Cancelled(cause) => {
                 TestBodyOutcome::Provisional(ProvisionalTestOutcome::Cancelled {
-                    reason: CancellationReason::Requested,
+                    reason: cause.reason,
                 })
             }
             crate::WaitCompletion::Failed(crate::ResourceFailure::Host(error)) => {
@@ -689,17 +747,15 @@ impl TreeExecution<'_, '_> {
         let scope = owner.event.clone();
         let cleanup_timeout = cleanup_timeout
             .unwrap_or(self.services.options.cleanup_timeout)
-            .min(self.services.options.cleanup_timeout);
+            .min(owner.cleanup_timeout(self.services.options.cleanup_timeout));
         let waits = self.services.waits;
         let events = self.services.events;
         let sink = self.services.event_sink;
         let execution_id = self.services.execution_id;
         let visible = self.branch.bindings.binding_checkpoint();
         let result = {
-            let mut source = wait::TestBodyWait {
-                future: Some(Box::pin(self.node(child, owner))),
-            };
-            waits
+            let mut source = wait::TestBodyWait::new(self.node(child, owner));
+            let mut result = waits
                 .wait(&context, &mut source, cleanup_timeout, |event| {
                     emit_event(
                         events,
@@ -711,7 +767,11 @@ impl TreeExecution<'_, '_> {
                         },
                     )
                 })
-                .await
+                .await;
+            if let Some(primary) = source.interrupted_failure.take() {
+                result.primary = crate::WaitCompletion::Ready(primary);
+            }
+            result
         };
         let owned_scopes = self.branch.scopes.subtree_ids(owner);
         self.branch.bindings.restore_bindings(&visible);
@@ -768,9 +828,9 @@ impl TreeExecution<'_, '_> {
                     origin: Some(node.origin),
                 })
             }
-            crate::WaitCompletion::Cancelled(_) => {
+            crate::WaitCompletion::Cancelled(cause) => {
                 TestBodyOutcome::Provisional(ProvisionalTestOutcome::Cancelled {
-                    reason: CancellationReason::Requested,
+                    reason: cause.reason,
                 })
             }
             crate::WaitCompletion::Failed(cause) => {
@@ -781,7 +841,7 @@ impl TreeExecution<'_, '_> {
                     cause,
                 });
                 TestBodyOutcome::Provisional(ProvisionalTestOutcome::Cancelled {
-                    reason: CancellationReason::Requested,
+                    reason: CancellationReason::UserCancelled,
                 })
             }
             crate::WaitCompletion::Rejected(error) => {
@@ -815,7 +875,15 @@ impl TreeExecution<'_, '_> {
             || control.is_some_and(RunControl::is_cancelled)
         {
             return TestBodyOutcome::Provisional(ProvisionalTestOutcome::Cancelled {
-                reason: CancellationReason::Requested,
+                reason: host_context.cancellation.cause().map_or_else(
+                    || {
+                        control.map_or(
+                            CancellationReason::UserCancelled,
+                            RunControl::cancellation_reason,
+                        )
+                    },
+                    |cause| cause.reason,
+                ),
             });
         }
         if let TestOperation::ServerProviderCall(call) = &step.operation {
@@ -838,7 +906,10 @@ impl TreeExecution<'_, '_> {
             }
             if host_context.cancellation.cause().is_some() || control.is_cancelled() {
                 return TestBodyOutcome::Provisional(ProvisionalTestOutcome::Cancelled {
-                    reason: CancellationReason::Requested,
+                    reason: host_context
+                        .cancellation
+                        .cause()
+                        .map_or_else(|| control.cancellation_reason(), |cause| cause.reason),
                 });
             }
         }
@@ -898,7 +969,15 @@ impl TreeExecution<'_, '_> {
         match completion {
             Ok(steps::StepCompletion::Cancelled) => {
                 return TestBodyOutcome::Provisional(ProvisionalTestOutcome::Cancelled {
-                    reason: CancellationReason::Requested,
+                    reason: host_context.cancellation.cause().map_or_else(
+                        || {
+                            control.map_or(
+                                CancellationReason::UserCancelled,
+                                RunControl::cancellation_reason,
+                            )
+                        },
+                        |cause| cause.reason,
+                    ),
                 });
             }
             Ok(steps::StepCompletion::Completed) => {
@@ -907,7 +986,15 @@ impl TreeExecution<'_, '_> {
                         state.accept_provider_result_metadata(call);
                     }
                     return TestBodyOutcome::Provisional(ProvisionalTestOutcome::Cancelled {
-                        reason: CancellationReason::Requested,
+                        reason: host_context.cancellation.cause().map_or_else(
+                            || {
+                                control.map_or(
+                                    CancellationReason::UserCancelled,
+                                    RunControl::cancellation_reason,
+                                )
+                            },
+                            |cause| cause.reason,
+                        ),
                     });
                 }
                 if let TestOperation::ServerProviderCall(call) = &step.operation {
@@ -938,16 +1025,17 @@ impl TreeExecution<'_, '_> {
                 );
             }
             Err(error) => {
-                if matches!(
-                    &error,
-                    crate::StepError::Provider(webtest_provider::ProviderError::Cancelled {
-                        cleanup_succeeded: true,
-                        ..
-                    })
-                ) {
+                if let crate::StepError::Provider(webtest_provider::ProviderError::Cancelled {
+                    cleanup_succeeded: true,
+                    cause,
+                }) = &error
+                {
                     return TestBodyOutcome::Provisional(ProvisionalTestOutcome::Cancelled {
-                        reason: CancellationReason::Requested,
+                        reason: cause.reason,
                     });
+                }
+                for signal in &self.branch.failure_signals {
+                    signal.report(error.failure_class());
                 }
                 let (redacted_fields, secrets) = state.redaction();
                 let error = redact_step_error(
@@ -956,6 +1044,16 @@ impl TreeExecution<'_, '_> {
                     secrets,
                     &options.inspection.redacted_query_parameters,
                 );
+                let primary_precedes_cancellation = host_context.cancellation.cause().is_none();
+                if primary_precedes_cancellation {
+                    self.branch.primary_failure = Some(TestBodyOutcome::PendingFailure(Box::new(
+                        PendingFailure::primary(
+                            step,
+                            error.clone(),
+                            duration_millis(step_started.elapsed()),
+                        ),
+                    )));
+                }
                 if host_context.cancellation.cause().is_none()
                     && error.failure_class() != FailureClass::Internal
                     && let Some(control) = control
@@ -976,7 +1074,11 @@ impl TreeExecution<'_, '_> {
                     secrets,
                 })
                 .await;
-                return TestBodyOutcome::PendingFailure(Box::new(pending));
+                let outcome = TestBodyOutcome::PendingFailure(Box::new(pending));
+                if primary_precedes_cancellation {
+                    self.branch.primary_failure = Some(outcome.clone());
+                }
+                return outcome;
             }
         }
 
@@ -1070,21 +1172,48 @@ fn combine_test_outcome(
         ProvisionalTestOutcome::Finalized(outcome) => *outcome,
         ProvisionalTestOutcome::Passed => TestOutcome::Passed,
         ProvisionalTestOutcome::Failed(failure) => TestOutcome::Failed(failure),
-        ProvisionalTestOutcome::TimedOut { timeout, active_step, .. } => TestOutcome::TimedOut { timeout, active_step },
-        ProvisionalTestOutcome::Cancelled { reason } => TestOutcome::Cancelled { reason },
-        ProvisionalTestOutcome::Aborted { failure } => TestOutcome::Aborted { failure, prior_outcome: None },
-    };
-    if cleanup_failures.is_empty() { return outcome; }
-    let prior_outcome = match outcome {
-        TestOutcome::Aborted { failure, prior_outcome } => return TestOutcome::Aborted {
-            failure: failure.combine_with_cleanup(cleanup_failures), prior_outcome,
+        ProvisionalTestOutcome::TimedOut {
+            timeout,
+            active_step,
+            ..
+        } => TestOutcome::TimedOut {
+            timeout,
+            active_step,
         },
+        ProvisionalTestOutcome::Cancelled { reason } => TestOutcome::Cancelled { reason },
+        ProvisionalTestOutcome::Aborted { failure } => TestOutcome::Aborted {
+            failure,
+            prior_outcome: None,
+        },
+    };
+    if cleanup_failures.is_empty() {
+        return outcome;
+    }
+    let prior_outcome = match outcome {
+        TestOutcome::Aborted {
+            failure,
+            prior_outcome,
+        } => {
+            return TestOutcome::Aborted {
+                failure: failure.combine_with_cleanup(cleanup_failures),
+                prior_outcome,
+            };
+        }
         TestOutcome::Passed | TestOutcome::Skipped { .. } => None,
         TestOutcome::Failed(failure) => Some(Box::new(PriorTestOutcome::Failed(failure))),
-        TestOutcome::TimedOut { timeout, active_step } => Some(Box::new(PriorTestOutcome::TimedOut { timeout, active_step })),
+        TestOutcome::TimedOut {
+            timeout,
+            active_step,
+        } => Some(Box::new(PriorTestOutcome::TimedOut {
+            timeout,
+            active_step,
+        })),
         TestOutcome::Cancelled { reason } => Some(Box::new(PriorTestOutcome::Cancelled { reason })),
     };
-    TestOutcome::Aborted { failure: cleanup_run_error(cleanup_failures), prior_outcome }
+    TestOutcome::Aborted {
+        failure: cleanup_run_error(cleanup_failures),
+        prior_outcome,
+    }
 }
 
 fn scope_outcome(outcome: &TestOutcome) -> webtest_observation::ScopeOutcome {

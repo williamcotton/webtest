@@ -14,6 +14,8 @@ pub(super) struct BranchState {
     pub scopes: BranchScopes,
     pub temporary: TemporaryResources,
     pub cleanup_failures: Vec<CleanupFailure>,
+    pub primary_failure: Option<super::TestBodyOutcome>,
+    pub failure_signals: Vec<super::scheduler::FailureSignal>,
     pub completed_branches: Vec<crate::BranchResult>,
 }
 
@@ -30,6 +32,8 @@ impl BranchState {
             scopes: BranchScopes::default(),
             temporary: TemporaryResources::default(),
             cleanup_failures: Vec::new(),
+            primary_failure: None,
+            failure_signals: Vec::new(),
             completed_branches: Vec::new(),
         }
     }
@@ -43,6 +47,8 @@ impl BranchState {
             scopes: BranchScopes::default(),
             temporary: TemporaryResources::default(),
             cleanup_failures: Vec::new(),
+            primary_failure: None,
+            failure_signals: self.failure_signals.clone(),
             completed_branches: Vec::new(),
         }
     }

@@ -27,12 +27,19 @@ pub struct HirTest {
 #[derive(Clone, Debug, PartialEq)]
 pub enum HirStmt {
     Timeout(HirTimeout),
+    Parallel(HirParallel),
     Server(HirServerBlock),
     Browser(HirBrowserBlock),
     Let(HirLet),
     Expression(HirExpressionStmt),
     Expect(HirExpectation),
     BrowserOperation(HirBrowserOp),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HirParallel {
+    pub branches: Vec<HirStmt>,
+    pub origin: SyntaxOrigin,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -322,6 +329,9 @@ fn lower_test(
 
 fn lower_flow_statement(context: &mut LowerContext, statement: FlowStatement) -> Option<HirStmt> {
     match statement {
+        FlowStatement::Parallel(statement) => {
+            lower_parallel(context, statement, true).map(HirStmt::Parallel)
+        }
         FlowStatement::Timeout(statement) => {
             lower_timeout(context, statement, true).map(HirStmt::Timeout)
         }
@@ -360,6 +370,9 @@ fn lower_domain_statement(
     statement: DomainStatement,
 ) -> Option<HirStmt> {
     match statement {
+        DomainStatement::Parallel(statement) => {
+            lower_parallel(context, statement, false).map(HirStmt::Parallel)
+        }
         DomainStatement::Timeout(statement) => {
             lower_timeout(context, statement, false).map(HirStmt::Timeout)
         }
@@ -374,6 +387,37 @@ fn lower_domain_statement(
             lower_browser_operation(context, operation).map(HirStmt::BrowserOperation)
         }
     }
+}
+
+fn lower_parallel(
+    context: &mut LowerContext,
+    statement: ast::ParallelStmt,
+    flow: bool,
+) -> Option<HirParallel> {
+    statement.body()?;
+    let bindings = context.bindings.clone();
+    let branches = if flow {
+        statement
+            .flow_statements()
+            .filter_map(|child| {
+                context.bindings = bindings.clone();
+                lower_flow_statement(context, child)
+            })
+            .collect()
+    } else {
+        statement
+            .domain_statements()
+            .filter_map(|child| {
+                context.bindings = bindings.clone();
+                lower_domain_statement(context, child)
+            })
+            .collect()
+    };
+    context.bindings = bindings;
+    Some(HirParallel {
+        branches,
+        origin: origin(context.file, statement.syntax()),
+    })
 }
 
 fn lower_timeout(

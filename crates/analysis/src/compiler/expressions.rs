@@ -36,6 +36,9 @@ impl Compiler<'_> {
             },
             HirExprKind::Name(HirNameRef::Binding { id, name }) => {
                 if let Some(binding) = self.bindings.get(id).cloned() {
+                    if self.concurrent_captures.contains(id) {
+                        self.error(expression.origin.range, "semantic.non_transferable_capture", format!("binding `{name}` has non-transferable type {} and cannot be captured by a concurrent branch", binding.ty));
+                    }
                     if domain == Capability::Browser
                         && binding.domain == Capability::Server
                         && !binding.ty.is_transferable()

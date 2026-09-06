@@ -28,6 +28,7 @@ pub(super) struct PrepareFailureInput<'a> {
     pub(super) secrets: &'a [String],
 }
 
+#[derive(Clone)]
 pub(super) struct PendingFailure {
     step: PlannedStep,
     error: StepError,
@@ -38,6 +39,16 @@ pub(super) struct PendingFailure {
 }
 
 impl PendingFailure {
+    pub(super) fn primary(step: &PlannedStep, error: StepError, elapsed_ms: u64) -> Self {
+        Self {
+            step: step.clone(),
+            error,
+            evidence: PageEvidence::default(),
+            inspection: None,
+            secondary_failures: Vec::new(),
+            elapsed_ms,
+        }
+    }
     pub(super) fn interruption_cleanup(&self) -> Result<(), webtest_observation::CleanupCause> {
         match &self.error {
             StepError::Provider(webtest_provider::ProviderError::Cancelled {

@@ -157,5 +157,13 @@ Use `webtest describe control.timeout --reporter json` before adding a local exe
 `timeout 2s { ... }` inherits the enclosing capability domain, keeps its declarations local, and
 uses the earliest enclosing deadline. Cleanup uses the separate bounded `[timeouts].cleanup`
 budget. Inspect structured timeout and cleanup facts together when a timed-out test aborts.
-Do not infer that parallel, race, retry, or jobs are available from timeout support; discover
-those constructs with the installed binary before using them.
+
+Use `webtest describe control.parallel --reporter json` before adding sibling concurrency.
+`parallel { server { ... } browser { ... } }` runs 1 to 64 direct child blocks. Each branch
+starts with transferable outer bindings; its declarations stay local. Browser branches in a
+flow domain acquire independent contexts. Do not capture native resource handles or use an
+inherited browser context concurrently. Test failures are collected in source order; an
+infrastructure/internal primary failure cancels siblings promptly and every teardown is awaited.
+Inspect the report's typed `branches` aggregate as well as its summary outcome.
+Race, retry, jobs, traces, and concurrent debugger stepping remain unfinished; discover those
+features with the installed binary before using them.

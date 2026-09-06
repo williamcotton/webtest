@@ -464,7 +464,7 @@ fn check_without_paths_discovers_configured_tests_in_order() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON report");
-    assert_eq!(report["schema_version"], 4);
+    assert_eq!(report["schema_version"], 5);
     let paths = report["files"]
         .as_array()
         .expect("files")
@@ -819,4 +819,73 @@ fn mixed_outcomes_use_the_highest_severity_exit_class() {
     assert_eq!(report["exit_class"], "infrastructure");
     assert_eq!(report["files"][0]["exit_class"], "test_failure");
     assert_eq!(report["files"][1]["exit_class"], "infrastructure");
+}
+
+#[test]
+fn parallel_reports_every_branch_failure_in_deterministic_source_order() {
+    let directory = tempfile::tempdir().unwrap();
+    write(
+        &directory.path().join("aggregate.webtest"),
+        r#"test "aggregate" { parallel { server { expect 101 == 102 } server { expect 201 == 202 } } }"#,
+    );
+    for reporter in ["json", "events", "human", "concise", "junit"] {
+        let output = webtest(directory.path())
+            .args(["test", "aggregate.webtest", "--reporter", reporter])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        if reporter == "json" || reporter == "events" {
+            let test = if reporter == "json" {
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(value["schema_version"], 5);
+                value["files"][0]["tests"][0].clone()
+            } else {
+                let events: Vec<serde_json::Value> = text
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                let aggregate = events
+                    .iter()
+                    .find(|event| event["type"] == "test_result")
+                    .unwrap();
+                assert_eq!(aggregate["schema_version"], 5);
+                aggregate["test"].clone()
+            };
+            assert_eq!(test["outcome"], "failed");
+            let branches = test["branches"].as_array().unwrap();
+            assert_eq!(branches.len(), 2);
+            for (ordinal, branch) in branches.iter().enumerate() {
+                assert_eq!(
+                    branch["scope"]["execution_context"]["task_path"],
+                    serde_json::json!([0, ordinal])
+                );
+                assert_eq!(branch["result"]["outcome"], "failed");
+                assert!(branch["result"]["failure"]["span"].is_object());
+                assert!(
+                    branch["result"]["failure"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains(if ordinal == 0 { "101" } else { "201" })
+                );
+            }
+        } else {
+            let first = text
+                .find("branch [0, 0]")
+                .unwrap_or_else(|| panic!("{reporter}: {text}"));
+            let second = text
+                .find("branch [0, 1]")
+                .unwrap_or_else(|| panic!("{reporter}: {text}"));
+            assert!(first < second);
+            if reporter == "junit" {
+                assert!(text.contains("<system-out>"));
+                assert!(text.contains("tests=\"1\" failures=\"1\""));
+            }
+        }
+    }
 }

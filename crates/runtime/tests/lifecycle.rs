@@ -38,6 +38,7 @@ struct LifecycleState {
     next_session: AtomicUsize,
     next_context: AtomicUsize,
     context_close_failures: Mutex<BTreeSet<usize>>,
+    context_close_delays: Mutex<BTreeMap<usize, Duration>>,
     session_close_failures: Mutex<BTreeSet<usize>>,
     page_creation_failures: Mutex<BTreeSet<usize>>,
     page_creation_delays: Mutex<BTreeMap<usize, Duration>>,
@@ -157,6 +158,17 @@ impl BrowserContext for LifecycleContext {
 
     async fn close(&mut self) -> Result<(), BrowserError> {
         self.state.push(format!("context_close:{}", self.id));
+        let delay = self
+            .state
+            .context_close_delays
+            .lock()
+            .unwrap()
+            .get(&self.id)
+            .copied();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+            self.state.push(format!("context_close_done:{}", self.id));
+        }
         if self
             .state
             .context_close_failures
@@ -1469,7 +1481,7 @@ async fn already_cancelled_empty_plan_is_cancelled_without_starting_a_browser() 
     assert!(matches!(
         result.outcome,
         RunOutcome::Cancelled {
-            reason: CancellationReason::Requested
+            reason: CancellationReason::UserCancelled
         }
     ));
     assert_eq!(event_names(&result.events), ["run_started", "run_finished"]);
@@ -1865,7 +1877,7 @@ async fn cancellation_and_snapshot_gating_keep_the_existing_hook_order() {
     assert!(matches!(
         result.outcome,
         RunOutcome::Cancelled {
-            reason: CancellationReason::Requested
+            reason: CancellationReason::UserCancelled
         }
     ));
     assert_eq!(
@@ -1916,7 +1928,7 @@ async fn cancellation_and_snapshot_gating_keep_the_existing_hook_order() {
     assert!(matches!(
         result.tests[0].outcome,
         TestOutcome::Cancelled {
-            reason: CancellationReason::Requested
+            reason: CancellationReason::UserCancelled
         }
     ));
     assert_eq!(
@@ -1960,7 +1972,7 @@ async fn cleanup_failure_outranks_cancellation_and_retains_the_reason() {
         } if matches!(
             prior.as_ref(),
             PriorTestOutcome::Cancelled {
-                reason: CancellationReason::Requested,
+                reason: CancellationReason::UserCancelled,
             }
         )
     ));
@@ -2013,7 +2025,7 @@ async fn cancellation_before_first_step_finishes_active_test_and_skips_later_tes
     assert!(matches!(
         result.tests[0].outcome,
         TestOutcome::Cancelled {
-            reason: CancellationReason::Requested
+            reason: CancellationReason::UserCancelled
         }
     ));
     assert!(matches!(
@@ -2093,7 +2105,7 @@ async fn cancellation_between_steps_keeps_the_passed_step_but_cancels_the_test()
     assert!(matches!(
         result.tests[0].outcome,
         TestOutcome::Cancelled {
-            reason: CancellationReason::Requested
+            reason: CancellationReason::UserCancelled
         }
     ));
     assert_eq!(
@@ -3356,4 +3368,593 @@ async fn debugger_pause_time_counts_toward_the_single_test_deadline() {
         }
     ));
     assert!(control.timeout_notified.load(Ordering::SeqCst));
+}
+
+#[tokio::test(start_paused = true)]
+async fn parallel_primary_infrastructure_failure_cancels_siblings_before_slow_teardown() {
+    let state = Arc::new(LifecycleState::default());
+    state.page_delays.lock().unwrap().extend([
+        ("fail".into(), Duration::from_millis(1)),
+        ("slow".into(), Duration::from_secs(10)),
+    ]);
+    state
+        .page_errors
+        .lock()
+        .unwrap()
+        .insert("fail".into(), BrowserError::BrowserDisconnected);
+    state
+        .context_close_delays
+        .lock()
+        .unwrap()
+        .insert(0, Duration::from_millis(500));
+    let plan = compile_source(
+        r#"test "early failure" {
+        parallel {
+            browser { evaluate "fail" }
+            browser { evaluate "slow" evaluate "must not run" }
+        }
+    }"#,
+    );
+    let started = tokio::time::Instant::now();
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .run(&plan, &LifecycleHost(state.clone()))
+        .await;
+    assert_eq!(started.elapsed(), Duration::from_millis(501));
+    assert!(matches!(
+        result.tests[0].outcome,
+        TestOutcome::Aborted { .. }
+    ));
+    let branches = &result.tests[0].branches;
+    assert_eq!(branches.len(), 2);
+    assert!(matches!(branches[0].outcome, TestOutcome::Aborted { .. }));
+    assert!(matches!(
+        branches[1].outcome,
+        TestOutcome::Cancelled {
+            reason: CancellationReason::ParentFailed
+        }
+    ));
+    let cause = branches[1].scope.cancellation.unwrap();
+    assert_eq!(cause.reason, CancellationReason::ParentFailed);
+    assert_eq!(
+        Some(cause.causing_scope_id),
+        branches[0].scope.execution_context.parent_scope_id
+    );
+    let log = state.log();
+    let position = |value: &str| log.iter().position(|entry| entry == value).unwrap();
+    assert!(
+        position("context_close:1") < position("context_close_done:0"),
+        "{log:?}"
+    );
+    assert_eq!(
+        log.iter()
+            .filter(|entry| entry.starts_with("context_create:"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        log.iter()
+            .filter(|entry| entry.starts_with("session_close:"))
+            .count(),
+        2
+    );
+    assert!(!log.iter().any(|entry| entry.contains("must not run")));
+    assert_scopes_finish_once_after_children(&result.events);
+}
+
+fn assert_scopes_finish_once_after_children(events: &[ExecutionEvent]) {
+    let mut started = BTreeMap::new();
+    let mut finished = BTreeMap::new();
+    for (index, event) in events.iter().enumerate() {
+        if let ExecutionEvent::Scope { event, .. } = event {
+            let id = event.execution_context.scope_id;
+            if event.outcome.is_none() {
+                assert!(started.insert(id, event).is_none());
+            } else {
+                assert!(finished.insert(id, index).is_none());
+            }
+        }
+    }
+    assert_eq!(started.len(), finished.len());
+    for (id, event) in started {
+        if let Some(parent) = event.execution_context.parent_scope_id {
+            assert!(finished[&id] < finished[&parent]);
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn parallel_collects_all_test_failures_in_source_order_and_preserves_binding_snapshots() {
+    struct OrderControl(tokio::sync::Barrier);
+    #[async_trait]
+    impl RunControl for OrderControl {
+        async fn before_step(&self, _: &PlannedTest, step: &PlannedStep) {
+            if matches!(step.operation, TestOperation::Assertion(_)) && step.id.0 < 7 {
+                self.0.wait().await;
+                if step.id.0 == 2 {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
+    }
+    let plan = compile_source(
+        r#"test "aggregate" {
+        let seed = 7
+        parallel {
+            server { let local = seed expect local == 8 }
+            server { let local = seed expect local == 9 }
+            server { let local = seed expect local == 7 }
+        }
+        expect seed == 7
+    }
+    test "later" { expect 1 == 1 }"#,
+    );
+    let observations = Arc::new(ObservationStore::default());
+    let result = Runner::new(observations.clone())
+        .run_with_control(
+            &plan,
+            &LifecycleHost(Arc::default()),
+            Some(&OrderControl(tokio::sync::Barrier::new(3))),
+        )
+        .await;
+    assert_eq!(result.failed(), 1);
+    assert_eq!(result.passed(), 1);
+    assert_eq!(
+        observations
+            .observations_for(plan.file, plan.source_revision)
+            .len(),
+        2
+    );
+    let test = &result.tests[0];
+    assert!(matches!(&test.outcome, TestOutcome::Failed(failure) if failure.step.id == StepId(2)));
+    assert_eq!(
+        test.bindings,
+        BTreeMap::from([("seed".into(), Value::Int(7))])
+    );
+    let branches = &test.branches;
+    assert_eq!(branches.len(), 3);
+    let steps = branches
+        .iter()
+        .map(|branch| match &branch.outcome {
+            TestOutcome::Failed(failure) => Some(failure.step.id.0),
+            TestOutcome::Passed => None,
+            other => panic!("{other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(steps, [Some(2), Some(4), None]);
+    assert!(
+        branches
+            .iter()
+            .all(|branch| branch.scope.cancellation.is_none())
+    );
+    assert!(
+        branches
+            .windows(2)
+            .all(|pair| pair[0].scope.execution_context.task_path
+                < pair[1].scope.execution_context.task_path)
+    );
+    let failed = result
+        .events
+        .iter()
+        .filter_map(|event| {
+            if let ExecutionEvent::StepFailed { step_id, .. } = event {
+                Some(step_id.0)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(failed, [4, 2]);
+    assert_scopes_finish_once_after_children(&result.events);
+}
+
+#[tokio::test(start_paused = true)]
+async fn enclosing_parallel_timeout_retains_completed_failures_and_typed_cancelled_children() {
+    let state = Arc::new(LifecycleState::default());
+    state
+        .page_delays
+        .lock()
+        .unwrap()
+        .insert("slow".into(), Duration::from_secs(10));
+    let plan = compile_source(
+        r#"test "interrupted aggregate" {
+        timeout 50ms {
+            parallel {
+                server { expect 1 == 2 }
+                browser { evaluate "slow" }
+            }
+        }
+    }"#,
+    );
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .run(&plan, &LifecycleHost(state.clone()))
+        .await;
+    assert!(
+        matches!(result.tests[0].outcome, TestOutcome::TimedOut { .. }),
+        "{:?}",
+        result.tests[0].outcome
+    );
+    let branches = &result.tests[0].branches;
+    assert_eq!(branches.len(), 2);
+    assert!(matches!(branches[0].outcome, TestOutcome::Failed(_)));
+    assert!(matches!(
+        branches[1].outcome,
+        TestOutcome::Cancelled {
+            reason: CancellationReason::Timeout
+        }
+    ));
+    assert_eq!(
+        branches[1].scope.cancellation.unwrap().reason,
+        CancellationReason::Timeout
+    );
+    assert_eq!(
+        state
+            .log()
+            .iter()
+            .filter(|entry| entry.starts_with("context_close:"))
+            .count(),
+        1
+    );
+    assert_scopes_finish_once_after_children(&result.events);
+}
+
+#[tokio::test(start_paused = true)]
+async fn parallel_cleanup_expiry_keeps_all_child_results_and_terminal_scopes() {
+    let state = Arc::new(LifecycleState::default());
+    state
+        .page_delays
+        .lock()
+        .unwrap()
+        .insert("slow".into(), Duration::from_secs(10));
+    state
+        .context_close_delays
+        .lock()
+        .unwrap()
+        .extend([(0, Duration::from_secs(10)), (1, Duration::from_secs(10))]);
+    let plan = compile_source(
+        r#"test "bounded cleanup" { timeout 50ms { parallel { browser { evaluate "slow" } browser { evaluate "slow" } } } }"#,
+    );
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .with_options(RunnerOptions {
+            cleanup_timeout: Duration::from_millis(100),
+            ..RunnerOptions::default()
+        })
+        .run(&plan, &LifecycleHost(state))
+        .await;
+    assert_eq!(
+        result.tests[0].branches.len(),
+        2,
+        "all siblings must reach a typed terminal result"
+    );
+    assert!(
+        result.tests[0]
+            .branches
+            .iter()
+            .all(|branch| matches!(branch.outcome, TestOutcome::Aborted { .. }))
+    );
+    assert_scopes_finish_once_after_children(&result.events);
+}
+
+#[tokio::test(start_paused = true)]
+async fn parallel_cancellation_results_use_the_shared_typed_reason_vocabulary() {
+    struct CancelTogether {
+        ready: tokio::sync::Barrier,
+        cancel: AtomicBool,
+        reason: CancellationReason,
+    }
+    #[async_trait]
+    impl RunControl for CancelTogether {
+        fn is_cancelled(&self) -> bool {
+            self.cancel.load(Ordering::SeqCst)
+        }
+        fn cancellation_reason(&self) -> CancellationReason {
+            self.reason
+        }
+        async fn before_step(&self, _: &PlannedTest, _: &PlannedStep) {
+            self.ready.wait().await;
+            self.cancel.store(true, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        }
+    }
+    let plan = compile_source(
+        r#"test "cancel siblings" { parallel { server { expect 1 == 1 } server { expect 2 == 2 } } }"#,
+    );
+    for reason in [
+        CancellationReason::UserCancelled,
+        CancellationReason::ParentFailed,
+        CancellationReason::RaceLost,
+        CancellationReason::Timeout,
+        CancellationReason::DebugDisconnect,
+        CancellationReason::FailFast,
+        CancellationReason::RunnerShutdown,
+    ] {
+        let control = CancelTogether {
+            ready: tokio::sync::Barrier::new(2),
+            cancel: AtomicBool::new(false),
+            reason,
+        };
+        let result = Runner::new(Arc::new(ObservationStore::default()))
+            .run_with_control(&plan, &LifecycleHost(Arc::default()), Some(&control))
+            .await;
+        assert_eq!(result.tests[0].branches.len(), 2);
+        for branch in &result.tests[0].branches {
+            assert!(
+                matches!(branch.outcome, TestOutcome::Cancelled { reason: actual } if actual == reason),
+                "{:?}",
+                branch.outcome
+            );
+            assert_eq!(branch.scope.cancellation.unwrap().reason, reason);
+        }
+        if reason != CancellationReason::Timeout {
+            assert!(
+                matches!(result.outcome, RunOutcome::Cancelled { reason: actual } if actual == reason)
+            );
+        }
+        assert_scopes_finish_once_after_children(&result.events);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_primary_failure_before_the_deadline_survives_slow_failure_observation() {
+    struct SlowFailureControl;
+    #[async_trait]
+    impl RunControl for SlowFailureControl {
+        async fn before_step(&self, _: &PlannedTest, _: &PlannedStep) {}
+        async fn after_step_failure(
+            &self,
+            _: &PlannedTest,
+            _: &PlannedStep,
+            _: &StepError,
+            _: &BTreeMap<String, Value>,
+        ) {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+    let plan = compile_source(r#"test "failure first" { expect 1 == 2 }"#);
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .with_options(RunnerOptions {
+            test_timeout: Duration::from_millis(50),
+            ..RunnerOptions::default()
+        })
+        .run_with_control(
+            &plan,
+            &LifecycleHost(Arc::default()),
+            Some(&SlowFailureControl),
+        )
+        .await;
+    assert!(
+        matches!(result.tests[0].outcome, TestOutcome::Failed(_)),
+        "{:?}",
+        result.tests[0].outcome
+    );
+    assert_eq!(
+        result
+            .events
+            .iter()
+            .filter(|event| matches!(event, ExecutionEvent::StepFailed { .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn parallel_acquisition_failure_signals_before_partial_resource_teardown() {
+    let state = Arc::new(LifecycleState::default());
+    state.page_creation_failures.lock().unwrap().insert(0);
+    state
+        .page_creation_delays
+        .lock()
+        .unwrap()
+        .insert(0, Duration::from_millis(1));
+    state
+        .context_close_delays
+        .lock()
+        .unwrap()
+        .insert(0, Duration::from_millis(500));
+    state
+        .page_delays
+        .lock()
+        .unwrap()
+        .insert("slow".into(), Duration::from_secs(10));
+    let plan = compile_source(
+        r#"test "failed readiness" { parallel { browser { evaluate "unreachable" } browser { evaluate "slow" } } }"#,
+    );
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .run(&plan, &LifecycleHost(state.clone()))
+        .await;
+    assert_eq!(result.tests[0].branches.len(), 2);
+    assert!(matches!(
+        result.tests[0].branches[1].outcome,
+        TestOutcome::Cancelled {
+            reason: CancellationReason::ParentFailed
+        }
+    ));
+    let log = state.log();
+    assert!(
+        log.iter()
+            .position(|entry| entry == "context_close:1")
+            .unwrap()
+            < log
+                .iter()
+                .position(|entry| entry == "context_close_done:0")
+                .unwrap()
+    );
+    assert!(!log.iter().any(|entry| entry.contains("unreachable")));
+    assert_scopes_finish_once_after_children(&result.events);
+}
+
+#[tokio::test(start_paused = true)]
+async fn parallel_preserves_primary_acquisition_failures_when_sibling_cancellation_arrives_during_cleanup()
+ {
+    let state = Arc::new(LifecycleState::default());
+    state.page_creation_failures.lock().unwrap().extend([0, 1]);
+    state
+        .page_creation_delays
+        .lock()
+        .unwrap()
+        .extend([(0, Duration::from_millis(1)), (1, Duration::from_millis(1))]);
+    state.context_close_delays.lock().unwrap().extend([
+        (0, Duration::from_millis(500)),
+        (1, Duration::from_millis(500)),
+    ]);
+    let plan = compile_source(
+        r#"test "both fail" { parallel { browser { evaluate "unreachable" } browser { evaluate "unreachable" } } }"#,
+    );
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .run(&plan, &LifecycleHost(state.clone()))
+        .await;
+    assert_eq!(
+        state
+            .log()
+            .iter()
+            .filter(|entry| entry.starts_with("page_create:"))
+            .count(),
+        2
+    );
+    assert_eq!(result.tests[0].branches.len(), 2);
+    assert!(
+        result.tests[0]
+            .branches
+            .iter()
+            .all(|branch| matches!(branch.outcome, TestOutcome::Aborted { .. })),
+        "{:?}",
+        result.tests[0].branches
+    );
+    assert_scopes_finish_once_after_children(&result.events);
+}
+
+#[tokio::test(start_paused = true)]
+async fn parallel_descendants_inherit_a_smaller_lexical_cleanup_budget() {
+    let state = Arc::new(LifecycleState::default());
+    state
+        .page_delays
+        .lock()
+        .unwrap()
+        .insert("slow".into(), Duration::from_secs(10));
+    state
+        .context_close_delays
+        .lock()
+        .unwrap()
+        .extend([(0, Duration::from_secs(10)), (1, Duration::from_secs(10))]);
+    let mut plan = compile_source(
+        r#"test "short cleanup" { timeout 50ms { parallel { browser { evaluate "slow" } browser { evaluate "slow" } } } }"#,
+    );
+    let webtest_plan::PlanNodeKind::Sequence { children } = &mut plan.tests[0].body.kind else {
+        panic!("root")
+    };
+    let webtest_plan::PlanNodeKind::Timeout {
+        cleanup_timeout, ..
+    } = &mut children[0].kind
+    else {
+        panic!("timeout")
+    };
+    *cleanup_timeout = Some(Duration::from_millis(10));
+    plan.validate_tree().unwrap();
+    let started = tokio::time::Instant::now();
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .with_options(RunnerOptions {
+            cleanup_timeout: Duration::from_millis(100),
+            ..RunnerOptions::default()
+        })
+        .run(&plan, &LifecycleHost(state))
+        .await;
+    assert_eq!(started.elapsed(), Duration::from_millis(60));
+    assert_eq!(result.tests[0].branches.len(), 2);
+    assert!(
+        result.tests[0]
+            .branches
+            .iter()
+            .all(|branch| matches!(branch.outcome, TestOutcome::Aborted { .. }))
+    );
+    assert_scopes_finish_once_after_children(&result.events);
+}
+
+#[tokio::test(start_paused = true)]
+async fn parallel_browser_acquisition_is_inside_its_lexical_timeout() {
+    let state = Arc::new(LifecycleState::default());
+    state
+        .page_creation_delays
+        .lock()
+        .unwrap()
+        .insert(0, Duration::from_secs(1));
+    let plan = compile_source(
+        r#"test "lexical deadline" { parallel { timeout 10ms { browser { evaluate "unreachable" } } server { expect 1 == 1 } } }"#,
+    );
+    let started = tokio::time::Instant::now();
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .run(&plan, &LifecycleHost(state.clone()))
+        .await;
+    assert_eq!(started.elapsed(), Duration::from_millis(10));
+    assert!(
+        matches!(result.tests[0].branches[0].outcome, TestOutcome::TimedOut { timeout, .. } if timeout == Duration::from_millis(10))
+    );
+    assert!(matches!(
+        result.tests[0].branches[1].outcome,
+        TestOutcome::Passed
+    ));
+    assert!(
+        !state
+            .log()
+            .iter()
+            .any(|entry| entry.contains("unreachable"))
+    );
+    assert_eq!(
+        state
+            .log()
+            .iter()
+            .filter(|entry| entry.starts_with("context_close:"))
+            .count(),
+        1
+    );
+    assert_scopes_finish_once_after_children(&result.events);
+}
+
+#[tokio::test(start_paused = true)]
+async fn nested_parallel_primary_failure_notifies_ancestor_scheduler_before_teardown() {
+    let state = Arc::new(LifecycleState::default());
+    state.page_delays.lock().unwrap().extend([
+        ("fail".into(), Duration::from_millis(1)),
+        ("slow".into(), Duration::from_secs(10)),
+    ]);
+    state
+        .page_errors
+        .lock()
+        .unwrap()
+        .insert("fail".into(), BrowserError::BrowserDisconnected);
+    state
+        .context_close_delays
+        .lock()
+        .unwrap()
+        .insert(0, Duration::from_millis(500));
+    let plan = compile_source(
+        r#"test "nested cancellation" { parallel { parallel { browser { evaluate "fail" } } browser { evaluate "slow" } } }"#,
+    );
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .run(&plan, &LifecycleHost(state.clone()))
+        .await;
+    let branches = &result.tests[0].branches;
+    assert!(matches!(
+        branches[0].branches[0].outcome,
+        TestOutcome::Aborted { .. }
+    ));
+    assert!(matches!(
+        branches[1].outcome,
+        TestOutcome::Cancelled {
+            reason: CancellationReason::ParentFailed
+        }
+    ));
+    let log = state.log();
+    assert!(
+        log.iter()
+            .position(|entry| entry == "context_close:1")
+            .unwrap()
+            < log
+                .iter()
+                .position(|entry| entry == "context_close_done:0")
+                .unwrap()
+    );
+    assert_eq!(
+        branches[1].scope.cancellation.unwrap().causing_scope_id,
+        branches[0].scope.execution_context.parent_scope_id.unwrap()
+    );
+    assert_scopes_finish_once_after_children(&result.events);
 }

@@ -116,6 +116,14 @@ impl<'a> Parser<'a> {
 
     fn statement(&mut self, domain: BlockDomain) {
         match (domain, self.current()) {
+            (_, SyntaxKind::ParallelKw)
+                if matches!(self.nth_non_trivia(1), SyntaxKind::LBrace | SyntaxKind::Eof) =>
+            {
+                self.start(SyntaxKind::ParallelStmt);
+                self.bump();
+                self.braced_block(SyntaxKind::Block, domain);
+                self.finish();
+            }
             (_, SyntaxKind::TimeoutKw)
                 if matches!(
                     self.nth_non_trivia(1),
@@ -225,7 +233,10 @@ impl<'a> Parser<'a> {
         self.start(SyntaxKind::LetStmt);
         self.bump();
         self.eat_trivia();
-        if matches!(self.current(), SyntaxKind::Ident | SyntaxKind::TimeoutKw) {
+        if matches!(
+            self.current(),
+            SyntaxKind::Ident | SyntaxKind::TimeoutKw | SyntaxKind::ParallelKw
+        ) {
             self.bump();
         } else {
             self.error_here(
@@ -758,6 +769,7 @@ impl<'a> Parser<'a> {
             kind,
             SyntaxKind::Ident
                 | SyntaxKind::TimeoutKw
+                | SyntaxKind::ParallelKw
                 | SyntaxKind::NameKw
                 | SyntaxKind::IdKw
                 | SyntaxKind::RoleKw

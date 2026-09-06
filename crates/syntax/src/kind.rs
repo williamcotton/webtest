@@ -125,6 +125,8 @@ pub enum SyntaxKind {
     TypeField,
     TimeoutKw,
     TimeoutStmt,
+    ParallelKw,
+    ParallelStmt,
     Eof,
 }
 
@@ -138,6 +140,7 @@ impl SyntaxKind {
             self,
             Self::TestKw
                 | Self::TimeoutKw
+                | Self::ParallelKw
                 | Self::BrowserKw
                 | Self::OpenKw
                 | Self::EvaluateKw
@@ -342,7 +345,9 @@ impl Language for WebtestLanguage {
             119 => SyntaxKind::TypeField,
             120 => SyntaxKind::TimeoutKw,
             121 => SyntaxKind::TimeoutStmt,
-            122 => SyntaxKind::Eof,
+            122 => SyntaxKind::ParallelKw,
+            123 => SyntaxKind::ParallelStmt,
+            124 => SyntaxKind::Eof,
             _ => SyntaxKind::Error,
         }
     }

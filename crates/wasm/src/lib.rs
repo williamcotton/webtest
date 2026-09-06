@@ -494,8 +494,21 @@ test "optional" {
     }
 
     #[test]
+    fn concurrent_resource_plans_have_native_portable_parity() {
+        let source = r#"test "parallel" { let seed = 7 parallel { server { expect seed == 7 } browser { open "/" } browser { open "/other" } } }"#;
+        let portable = compile(source).plan.expect("portable parallel");
+        let mut database = AnalysisDatabase::default();
+        let file = database.open_file("memory://document.webtest", source);
+        assert!(database.diagnostics(file).unwrap().is_empty());
+        assert_eq!(portable, *database.test_plan(file).unwrap());
+        portable.validate_tree().unwrap();
+    }
+
+    #[test]
     fn descriptions_and_static_repair_diagnostics_match_the_native_core() {
         for query in [
+            "control.parallel",
+            "parallel",
             "control.timeout",
             "timeout",
             "controls",

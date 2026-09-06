@@ -12,7 +12,7 @@ use webtest_project::Project;
 
 use crate::{error::AppError, project_context::normalized_path};
 
-pub(crate) const REPORT_SCHEMA_VERSION: u32 = 4;
+pub(crate) const REPORT_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -107,6 +107,8 @@ pub struct DiagnosticReport {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct TestReport {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub branches: Vec<BranchReport>,
     pub name: String,
     pub exit_class: ExitClass,
     pub outcome: TestReportOutcome,
@@ -118,6 +120,50 @@ pub struct TestReport {
     pub timeout_nanos: Option<u64>,
     pub duration_nanos: u64,
     pub failure: Option<FailureReport>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct BranchReport {
+    pub scope: webtest_observation::ScopeEvent,
+    pub result: TestReport,
+}
+
+fn write_branches(output: &mut dyn Write, path: &str, branches: &[BranchReport]) -> io::Result<()> {
+    for branch in branches {
+        writeln!(
+            output,
+            "  {}: {}",
+            branch.result.name,
+            test_status(&branch.result)
+        )?;
+        if let Some(failure) = &branch.result.failure {
+            if let Some(span) = &failure.span {
+                write_source_diagnostic(
+                    output,
+                    path,
+                    "error",
+                    &failure.code,
+                    &failure.message,
+                    span,
+                )?;
+            } else {
+                writeln!(output, "  error[{}]: {}", failure.code, failure.message)?;
+            }
+            for artifact in &failure.artifacts {
+                writeln!(output, "  evidence: {artifact}")?;
+            }
+        }
+        write_branches(output, path, &branch.result.branches)?;
+    }
+    Ok(())
+}
+
+fn write_junit_branches(output: &mut dyn Write, test: &TestReport) -> io::Result<()> {
+    if !test.branches.is_empty() {
+        let data = serde_json::to_string(&test.branches)?;
+        writeln!(output, "      <system-out>{}</system-out>", xml(&data))?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -406,6 +452,7 @@ impl CommandReport {
                 if include_test_status {
                     writeln!(output, "test {:?} ... {}", test.name, test_status(test))?;
                 }
+                write_branches(output, &file.path, &test.branches)?;
                 if let Some(failure) = &test.failure {
                     if !include_test_status {
                         writeln!(output, "failure in test {:?}:", test.name)?;
@@ -500,6 +547,7 @@ impl CommandReport {
                     test.name,
                     test_status(test)
                 )?;
+                write_branches(output, &file.path, &test.branches)?;
             }
             if let Some(error) = &file.execution_error {
                 writeln!(
@@ -567,6 +615,15 @@ impl CommandReport {
             }
             for event in &file.events {
                 write_json_line(output, event)?;
+            }
+            for test in &file.tests {
+                write_json_line(
+                    output,
+                    &serde_json::json!({
+                        "schema_version": REPORT_SCHEMA_VERSION, "type": "test_result",
+                        "file": file.path, "source_revision": file.source_revision, "test": test,
+                    }),
+                )?;
             }
             if let Some(error) = &file.execution_error {
                 write_json_line(
@@ -636,11 +693,21 @@ impl CommandReport {
                 let seconds = test.duration_nanos as f64 / 1_000_000_000.0;
                 match test.outcome {
                     TestReportOutcome::Passed => {
-                        writeln!(
-                            output,
-                            "    <testcase name=\"{}\" time=\"{seconds:.9}\" />",
-                            xml(&test.name)
-                        )?;
+                        if test.branches.is_empty() {
+                            writeln!(
+                                output,
+                                "    <testcase name=\"{}\" time=\"{seconds:.9}\" />",
+                                xml(&test.name)
+                            )?;
+                        } else {
+                            writeln!(
+                                output,
+                                "    <testcase name=\"{}\" time=\"{seconds:.9}\">",
+                                xml(&test.name)
+                            )?;
+                            write_junit_branches(output, test)?;
+                            writeln!(output, "    </testcase>")?;
+                        }
                     }
                     TestReportOutcome::Failed | TestReportOutcome::TimedOut => {
                         writeln!(
@@ -669,6 +736,7 @@ impl CommandReport {
                             xml(message),
                             xml(message)
                         )?;
+                        write_junit_branches(output, test)?;
                         writeln!(output, "    </testcase>")?;
                     }
                     TestReportOutcome::Cancelled | TestReportOutcome::Skipped => {
@@ -679,6 +747,7 @@ impl CommandReport {
                         )?;
                         let message = test.reason.as_deref().unwrap_or("test skipped");
                         writeln!(output, "      <skipped message=\"{}\" />", xml(message))?;
+                        write_junit_branches(output, test)?;
                         writeln!(output, "    </testcase>")?;
                     }
                     TestReportOutcome::Aborted => {
@@ -699,6 +768,7 @@ impl CommandReport {
                             xml(message),
                             xml(message)
                         )?;
+                        write_junit_branches(output, test)?;
                         writeln!(output, "    </testcase>")?;
                     }
                 }
@@ -831,6 +901,7 @@ mod tests {
             duration_nanos: 12,
             diagnostics: Vec::new(),
             tests: vec![TestReport {
+                branches: Vec::new(),
                 name: "a < b".into(),
                 exit_class: ExitClass::TestFailure,
                 outcome: TestReportOutcome::Failed,
@@ -912,16 +983,18 @@ mod tests {
             diagnostics: Vec::new(),
             tests: vec![
                 TestReport {
+                    branches: Vec::new(),
                     name: "active".into(),
                     exit_class: ExitClass::TestFailure,
                     outcome: TestReportOutcome::Cancelled,
                     failure_class: None,
-                    reason: Some("requested".into()),
+                    reason: Some("user_cancelled".into()),
                     timeout_nanos: None,
                     duration_nanos: 5,
                     failure: None,
                 },
                 TestReport {
+                    branches: Vec::new(),
                     name: "later".into(),
                     exit_class: ExitClass::TestFailure,
                     outcome: TestReportOutcome::Skipped,
@@ -933,7 +1006,7 @@ mod tests {
                 },
             ],
             outcome: Some(RunReportOutcome::Cancelled),
-            reason: Some("requested".into()),
+            reason: Some("user_cancelled".into()),
             execution_error: None,
             events,
         });
@@ -1033,6 +1106,7 @@ mod tests {
             duration_nanos: 250_000_000,
             diagnostics: Vec::new(),
             tests: vec![TestReport {
+                branches: Vec::new(),
                 name: "slow".into(),
                 exit_class: ExitClass::TestFailure,
                 outcome: TestReportOutcome::TimedOut,
@@ -1134,7 +1208,7 @@ mod tests {
         assert_eq!(value["exit_class"], "test_failure");
         assert_eq!(
             String::from_utf8(json).expect("UTF-8 JSON"),
-            include_str!("../tests/fixtures/report-v4.json")
+            include_str!("../tests/fixtures/report-v5.json")
         );
 
         let mut events = Vec::new();
@@ -1146,7 +1220,7 @@ mod tests {
             let value: serde_json::Value = serde_json::from_str(line).expect("json line");
             assert_eq!(value["schema_version"], REPORT_SCHEMA_VERSION);
         }
-        assert_eq!(events, include_str!("../tests/fixtures/report-v4.jsonl"));
+        assert_eq!(events, include_str!("../tests/fixtures/report-v5.jsonl"));
     }
 
     #[test]
@@ -1165,23 +1239,23 @@ mod tests {
         for (reporter, expected) in [
             (
                 Reporter::Human,
-                include_str!("../tests/fixtures/cancellation-v2.txt"),
+                include_str!("../tests/fixtures/cancellation-v5.txt"),
             ),
             (
                 Reporter::Concise,
-                include_str!("../tests/fixtures/cancellation-concise-v2.txt"),
+                include_str!("../tests/fixtures/cancellation-concise-v5.txt"),
             ),
             (
                 Reporter::Json,
-                include_str!("../tests/fixtures/cancellation-v4.json"),
+                include_str!("../tests/fixtures/cancellation-v5.json"),
             ),
             (
                 Reporter::Events,
-                include_str!("../tests/fixtures/cancellation-v4.jsonl"),
+                include_str!("../tests/fixtures/cancellation-v5.jsonl"),
             ),
             (
                 Reporter::Junit,
-                include_str!("../tests/fixtures/cancellation-v2.xml"),
+                include_str!("../tests/fixtures/cancellation-v5.xml"),
             ),
         ] {
             let mut output = Vec::new();
@@ -1299,6 +1373,7 @@ mod tests {
             .take()
             .expect("execution error");
         report.files[0].tests = vec![TestReport {
+            branches: Vec::new(),
             name: "active".into(),
             exit_class: ExitClass::Internal,
             outcome: TestReportOutcome::Aborted,
