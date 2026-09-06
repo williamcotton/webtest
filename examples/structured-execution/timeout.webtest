@@ -1,0 +1,19 @@
+test "bounded child flow" {
+    let message = "ready"
+    timeout 2s {
+        let child_message = message
+        timeout 1s {
+            expect child_message == "ready"
+        }
+    }
+    expect message == "ready"
+}
+
+test "temporary resources follow the child scope" {
+    timeout 2s {
+        server {
+            fs.temp_dir()
+        }
+    }
+    expect true
+}

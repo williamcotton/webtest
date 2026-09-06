@@ -39,6 +39,15 @@ impl TestExecutionState {
         &self.environment
     }
 
+    pub(super) fn binding_checkpoint(&self) -> BTreeSet<BindingId> {
+        self.environment.keys().copied().collect()
+    }
+
+    pub(super) fn restore_bindings(&mut self, visible: &BTreeSet<BindingId>) {
+        self.environment.retain(|id, _| visible.contains(id));
+        self.binding_names.retain(|id, _| visible.contains(id));
+    }
+
     pub(super) fn bind(&mut self, id: BindingId, name: Option<&str>, value: Value) {
         self.environment.insert(id, value);
         self.binding_names.insert(
@@ -68,14 +77,14 @@ impl TestExecutionState {
             &self.redacted_fields,
             &mut self.secrets,
         );
-        if let Some(value) = call
-            .result_binding
-            .and_then(|binding| self.environment.get(&binding))
-        {
-            for path in temporary_directories(value) {
-                self.owned_temporary_directories
-                    .insert(normalize_owned_path(&self.project_root, &path));
-            }
+    }
+
+    /// Accept ownership before discarding an unbound provider result, or checking
+    /// cancellation. Pure values and aliases do not transfer new ownership.
+    pub(super) fn accept_provider_resources(&mut self, value: &Value) {
+        for path in temporary_directories(value) {
+            self.owned_temporary_directories
+                .insert(normalize_owned_path(&self.project_root, &path));
         }
     }
 
@@ -135,6 +144,10 @@ impl TestExecutionState {
 
     pub(super) fn temporary_directories(&self) -> Vec<PathBuf> {
         self.owned_temporary_directories.iter().cloned().collect()
+    }
+
+    pub(super) fn release_temporary_directory(&mut self, path: &Path) {
+        self.owned_temporary_directories.remove(path);
     }
 }
 

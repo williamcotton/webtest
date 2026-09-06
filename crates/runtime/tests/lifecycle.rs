@@ -382,6 +382,219 @@ fn browser_evaluate(expression: &str) -> TestOperation {
     })
 }
 
+fn compile_source(source: &str) -> TestPlan {
+    let mut database = webtest_analysis::AnalysisDatabase::default();
+    let file = database.open_file("structured.webtest", source);
+    let diagnostics = database.diagnostics(file).unwrap();
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    database.test_plan(file).unwrap().as_ref().clone()
+}
+
+#[tokio::test(start_paused = true)]
+async fn nested_timeout_uses_the_earliest_deadline_and_preserves_its_causing_scope() {
+    for (outer, inner, expected) in [(2, 5, 2), (5, 2, 2)] {
+        let source = format!(
+            "test \"é\" {{ browser {{ timeout {outer}s {{ timeout {inner}s {{ evaluate \"slow\" }} }} evaluate \"never\" }} }}"
+        );
+        let plan = compile_source(&source);
+        let state = Arc::new(LifecycleState::default());
+        state
+            .page_delays
+            .lock()
+            .unwrap()
+            .insert("slow".into(), Duration::from_secs(20));
+        let observations = Arc::new(ObservationStore::default());
+        let started = tokio::time::Instant::now();
+        let result = Runner::new(observations.clone())
+            .run(&plan, &LifecycleHost(state.clone()))
+            .await;
+        assert!(
+            matches!(result.tests[0].outcome, TestOutcome::TimedOut { timeout, .. } if timeout == Duration::from_secs(expected)),
+            "{:?}",
+            result.tests[0].outcome
+        );
+        assert_eq!(started.elapsed(), Duration::from_secs(expected));
+        assert!(!state.log().iter().any(|event| event.contains("never")));
+        assert!(
+            state
+                .log()
+                .iter()
+                .any(|event| event.starts_with("context_close:"))
+        );
+        let timed_out: Vec<_> = result
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                ExecutionEvent::Scope { event, .. }
+                    if event.outcome == Some(webtest_observation::ScopeOutcome::TimedOut)
+                        && event.execution_context.parent_scope_id.is_some() =>
+                {
+                    Some(event)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(timed_out.len(), 1);
+        let cause = timed_out[0].cancellation.unwrap();
+        assert_eq!(
+            cause.causing_scope_id,
+            timed_out[0].execution_context.scope_id
+        );
+        assert!(result.events.iter().any(|event| matches!(event, ExecutionEvent::Scope { event, .. }
+            if event.outcome == Some(webtest_observation::ScopeOutcome::Cancelled) && event.cancellation == Some(cause))));
+        assert_eq!(
+            observations.observations_for(plan.file, plan.source_revision)[0].range,
+            timed_out[0].origin.range
+        );
+        assert!(
+            state
+                .operation_timeouts
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, timeout)| *timeout <= Duration::from_secs(expected))
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn successful_timeout_does_not_export_locals_and_preserves_earlier_assertion_failure() {
+    let plan = compile_source(
+        "test \"scope\" { let outer = 1 timeout 2s { let local = 2 expect local == 2 } expect outer == 1 }",
+    );
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .run(&plan, &LifecycleHost(Arc::default()))
+        .await;
+    assert_eq!(result.passed(), 1);
+    assert!(result.tests[0].bindings.contains_key("outer"));
+    assert!(!result.tests[0].bindings.contains_key("local"));
+    let plan = compile_source("test \"failure\" { timeout 2s { expect 1 == 2 } }");
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .run(&plan, &LifecycleHost(Arc::default()))
+        .await;
+    assert!(matches!(result.tests[0].outcome, TestOutcome::Failed(_)));
+    assert!(
+        !result
+            .events
+            .iter()
+            .any(|event| matches!(event, ExecutionEvent::TestTimedOut { .. }))
+    );
+}
+
+#[tokio::test]
+async fn timeout_owns_discarded_temp_results_and_releases_before_following_steps() {
+    let root = tempfile::tempdir().unwrap();
+    let plan = compile_source(
+        r#"test "temporary scopes" {
+        server { let outer = fs.temp_dir() }
+        timeout 2s { server { fs.temp_dir() } }
+        expect 1 == 1
+    }"#,
+    );
+    struct CheckDirectories(PathBuf);
+    #[async_trait]
+    impl RunControl for CheckDirectories {
+        async fn before_step(&self, _: &PlannedTest, step: &PlannedStep) {
+            if matches!(step.operation, TestOperation::Assertion(_)) {
+                let entries = std::fs::read_dir(self.0.join(".webtest/tmp")).unwrap();
+                assert_eq!(
+                    entries.count(),
+                    1,
+                    "only the outer resource survives the timeout scope"
+                );
+            }
+        }
+    }
+    let result = Runner::new(Arc::default())
+        .with_options(RunnerOptions {
+            project_root: root.path().into(),
+            ..Default::default()
+        })
+        .run_with_control(
+            &plan,
+            &LifecycleHost(Arc::default()),
+            Some(&CheckDirectories(root.path().into())),
+        )
+        .await;
+    assert_eq!(result.passed(), 1, "{:?}", result.tests);
+    assert_eq!(
+        std::fs::read_dir(root.path().join(".webtest/tmp"))
+            .unwrap()
+            .count(),
+        0
+    );
+    use webtest_observation::{ResourceEventKind, ResourceKind};
+    let resources: Vec<_> = result
+        .events
+        .iter()
+        .enumerate()
+        .filter_map(|(i, event)| match event {
+            ExecutionEvent::Resource { event, .. }
+                if event.resource.resource_kind == ResourceKind::TemporaryDirectory =>
+            {
+                Some((i, event))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        resources.len(),
+        8,
+        "four lifecycle events for each owned directory"
+    );
+    let inner = resources
+        .iter()
+        .find(|(_, event)| event.kind == ResourceEventKind::Released)
+        .unwrap();
+    let owner = inner.1.resource.owner_scope_id;
+    let terminal = result.events.iter().position(|event| matches!(event,
+        ExecutionEvent::Scope { event, .. } if event.execution_context.scope_id == owner && event.outcome.is_some()
+    )).unwrap();
+    assert!(
+        inner.0 < terminal,
+        "resource release precedes scope completion"
+    );
+}
+
+#[tokio::test]
+async fn child_cleanup_failure_stops_following_steps_and_retains_resource_outcome() {
+    let root = tempfile::tempdir().unwrap();
+    let bad = root.path().join("not-a-directory");
+    std::fs::write(&bad, "file").unwrap();
+    let provider = Arc::new(RecordingProvider::new(Ok(Value::TempDirectory(bad))));
+    let mut providers = ProviderRegistry::default();
+    providers.register(provider);
+    let mut database =
+        webtest_analysis::AnalysisDatabase::with_provider_registry(providers.clone());
+    let file = database.open_file(
+        "scope.webtest",
+        r#"test "cleanup" { timeout 2s { server { fake.call() } } expect 1 == 2 }"#,
+    );
+    let diagnostics = database.diagnostics(file).unwrap();
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    let plan = database.test_plan(file).unwrap();
+    let result = Runner::new(Arc::default())
+        .with_provider_registry(providers)
+        .run(&plan, &LifecycleHost(Arc::default()))
+        .await;
+    assert!(matches!(
+        result.tests[0].outcome,
+        TestOutcome::Aborted { .. }
+    ));
+    assert_eq!(
+        result
+            .events
+            .iter()
+            .filter(|event| matches!(event, ExecutionEvent::StepStarted { .. }))
+            .count(),
+        1
+    );
+    assert!(result.events.iter().any(
+        |event| matches!(event, ExecutionEvent::Resource { event, .. }
+        if event.kind == webtest_observation::ResourceEventKind::ReleaseFailed)
+    ));
+}
+
 fn pure(value: Value) -> TestOperation {
     TestOperation::EvaluatePure(EvaluatePureOperation {
         expression: PlanExpr::Literal(value),
@@ -404,7 +617,20 @@ async fn execution_scope_occurrences_are_parented_unique_and_closed_after_childr
     let mut scopes = BTreeSet::new();
     let mut operations = BTreeSet::new();
     let mut tests = BTreeSet::new();
+    let mut wait_ids = BTreeSet::new();
+    let mut active_waits = BTreeSet::new();
     for event in &result.events {
+        if let ExecutionEvent::Wait { event, .. } = event {
+            if event.kind == webtest_observation::WaitEventKind::Registered {
+                assert!(
+                    wait_ids.insert(event.registration_id),
+                    "wait IDs are unique across test roots"
+                );
+                assert!(active_waits.insert(event.registration_id));
+            } else {
+                assert!(active_waits.remove(&event.registration_id));
+            }
+        }
         let ExecutionEvent::Scope {
             execution_id,
             event,
@@ -439,6 +665,8 @@ async fn execution_scope_occurrences_are_parented_unique_and_closed_after_childr
             *event
         );
     }
+    assert!(active_waits.is_empty());
+    assert_eq!(wait_ids.len(), plan.tests.len());
     assert!(active.is_empty());
     assert_eq!(scopes.len(), 4);
     assert_eq!(operations.len(), 2);
@@ -483,7 +711,8 @@ async fn scope_timeout_cancels_descendants_with_the_causing_scope_identity() {
     );
     assert_eq!(
         terminal[0].cancellation,
-        Some(webtest_observation::ScopeCancellation::Timeout {
+        Some(webtest_observation::ScopeCancellation {
+            reason: webtest_host::CancellationReason::Timeout,
             causing_scope_id: terminal[1].execution_context.scope_id,
         })
     );
@@ -543,9 +772,20 @@ fn missing_binding() -> TestOperation {
 fn event_names(events: &[ExecutionEvent]) -> Vec<&'static str> {
     events
         .iter()
-        .filter(|event| !matches!(event, ExecutionEvent::Scope { .. }))
+        .filter(|event| {
+            !matches!(
+                event,
+                ExecutionEvent::Scope { .. }
+                    | ExecutionEvent::Resource { .. }
+                    | ExecutionEvent::Wait { .. }
+            )
+        })
         .map(|event| match event {
-            ExecutionEvent::Scope { .. } => unreachable!("scope events are tested separately"),
+            ExecutionEvent::Scope { .. }
+            | ExecutionEvent::Resource { .. }
+            | ExecutionEvent::Wait { .. } => {
+                unreachable!("scope events are tested separately")
+            }
             ExecutionEvent::RunStarted { .. } => "run_started",
             ExecutionEvent::TestStarted { .. } => "test_started",
             ExecutionEvent::StepStarted { .. } => "step_started",
@@ -2989,6 +3229,86 @@ async fn cleanup_failure_after_timeout_outranks_and_retains_the_timeout() {
 
 struct DeadlinePauseControl {
     timeout_notified: AtomicBool,
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn run_control_cancels_an_active_process_and_waits_for_reaping() {
+    struct ProcessStarted(PathBuf);
+    #[async_trait]
+    impl RunControl for ProcessStarted {
+        fn is_cancelled(&self) -> bool {
+            self.0.exists()
+        }
+        fn cancellation_reason(&self) -> webtest_host::CancellationReason {
+            webtest_host::CancellationReason::DebugDisconnect
+        }
+        async fn before_step(&self, _: &PlannedTest, _: &PlannedStep) {}
+    }
+    for with_browser in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let pid_file = root.path().join("child.pid");
+        let mut operations = vec![built_in_provider_operation(
+            "process",
+            "run",
+            [
+                ("executable", Value::String("/bin/sh".into())),
+                (
+                    "args",
+                    Value::List(vec![
+                        Value::String("-c".into()),
+                        Value::String("echo $$ > child.pid; exec sleep 30".into()),
+                    ]),
+                ),
+            ],
+            Type::ProcessResult,
+        )];
+        let mut capabilities = vec![Capability::Server];
+        if with_browser {
+            operations.push(browser_evaluate("never"));
+            capabilities.push(Capability::Browser);
+        }
+        let plan = plan_with_tests(capabilities, vec![operations]);
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            Runner::new(Arc::new(ObservationStore::default()))
+                .with_options(RunnerOptions {
+                    project_root: root.path().to_owned(),
+                    ..RunnerOptions::default()
+                })
+                .run_with_control(
+                    &plan,
+                    &LifecycleHost(Arc::default()),
+                    Some(&ProcessStarted(pid_file.clone())),
+                ),
+        )
+        .await
+        .expect("explicit host interruption finished");
+        assert!(
+            matches!(result.tests[0].outcome, TestOutcome::Cancelled { .. }),
+            "{:?}",
+            result.tests[0].outcome
+        );
+        let pid = std::fs::read_to_string(pid_file).unwrap();
+        let status = std::process::Command::new("/bin/kill")
+            .args(["-0", pid.trim()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(
+            !status.success(),
+            "child has been reaped before returning the result"
+        );
+        assert!(result.events.iter().any(|event| matches!(event, ExecutionEvent::Wait { event, .. }
+        if event.cancellation.is_some_and(|cause| cause.reason == webtest_host::CancellationReason::DebugDisconnect))));
+        assert!(
+            !result
+                .events
+                .iter()
+                .any(|event| matches!(event, ExecutionEvent::CleanupFailed { .. }))
+        );
+    }
 }
 
 #[async_trait]

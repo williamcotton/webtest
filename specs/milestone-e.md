@@ -16,7 +16,7 @@ Milestone E changes how operations are scheduled, owned, cancelled, and observed
 
 ### Implementation progress — 2026-09-05
 
-Milestone E is **not complete**. The initial sequential execution-tree foundation is implemented:
+Milestone E is **not complete**. The sequential execution-tree and resource/wait foundations are implemented:
 
 - Tests and capability blocks lower through explicit `Sequence` nodes. Leaf operations exist only
   in that tree; diagnostic, debugger, and secret-checking traversal is a read-only projection.
@@ -26,8 +26,8 @@ Milestone E is **not complete**. The initial sequential execution-tree foundatio
 - The sequential runner dispatches the tree recursively and emits parented scope and operation
   occurrences. A test root includes browser acquisition and test cleanup. Descendants interrupted
   by the existing test deadline record cancellation and its causing scope; the root records its
-  final outcome after cleanup. This is not yet the general cancellation/resource scheduler.
-- Plan format 4 separates format and runtime-semantics versions. Native builds fingerprint
+  final outcome after cleanup. Cancellation facts retain their typed reason and causing scope.
+- Plan format 5 and runtime semantics 2 version the tree and timeout behavior independently. Native builds fingerprint
   resolved configuration, keeping configuration values out of the artifact. Shared validation
   checks tree structure, identities, revisions, capability requirements, and explicit execution
   inputs for detectable drift. There is still no CLI command to execute an emitted plan.
@@ -37,9 +37,41 @@ Milestone E is **not complete**. The initial sequential execution-tree foundatio
   run clears prior observations and prevents an older in-flight run from overwriting the newer
   batch. Cross-process publication remains unimplemented.
 
-Remaining work includes the general resource registry and leases; acknowledged acquisition and
-bounded teardown; cancellation-aware host contracts and wait registrations; parallel/race/retry/
-timeout syntax, semantics, and scheduling; isolated `--jobs`; the authoritative event journal;
+- The runtime resource registry enforces acquisition acknowledgement, shared/exclusive leases,
+  generation identity, and exactly-once terminal teardown. The generic adapter driver has fake
+  conformance tests for acquisition/body/release cancellation, readiness barriers, cleanup failure
+  aggregation, wait rejection, and one shared cleanup budget.
+- Browser contexts use that resource driver. CDP interrupts owned targets before disposing the
+  context; structured wait/resource events accompany scope events. Native direct-process calls
+  bound output reads and explicitly kill and reap on cancellation, including blocked stdin.
+  Direct calls and the application command adapter share the native process-capture driver.
+  On Unix, successful calls also terminate background descendants in their owned process group;
+  failed cleanup retains a distinct typed cause and any primary process failure.
+- Scope cancellation propagates downwards, and operation contexts carry inherited remaining time.
+  RunControl cancellation wakes active root waits; DAP disconnect retains its distinct cause.
+  Provider-only and browser-owning bodies await cooperative host interruption under the cleanup bound.
+- `[timeouts].cleanup` configures an independent positive cleanup budget (default five seconds).
+  `describe runtime.configuration` reports it in milliseconds. Paused Tokio clocks verify that
+  inherited deadlines only shrink and interruption/teardown share an absolute cleanup deadline.
+
+- `timeout <duration> { ... }` is implemented through the shared syntax/HIR/analysis/plan/runtime
+  path in flow, server, and browser domains. Nested deadlines only shrink, child bindings stay
+  local, and timeout observations retain the exact control origin and cancellation cause.
+  Canonical descriptions, semantic tokens, formatting, and portable compilation use that path.
+  `examples/structured-execution` is a self-contained passing fixture for this checkpoint.
+- Temporary directories returned by providers, including discarded results, enter the resource
+  registry. They belong to the nearest timeout or test scope and emit terminal teardown events
+  before their owner finishes. Inner cleanup failure prevents subsequent ordinary steps.
+
+- Active Protocol 1 bridge calls send cancellation and await a terminal acknowledgement under
+  a separate cleanup bound. Failed acknowledgement remains a typed cleanup failure; a partial
+  frame write invalidates the transport. Reader and fallback cancellation tasks are owned and
+  finalized during transport shutdown. Cancellation tests cover a successful sibling call,
+  missing acknowledgement, and command-adapter cancellation with blocked stdin.
+
+Remaining work includes complete resource ownership and explicit host interruption across HTTP,
+bridge/application startup and lifecycle, non-Unix process trees, and browser sessions;
+parallel/race/retry syntax, semantics, and scheduling; isolated `--jobs`; the authoritative event journal;
 trace artifacts/viewer; observation IPC; concurrent DAP behavior; and their conformance/stress
 coverage. The acceptance criteria below remain normative and unsatisfied as a whole.
 

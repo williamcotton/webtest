@@ -1167,10 +1167,17 @@ Acceptance: the same WebTest source calls `app.create_user` against applications
 
 ### [Milestone E — Structured execution and observability](./milestone-e.md)
 
+`timeout` now lowers and executes through the shared control tree, with local bindings, inherited
+deadlines, and lexical temporary-directory cleanup, including discarded provider results.
+
 Status: in progress. The sequential execution-tree foundation, structural node identities,
-parented scope/operation events, plan format 4 compatibility metadata, and atomic runtime
-observation commits are implemented. General structured concurrency, resource/cancellation
-ownership, jobs, the authoritative journal, traces, observation IPC, and concurrent DAP remain
+parented scope/operation events, plan format 5/runtime semantics 2 compatibility metadata, and atomic runtime
+observation commits are implemented. Generic resource/lease/wait contracts, browser-context
+lifecycle integration, inherited cancellation/deadline contexts, and bounded cleanup now have
+conformance coverage. Direct processes and command adapters share cancellation-aware capture;
+active bridge calls await terminal cancellation acknowledgement. Complete host/resource ownership,
+parallel/race/retry constructs, jobs,
+the authoritative journal, traces, observation IPC, and concurrent DAP remain
 pending; see the milestone's implementation-progress section for the exact boundary.
 
 - sequence/parallel/race/retry/timeout plan nodes;

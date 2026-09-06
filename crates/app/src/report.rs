@@ -228,6 +228,10 @@ pub struct SummaryReport {
 #[derive(Clone, Debug, Serialize)]
 pub struct EventReport {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_lifecycle: Option<webtest_observation::ResourceEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait: Option<webtest_observation::WaitEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<webtest_observation::ScopeEvent>,
     pub schema_version: u32,
     #[serde(rename = "type")]

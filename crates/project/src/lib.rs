@@ -86,6 +86,7 @@ pub struct TimeoutSection {
     pub navigation: Duration,
     pub provider_call: Duration,
     pub test: Duration,
+    pub cleanup: Duration,
 }
 
 #[derive(serde::Serialize, Clone, Debug)]
@@ -235,6 +236,7 @@ impl Default for ProjectConfig {
                 navigation: Duration::from_secs(30),
                 provider_call: Duration::from_secs(60),
                 test: Duration::from_secs(60),
+                cleanup: Duration::from_secs(5),
             },
             artifacts: ArtifactSection {
                 directory: PathBuf::from(".webtest/artifacts"),
@@ -384,6 +386,7 @@ struct RawTimeouts {
     navigation: Option<String>,
     provider_call: Option<String>,
     test: Option<String>,
+    cleanup: Option<String>,
     #[serde(flatten)]
     extra: toml::Table,
 }
@@ -826,6 +829,7 @@ fn parse_config(
             defaults.timeouts.provider_call,
         )?,
         test: timeout("test", raw.timeouts.test, defaults.timeouts.test)?,
+        cleanup: timeout("cleanup", raw.timeouts.cleanup, defaults.timeouts.cleanup)?,
     };
     let server_app = raw
         .server
@@ -1606,6 +1610,7 @@ assertion = "3s"
 navigation = "10s"
 provider_call = "11s"
 test = "20s"
+cleanup = "25s"
 
 [evidence]
 screenshot = "on-failure"
@@ -1630,12 +1635,15 @@ max_dom_bytes = 4096
         assert_eq!(config.timeouts.action, Duration::from_secs(2));
         assert_eq!(config.timeouts.assertion, Duration::from_secs(3));
         assert_eq!(config.timeouts.provider_call, Duration::from_secs(11));
+        // Teardown has an independent budget that may exceed the execution deadline.
+        assert_eq!(config.timeouts.cleanup, Duration::from_secs(25));
         assert_eq!(config.evidence.dom_snapshot, EvidenceMode::Off);
         assert_eq!(config.evidence.max_dom_bytes, 4096);
 
         assert!(parse_config(path, "[browser]\nbase_url = \"/relative\"\n").is_err());
         assert!(parse_config(path, "[browser]\nviewport = { width = 0, height = 10 }\n").is_err());
         assert!(parse_config(path, "[timeouts]\naction = \"61s\"\ntest = \"60s\"\n").is_err());
+        assert!(parse_config(path, "[timeouts]\ncleanup = \"0s\"\n").is_err());
         assert!(
             parse_config(
                 path,

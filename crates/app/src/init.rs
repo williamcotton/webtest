@@ -646,6 +646,7 @@ mod tests {
         assert!(WEBTEST_SKILL.contains("webtest describe app.schema"));
         assert!(WEBTEST_SKILL.contains("webtest describe app.configuration"));
         assert!(WEBTEST_SKILL.contains("webtest describe runtime.configuration"));
+        assert!(WEBTEST_SKILL.contains("webtest describe control.timeout"));
         assert!(WEBTEST_SKILL.contains("webtest describe app.bridge"));
         assert!(WEBTEST_SKILL.contains("webtest describe app.protocol"));
         assert!(WEBTEST_SKILL.contains("webtest describe app.bridge.example"));

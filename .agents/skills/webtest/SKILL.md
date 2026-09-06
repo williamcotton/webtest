@@ -150,3 +150,12 @@ Run `webtest inspect [<url>] --reporter json` to obtain bounded semantic element
 Diagnostics may contain canonical `reference_queries` and bounded `repair_hints`. Runtime failures may contain locator replacement candidates when WebTest has safe evidence. Treat both as advisory, preserve their source ranges, and rerun `check` or `test` after any edit; WebTest does not apply repairs automatically.
 
 Do not infer unavailable roadmap syntax from prose or model memory. If a query is unknown, search the installed reference or inspect `webtest describe language --reporter json` rather than inventing a construct.
+
+## Bound a child flow
+
+Use `webtest describe control.timeout --reporter json` before adding a local execution deadline.
+`timeout 2s { ... }` inherits the enclosing capability domain, keeps its declarations local, and
+uses the earliest enclosing deadline. Cleanup uses the separate bounded `[timeouts].cleanup`
+budget. Inspect structured timeout and cleanup facts together when a timed-out test aborts.
+Do not infer that parallel, race, retry, or jobs are available from timeout support; discover
+those constructs with the installed binary before using them.

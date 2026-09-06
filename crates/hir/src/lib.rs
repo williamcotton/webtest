@@ -26,12 +26,22 @@ pub struct HirTest {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum HirStmt {
+    Timeout(HirTimeout),
     Server(HirServerBlock),
     Browser(HirBrowserBlock),
     Let(HirLet),
     Expression(HirExpressionStmt),
     Expect(HirExpectation),
     BrowserOperation(HirBrowserOp),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HirTimeout {
+    pub duration: Option<Duration>,
+    pub duration_origin: SyntaxOrigin,
+    pub statements: Vec<HirStmt>,
+    pub body_origin: SyntaxOrigin,
+    pub origin: SyntaxOrigin,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -312,6 +322,9 @@ fn lower_test(
 
 fn lower_flow_statement(context: &mut LowerContext, statement: FlowStatement) -> Option<HirStmt> {
     match statement {
+        FlowStatement::Timeout(statement) => {
+            lower_timeout(context, statement, true).map(HirStmt::Timeout)
+        }
         FlowStatement::Server(block) => {
             let statements = block
                 .statements()
@@ -347,6 +360,9 @@ fn lower_domain_statement(
     statement: DomainStatement,
 ) -> Option<HirStmt> {
     match statement {
+        DomainStatement::Timeout(statement) => {
+            lower_timeout(context, statement, false).map(HirStmt::Timeout)
+        }
         DomainStatement::Let(statement) => lower_let(context, statement).map(HirStmt::Let),
         DomainStatement::Expression(statement) => {
             lower_expression_statement(context, statement).map(HirStmt::Expression)
@@ -358,6 +374,35 @@ fn lower_domain_statement(
             lower_browser_operation(context, operation).map(HirStmt::BrowserOperation)
         }
     }
+}
+
+fn lower_timeout(
+    context: &mut LowerContext,
+    statement: ast::TimeoutStmt,
+    flow: bool,
+) -> Option<HirTimeout> {
+    let duration = statement.duration()?;
+    let body = statement.body()?;
+    let bindings = context.bindings.clone();
+    let statements = if flow {
+        statement
+            .flow_statements()
+            .filter_map(|statement| lower_flow_statement(context, statement))
+            .collect()
+    } else {
+        statement
+            .domain_statements()
+            .filter_map(|statement| lower_domain_statement(context, statement))
+            .collect()
+    };
+    context.bindings = bindings;
+    Some(HirTimeout {
+        duration: duration.value(),
+        duration_origin: SyntaxOrigin::new(context.file, duration.syntax().text_range()),
+        statements,
+        body_origin: origin(context.file, body.syntax()),
+        origin: origin(context.file, statement.syntax()),
+    })
 }
 
 fn lower_let(context: &mut LowerContext, statement: ast::LetStmt) -> Option<HirLet> {

@@ -1,3 +1,4 @@
+use crate::events::EventBuffer;
 use webtest_browser::{
     BrowserError, EvidenceRequest, Page, PageEvidence, PageInspection, RepairHint, RepairHintKind,
     locator_repair_hints,
@@ -37,6 +38,21 @@ pub(super) struct PendingFailure {
 }
 
 impl PendingFailure {
+    pub(super) fn interruption_cleanup(&self) -> Result<(), webtest_observation::CleanupCause> {
+        match &self.error {
+            StepError::Provider(webtest_provider::ProviderError::Cancelled {
+                cleanup_succeeded: true,
+                ..
+            }) => Ok(()),
+            StepError::Provider(error) if error.is_infrastructure() => {
+                Err(webtest_observation::CleanupCause::Provider(error.clone()))
+            }
+            StepError::Internal(message) => Err(webtest_observation::CleanupCause::Internal {
+                message: message.clone(),
+            }),
+            _ => Ok(()),
+        }
+    }
     pub(super) fn failure_class(&self) -> FailureClass {
         self.error.failure_class()
     }
@@ -51,7 +67,7 @@ pub(super) struct FailureInput<'a> {
     pub(super) options: &'a RunnerOptions,
     pub(super) providers: &'a ProviderRegistry,
     pub(super) observations: &'a ObservationStore,
-    pub(super) events: &'a mut Vec<ExecutionEvent>,
+    pub(super) events: &'a EventBuffer,
     pub(super) event_sink: Option<&'a dyn RunEventSink>,
 }
 
@@ -166,7 +182,7 @@ struct FinishFailureInput<'a> {
     options: &'a RunnerOptions,
     providers: &'a ProviderRegistry,
     observations: &'a ObservationStore,
-    events: &'a mut Vec<ExecutionEvent>,
+    events: &'a EventBuffer,
     event_sink: Option<&'a dyn RunEventSink>,
     elapsed_ms: u64,
     artifact_deadline: tokio::time::Instant,
@@ -531,7 +547,7 @@ mod tests {
         let providers = ProviderRegistry::default();
         let observations = Arc::new(ObservationStore::default());
         let execution_id = ExecutionId::next();
-        let mut events = Vec::new();
+        let events = EventBuffer::default();
 
         let failure = process_failure(FailureInput {
             plan: &plan,
@@ -542,7 +558,7 @@ mod tests {
             options: &options,
             providers: &providers,
             observations: &observations,
-            events: &mut events,
+            events: &events,
             event_sink: None,
         })
         .await
@@ -558,7 +574,7 @@ mod tests {
             ["artifact persistence exceeded the remaining test budget"]
         );
         assert!(!options.evidence.artifact_directory.exists());
-        assert!(events.iter().any(|event| matches!(
+        assert!(events.into_events().iter().any(|event| matches!(
             event,
             ExecutionEvent::StepFailed {
                 failure: RuntimeFailure::Browser(BrowserError::LocatorNotFound { .. }),

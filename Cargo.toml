@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/text",
     "crates/model",
+    "crates/host",
     "crates/project",
     "crates/syntax",
     "crates/hir",
@@ -33,6 +34,7 @@ repository = "https://example.invalid/webtest"
 [workspace.dependencies]
 webtest-text = { path = "crates/text" }
 webtest-model = { path = "crates/model" }
+webtest-host = { path = "crates/host" }
 webtest-project = { path = "crates/project" }
 webtest-syntax = { path = "crates/syntax" }
 webtest-hir = { path = "crates/hir" }

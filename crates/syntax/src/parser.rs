@@ -116,6 +116,14 @@ impl<'a> Parser<'a> {
 
     fn statement(&mut self, domain: BlockDomain) {
         match (domain, self.current()) {
+            (_, SyntaxKind::TimeoutKw)
+                if matches!(
+                    self.nth_non_trivia(1),
+                    SyntaxKind::Duration | SyntaxKind::LBrace | SyntaxKind::Eof
+                ) =>
+            {
+                self.timeout_statement(domain)
+            }
             (BlockDomain::Test, SyntaxKind::ServerKw) => {
                 self.capability_block(SyntaxKind::ServerBlock, BlockDomain::Server)
             }
@@ -173,6 +181,18 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn timeout_statement(&mut self, domain: BlockDomain) {
+        self.start(SyntaxKind::TimeoutStmt);
+        self.bump();
+        self.expect(
+            SyntaxKind::Duration,
+            "syntax.expected_timeout_duration",
+            "expected duration after `timeout`",
+        );
+        self.braced_block(SyntaxKind::Block, domain);
+        self.finish();
+    }
+
     fn capability_block(&mut self, kind: SyntaxKind, domain: BlockDomain) {
         self.start(kind);
         self.bump();
@@ -204,11 +224,15 @@ impl<'a> Parser<'a> {
     fn let_statement(&mut self) {
         self.start(SyntaxKind::LetStmt);
         self.bump();
-        self.expect(
-            SyntaxKind::Ident,
-            "syntax.expected_binding_name",
-            "expected binding name after `let`",
-        );
+        self.eat_trivia();
+        if matches!(self.current(), SyntaxKind::Ident | SyntaxKind::TimeoutKw) {
+            self.bump();
+        } else {
+            self.error_here(
+                "syntax.expected_binding_name",
+                "expected binding name after `let`",
+            );
+        }
         self.eat_trivia();
         if self.current() == SyntaxKind::Colon {
             self.bump();
@@ -733,6 +757,7 @@ impl<'a> Parser<'a> {
         matches!(
             kind,
             SyntaxKind::Ident
+                | SyntaxKind::TimeoutKw
                 | SyntaxKind::NameKw
                 | SyntaxKind::IdKw
                 | SyntaxKind::RoleKw

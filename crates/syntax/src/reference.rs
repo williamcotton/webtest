@@ -36,19 +36,20 @@ pub fn author_facing_language() -> AuthorFacingLanguage {
             ("flow_block", "{ <flow_statement>* }"),
             (
                 "flow_statement",
-                "<let_binding> | <server_block> | <browser_block> | <value_assertion> | <expression_statement>",
+                "<timeout_statement> | <let_binding> | <server_block> | <browser_block> | <value_assertion> | <expression_statement>",
             ),
             ("let_binding", "let <Identifier> [: <Type>] = <expression>"),
             ("server_block", "server { <server_statement>* }"),
             (
                 "server_statement",
-                "<let_binding> | <value_assertion> | <expression_statement>",
+                "<timeout_statement> | <let_binding> | <value_assertion> | <expression_statement>",
             ),
             ("browser_block", "browser { <browser_statement>* }"),
             (
                 "browser_statement",
-                "<let_binding> | <browser_operation> | <browser_assertion> | <value_assertion> | <expression_statement>",
+                "<timeout_statement> | <let_binding> | <browser_operation> | <browser_assertion> | <value_assertion> | <expression_statement>",
             ),
+            ("timeout_statement", "timeout <Duration> { <statement_in_inherited_domain>* }"),
             ("value_assertion", "expect <expression>"),
             (
                 "provider_call",
@@ -126,7 +127,7 @@ pub fn author_facing_language() -> AuthorFacingLanguage {
         .map(|(key, value)| (key.into(), value.into()))
         .collect(),
         reserved_words: [
-            "test", "server", "browser", "let", "open", "evaluate", "click", "fill",
+            "test", "server", "browser", "timeout", "let", "open", "evaluate", "click", "fill",
             "type", "press", "key", "with", "check", "uncheck", "select", "option",
             "hover", "wait", "expect", "within", "url", "id", "role", "name", "label",
             "text", "placeholder", "test_id", "css", "xpath", "visible", "hidden",
@@ -140,6 +141,8 @@ pub fn author_facing_language() -> AuthorFacingLanguage {
         composition: vec![
             "top-level declarations are tests".into(),
             "server and browser are capability scopes inside a test flow".into(),
+            "timeout inherits its enclosing capability domain; its bindings remain local and its deadline cannot extend an ancestor deadline".into(),
+            "timeout is contextual and remains usable as a binding, member, or provider parameter name".into(),
             "a binding is visible only after its declaration in the enclosing sequential flow"
                 .into(),
             "a transferable server value may be referenced by a later browser block".into(),

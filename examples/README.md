@@ -5,6 +5,7 @@
 Each directory is a self-contained WebTest project with its own `webtest.toml`.
 
 - `plain-html` exercises browser operations against files served by Python's static HTTP server.
+- `structured-execution` exercises nested timeouts and lexical temporary-resource cleanup without a fixture server or Chrome.
 - `simple-server` exercises a typed `server` block and transfers the created user into a browser sign-in flow against a Python standard-library application.
 - `application-bridge` runs one byte-identical `app.create_user` scenario against nine host-language web servers and includes an independent no-SDK stdio fixture.
 

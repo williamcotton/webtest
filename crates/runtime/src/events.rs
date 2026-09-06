@@ -9,12 +9,28 @@ pub trait RunEventSink: Send + Sync {
 }
 
 pub(crate) fn emit_event(
-    events: &mut Vec<ExecutionEvent>,
+    events: &EventBuffer,
     sink: Option<&dyn RunEventSink>,
     event: ExecutionEvent,
 ) {
     if let Some(sink) = sink {
         sink.publish(&event);
     }
-    events.push(event);
+    events
+        .0
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .push(event);
+}
+
+/// Shared append ownership lets resource callbacks and descendant scopes publish
+/// without holding an execution-state borrow across an await.
+#[derive(Default)]
+pub(crate) struct EventBuffer(std::sync::Mutex<Vec<ExecutionEvent>>);
+impl EventBuffer {
+    pub(crate) fn into_events(self) -> Vec<ExecutionEvent> {
+        self.0
+            .into_inner()
+            .unwrap_or_else(|error| error.into_inner())
+    }
 }

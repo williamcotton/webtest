@@ -18,11 +18,45 @@ pub struct PlanNode {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PlanNodeKind {
-    Sequence { children: Vec<PlanNode> },
-    Operation { step: Box<PlannedStep> },
+    Timeout {
+        child: Box<PlanNode>,
+        duration: std::time::Duration,
+        cleanup_timeout: Option<std::time::Duration>,
+    },
+    Sequence {
+        children: Vec<PlanNode>,
+    },
+    Operation {
+        step: Box<PlannedStep>,
+    },
 }
 
+pub const MAX_CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
 impl PlanNode {
+    pub fn timeout(
+        test: PlanDeclarationId,
+        origin: SyntaxOrigin,
+        revision: SourceRevision,
+        path: Vec<u32>,
+        child: Self,
+        duration: std::time::Duration,
+    ) -> Self {
+        let mut node = Self {
+            id: PlanNodeId([0; 32]),
+            path,
+            origin,
+            source_revision: revision,
+            required_capabilities: child.required_capabilities.clone(),
+            kind: PlanNodeKind::Timeout {
+                child: Box::new(child),
+                duration,
+                cleanup_timeout: None,
+            },
+        };
+        node.assign_identity(test);
+        node
+    }
     pub fn sequence(
         test: PlanDeclarationId,
         origin: SyntaxOrigin,
@@ -77,6 +111,7 @@ impl PlanNode {
     fn kind_identity(&self) -> &'static str {
         match &self.kind {
             PlanNodeKind::Sequence { .. } => "sequence/v1",
+            PlanNodeKind::Timeout { .. } => "timeout/v1",
             PlanNodeKind::Operation { step } => match &step.operation {
                 crate::TestOperation::EvaluatePure(_) => "eval/v1",
                 crate::TestOperation::ServerProviderCall(_) => "provider/v1",
@@ -99,6 +134,7 @@ impl PlanNode {
 
     pub fn steps(&self) -> Vec<&PlannedStep> {
         match &self.kind {
+            PlanNodeKind::Timeout { child, .. } => child.steps(),
             PlanNodeKind::Sequence { children } => children.iter().flat_map(Self::steps).collect(),
             PlanNodeKind::Operation { step } => vec![step],
         }
@@ -106,6 +142,7 @@ impl PlanNode {
 
     pub fn steps_mut(&mut self) -> Vec<&mut PlannedStep> {
         match &mut self.kind {
+            PlanNodeKind::Timeout { child, .. } => child.steps_mut(),
             PlanNodeKind::Sequence { children } => {
                 children.iter_mut().flat_map(Self::steps_mut).collect()
             }
@@ -128,6 +165,7 @@ fn operation_capabilities(operation: &crate::TestOperation) -> Vec<Capability> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PlanTreeError {
     RootIsNotSequence,
+    InvalidControlSetting,
     InvalidPath,
     InvalidIdentity,
     SourceRevisionMismatch,
@@ -166,6 +204,26 @@ impl PlanNode {
             return Err(PlanTreeError::InvalidIdentity);
         }
         let capabilities = match &self.kind {
+            PlanNodeKind::Timeout {
+                child,
+                duration,
+                cleanup_timeout,
+            } => {
+                if duration.is_zero()
+                    || *duration > MAX_CONTROL_TIMEOUT
+                    || cleanup_timeout
+                        .is_some_and(|value| value.is_zero() || value > MAX_CONTROL_TIMEOUT)
+                {
+                    return Err(PlanTreeError::InvalidControlSetting);
+                }
+                if child.origin.file != self.origin.file {
+                    return Err(PlanTreeError::OriginMismatch);
+                }
+                let mut child_path = path.to_vec();
+                child_path.push(0);
+                child.validate(test, revision, &child_path, steps)?;
+                child.required_capabilities.clone()
+            }
             PlanNodeKind::Sequence { children } => {
                 for (ordinal, child) in children.iter().enumerate() {
                     if child.origin.file != self.origin.file {

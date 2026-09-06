@@ -7,6 +7,7 @@ pub(super) fn core_constructs() -> BTreeMap<String, ConstructDescription> {
         scope_construct("server", Capability::Server),
         scope_construct("browser", Capability::Browser),
         let_construct(),
+        timeout_construct(),
         typed_json_decode(),
     ] {
         constructs.insert(construct.id.clone(), construct);
@@ -175,6 +176,79 @@ fn declaration_test() -> ConstructDescription {
             "source_file",
             "source_file",
         ),
+    ];
+    value
+}
+
+fn timeout_construct() -> ConstructDescription {
+    let mut value = base_construct(
+        "control.timeout",
+        "timeout",
+        "control",
+        "timeout <Duration> { <inherited_statement>* }",
+        "Run a sequential child scope under a positive deadline, then await bounded cleanup before returning a timeout failure.",
+    );
+    value.search_terms = vec![
+        "deadline".into(),
+        "bounded execution".into(),
+        "cancellation".into(),
+        "cleanup".into(),
+    ];
+    value.parameters = vec![parameter(
+        "duration",
+        Type::Duration,
+        true,
+        Some(0),
+        false,
+        "deadline",
+        "Duration",
+    )];
+    value.produces_value = Some(false);
+    value.allowed_contexts = vec![
+        "flow_block".into(),
+        "scope.server".into(),
+        "scope.browser".into(),
+    ];
+    value.effects = vec!["Execute child operations in source order with their inherited capabilities and an absolute monotonic deadline.".into(), "Cancel descendants on expiry and wait for bounded host cleanup.".into()];
+    value.failure_modes = vec!["test_timeout".into(), "cleanup_scope_failed".into()];
+    value.constraints = vec![
+        constraint(
+            "positive_bounded_timeout",
+            "analysis",
+            "duration",
+            "The duration must be positive and at most 24 hours (1440m). Nested deadlines use the earliest inherited or local deadline.",
+        ),
+        constraint(
+            "timeout_local_bindings",
+            "analysis",
+            "body",
+            "Bindings declared inside the body remain local to it; visible outer bindings may be read.",
+        ),
+        constraint(
+            "separate_cleanup_deadline",
+            "runtime",
+            "body",
+            "Cleanup uses the configured separate bounded budget. Cleanup failures remain secondary typed facts and may make the final outcome an infrastructure error.",
+        ),
+    ];
+    value.examples = vec![
+        example(
+            "bounded flow",
+            "timeout 2s { server { let value = 1 expect value == 1 } }",
+            "statement_fragment",
+            "flow_block",
+        ),
+        example(
+            "bounded browser assertion",
+            "timeout 500ms { expect text(\"Ready\").visible }",
+            "statement_fragment",
+            "scope.browser",
+        ),
+    ];
+    value.related = vec![
+        "scope.server".into(),
+        "scope.browser".into(),
+        "runtime.configuration".into(),
     ];
     value
 }
@@ -2208,9 +2282,11 @@ pub(super) fn provider_failures(provider: &str) -> Vec<String> {
             "provider_unavailable".into(),
         ],
         "process" => vec![
+            "provider_cancelled".into(),
             "process_spawn".into(),
             "process_timeout".into(),
             "process_output_too_large".into(),
+            "process_cleanup".into(),
             "provider_unavailable".into(),
         ],
         "fs" => vec![
@@ -2219,6 +2295,7 @@ pub(super) fn provider_failures(provider: &str) -> Vec<String> {
             "provider_unavailable".into(),
         ],
         "app" => vec![
+            "provider_cancelled".into(),
             "app_provider_failure".into(),
             "app_bridge_handshake".into(),
             "app_bridge_protocol".into(),
@@ -2227,6 +2304,7 @@ pub(super) fn provider_failures(provider: &str) -> Vec<String> {
             "app_schema_drift".into(),
             "app_bridge_validation".into(),
             "app_bridge_timeout".into(),
+            "app_bridge_cleanup".into(),
             "provider_unavailable".into(),
         ],
         _ => vec![

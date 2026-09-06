@@ -140,6 +140,7 @@ fn run_error_semantic_details(error: &RunError) -> serde_json::Value {
 
 fn cleanup_failure_details(failure: &CleanupFailure) -> serde_json::Value {
     let cause = match &failure.cause {
+        CleanupCause::Provider(error) => serde_json::json!({"kind": "provider", "error": error}),
         CleanupCause::Browser(error) => serde_json::json!({
             "kind": "browser",
             "code": RuntimeFailureCode::from(error).short_code(),
@@ -151,6 +152,9 @@ fn cleanup_failure_details(failure: &CleanupFailure) -> serde_json::Value {
             "raw_os_error": error.raw_os_error,
             "message": error.message,
         }),
+        CleanupCause::TimedOut { timeout_ms } => {
+            serde_json::json!({"kind": "timed_out", "timeout_ms": timeout_ms})
+        }
         CleanupCause::Internal { message } => serde_json::json!({
             "kind": "internal",
             "message": message,
@@ -319,6 +323,43 @@ pub(crate) fn event_reports(path: &str, events: &[ExecutionEvent]) -> Vec<EventR
     events
         .iter()
         .map(|event| match event {
+            ExecutionEvent::Wait {
+                execution_id,
+                scope,
+                event: wait,
+            } => {
+                let kind = match wait.kind {
+                    webtest_observation::WaitEventKind::Registered => "wait_registered",
+                    webtest_observation::WaitEventKind::Ready => "wait_ready",
+                    webtest_observation::WaitEventKind::Cancelled => "wait_cancelled",
+                };
+                let mut event = event_report(
+                    path,
+                    kind,
+                    Some(execution_id.0),
+                    Some(scope.execution_context.test_id.0),
+                    None,
+                );
+                event.scope = Some(scope.clone());
+                event.wait = Some(wait.clone());
+                event
+            }
+            ExecutionEvent::Resource {
+                execution_id,
+                scope,
+                event: resource,
+            } => {
+                let mut event = event_report(
+                    path,
+                    resource.kind.name(),
+                    Some(execution_id.0),
+                    Some(scope.execution_context.test_id.0),
+                    None,
+                );
+                event.scope = Some(scope.clone());
+                event.resource_lifecycle = Some(resource.clone());
+                event
+            }
             ExecutionEvent::Scope {
                 execution_id,
                 event: scope,
@@ -615,6 +656,8 @@ fn event_report(
     step_id: Option<u32>,
 ) -> EventReport {
     EventReport {
+        resource_lifecycle: None,
+        wait: None,
         scope: None,
         schema_version: REPORT_SCHEMA_VERSION,
         kind: kind.into(),

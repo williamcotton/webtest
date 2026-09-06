@@ -1,3 +1,4 @@
+use crate::events::EventBuffer;
 use crate::{RunEventSink, events::emit_event};
 use std::sync::{
     Arc,
@@ -24,25 +25,40 @@ pub(super) struct ScopeTree {
     test_execution_id: TestExecutionId,
     test_id: TestId,
     active: Vec<ScopeEvent>,
+    contexts: Vec<crate::ScopeContext>,
+    resource_owners: Vec<bool>,
+    deadline: tokio::time::Instant,
 }
 
 impl ScopeTree {
-    pub(super) fn new(ids: ExecutionIds, execution_id: ExecutionId, test_id: TestId) -> Self {
+    pub(super) fn new(
+        ids: ExecutionIds,
+        execution_id: ExecutionId,
+        test_id: TestId,
+        deadline: tokio::time::Instant,
+    ) -> Self {
         Self {
             test_execution_id: TestExecutionId(ids.next()),
             ids,
             execution_id,
             test_id,
             active: Vec::new(),
+            contexts: Vec::new(),
+            resource_owners: Vec::new(),
+            deadline,
         }
+    }
+
+    pub(super) fn current_context(&self) -> Option<crate::ScopeContext> {
+        self.contexts.last().cloned()
     }
 
     pub(super) fn enter(
         &mut self,
         node: &PlanNode,
-        events: &mut Vec<ExecutionEvent>,
+        events: &EventBuffer,
         sink: Option<&dyn RunEventSink>,
-    ) {
+    ) -> (ScopeEvent, crate::ScopeContext) {
         let event = ScopeEvent {
             execution_context: ExecutionContext {
                 test_execution_id: self.test_execution_id,
@@ -63,25 +79,93 @@ impl ScopeTree {
             outcome: None,
             cancellation: None,
         };
+        let scope_id = event.execution_context.scope_id;
+        let context = self
+            .contexts
+            .last()
+            .map(|parent| {
+                parent.child(
+                    scope_id,
+                    match &node.kind {
+                        PlanNodeKind::Timeout { duration, .. } => {
+                            Some(tokio::time::Instant::now() + *duration)
+                        }
+                        _ => None,
+                    },
+                )
+            })
+            .unwrap_or_else(|| crate::ScopeContext {
+                scope_id,
+                cancellation: crate::CancellationToken::default(),
+                deadline: Some(self.deadline),
+                deadline_scope_id: Some(scope_id),
+            });
+        self.contexts.push(context.clone());
+        self.resource_owners
+            .push(node.path.is_empty() || matches!(node.kind, PlanNodeKind::Timeout { .. }));
         self.active.push(event.clone());
         emit_event(
             events,
             sink,
             ExecutionEvent::Scope {
                 execution_id: self.execution_id,
-                event,
+                event: event.clone(),
             },
         );
+        (event, context)
+    }
+
+    pub(super) fn current_event(&self) -> Option<ScopeEvent> {
+        self.active.last().cloned()
+    }
+
+    pub(super) fn resource_owner(&self) -> Option<(ScopeEvent, crate::ScopeContext)> {
+        self.active
+            .iter()
+            .zip(&self.contexts)
+            .zip(&self.resource_owners)
+            .rev()
+            .find(|(_, owns)| **owns)
+            .map(|((event, context), _)| (event.clone(), context.clone()))
+    }
+
+    pub(super) fn unwind_to(
+        &mut self,
+        owner: ExecutionScopeId,
+        events: &EventBuffer,
+        sink: Option<&dyn RunEventSink>,
+    ) {
+        while self
+            .active
+            .last()
+            .is_some_and(|event| event.execution_context.scope_id != owner)
+        {
+            self.leave(ScopeOutcome::Cancelled, events, sink);
+        }
     }
 
     pub(super) fn leave(
         &mut self,
         outcome: ScopeOutcome,
-        events: &mut Vec<ExecutionEvent>,
+        events: &EventBuffer,
         sink: Option<&dyn RunEventSink>,
     ) {
         if let Some(mut event) = self.active.pop() {
-            event.outcome = Some(outcome);
+            self.resource_owners.pop();
+            let context = self.contexts.pop();
+            event.cancellation = context
+                .as_ref()
+                .and_then(|context| context.cancellation.cause());
+            event.outcome = Some(
+                if event
+                    .cancellation
+                    .is_some_and(|cause| cause.causing_scope_id != event.execution_context.scope_id)
+                {
+                    ScopeOutcome::Cancelled
+                } else {
+                    outcome
+                },
+            );
             emit_event(
                 events,
                 sink,
@@ -95,17 +179,19 @@ impl ScopeTree {
 
     pub(super) fn interrupt(
         &mut self,
-        events: &mut Vec<ExecutionEvent>,
+        cause: webtest_host::Cancellation,
+        events: &EventBuffer,
         sink: Option<&dyn RunEventSink>,
     ) {
-        let Some(root) = self.active.first() else {
+        let Some(_root) = self.active.first() else {
             return;
         };
-        let causing_scope_id = root.execution_context.scope_id;
+        if let Some(context) = self.contexts.first() {
+            context.cancellation.cancel(cause);
+        }
         while self.active.len() > 1 {
             if let Some(active) = self.active.last_mut() {
-                active.cancellation =
-                    Some(webtest_observation::ScopeCancellation::Timeout { causing_scope_id });
+                active.cancellation = Some(cause);
             }
             self.leave(ScopeOutcome::Cancelled, events, sink);
         }

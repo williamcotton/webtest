@@ -496,6 +496,9 @@ test "optional" {
     #[test]
     fn descriptions_and_static_repair_diagnostics_match_the_native_core() {
         for query in [
+            "control.timeout",
+            "timeout",
+            "controls",
             "locator.role",
             "browser.fill",
             "browser.wait.locator",

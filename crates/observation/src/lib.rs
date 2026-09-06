@@ -1,7 +1,14 @@
 //! Structured execution events and revision-safe source observations.
 
+mod resource;
 mod scope;
+mod wait;
+pub use resource::{
+    AcquisitionState, ResourceAccess, ResourceEvent, ResourceEventKind, ResourceKey, ResourceKind,
+    RuntimeResourceEntry, TeardownState,
+};
 pub use scope::{ExecutionContext, ScopeCancellation, ScopeEvent, ScopeOutcome};
+pub use wait::{WaitEvent, WaitEventKind};
 
 use std::{
     collections::BTreeMap,
@@ -49,6 +56,7 @@ pub enum RuntimeFailureCode {
     BrowserLaunch,
     EvaluationFailed,
     UnsupportedBrowserCapability,
+    ProviderCancelled,
     ProviderNotRegistered,
     ProviderUnknownOperation,
     ProviderInvalidArgument,
@@ -56,6 +64,7 @@ pub enum RuntimeFailureCode {
     ResponseTooLarge,
     ProcessSpawn,
     ProcessTimeout,
+    ProcessCleanup,
     ProcessOutputTooLarge,
     Filesystem,
     PathEscape,
@@ -66,6 +75,7 @@ pub enum RuntimeFailureCode {
     AppBridgeProcess,
     AppSchemaDrift,
     AppBridgeValidation,
+    AppBridgeCleanup,
     AppBridgeTimeout,
     AppProviderFailure,
     TestTimeout,
@@ -74,6 +84,7 @@ pub enum RuntimeFailureCode {
     DivisionByZero,
     IntegerOverflow,
     InternalError,
+    CleanupScopeFailed,
     CleanupBrowserContextFailed,
     CleanupBrowserSessionFailed,
     CleanupTemporaryDirectoryFailed,
@@ -107,6 +118,7 @@ impl RuntimeFailureCode {
             Self::BrowserLaunch => "browser_launch",
             Self::EvaluationFailed => "evaluation_failed",
             Self::UnsupportedBrowserCapability => "unsupported_browser_capability",
+            Self::ProviderCancelled => "provider_cancelled",
             Self::ProviderNotRegistered => "provider_not_registered",
             Self::ProviderUnknownOperation => "provider_unknown_operation",
             Self::ProviderInvalidArgument => "provider_invalid_argument",
@@ -114,6 +126,7 @@ impl RuntimeFailureCode {
             Self::ResponseTooLarge => "response_too_large",
             Self::ProcessSpawn => "process_spawn",
             Self::ProcessTimeout => "process_timeout",
+            Self::ProcessCleanup => "process_cleanup",
             Self::ProcessOutputTooLarge => "process_output_too_large",
             Self::Filesystem => "filesystem",
             Self::PathEscape => "path_escape",
@@ -124,6 +137,7 @@ impl RuntimeFailureCode {
             Self::AppBridgeProcess => "app_bridge_process",
             Self::AppSchemaDrift => "app_schema_drift",
             Self::AppBridgeValidation => "app_bridge_validation",
+            Self::AppBridgeCleanup => "app_bridge_cleanup",
             Self::AppBridgeTimeout => "app_bridge_timeout",
             Self::AppProviderFailure => "app_provider_failure",
             Self::TestTimeout => "test_timeout",
@@ -132,6 +146,7 @@ impl RuntimeFailureCode {
             Self::DivisionByZero => "division_by_zero",
             Self::IntegerOverflow => "integer_overflow",
             Self::InternalError => "internal_error",
+            Self::CleanupScopeFailed => "cleanup_scope_failed",
             Self::CleanupBrowserContextFailed => "cleanup_browser_context_failed",
             Self::CleanupBrowserSessionFailed => "cleanup_browser_session_failed",
             Self::CleanupTemporaryDirectoryFailed => "cleanup_temporary_directory_failed",
@@ -165,6 +180,7 @@ impl RuntimeFailureCode {
             Self::BrowserLaunch => "runtime.browser_launch",
             Self::EvaluationFailed => "runtime.evaluation_failed",
             Self::UnsupportedBrowserCapability => "runtime.unsupported_browser_capability",
+            Self::ProviderCancelled => "runtime.provider_cancelled",
             Self::ProviderNotRegistered => "runtime.provider_not_registered",
             Self::ProviderUnknownOperation => "runtime.provider_unknown_operation",
             Self::ProviderInvalidArgument => "runtime.provider_invalid_argument",
@@ -172,6 +188,7 @@ impl RuntimeFailureCode {
             Self::ResponseTooLarge => "runtime.response_too_large",
             Self::ProcessSpawn => "runtime.process_spawn",
             Self::ProcessTimeout => "runtime.process_timeout",
+            Self::ProcessCleanup => "runtime.process_cleanup",
             Self::ProcessOutputTooLarge => "runtime.process_output_too_large",
             Self::Filesystem => "runtime.filesystem",
             Self::PathEscape => "runtime.path_escape",
@@ -182,6 +199,7 @@ impl RuntimeFailureCode {
             Self::AppBridgeProcess => "runtime.app_bridge_process",
             Self::AppSchemaDrift => "runtime.app_schema_drift",
             Self::AppBridgeValidation => "runtime.app_bridge_validation",
+            Self::AppBridgeCleanup => "runtime.app_bridge_cleanup",
             Self::AppBridgeTimeout => "runtime.app_bridge_timeout",
             Self::AppProviderFailure => "runtime.app_provider_failure",
             Self::TestTimeout => "runtime.test_timeout",
@@ -190,6 +208,7 @@ impl RuntimeFailureCode {
             Self::DivisionByZero => "runtime.division_by_zero",
             Self::IntegerOverflow => "runtime.integer_overflow",
             Self::InternalError => "runtime.internal_error",
+            Self::CleanupScopeFailed => "runtime.cleanup_scope_failed",
             Self::CleanupBrowserContextFailed => "runtime.cleanup_browser_context_failed",
             Self::CleanupBrowserSessionFailed => "runtime.cleanup_browser_session_failed",
             Self::CleanupTemporaryDirectoryFailed => "runtime.cleanup_temporary_directory_failed",
@@ -223,6 +242,7 @@ impl RuntimeFailureCode {
             "browser_launch" => Some(Self::BrowserLaunch),
             "evaluation_failed" => Some(Self::EvaluationFailed),
             "unsupported_browser_capability" => Some(Self::UnsupportedBrowserCapability),
+            "provider_cancelled" => Some(Self::ProviderCancelled),
             "provider_not_registered" => Some(Self::ProviderNotRegistered),
             "provider_unknown_operation" => Some(Self::ProviderUnknownOperation),
             "provider_invalid_argument" => Some(Self::ProviderInvalidArgument),
@@ -230,6 +250,7 @@ impl RuntimeFailureCode {
             "response_too_large" => Some(Self::ResponseTooLarge),
             "process_spawn" => Some(Self::ProcessSpawn),
             "process_timeout" => Some(Self::ProcessTimeout),
+            "process_cleanup" => Some(Self::ProcessCleanup),
             "process_output_too_large" => Some(Self::ProcessOutputTooLarge),
             "filesystem" => Some(Self::Filesystem),
             "path_escape" => Some(Self::PathEscape),
@@ -240,6 +261,7 @@ impl RuntimeFailureCode {
             "app_bridge_process" => Some(Self::AppBridgeProcess),
             "app_schema_drift" => Some(Self::AppSchemaDrift),
             "app_bridge_validation" => Some(Self::AppBridgeValidation),
+            "app_bridge_cleanup" => Some(Self::AppBridgeCleanup),
             "app_bridge_timeout" => Some(Self::AppBridgeTimeout),
             "app_provider_failure" => Some(Self::AppProviderFailure),
             "test_timeout" => Some(Self::TestTimeout),
@@ -248,6 +270,7 @@ impl RuntimeFailureCode {
             "division_by_zero" => Some(Self::DivisionByZero),
             "integer_overflow" => Some(Self::IntegerOverflow),
             "internal_error" => Some(Self::InternalError),
+            "cleanup_scope_failed" => Some(Self::CleanupScopeFailed),
             "cleanup_browser_context_failed" => Some(Self::CleanupBrowserContextFailed),
             "cleanup_browser_session_failed" => Some(Self::CleanupBrowserSessionFailed),
             "cleanup_temporary_directory_failed" => Some(Self::CleanupTemporaryDirectoryFailed),
@@ -263,6 +286,7 @@ impl RuntimeFailureCode {
             | Self::AppBridgeProcess
             | Self::AppSchemaDrift
             | Self::AppBridgeValidation
+            | Self::AppBridgeCleanup
             | Self::AppBridgeTimeout => &["app.diagnostics", "runtime.configuration"],
             Self::AssertionFailed
             | Self::JsonDecodeFailed
@@ -313,6 +337,7 @@ impl From<&webtest_browser::BrowserError> for RuntimeFailureCode {
 impl From<&webtest_provider::ProviderError> for RuntimeFailureCode {
     fn from(error: &webtest_provider::ProviderError) -> Self {
         match error {
+            webtest_provider::ProviderError::Cancelled { .. } => Self::ProviderCancelled,
             webtest_provider::ProviderError::NotRegistered { .. } => Self::ProviderNotRegistered,
             webtest_provider::ProviderError::UnknownOperation { .. } => {
                 Self::ProviderUnknownOperation
@@ -324,6 +349,7 @@ impl From<&webtest_provider::ProviderError> for RuntimeFailureCode {
             webtest_provider::ProviderError::ResponseTooLarge { .. } => Self::ResponseTooLarge,
             webtest_provider::ProviderError::ProcessSpawn { .. } => Self::ProcessSpawn,
             webtest_provider::ProviderError::ProcessTimeout { .. } => Self::ProcessTimeout,
+            webtest_provider::ProviderError::ProcessCleanup { .. } => Self::ProcessCleanup,
             webtest_provider::ProviderError::ProcessOutputTooLarge { .. } => {
                 Self::ProcessOutputTooLarge
             }
@@ -336,6 +362,7 @@ impl From<&webtest_provider::ProviderError> for RuntimeFailureCode {
             webtest_provider::ProviderError::BridgeProcess { .. } => Self::AppBridgeProcess,
             webtest_provider::ProviderError::BridgeSchemaDrift { .. } => Self::AppSchemaDrift,
             webtest_provider::ProviderError::BridgeValidation { .. } => Self::AppBridgeValidation,
+            webtest_provider::ProviderError::BridgeCleanup { .. } => Self::AppBridgeCleanup,
             webtest_provider::ProviderError::BridgeTimeout { .. } => Self::AppBridgeTimeout,
             webtest_provider::ProviderError::Application { .. } => Self::AppProviderFailure,
         }
@@ -434,9 +461,14 @@ pub enum RunOutcomeKind {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CleanupResource {
+    ExecutionScope {
+        scope_id: webtest_model::ExecutionScopeId,
+    },
     BrowserContext,
     BrowserSession,
-    TemporaryDirectory { path: PathBuf },
+    TemporaryDirectory {
+        path: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
@@ -496,6 +528,8 @@ impl From<std::io::Error> for CleanupIoFailure {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CleanupCause {
+    Provider(webtest_provider::ProviderError),
+    TimedOut { timeout_ms: u64 },
     Browser(webtest_browser::BrowserError),
     Io(CleanupIoFailure),
     Internal { message: String },
@@ -510,13 +544,17 @@ pub struct CleanupFailure {
 impl CleanupFailure {
     pub const fn failure_class(&self) -> FailureClass {
         match self.cause {
-            CleanupCause::Browser(_) | CleanupCause::Io(_) => FailureClass::Infrastructure,
+            CleanupCause::Provider(_)
+            | CleanupCause::TimedOut { .. }
+            | CleanupCause::Browser(_)
+            | CleanupCause::Io(_) => FailureClass::Infrastructure,
             CleanupCause::Internal { .. } => FailureClass::Internal,
         }
     }
 
     pub const fn code(&self) -> RuntimeFailureCode {
         match self.resource {
+            CleanupResource::ExecutionScope { .. } => RuntimeFailureCode::CleanupScopeFailed,
             CleanupResource::BrowserContext => RuntimeFailureCode::CleanupBrowserContextFailed,
             CleanupResource::BrowserSession => RuntimeFailureCode::CleanupBrowserSessionFailed,
             CleanupResource::TemporaryDirectory { .. } => {
@@ -527,6 +565,9 @@ impl CleanupFailure {
 
     pub fn message(&self) -> String {
         let resource = match &self.resource {
+            CleanupResource::ExecutionScope { scope_id } => {
+                format!("execution scope {}", scope_id.0)
+            }
             CleanupResource::BrowserContext => "browser context".into(),
             CleanupResource::BrowserSession => "browser session".into(),
             CleanupResource::TemporaryDirectory { path } => {
@@ -534,8 +575,12 @@ impl CleanupFailure {
             }
         };
         let cause = match &self.cause {
+            CleanupCause::Provider(error) => error.to_string(),
             CleanupCause::Browser(error) => error.to_string(),
             CleanupCause::Io(error) => error.message.clone(),
+            CleanupCause::TimedOut { timeout_ms } => {
+                format!("cleanup timed out after {timeout_ms}ms")
+            }
             CleanupCause::Internal { message } => message.clone(),
         };
         bounded_cleanup_message(format!("failed to clean up {resource}: {cause}"))
@@ -631,6 +676,16 @@ impl RuntimeFailure {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExecutionEvent {
+    Wait {
+        execution_id: ExecutionId,
+        scope: ScopeEvent,
+        event: WaitEvent,
+    },
+    Resource {
+        execution_id: ExecutionId,
+        scope: ScopeEvent,
+        event: ResourceEvent,
+    },
     Scope {
         execution_id: ExecutionId,
         event: ScopeEvent,
@@ -733,7 +788,9 @@ impl ExecutionEvent {
             Self::ProviderCallFailed { code, .. } | Self::CleanupFailed { code, .. } => Some(*code),
             Self::StepFailed { failure, .. } => Some(failure.code()),
             Self::TestTimedOut { .. } => Some(RuntimeFailureCode::TestTimeout),
-            Self::Scope { .. }
+            Self::Wait { .. }
+            | Self::Resource { .. }
+            | Self::Scope { .. }
             | Self::RunStarted { .. }
             | Self::TestStarted { .. }
             | Self::StepStarted { .. }
@@ -1171,11 +1228,21 @@ mod failure_code_tests {
                 "provider_invalid_argument",
                 "runtime.provider_invalid_argument",
             ),
+            (
+                C::AppBridgeCleanup,
+                "app_bridge_cleanup",
+                "runtime.app_bridge_cleanup",
+            ),
             (C::HttpTransport, "http_transport", "runtime.http_transport"),
             (
                 C::ResponseTooLarge,
                 "response_too_large",
                 "runtime.response_too_large",
+            ),
+            (
+                C::ProcessCleanup,
+                "process_cleanup",
+                "runtime.process_cleanup",
             ),
             (C::ProcessSpawn, "process_spawn", "runtime.process_spawn"),
             (
@@ -1534,6 +1601,11 @@ mod failure_code_tests {
                 FailureClass::Infrastructure,
             ),
             (
+                ProviderError::ProcessCleanup { primary: None },
+                C::ProcessCleanup,
+                FailureClass::Infrastructure,
+            ),
+            (
                 ProviderError::ProcessOutputTooLarge { limit: 1 },
                 C::ProcessOutputTooLarge,
                 FailureClass::Infrastructure,
@@ -1600,6 +1672,13 @@ mod failure_code_tests {
                     message: "bad".into(),
                 },
                 C::AppBridgeValidation,
+                FailureClass::Infrastructure,
+            ),
+            (
+                ProviderError::BridgeCleanup {
+                    primary: Box::new(ProviderError::BridgeTimeout { timeout_ms: 1 }),
+                },
+                C::AppBridgeCleanup,
                 FailureClass::Infrastructure,
             ),
             (

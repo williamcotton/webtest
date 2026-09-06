@@ -12,12 +12,12 @@ use webtest_model::{
 use webtest_text::{FileId, SourceRevision, SyntaxOrigin};
 
 mod tree;
-pub use tree::{PlanNode, PlanNodeKind, PlanTreeError, declaration_identity};
+pub use tree::{MAX_CONTROL_TIMEOUT, PlanNode, PlanNodeKind, PlanTreeError, declaration_identity};
 mod compatibility;
 pub use compatibility::{PlanCompatibilityError, PlanExecutionInputs};
 
-pub const PLAN_FORMAT_VERSION: u32 = 4;
-pub const RUNTIME_SEMANTICS_VERSION: u32 = 1;
+pub const PLAN_FORMAT_VERSION: u32 = 5;
+pub const RUNTIME_SEMANTICS_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PlanEnvelope {
@@ -430,7 +430,7 @@ mod tests {
         let encoded = serde_json::to_string(&envelope).expect("serialize plan");
         let decoded: PlanEnvelope = serde_json::from_str(&encoded).expect("deserialize plan");
         assert_eq!(decoded, envelope);
-        for version in [1, 2, 3, PLAN_FORMAT_VERSION + 1] {
+        for version in [1, 2, 3, 4, PLAN_FORMAT_VERSION + 1] {
             let mut unsupported = decoded.clone();
             unsupported.format_version = version;
             assert!(unsupported.validate_version().is_err());

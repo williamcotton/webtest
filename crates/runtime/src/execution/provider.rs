@@ -15,6 +15,7 @@ pub(super) async fn execute_provider(
     call: &ServerProviderCall,
     environment: &HashMap<BindingId, Value>,
     remaining: Duration,
+    context: std::sync::Arc<dyn webtest_host::OperationContext>,
 ) -> Result<Value, StepError> {
     let mut arguments = BTreeMap::new();
     for (name, expression) in &call.arguments {
@@ -29,6 +30,7 @@ pub(super) async fn execute_provider(
                 schema_hash: call.schema_hash.clone(),
             },
             CallContext {
+                execution: Some(context),
                 project_root: options.project_root.clone(),
                 timeout: call
                     .timeout

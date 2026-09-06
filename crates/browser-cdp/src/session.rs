@@ -67,6 +67,26 @@ struct CdpBrowserContext {
 
 #[async_trait]
 impl BrowserContext for CdpBrowserContext {
+    async fn interrupt(&mut self, _cause: webtest_host::Cancellation) -> Result<(), BrowserError> {
+        let mut failure = None;
+        for target in std::mem::take(&mut self.target_ids) {
+            if let Err(error) = self
+                .connection
+                .command(
+                    "Target.closeTarget",
+                    Some(json!({"targetId": target})),
+                    None,
+                )
+                .await
+            {
+                failure.get_or_insert(error);
+            }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
     async fn new_page(&mut self) -> Result<Box<dyn Page>, BrowserError> {
         let context_id = self
             .context_id
@@ -340,5 +360,40 @@ mod tests {
             Err(BrowserError::Protocol { method, message })
                 if method == "BrowserContext.new_page" && message.contains("already closed")
         ));
+    }
+
+    #[tokio::test]
+    async fn interrupt_closes_owned_targets_before_context_teardown() {
+        let Some((connection, mut server)) = fake_cdp().await else {
+            return;
+        };
+        let mut context = CdpBrowserContext {
+            connection,
+            context_id: Some("owned-context".into()),
+            options: BrowserContextOptions::default(),
+            navigation_timeout: Duration::from_secs(15),
+            target_ids: vec!["first".into(), "second".into()],
+        };
+        let work = tokio::spawn(async move {
+            context
+                .interrupt(webtest_host::Cancellation {
+                    reason: webtest_host::CancellationReason::Timeout,
+                    causing_scope_id: webtest_host::ExecutionScopeId(1),
+                })
+                .await
+                .expect("interrupt targets");
+            context.close().await.expect("dispose context");
+        });
+        for target in ["first", "second"] {
+            let command = receive_command(&mut server).await;
+            assert_eq!(command["method"], "Target.closeTarget");
+            assert_eq!(command["params"]["targetId"], target);
+            respond(&mut server, &command, json!({"success": true})).await;
+        }
+        let command = receive_command(&mut server).await;
+        assert_eq!(command["method"], "Target.disposeBrowserContext");
+        assert_eq!(command["params"]["browserContextId"], "owned-context");
+        respond(&mut server, &command, json!({})).await;
+        work.await.expect("owned task completion");
     }
 }

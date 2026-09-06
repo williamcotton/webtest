@@ -1,5 +1,8 @@
 //! Provider schemas, calls, results, errors, registry, and native server-provider contracts.
 
+#[cfg(feature = "native")]
+pub mod process;
+
 use std::{
     collections::{BTreeMap, HashMap},
     path::PathBuf,
@@ -107,13 +110,36 @@ pub struct ProviderResult {
 
 #[derive(Clone, Debug)]
 pub struct CallContext {
+    pub execution: Option<Arc<dyn webtest_host::OperationContext>>,
     pub project_root: PathBuf,
     pub timeout: Duration,
     pub redacted_json_fields: Vec<String>,
 }
 
+impl CallContext {
+    /// The provider's own limit can only tighten its owning scope's deadline.
+    pub fn effective_timeout(&self) -> Duration {
+        self.execution
+            .as_ref()
+            .and_then(|execution| execution.remaining())
+            .map_or(self.timeout, |remaining| remaining.min(self.timeout))
+    }
+
+    pub async fn cancelled(&self) -> webtest_host::Cancellation {
+        match &self.execution {
+            Some(execution) => execution.cancelled().await,
+            None => std::future::pending().await,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Error, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProviderError {
+    #[error("provider operation cancelled ({cause:?}); cleanup succeeded: {cleanup_succeeded}")]
+    Cancelled {
+        cause: webtest_host::Cancellation,
+        cleanup_succeeded: bool,
+    },
     #[error("provider `{provider}` is not registered")]
     NotRegistered { provider: String },
     #[error("unknown operation `{provider}.{operation}`")]
@@ -131,6 +157,8 @@ pub enum ProviderError {
         timeout_ms: u64,
         cleanup_succeeded: bool,
     },
+    #[error("owned process group did not finish cleanup")]
+    ProcessCleanup { primary: Option<Box<ProviderError>> },
     #[error("process output exceeded the configured {limit} byte limit")]
     ProcessOutputTooLarge { limit: usize },
     #[error("filesystem operation failed for `{path}`: {message}")]
@@ -153,6 +181,8 @@ pub enum ProviderError {
     BridgeSchemaDrift { expected: String, live: String },
     #[error("application bridge value validation failed at {path}: {message}")]
     BridgeValidation { path: String, message: String },
+    #[error("application bridge call did not acknowledge interruption")]
+    BridgeCleanup { primary: Box<ProviderError> },
     #[error("application bridge call timed out after {timeout_ms}ms")]
     BridgeTimeout { timeout_ms: u64 },
     #[error("application function failed ({code}): {message}")]
@@ -167,6 +197,7 @@ pub enum ProviderError {
 impl ProviderError {
     pub fn code(&self) -> &'static str {
         match self {
+            Self::Cancelled { .. } => "provider_cancelled",
             Self::NotRegistered { .. } => "provider_not_registered",
             Self::UnknownOperation { .. } => "provider_unknown_operation",
             Self::InvalidArgument { .. } => "provider_invalid_argument",
@@ -174,6 +205,7 @@ impl ProviderError {
             Self::ResponseTooLarge { .. } => "response_too_large",
             Self::ProcessSpawn { .. } => "process_spawn",
             Self::ProcessTimeout { .. } => "process_timeout",
+            Self::ProcessCleanup { .. } => "process_cleanup",
             Self::ProcessOutputTooLarge { .. } => "process_output_too_large",
             Self::Filesystem { .. } => "filesystem",
             Self::PathEscape { .. } => "path_escape",
@@ -184,6 +216,7 @@ impl ProviderError {
             Self::BridgeProcess { .. } => "app_bridge_process",
             Self::BridgeSchemaDrift { .. } => "app_schema_drift",
             Self::BridgeValidation { .. } => "app_bridge_validation",
+            Self::BridgeCleanup { .. } => "app_bridge_cleanup",
             Self::BridgeTimeout { .. } => "app_bridge_timeout",
             Self::Application { .. } => "app_provider_failure",
         }
@@ -198,6 +231,13 @@ impl ProviderError {
 
     pub fn redacted(&self, secrets: &[String]) -> Self {
         match self {
+            Self::Cancelled {
+                cause,
+                cleanup_succeeded,
+            } => Self::Cancelled {
+                cause: *cause,
+                cleanup_succeeded: *cleanup_succeeded,
+            },
             Self::NotRegistered { provider } => Self::NotRegistered {
                 provider: redact_text(provider, secrets),
             },
@@ -224,6 +264,11 @@ impl ProviderError {
             } => Self::ProcessTimeout {
                 timeout_ms: *timeout_ms,
                 cleanup_succeeded: *cleanup_succeeded,
+            },
+            Self::ProcessCleanup { primary } => Self::ProcessCleanup {
+                primary: primary
+                    .as_ref()
+                    .map(|error| Box::new(error.redacted(secrets))),
             },
             Self::ProcessOutputTooLarge { limit } => Self::ProcessOutputTooLarge { limit: *limit },
             Self::Filesystem { path, message } => Self::Filesystem {
@@ -255,6 +300,9 @@ impl ProviderError {
             Self::BridgeValidation { path, message } => Self::BridgeValidation {
                 path: path.clone(),
                 message: redact_text(message, secrets),
+            },
+            Self::BridgeCleanup { primary } => Self::BridgeCleanup {
+                primary: Box::new(primary.redacted(secrets)),
             },
             Self::BridgeTimeout { timeout_ms } => Self::BridgeTimeout {
                 timeout_ms: *timeout_ms,
@@ -361,6 +409,17 @@ impl ProviderRegistry {
         call: ProviderCall,
         mut context: CallContext,
     ) -> Result<ProviderResult, ProviderError> {
+        if let Some(cause) = context
+            .execution
+            .as_ref()
+            .and_then(|execution| execution.cancellation())
+        {
+            return Err(ProviderError::Cancelled {
+                cause,
+                cleanup_succeeded: true,
+            });
+        }
+        context.timeout = context.effective_timeout();
         let provider =
             self.providers
                 .get(&call.provider.0)
@@ -743,7 +802,6 @@ impl ServerProvider for ProcessProvider {
         call: ProviderCall,
         context: CallContext,
     ) -> Result<ProviderResult, ProviderError> {
-        use tokio::io::AsyncWriteExt;
         let executable = string_argument(&call.arguments, "executable")?;
         let mut command = tokio::process::Command::new(executable);
         command.kill_on_drop(true);
@@ -780,93 +838,40 @@ impl ServerProvider for ProcessProvider {
         if call.arguments.contains_key("stdin") {
             command.stdin(std::process::Stdio::piped());
         }
-        let mut child = command
-            .spawn()
-            .map_err(|error| ProviderError::ProcessSpawn {
-                message: error.to_string(),
-            })?;
-        let mut process_group = ProcessGroupGuard::new(child.id());
-        if let Some(Value::String(stdin)) = call.arguments.get("stdin")
-            && let Some(mut input) = child.stdin.take()
-        {
-            input.write_all(stdin.as_bytes()).await.map_err(|error| {
-                ProviderError::ProcessSpawn {
-                    message: error.to_string(),
-                }
-            })?;
-        }
-        let timeout = effective_timeout(&call.arguments, context.timeout);
-        let process_id = child.id();
-        let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
-            Ok(output) => {
-                process_group.disarm();
-                output.map_err(|error| ProviderError::ProcessSpawn {
-                    message: error.to_string(),
-                })?
-            }
-            Err(_) => {
-                let cleanup_succeeded = cleanup_process_group(process_id).await;
-                if cleanup_succeeded {
-                    process_group.disarm();
-                }
-                return Err(ProviderError::ProcessTimeout {
-                    timeout_ms: timeout.as_millis().min(u128::from(u64::MAX)) as u64,
-                    cleanup_succeeded,
-                });
-            }
-        };
-        if output.stdout.len() > self.config.max_output_bytes
-            || output.stderr.len() > self.config.max_output_bytes
-        {
-            return Err(ProviderError::ProcessOutputTooLarge {
-                limit: self.config.max_output_bytes,
-            });
-        }
+        let mut context = context;
+        context.timeout = effective_timeout(&call.arguments, context.effective_timeout());
+        let input = call.arguments.get("stdin").and_then(|value| match value {
+            Value::String(value) => Some(value.as_bytes()),
+            _ => None,
+        });
+        let output = process::capture(
+            &mut command,
+            input,
+            &context,
+            process::CaptureLimits {
+                stdout_bytes: self.config.max_output_bytes,
+                stderr_bytes: self.config.max_output_bytes,
+                truncate_stderr: false,
+            },
+        )
+        .await?;
+        let process::ProcessOutput {
+            status,
+            stdout,
+            stderr,
+        } = output;
+        let stdout = stdout.bytes;
+        let stderr = stderr.bytes;
         Ok(ProviderResult {
             value: Value::ProcessResult(ProcessResultValue {
-                exit_code: output.status.code().map(i64::from).unwrap_or(-1),
-                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                stdout_bytes: output.stdout,
-                stderr_bytes: output.stderr,
+                exit_code: status.code().map(i64::from).unwrap_or(-1),
+                stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                stdout_bytes: stdout,
+                stderr_bytes: stderr,
             }),
         })
     }
-}
-
-#[cfg(feature = "native")]
-struct ProcessGroupGuard {
-    process_id: Option<u32>,
-}
-
-#[cfg(feature = "native")]
-impl ProcessGroupGuard {
-    const fn new(process_id: Option<u32>) -> Self {
-        Self { process_id }
-    }
-
-    fn disarm(&mut self) {
-        self.process_id = None;
-    }
-}
-
-#[cfg(all(feature = "native", unix))]
-impl Drop for ProcessGroupGuard {
-    fn drop(&mut self) {
-        let Some(process_id) = self.process_id.and_then(|id| i32::try_from(id).ok()) else {
-            return;
-        };
-        // The provider created this process group. A synchronous signal in Drop
-        // keeps cancellation of the parent future from leaving descendants alive.
-        unsafe {
-            libc::kill(-process_id, libc::SIGKILL);
-        }
-    }
-}
-
-#[cfg(all(feature = "native", not(unix)))]
-impl Drop for ProcessGroupGuard {
-    fn drop(&mut self) {}
 }
 
 #[cfg(feature = "native")]
@@ -1150,33 +1155,6 @@ fn filesystem_error(path: &Path, error: std::io::Error) -> ProviderError {
     }
 }
 
-#[cfg(all(feature = "native", unix))]
-async fn cleanup_process_group(process_id: Option<u32>) -> bool {
-    let Some(process_id) = process_id.and_then(|id| i32::try_from(id).ok()) else {
-        return false;
-    };
-    // The provider created this process group, so a negative PID targets only its descendants.
-    let killed = unsafe { libc::kill(-process_id, libc::SIGKILL) } == 0
-        || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
-    if !killed {
-        return false;
-    }
-    for _ in 0..50 {
-        if unsafe { libc::kill(-process_id, 0) } != 0
-            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-        {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    false
-}
-
-#[cfg(all(feature = "native", not(unix)))]
-async fn cleanup_process_group(_process_id: Option<u32>) -> bool {
-    false
-}
-
 #[cfg(all(test, feature = "native"))]
 mod tests {
     use std::io::{Read, Write};
@@ -1186,6 +1164,7 @@ mod tests {
 
     fn context(root: &Path) -> CallContext {
         CallContext {
+            execution: None,
             project_root: root.to_path_buf(),
             timeout: Duration::from_secs(2),
             redacted_json_fields: vec!["password".into(), "authorization".into()],
@@ -1256,6 +1235,7 @@ mod tests {
                             .collect(),
                     ),
                     CallContext {
+                        execution: None,
                         project_root: root.path().into(),
                         timeout: Duration::from_secs(2),
                         redacted_json_fields: Vec::new(),
@@ -1497,5 +1477,143 @@ mod tests {
             panic!("process timeout")
         };
         assert!(cleanup_succeeded);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_cancellation_interrupts_blocked_stdin_and_reaps_the_owned_child() {
+        #[derive(Debug)]
+        struct AfterSpawn(PathBuf);
+        #[async_trait]
+        impl webtest_host::OperationContext for AfterSpawn {
+            fn scope_id(&self) -> webtest_model::ExecutionScopeId {
+                webtest_model::ExecutionScopeId(7)
+            }
+            fn remaining(&self) -> Option<Duration> {
+                Some(Duration::from_secs(10))
+            }
+            fn cancellation(&self) -> Option<webtest_host::Cancellation> {
+                None
+            }
+            async fn cancelled(&self) -> webtest_host::Cancellation {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !self.0.exists() {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("child wrote its PID");
+                webtest_host::Cancellation {
+                    reason: webtest_host::CancellationReason::ParentFailed,
+                    causing_scope_id: self.scope_id(),
+                }
+            }
+        }
+        let project = tempfile::tempdir().unwrap();
+        let pid_file = project.path().join("child.pid");
+        let mut context = context(project.path());
+        context.execution = Some(Arc::new(AfterSpawn(pid_file.clone())));
+        let outcome = ProcessProvider::new(ProcessProviderConfig::default())
+            .call(
+                call(
+                    "process",
+                    "run",
+                    [
+                        ("executable".into(), Value::String("/bin/sh".into())),
+                        (
+                            "args".into(),
+                            Value::List(vec![
+                                Value::String("-c".into()),
+                                Value::String("echo $$ > child.pid; exec sleep 30".into()),
+                            ]),
+                        ),
+                        ("stdin".into(), Value::String("x".repeat(1024 * 1024))),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+                context,
+            )
+            .await;
+        assert!(
+            matches!(
+                outcome,
+                Err(ProviderError::Cancelled {
+                    cleanup_succeeded: true,
+                    ..
+                })
+            ),
+            "{outcome:?}"
+        );
+        let pid = std::fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "child did not survive cancellation"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_process_exit_still_terminates_background_descendants() {
+        let project = tempfile::tempdir().unwrap();
+        let provider = ProcessProvider::new(Default::default());
+        let outcome = provider.call(call("process", "run", [
+            ("executable".into(), Value::String("/bin/sh".into())),
+            ("args".into(), Value::List(vec![Value::String("-c".into()),
+                Value::String("sleep 30 </dev/null >/dev/null 2>&1 & echo $! > descendant.pid".into())])),
+        ].into_iter().collect()), context(project.path())).await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+        let pid = std::fs::read_to_string(project.path().join("descendant.pid"))
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "descendant survived completed provider call"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_output_limit_interrupts_a_producer_without_waiting_for_exit() {
+        let project = tempfile::tempdir().unwrap();
+        let provider = ProcessProvider::new(ProcessProviderConfig {
+            max_output_bytes: 64,
+            ..ProcessProviderConfig::default()
+        });
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            provider.call(
+                call(
+                    "process",
+                    "run",
+                    [("executable".into(), Value::String("/usr/bin/yes".into()))]
+                        .into_iter()
+                        .collect(),
+                ),
+                context(project.path()),
+            ),
+        )
+        .await
+        .expect("bounded output terminates producer");
+        assert_eq!(
+            outcome.unwrap_err(),
+            ProviderError::ProcessOutputTooLarge { limit: 64 }
+        );
     }
 }

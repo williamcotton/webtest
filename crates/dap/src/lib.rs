@@ -730,6 +730,9 @@ fn run_failure_output_data(failure: &webtest_runtime::RunError) -> Value {
     match failure {
         webtest_runtime::RunError::Cleanup(cleanup) => {
             let cause = match &cleanup.cause {
+                webtest_runtime::CleanupCause::Provider(error) => {
+                    json!({"kind": "provider", "error": error})
+                }
                 webtest_runtime::CleanupCause::Browser(error) => json!({
                     "kind": "browser",
                     "code": RuntimeFailureCode::from(error).short_code(),
@@ -741,6 +744,9 @@ fn run_failure_output_data(failure: &webtest_runtime::RunError) -> Value {
                     "raw_os_error": error.raw_os_error,
                     "message": error.message,
                 }),
+                webtest_runtime::CleanupCause::TimedOut { timeout_ms } => {
+                    json!({"kind": "timed_out", "timeout_ms": timeout_ms})
+                }
                 webtest_runtime::CleanupCause::Internal { message } => json!({
                     "kind": "internal",
                     "message": message,
@@ -976,6 +982,9 @@ impl DebugState {
 
 #[async_trait]
 impl RunControl for DebugState {
+    fn cancellation_reason(&self) -> webtest_host::CancellationReason {
+        webtest_host::CancellationReason::DebugDisconnect
+    }
     fn is_cancelled(&self) -> bool {
         self.shutting_down.load(Ordering::Acquire)
     }

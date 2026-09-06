@@ -21,6 +21,64 @@ fn analyze(source: &str) -> (Vec<Diagnostic>, TestPlan) {
     )
 }
 
+#[test]
+fn timeout_remains_a_contextual_name() {
+    let source = r#"test "names" { let timeout = { timeout: 2s } timeout.timeout expect timeout.timeout == 2s timeout 1s { expect timeout.timeout == 2s } server { http.get("https://example.test", timeout: timeout.timeout) } }"#;
+    let parsed = webtest_syntax::parse(source);
+    assert_eq!(parsed.syntax().text().to_string(), source);
+    assert!(parsed.errors().is_empty(), "{:?}", parsed.errors());
+    let (diagnostics, _) = analyze(source);
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+}
+
+#[test]
+fn timeout_lowers_to_a_source_mapped_control_with_an_explicit_sequence() {
+    let source = "test \"é\" { timeout 2s { server { let x = 1 expect x == 1 } } }";
+    let (diagnostics, plan) = analyze(source);
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    plan.validate_tree().unwrap();
+    let webtest_plan::PlanNodeKind::Sequence { children } = &plan.tests[0].body.kind else {
+        panic!("root sequence")
+    };
+    let node = &children[0];
+    let webtest_plan::PlanNodeKind::Timeout {
+        child, duration, ..
+    } = &node.kind
+    else {
+        panic!("timeout")
+    };
+    assert_eq!(*duration, std::time::Duration::from_secs(2));
+    assert_eq!(node.path, [0]);
+    assert_eq!(child.path, [0, 0]);
+    assert!(matches!(
+        child.kind,
+        webtest_plan::PlanNodeKind::Sequence { .. }
+    ));
+    assert_eq!(
+        &source[node.origin.range.start().into()..node.origin.range.end().into()],
+        "timeout 2s { server { let x = 1 expect x == 1 } }"
+    );
+    assert_eq!(plan, analyze(source).1);
+}
+
+#[test]
+fn timeout_rejects_invalid_bounds_and_does_not_export_local_bindings() {
+    for duration in ["0ms", "1441m", "999999999999999999999s"] {
+        let (diagnostics, _) = analyze(&format!("test \"x\" {{ timeout {duration} {{ }} }}"));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "semantic.invalid_timeout"),
+            "{duration}: {diagnostics:?}"
+        );
+    }
+    let (diagnostics, _) = analyze("test \"x\" { timeout 1s { let local = 1 } expect local == 1 }");
+    assert!(!diagnostics.is_empty());
+    let (diagnostics, _) =
+        analyze("test \"x\" { let outer = 1 timeout 1s { expect outer == 1 } expect outer == 1 }");
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+}
+
 fn analyze_with_registry(source: &str, providers: ProviderRegistry) -> (Vec<Diagnostic>, TestPlan) {
     let mut database = AnalysisDatabase::with_provider_registry(providers);
     let file = database.open_file("file:///test.webtest", source);

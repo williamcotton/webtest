@@ -326,6 +326,9 @@ impl EditorService {
             .filter_map(|token| {
                 let parent = token.parent().map(|node| node.kind());
                 let kind = match token.kind() {
+                    SyntaxKind::TimeoutKw if parent == Some(SyntaxKind::TimeoutStmt) => {
+                        SemanticTokenKind::Keyword
+                    }
                     SyntaxKind::TestKw
                     | SyntaxKind::BrowserKw
                     | SyntaxKind::ServerKw
@@ -369,12 +372,14 @@ impl EditorService {
                     | SyntaxKind::UrlKw => SemanticTokenKind::Function,
                     SyntaxKind::String => SemanticTokenKind::String,
                     SyntaxKind::LineComment => SemanticTokenKind::Comment,
-                    SyntaxKind::Ident
+                    SyntaxKind::Ident | SyntaxKind::TimeoutKw
                         if matches!(parent, Some(SyntaxKind::LetStmt | SyntaxKind::NameExpr)) =>
                     {
                         SemanticTokenKind::Variable
                     }
-                    SyntaxKind::Ident if parent == Some(SyntaxKind::MemberExpr) => {
+                    SyntaxKind::Ident | SyntaxKind::TimeoutKw
+                        if parent == Some(SyntaxKind::MemberExpr) =>
+                    {
                         SemanticTokenKind::Property
                     }
                     SyntaxKind::Ident

@@ -25,6 +25,44 @@ impl Compiler<'_> {
             let mut child_path = path.clone();
             child_path.push(ordinal as u32);
             let node = match statement {
+                HirStmt::Timeout(block) => {
+                    self.type_fact(
+                        block.duration_origin.range,
+                        Type::Duration,
+                        Capability::Pure,
+                    );
+                    let duration = block.duration.filter(|duration| {
+                        !duration.is_zero() && *duration <= webtest_plan::MAX_CONTROL_TIMEOUT
+                    });
+                    if duration.is_none() {
+                        self.error(
+                            block.duration_origin.range,
+                            "semantic.invalid_timeout",
+                            "timeout must be positive and no greater than 24 hours".into(),
+                        );
+                    }
+                    let bindings = self.bindings.clone();
+                    let names = self.names.clone();
+                    let mut body_path = child_path.clone();
+                    body_path.push(0);
+                    let body = self.compile_sequence(
+                        test,
+                        block.body_origin,
+                        &block.statements,
+                        domain,
+                        body_path,
+                    );
+                    self.bindings = bindings;
+                    self.names = names;
+                    webtest_plan::PlanNode::timeout(
+                        test,
+                        block.origin,
+                        self.revision,
+                        child_path,
+                        body,
+                        duration.unwrap_or(std::time::Duration::from_millis(1)),
+                    )
+                }
                 HirStmt::Server(block) => self.compile_sequence(
                     test,
                     block.origin,
@@ -60,6 +98,7 @@ impl Compiler<'_> {
         steps: &mut Vec<PlannedStep>,
     ) {
         match statement {
+            HirStmt::Timeout(_) => unreachable!("control nodes compile through the execution tree"),
             HirStmt::Server(block) => {
                 for statement in &block.statements {
                     self.compile_statement(statement, Capability::Server, steps);
@@ -313,6 +352,11 @@ impl Compiler<'_> {
 
 pub(super) fn collect_binding_names(statement: &HirStmt, names: &mut HashSet<String>) {
     match statement {
+        HirStmt::Timeout(block) => {
+            for statement in &block.statements {
+                collect_binding_names(statement, names);
+            }
+        }
         HirStmt::Server(block) => {
             for statement in &block.statements {
                 collect_binding_names(statement, names);

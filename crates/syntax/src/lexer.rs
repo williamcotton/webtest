@@ -183,6 +183,7 @@ pub(crate) fn lex(source: &str) -> Vec<Token> {
                     "test" => SyntaxKind::TestKw,
                     "browser" => SyntaxKind::BrowserKw,
                     "server" => SyntaxKind::ServerKw,
+                    "timeout" => SyntaxKind::TimeoutKw,
                     "let" => SyntaxKind::LetKw,
                     "true" => SyntaxKind::TrueKw,
                     "false" => SyntaxKind::FalseKw,

@@ -19,6 +19,7 @@ mod navigation;
 mod redaction;
 
 pub(crate) struct CdpPage {
+    operation_context: Option<std::sync::Arc<dyn webtest_host::OperationContext>>,
     connection: CdpConnection,
     session_id: String,
     navigation_timeout: Duration,
@@ -33,22 +34,36 @@ impl CdpPage {
         test_id_attribute: String,
     ) -> Self {
         Self {
+            operation_context: None,
             connection,
             session_id,
             navigation_timeout,
             test_id_attribute,
         }
     }
+
+    fn operation_timeout(&self, timeout: Duration) -> Duration {
+        self.operation_context
+            .as_ref()
+            .and_then(|context| context.remaining())
+            .map_or(timeout, |remaining| remaining.min(timeout))
+    }
 }
 
 #[async_trait]
 impl Page for CdpPage {
+    fn set_operation_context(
+        &mut self,
+        context: Option<std::sync::Arc<dyn webtest_host::OperationContext>>,
+    ) {
+        self.operation_context = context;
+    }
     async fn open(&mut self, url: &str) -> Result<(), BrowserError> {
-        navigation::open(self, url, self.navigation_timeout).await
+        self.open_with_timeout(url, self.navigation_timeout).await
     }
 
     async fn click(&mut self, locator: &Locator) -> Result<(), BrowserError> {
-        let timeout = Duration::from_secs(5);
+        let timeout = self.operation_timeout(Duration::from_secs(5));
         actions::perform(
             self,
             &Action::Click {
@@ -61,7 +76,7 @@ impl Page for CdpPage {
     }
 
     async fn expect_visible(&mut self, locator: &Locator) -> Result<(), BrowserError> {
-        let timeout = Duration::from_secs(5);
+        let timeout = self.operation_timeout(Duration::from_secs(5));
         locator::wait_for_locator(
             self,
             locator,
@@ -80,7 +95,12 @@ impl Page for CdpPage {
         url: &str,
         timeout: Duration,
     ) -> Result<(), BrowserError> {
-        navigation::open(self, url, timeout.min(self.navigation_timeout)).await
+        navigation::open(
+            self,
+            url,
+            self.operation_timeout(timeout.min(self.navigation_timeout)),
+        )
+        .await
     }
 
     async fn evaluate_with_timeout(
@@ -88,10 +108,11 @@ impl Page for CdpPage {
         expression: &str,
         timeout: Duration,
     ) -> Result<(), BrowserError> {
-        evaluation::evaluate_with_timeout(self, expression, timeout).await
+        evaluation::evaluate_with_timeout(self, expression, self.operation_timeout(timeout)).await
     }
 
     async fn perform(&mut self, action: &Action, timeout: Duration) -> Result<(), BrowserError> {
+        let timeout = self.operation_timeout(timeout);
         let deadline = Instant::now() + timeout;
         match complete_before_deadline(deadline, actions::perform(self, action, timeout, deadline))
             .await
@@ -110,6 +131,7 @@ impl Page for CdpPage {
         state: LocatorState,
         timeout: Duration,
     ) -> Result<(), BrowserError> {
+        let timeout = self.operation_timeout(timeout);
         let deadline = Instant::now() + timeout;
         match complete_before_deadline(
             deadline,
@@ -131,6 +153,7 @@ impl Page for CdpPage {
         expected: &str,
         timeout: Duration,
     ) -> Result<(), BrowserError> {
+        let timeout = self.operation_timeout(timeout);
         let deadline = Instant::now() + timeout;
         match complete_before_deadline(deadline, navigation::wait_for_url(self, expected, deadline))
             .await

@@ -29,11 +29,7 @@ pub enum ScopeOutcome {
     TimedOut,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ScopeCancellation {
-    Timeout { causing_scope_id: ExecutionScopeId },
-}
+pub use webtest_host::Cancellation as ScopeCancellation;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScopeEvent {

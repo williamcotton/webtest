@@ -429,6 +429,10 @@ pub trait BrowserSession: Send {
 #[async_trait]
 pub trait BrowserContext: Send {
     async fn new_page(&mut self) -> Result<Box<dyn Page>, BrowserError>;
+    /// Interrupt work in this owned context before asynchronous teardown.
+    async fn interrupt(&mut self, _cause: webtest_host::Cancellation) -> Result<(), BrowserError> {
+        Ok(())
+    }
     async fn close(&mut self) -> Result<(), BrowserError> {
         Ok(())
     }
@@ -450,6 +454,12 @@ impl BrowserContext for SinglePageContext {
 
 #[async_trait]
 pub trait Page: Send {
+    /// Supplies the owning operation's cancellation and remaining-deadline context.
+    fn set_operation_context(
+        &mut self,
+        _context: Option<std::sync::Arc<dyn webtest_host::OperationContext>>,
+    ) {
+    }
     async fn open(&mut self, url: &str) -> Result<(), BrowserError>;
     async fn click(&mut self, locator: &Locator) -> Result<(), BrowserError>;
     async fn expect_visible(&mut self, locator: &Locator) -> Result<(), BrowserError>;

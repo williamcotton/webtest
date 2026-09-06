@@ -13,6 +13,45 @@ pub use parser::{Parse, parse};
 pub use reference::{AuthorFacingLanguage, GrammarExample, author_facing_language};
 
 #[cfg(test)]
+mod timeout_tests {
+    use super::*;
+    use rowan::ast::AstNode;
+
+    #[test]
+    fn timeout_blocks_are_lossless_in_every_domain_and_recover_when_half_typed() {
+        for source in [
+            "test \"é\" { timeout 2s { server { let x = 1 } } }",
+            "test \"nested\" { browser { timeout 2s { timeout 50ms { click text(\"é\") } } } }",
+            "test \"server\" { server { timeout 2s { http.get(\"/\", timeout: 1s) } } }",
+        ] {
+            let parsed = parse(source);
+            assert!(parsed.errors().is_empty(), "{:?}", parsed.errors());
+            assert_eq!(parsed.syntax().text().to_string(), source);
+            let timeout = parsed
+                .syntax()
+                .descendants()
+                .find_map(ast::TimeoutStmt::cast)
+                .unwrap();
+            assert_eq!(
+                timeout.duration().unwrap().value(),
+                Some(std::time::Duration::from_secs(2))
+            );
+            assert!(timeout.body().is_some());
+        }
+        for source in [
+            "test \"x\" { timeout",
+            "test \"x\" { timeout {",
+            "test \"x\" { timeout 2s { browser {",
+            "test \"x\" { timeout 5 { let x = 1 } }",
+        ] {
+            let parsed = parse(source);
+            assert!(!parsed.errors().is_empty());
+            assert_eq!(parsed.syntax().text().to_string(), source);
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use rowan::ast::AstNode;
 

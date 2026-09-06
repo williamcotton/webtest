@@ -123,6 +123,8 @@ pub enum SyntaxKind {
     GenericType,
     RecordType,
     TypeField,
+    TimeoutKw,
+    TimeoutStmt,
     Eof,
 }
 
@@ -135,6 +137,7 @@ impl SyntaxKind {
         matches!(
             self,
             Self::TestKw
+                | Self::TimeoutKw
                 | Self::BrowserKw
                 | Self::OpenKw
                 | Self::EvaluateKw
@@ -337,7 +340,9 @@ impl Language for WebtestLanguage {
             117 => SyntaxKind::GenericType,
             118 => SyntaxKind::RecordType,
             119 => SyntaxKind::TypeField,
-            120 => SyntaxKind::Eof,
+            120 => SyntaxKind::TimeoutKw,
+            121 => SyntaxKind::TimeoutStmt,
+            122 => SyntaxKind::Eof,
             _ => SyntaxKind::Error,
         }
     }

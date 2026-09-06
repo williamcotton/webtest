@@ -148,7 +148,10 @@ pub fn format_file(parse: &Parse) -> String {
                         | SyntaxKind::HoverKw
                         | SyntaxKind::WaitKw
                         | SyntaxKind::ExpectKw
-                );
+                ) || (kind == SyntaxKind::TimeoutKw
+                    && token
+                        .parent()
+                        .is_some_and(|parent| parent.kind() == SyntaxKind::TimeoutStmt));
                 if starts_statement && !line_start {
                     output.push('\n');
                     line_start = true;

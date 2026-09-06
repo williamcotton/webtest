@@ -12,6 +12,17 @@ pub trait RunControl: Send + Sync {
         false
     }
 
+    fn cancellation_reason(&self) -> webtest_host::CancellationReason {
+        webtest_host::CancellationReason::UserCancelled
+    }
+
+    /// Hosts may override this with their own wakeup primitive. No task is spawned.
+    async fn cancelled(&self) {
+        while !self.is_cancelled() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     async fn before_step(&self, test: &PlannedTest, step: &PlannedStep);
 
     /// Called after the per-test deadline drops an active debugger hook or step.

@@ -16,6 +16,7 @@ pub(crate) fn runner_options(project: &Project) -> RunnerOptions {
         navigation_timeout: project.config.timeouts.navigation,
         provider_call_timeout: project.config.timeouts.provider_call,
         test_timeout: project.config.timeouts.test,
+        cleanup_timeout: project.config.timeouts.cleanup,
         browser_context: browser_context_options(project),
         evidence: EvidenceOptions {
             screenshot_on_failure: project.config.evidence.screenshot
@@ -126,6 +127,7 @@ pub(crate) fn resolved_runtime_configuration(project: &Project) -> ResolvedRunti
         server_base_url: project.config.server.base_url.clone(),
         test_timeout_ms: duration_millis(project.config.timeouts.test),
         provider_call_timeout_ms: duration_millis(project.config.timeouts.provider_call),
+        cleanup_timeout_ms: duration_millis(project.config.timeouts.cleanup),
     }
 }
 

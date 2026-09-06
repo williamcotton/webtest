@@ -1,0 +1,7 @@
+[project]
+name = "structured-execution"
+test_roots = ["."]
+
+[timeouts]
+test = "10s"
+cleanup = "2s"

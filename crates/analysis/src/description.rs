@@ -47,6 +47,7 @@ pub struct ResolvedRuntimeConfiguration {
     pub server_base_url: Option<String>,
     pub test_timeout_ms: u64,
     pub provider_call_timeout_ms: u64,
+    pub cleanup_timeout_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -365,6 +366,14 @@ struct CategorySpec {
 }
 
 const CATEGORY_SPECS: &[CategorySpec] = &[
+    CategorySpec {
+        index_key: "controls",
+        query: "control",
+        aliases: &["controls"],
+        prefixes: &["control"],
+        exact_children: &[],
+        summary: "Structured execution controls.",
+    },
     CategorySpec {
         index_key: "declarations",
         query: "declaration",
@@ -1025,6 +1034,7 @@ mod tests {
         assert_eq!(search.results[0].id, "browser.click");
 
         for (query, expected) in [
+            ("timeout", "control.timeout"),
             ("integer overflow", "type.Int"),
             ("optional member", "type.Record"),
             ("passive locator observation", "browser.wait.locator"),
@@ -1213,6 +1223,7 @@ mod tests {
     fn public_reference_is_complete_unique_and_does_not_advertise_roadmap_constructs() {
         let expected = [
             "declaration.test",
+            "control.timeout",
             "scope.server",
             "scope.browser",
             "statement.let",
@@ -1609,6 +1620,7 @@ mod tests {
             server_base_url: None,
             test_timeout_ms: 60_000,
             provider_call_timeout_ms: 60_000,
+            cleanup_timeout_ms: 5_000,
         };
         let project = DescriptionProject {
             root: "/project".into(),

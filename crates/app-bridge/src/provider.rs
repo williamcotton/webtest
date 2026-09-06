@@ -15,7 +15,7 @@ use std::{
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::{
-    io::{AsyncRead, AsyncWrite, BufReader, ReadBuf, ReadHalf, WriteHalf},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf, ReadHalf, WriteHalf},
     process::{Child, ChildStdin, ChildStdout, Command},
     sync::{Mutex, Notify, oneshot},
 };
@@ -784,83 +784,65 @@ impl AppProvider {
         &self,
         function: &str,
         arguments: serde_json::Value,
-        timeout: Duration,
+        context: &CallContext,
     ) -> Result<serde_json::Value, ProviderError> {
-        use tokio::io::AsyncWriteExt;
         let (program, args) = command_parts(&self.config.command)?;
         let mut command = Command::new(program);
-        command
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        let mut child = command.spawn().map_err(transport_error)?;
+        command.args(args).current_dir(&context.project_root);
         let request = serde_json::to_vec(&serde_json::json!({
             "function": function,
             "arguments": arguments,
-            "deadline_ms": duration_millis(timeout),
+            "deadline_ms": duration_millis(context.effective_timeout()),
             "schema_hash": self.manifest.schema_hash,
         }))
         .map_err(|error| protocol_error("encode", error))?;
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(&request).await.map_err(transport_error)?;
+        if request.len() > self.config.max_message_bytes {
+            return Err(ProviderError::BridgeProtocol {
+                code: "frame_too_large".into(),
+                message: "command adapter input exceeded the configured limit".into(),
+            });
         }
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| ProviderError::BridgeTransport {
-                message: "command adapter stdout was unavailable".into(),
-            })?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| ProviderError::BridgeTransport {
-                message: "command adapter stderr was unavailable".into(),
-            })?;
-        let stdout_task = tokio::spawn(read_bounded_stream(stdout, self.config.max_message_bytes));
-        let stderr_task = tokio::spawn(read_bounded_stream(stderr, self.config.max_stderr_bytes));
-        let status = match tokio::time::timeout(timeout, child.wait()).await {
-            Ok(result) => result.map_err(transport_error)?,
-            Err(_) => {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                return Err(ProviderError::BridgeTimeout {
-                    timeout_ms: duration_millis(timeout),
-                });
+        let output = webtest_provider::process::capture(
+            &mut command,
+            Some(&request),
+            context,
+            webtest_provider::process::CaptureLimits {
+                stdout_bytes: self.config.max_message_bytes,
+                stderr_bytes: self.config.max_stderr_bytes,
+                truncate_stderr: true,
+            },
+        )
+        .await
+        .map_err(|error| match error {
+            ProviderError::ProcessTimeout {
+                timeout_ms,
+                cleanup_succeeded: true,
+            } => ProviderError::BridgeTimeout { timeout_ms },
+            ProviderError::ProcessTimeout { .. } | ProviderError::ProcessCleanup { .. } => {
+                ProviderError::BridgeCleanup {
+                    primary: Box::new(error),
+                }
             }
-        };
-        let (stdout, _, stdout_exceeded) = stdout_task
-            .await
-            .map_err(|error| ProviderError::BridgeTransport {
-                message: format!("command adapter output task failed: {error}"),
-            })?
-            .map_err(transport_error)?;
-        let (_, stderr_bytes, stderr_exceeded) = stderr_task
-            .await
-            .map_err(|error| ProviderError::BridgeTransport {
-                message: format!("command adapter log task failed: {error}"),
-            })?
-            .map_err(transport_error)?;
-        if stderr_bytes > 0 {
+            ProviderError::ProcessOutputTooLarge { .. } => ProviderError::BridgeProtocol {
+                code: "frame_too_large".into(),
+                message: "command adapter output exceeded the configured limit".into(),
+            },
+            ProviderError::ProcessSpawn { message } => ProviderError::BridgeTransport { message },
+            error => error,
+        })?;
+        if output.stderr.total_bytes > 0 {
             warn!(
-                bytes = stderr_bytes,
-                truncated = stderr_exceeded,
+                bytes = output.stderr.total_bytes,
+                truncated = output.stderr.truncated,
                 "command adapter wrote to stderr"
             );
         }
-        if stdout_exceeded {
-            return Err(ProviderError::BridgeProtocol {
-                code: "frame_too_large".into(),
-                message: "command adapter output exceeded the configured limit".into(),
-            });
-        }
-        if !status.success() && stdout.is_empty() {
+        if !output.status.success() && output.stdout.bytes.is_empty() {
             return Err(ProviderError::BridgeTransport {
-                message: format!("command adapter exited with {status}"),
+                message: format!("command adapter exited with {}", output.status),
             });
         }
-        compatibility_response(&stdout, self.config.value_limits)
+        compatibility_response(&output.stdout.bytes, self.config.value_limits)
     }
 
     async fn http_call(
@@ -966,7 +948,7 @@ impl ServerProvider for AppProvider {
     ) -> Result<ProviderResult, ProviderError> {
         let arguments = self.checked_arguments(&call)?;
         self.ensure_started(&context.project_root).await?;
-        let timeout = context.timeout;
+        let timeout = context.effective_timeout();
         let value = match self.config.adapter {
             AppAdapter::Bridge => {
                 let (client, transport) = {
@@ -979,10 +961,18 @@ impl ServerProvider for AppProvider {
                     (Arc::clone(&active.client), active.transport)
                 };
                 info!(transport, function = %call.operation.0, "calling application bridge");
-                client.call(&call.operation.0, arguments, timeout).await?
+                client
+                    .call_with_context(
+                        &call.operation.0,
+                        arguments,
+                        timeout,
+                        context.execution.as_deref(),
+                        self.config.shutdown_timeout,
+                    )
+                    .await?
             }
             AppAdapter::Command => {
-                self.command_call(&call.operation.0, arguments, timeout)
+                self.command_call(&call.operation.0, arguments, &context)
                     .await?
             }
             AppAdapter::Http => {
@@ -1003,6 +993,8 @@ struct BridgeClient {
     max_message_bytes: usize,
     max_pending_calls: usize,
     supports_cancel: bool,
+    reader: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    maintenance: Arc<StdMutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 #[derive(Default)]
@@ -1010,6 +1002,7 @@ struct PendingState {
     requests: HashMap<u64, PendingRequest>,
     cancelled: HashMap<u64, ExpectedResponse>,
     event_counts: HashMap<u64, usize>,
+    failure: Option<ProviderError>,
 }
 
 struct PendingRequest {
@@ -1025,6 +1018,7 @@ struct PendingRequestCancellation {
     max_message_bytes: usize,
     supports_cancel: bool,
     armed: bool,
+    maintenance: Arc<StdMutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 impl PendingRequestCancellation {
@@ -1037,6 +1031,7 @@ impl PendingRequestCancellation {
             max_message_bytes: client.max_message_bytes,
             supports_cancel: client.supports_cancel,
             armed: true,
+            maintenance: Arc::clone(&client.maintenance),
         }
     }
 
@@ -1059,7 +1054,7 @@ impl Drop for PendingRequestCancellation {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        runtime.spawn(async move {
+        let task = runtime.spawn(async move {
             let removed = {
                 let mut state = pending.lock().await;
                 let request = state.requests.remove(&id);
@@ -1083,6 +1078,12 @@ impl Drop for PendingRequestCancellation {
                 .await;
             }
         });
+        let mut maintenance = self
+            .maintenance
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        maintenance.retain(|task| !task.is_finished());
+        maintenance.push(task);
     }
 }
 
@@ -1229,7 +1230,7 @@ impl BridgeClient {
 
         let writer = Arc::new(Mutex::new(write));
         let pending = Arc::new(Mutex::new(PendingState::default()));
-        spawn_reader(
+        let reader_task = spawn_reader(
             reader,
             Arc::clone(&writer),
             Arc::clone(&pending),
@@ -1244,18 +1245,33 @@ impl BridgeClient {
             max_message_bytes: config.max_message_bytes,
             max_pending_calls: config.max_pending_calls,
             supports_cancel: capabilities.cancel,
+            reader: StdMutex::new(Some(reader_task)),
+            maintenance: Arc::default(),
         })
     }
 
+    #[cfg(test)]
     async fn call(
         &self,
         function: &str,
         arguments: serde_json::Value,
         timeout: Duration,
     ) -> Result<serde_json::Value, ProviderError> {
+        self.call_with_context(function, arguments, timeout, None, DEFAULT_SHUTDOWN_TIMEOUT)
+            .await
+    }
+
+    async fn call_with_context(
+        &self,
+        function: &str,
+        arguments: serde_json::Value,
+        timeout: Duration,
+        execution: Option<&dyn webtest_host::OperationContext>,
+        cleanup_timeout: Duration,
+    ) -> Result<serde_json::Value, ProviderError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let response = self
-            .request(
+            .request_with_context(
                 id,
                 BridgeMessage::Call {
                     id,
@@ -1264,27 +1280,11 @@ impl BridgeClient {
                     deadline_ms: duration_millis(timeout),
                 },
                 timeout,
+                execution,
+                cleanup_timeout,
             )
             .await;
-        let response = match response {
-            Err(ProviderError::BridgeTimeout { .. }) => {
-                if self.supports_cancel {
-                    let _ = write_frame(
-                        &mut *self.writer.lock().await,
-                        &BridgeMessage::Cancel {
-                            id,
-                            reason: "deadline".into(),
-                        },
-                        self.max_message_bytes,
-                    )
-                    .await;
-                }
-                return Err(ProviderError::BridgeTimeout {
-                    timeout_ms: duration_millis(timeout),
-                });
-            }
-            value => value?,
-        };
+        let response = response?;
         match response {
             BridgeMessage::Result {
                 id: response_id,
@@ -1316,7 +1316,26 @@ impl BridgeClient {
         message: BridgeMessage,
         timeout: Duration,
     ) -> Result<BridgeMessage, ProviderError> {
-        let (sender, receiver) = oneshot::channel();
+        self.request_with_context(id, message, timeout, None, DEFAULT_SHUTDOWN_TIMEOUT)
+            .await
+    }
+
+    async fn request_with_context(
+        &self,
+        id: u64,
+        message: BridgeMessage,
+        timeout: Duration,
+        execution: Option<&dyn webtest_host::OperationContext>,
+        cleanup_timeout: Duration,
+    ) -> Result<BridgeMessage, ProviderError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        if let Some(cause) = execution.and_then(|context| context.cancellation()) {
+            return Err(ProviderError::Cancelled {
+                cause,
+                cleanup_succeeded: true,
+            });
+        }
+        let (sender, mut receiver) = oneshot::channel();
         let expected = match &message {
             BridgeMessage::Call { .. } => ExpectedResponse::Call,
             BridgeMessage::Shutdown { .. } => ExpectedResponse::Shutdown,
@@ -1329,6 +1348,9 @@ impl BridgeClient {
         };
         {
             let mut pending = self.pending.lock().await;
+            if let Some(error) = &pending.failure {
+                return Err(error.clone());
+            }
             if pending.requests.len() + pending.cancelled.len() >= self.max_pending_calls {
                 return Err(ProviderError::BridgeProtocol {
                     code: "too_many_pending_calls".into(),
@@ -1352,53 +1374,198 @@ impl BridgeClient {
             }
         }
         let mut cancellation = PendingRequestCancellation::new(self, id, expected);
-        if let Err(error) = write_frame(
-            &mut *self.writer.lock().await,
-            &message,
-            self.max_message_bytes,
-        )
-        .await
-        {
-            let mut pending = self.pending.lock().await;
-            pending.requests.remove(&id);
-            pending.event_counts.remove(&id);
+        let send = async {
+            write_frame(
+                &mut *self.writer.lock().await,
+                &message,
+                self.max_message_bytes,
+            )
+            .await
+            .map_err(protocol_from_frame)
+        };
+        let sent = tokio::select! {
+            biased;
+            cause = host_cancelled(execution) => Err(ProviderError::Cancelled { cause, cleanup_succeeded: false }),
+            result = tokio::time::timeout_at(deadline, send) => result.unwrap_or_else(|_| Err(ProviderError::BridgeTimeout { timeout_ms: duration_millis(timeout) })),
+        };
+        if let Err(error) = sent {
             cancellation.disarm();
-            return Err(protocol_from_frame(error));
+            // A cancelled or timed-out write may have sent part of a frame. The
+            // transport can no longer be used safely by this or sibling calls.
+            self.close_transport(cleanup_timeout).await;
+            return Err(error);
         }
-        let result = match tokio::time::timeout(timeout, receiver).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(ProviderError::BridgeTransport {
-                message: "bridge response channel closed".into(),
-            }),
-            Err(_) => {
-                let mut pending = self.pending.lock().await;
-                let request = pending.requests.remove(&id);
-                if let Some(request) = request {
-                    pending.cancelled.insert(id, request.expected);
-                } else {
-                    pending.event_counts.remove(&id);
-                }
-                Err(ProviderError::BridgeTimeout {
-                    timeout_ms: duration_millis(timeout),
+        enum Completion {
+            Response(Result<Result<BridgeMessage, ProviderError>, oneshot::error::RecvError>),
+            Cancelled(webtest_host::Cancellation),
+            Deadline,
+        }
+        let completion = tokio::select! {
+            biased;
+            cause = host_cancelled(execution) => Completion::Cancelled(cause),
+            response = &mut receiver => Completion::Response(response),
+            _ = tokio::time::sleep_until(deadline) => Completion::Deadline,
+        };
+        let result = match completion {
+            Completion::Response(response) => response.unwrap_or_else(|_| {
+                Err(ProviderError::BridgeTransport {
+                    message: "bridge response channel closed".into(),
                 })
+            }),
+            interrupted => {
+                let reason = match &interrupted {
+                    Completion::Cancelled(cause) => match cause.reason {
+                        webtest_host::CancellationReason::UserCancelled => "user_cancelled",
+                        webtest_host::CancellationReason::ParentFailed => "parent_failed",
+                        webtest_host::CancellationReason::RaceLost => "race_lost",
+                        webtest_host::CancellationReason::Timeout => "deadline",
+                        webtest_host::CancellationReason::DebugDisconnect => "debug_disconnect",
+                        webtest_host::CancellationReason::FailFast => "fail_fast",
+                        webtest_host::CancellationReason::RunnerShutdown => "runner_shutdown",
+                    },
+                    _ => "deadline",
+                };
+                let cleanup_deadline = tokio::time::Instant::now() + cleanup_timeout;
+                // Keep correlation and the receiver alive until a terminal reply
+                // acknowledges that the remote call finished, even after cancel.
+                let acknowledged = if self.supports_cancel && expected == ExpectedResponse::Call {
+                    tokio::time::timeout_at(cleanup_deadline, async {
+                        write_frame(
+                            &mut *self.writer.lock().await,
+                            &BridgeMessage::Cancel {
+                                id,
+                                reason: reason.into(),
+                            },
+                            self.max_message_bytes,
+                        )
+                        .await
+                        .ok()?;
+                        match receiver.await.ok()?.ok()? {
+                            BridgeMessage::Result {
+                                id: response_id, ..
+                            }
+                            | BridgeMessage::Error {
+                                id: response_id, ..
+                            } if response_id == id => Some(()),
+                            _ => None,
+                        }
+                    })
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some()
+                } else {
+                    false
+                };
+                cancellation.disarm();
+                if !acknowledged {
+                    self.close_transport(
+                        cleanup_deadline.saturating_duration_since(tokio::time::Instant::now()),
+                    )
+                    .await;
+                }
+                match interrupted {
+                    Completion::Cancelled(cause) => Err(ProviderError::Cancelled {
+                        cause,
+                        cleanup_succeeded: acknowledged,
+                    }),
+                    _ => {
+                        let primary = ProviderError::BridgeTimeout {
+                            timeout_ms: duration_millis(timeout),
+                        };
+                        Err(if acknowledged {
+                            primary
+                        } else {
+                            ProviderError::BridgeCleanup {
+                                primary: Box::new(primary),
+                            }
+                        })
+                    }
+                }
             }
         };
         cancellation.disarm();
         result
     }
 
+    async fn close_transport(&self, timeout: Duration) {
+        let maintenance = std::mem::take(
+            &mut *self
+                .maintenance
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        for task in maintenance {
+            task.abort();
+            let _ = task.await;
+        }
+        let reader = self
+            .reader
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(reader) = reader {
+            reader.abort();
+            let _ = reader.await;
+        }
+        let _ = tokio::time::timeout(timeout, async { self.writer.lock().await.shutdown().await })
+            .await;
+        fail_pending(
+            &self.pending,
+            ProviderError::BridgeTransport {
+                message: "bridge transport interrupted".into(),
+            },
+        )
+        .await;
+    }
+
     async fn shutdown(&self, timeout: Duration) -> Result<(), ProviderError> {
+        let deadline = tokio::time::Instant::now() + timeout;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        match self
+        let result = match self
             .request(id, BridgeMessage::Shutdown { id }, timeout)
-            .await?
+            .await
         {
-            BridgeMessage::ShutdownOk { id: response_id } if response_id == id => Ok(()),
+            Ok(BridgeMessage::ShutdownOk { id: response_id }) if response_id == id => Ok(()),
+            Err(error) => Err(error),
             _ => Err(ProviderError::BridgeProtocol {
                 code: "expected_shutdown_ok".into(),
                 message: "bridge did not confirm shutdown".into(),
             }),
+        };
+        self.close_transport(deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .await;
+        result
+    }
+}
+
+impl Drop for BridgeClient {
+    fn drop(&mut self) {
+        for task in self
+            .maintenance
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain(..)
+        {
+            task.abort();
         }
+        if let Some(reader) = self
+            .reader
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            reader.abort();
+        }
+    }
+}
+
+async fn host_cancelled(
+    execution: Option<&dyn webtest_host::OperationContext>,
+) -> webtest_host::Cancellation {
+    match execution {
+        Some(execution) => execution.cancelled().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -1409,7 +1576,7 @@ fn spawn_reader(
     max_message_bytes: usize,
     max_events_per_call: usize,
     value_limits: SchemaLimits,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             let message = match read_frame(&mut reader, max_message_bytes).await {
@@ -1585,7 +1752,7 @@ fn spawn_reader(
                 }
             }
         }
-    });
+    })
 }
 
 async fn fail_pending(pending: &Mutex<PendingState>, error: ProviderError) {
@@ -1593,6 +1760,7 @@ async fn fail_pending(pending: &Mutex<PendingState>, error: ProviderError) {
     let values = std::mem::take(&mut state.requests);
     state.cancelled.clear();
     state.event_counts.clear();
+    state.failure.get_or_insert_with(|| error.clone());
     drop(state);
     for (_, request) in values {
         let _ = request.sender.send(Err(error.clone()));
@@ -2416,6 +2584,7 @@ mod tests {
 
     fn call_context() -> CallContext {
         CallContext {
+            execution: None,
             project_root: std::env::current_dir().expect("current directory"),
             timeout: Duration::from_secs(2),
             redacted_json_fields: Vec::new(),
@@ -2452,6 +2621,125 @@ mod tests {
             .shutdown(Duration::from_secs(1))
             .await
             .expect("shutdown");
+    }
+
+    #[derive(Debug)]
+    struct CancelAt(tokio::time::Instant);
+    #[async_trait]
+    impl webtest_host::OperationContext for CancelAt {
+        fn scope_id(&self) -> webtest_host::ExecutionScopeId {
+            webtest_host::ExecutionScopeId(7)
+        }
+        fn remaining(&self) -> Option<Duration> {
+            Some(Duration::from_secs(30))
+        }
+        fn cancellation(&self) -> Option<webtest_host::Cancellation> {
+            (tokio::time::Instant::now() >= self.0).then(|| webtest_host::Cancellation {
+                reason: webtest_host::CancellationReason::RaceLost,
+                causing_scope_id: self.scope_id(),
+            })
+        }
+        async fn cancelled(&self) -> webtest_host::Cancellation {
+            tokio::time::sleep_until(self.0).await;
+            self.cancellation().unwrap()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn host_cancellation_waits_for_terminal_acknowledgement_without_poisoning_siblings() {
+        let manifest = manifest();
+        let (runner, bridge) = tokio::io::duplex(16_384);
+        let fixture = tokio::spawn(delayed_bridge(bridge, "secret".into(), manifest.clone()));
+        let client = BridgeClient::handshake(
+            Box::new(runner),
+            "secret".into(),
+            "run".into(),
+            &manifest,
+            &AppProviderConfig::default(),
+        )
+        .await
+        .unwrap();
+        let started = tokio::time::Instant::now();
+        let execution = CancelAt(started + Duration::from_millis(5));
+        let cancelled = client.call_with_context(
+            "echo",
+            serde_json::json!({"value":"slow"}),
+            Duration::from_secs(30),
+            Some(&execution),
+            Duration::from_secs(1),
+        );
+        let sibling = client.call(
+            "echo",
+            serde_json::json!({"value":"fast"}),
+            Duration::from_secs(1),
+        );
+        let (cancelled, sibling) = tokio::join!(cancelled, sibling);
+        assert!(
+            matches!(cancelled, Err(ProviderError::Cancelled { cleanup_succeeded: true, cause }) if cause.reason == webtest_host::CancellationReason::RaceLost)
+        );
+        assert_eq!(sibling.unwrap(), serde_json::json!("fast"));
+        assert!(
+            started.elapsed() >= Duration::from_millis(40),
+            "terminal reply precedes cancelled result"
+        );
+        assert!(client.pending.lock().await.requests.is_empty());
+        assert!(client.pending.lock().await.cancelled.is_empty());
+        client.shutdown(Duration::from_secs(1)).await.unwrap();
+        fixture.await.unwrap();
+        assert!(client.reader.lock().unwrap().is_none());
+        assert!(client.maintenance.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn missing_cancel_acknowledgement_closes_transport_and_records_failed_cleanup() {
+        let manifest = manifest();
+        let (runner, bridge) = tokio::io::duplex(16_384);
+        let fixture = tokio::spawn(delayed_bridge(bridge, "secret".into(), manifest.clone()));
+        let client = BridgeClient::handshake(
+            Box::new(runner),
+            "secret".into(),
+            "run".into(),
+            &manifest,
+            &AppProviderConfig::default(),
+        )
+        .await
+        .unwrap();
+        let started = tokio::time::Instant::now();
+        let execution = CancelAt(started + Duration::from_millis(5));
+        let result = client
+            .call_with_context(
+                "echo",
+                serde_json::json!({"value":"slow"}),
+                Duration::from_secs(30),
+                Some(&execution),
+                Duration::from_millis(3),
+            )
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(ProviderError::Cancelled {
+                    cleanup_succeeded: false,
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(started.elapsed(), Duration::from_millis(8));
+        assert!(client.reader.lock().unwrap().is_none());
+        assert!(client.pending.lock().await.requests.is_empty());
+        assert!(client.pending.lock().await.failure.is_some());
+        assert!(matches!(
+            client
+                .call(
+                    "echo",
+                    serde_json::json!({"value":"fast"}),
+                    Duration::from_secs(1)
+                )
+                .await,
+            Err(ProviderError::BridgeTransport { .. })
+        ));
+        fixture.await.unwrap();
     }
 
     #[tokio::test]
@@ -2571,6 +2859,82 @@ mod tests {
             .expect("command call");
         assert_eq!(result.value, Value::String("from-command".into()));
         provider.shutdown().await.expect("shutdown");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_adapter_cancellation_interrupts_blocked_input_and_reaps_process() {
+        #[derive(Debug)]
+        struct Started(PathBuf);
+        #[async_trait]
+        impl webtest_host::OperationContext for Started {
+            fn scope_id(&self) -> webtest_host::ExecutionScopeId {
+                webtest_host::ExecutionScopeId(11)
+            }
+            fn remaining(&self) -> Option<Duration> {
+                Some(Duration::from_secs(30))
+            }
+            fn cancellation(&self) -> Option<webtest_host::Cancellation> {
+                self.0.exists().then(|| webtest_host::Cancellation {
+                    reason: webtest_host::CancellationReason::DebugDisconnect,
+                    causing_scope_id: self.scope_id(),
+                })
+            }
+            async fn cancelled(&self) -> webtest_host::Cancellation {
+                loop {
+                    if let Some(cause) = self.cancellation() {
+                        return cause;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let manifest = manifest();
+        let provider = AppProvider::new(
+            manifest.clone(),
+            AppProviderConfig {
+                adapter: AppAdapter::Command,
+                command: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "echo $$ > child.pid; exec sleep 30".into(),
+                ],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut context = call_context();
+        context.project_root = root.path().into();
+        context.timeout = Duration::from_secs(30);
+        context.execution = Some(Arc::new(Started(root.path().join("child.pid"))));
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            provider.call(echo_call(&manifest, &"x".repeat(256 * 1024)), context),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                result,
+                Err(ProviderError::Cancelled {
+                    cleanup_succeeded: true,
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+        let pid = std::fs::read_to_string(root.path().join("child.pid")).unwrap();
+        assert!(
+            !std::process::Command::new("/bin/kill")
+                .args(["-0", pid.trim()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        );
+        provider.shutdown().await.unwrap();
     }
 
     #[tokio::test]

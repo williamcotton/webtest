@@ -1,3 +1,4 @@
+use crate::events::EventBuffer;
 use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
 use tracing::instrument;
@@ -90,9 +91,11 @@ impl Runner {
         self.observations.begin_execution(plan.file, execution_id);
         let pending_observations = ObservationStore::default();
         let ids = crate::execution::scopes::ExecutionIds::default();
-        let mut events = Vec::new();
+        let resources = crate::ResourceRegistry::default();
+        let waits = crate::WaitRegistry::default();
+        let events = EventBuffer::default();
         emit_event(
-            &mut events,
+            &events,
             self.event_sink.as_deref(),
             ExecutionEvent::RunStarted { execution_id },
         );
@@ -109,7 +112,7 @@ impl Runner {
                 Some(FailureClass::Internal),
                 execution_id,
                 &mut tests,
-                &mut events,
+                &events,
                 self.event_sink.as_deref(),
             );
             finish_run(
@@ -130,7 +133,7 @@ impl Runner {
                 None,
                 execution_id,
                 &mut tests,
-                &mut events,
+                &events,
                 self.event_sink.as_deref(),
             );
             finish_run(
@@ -155,7 +158,7 @@ impl Runner {
                         None,
                         execution_id,
                         &mut tests,
-                        &mut events,
+                        &events,
                         self.event_sink.as_deref(),
                     );
                     break;
@@ -164,7 +167,7 @@ impl Runner {
                     plan,
                     test,
                     execution_id,
-                    &mut events,
+                    &events,
                     self.event_sink.as_deref(),
                     browser,
                     &mut session,
@@ -173,6 +176,8 @@ impl Runner {
                     &providers,
                     &pending_observations,
                     ids.clone(),
+                    &resources,
+                    &waits,
                 )
                 .await;
                 let terminal = match &result.outcome {
@@ -203,7 +208,7 @@ impl Runner {
                         failure_class,
                         execution_id,
                         &mut tests,
-                        &mut events,
+                        &events,
                         self.event_sink.as_deref(),
                     );
                     break;
@@ -211,14 +216,17 @@ impl Runner {
             }
 
             if let Some(mut session) = session.take()
-                && let Err(error) = session.close().await
+                && let Err(failure) =
+                    crate::cleanup::CleanupDeadline::new(self.options.cleanup_timeout)
+                        .run(
+                            CleanupResource::BrowserSession,
+                            session.close(),
+                            CleanupCause::Browser,
+                        )
+                        .await
             {
-                let failure = CleanupFailure {
-                    resource: CleanupResource::BrowserSession,
-                    cause: CleanupCause::Browser(error),
-                };
                 emit_cleanup_failed(
-                    &mut events,
+                    &events,
                     self.event_sink.as_deref(),
                     execution_id,
                     None,
@@ -313,7 +321,7 @@ fn skip_tests(
     failure_class: Option<FailureClass>,
     execution_id: ExecutionId,
     results: &mut Vec<TestResult>,
-    events: &mut Vec<ExecutionEvent>,
+    events: &EventBuffer,
     event_sink: Option<&dyn RunEventSink>,
 ) {
     for test in planned {
@@ -345,13 +353,13 @@ fn finish_run(
     execution_id: ExecutionId,
     outcome: RunOutcome,
     tests: Vec<TestResult>,
-    mut events: Vec<ExecutionEvent>,
+    events: EventBuffer,
     started: Instant,
     event_sink: Option<&dyn RunEventSink>,
 ) -> RunResult {
     let failure_class = outcome.failure_class();
     emit_event(
-        &mut events,
+        &events,
         event_sink,
         ExecutionEvent::RunFinished {
             execution_id,
@@ -363,7 +371,7 @@ fn finish_run(
         execution_id,
         outcome,
         tests,
-        events,
+        events: events.into_events(),
         duration: started.elapsed(),
     }
 }
