@@ -75,6 +75,26 @@ parallel/race/retry syntax, semantics, and scheduling; isolated `--jobs`; the au
 trace artifacts/viewer; observation IPC; concurrent DAP behavior; and their conformance/stress
 coverage. The acceptance criteria below remain normative and unsatisfied as a whole.
 
+### Checkpoint 2 handoff — 2026-09-06
+
+This checkpoint stops after the timeout and native cancellation/resource work above. Before
+implementing real sibling concurrency, decompose `ScopeTree`/`TreeExecution`: their current mutable
+stack represents one active branch. Each branch needs its own binding environment, active operation,
+local resource ownership, and explicit scope parentage. Share only run services such as identity
+allocation, resource/wait registries, and event collection. Do not place the whole execution state
+behind an `Arc<Mutex<_>>` and share it across sibling futures.
+
+Remaining foundation gaps include HTTP interruption, startup/application ownership, generic plan
+resource scopes, and full host-resource conformance. Browser contexts are currently test-owned;
+retry and concurrent branches will need explicit lexical resource acquisition and generation rules.
+The synchronous event sink and unbounded event buffer still need replacement by E's bounded
+authoritative journal and bounded subscriber projections. Parallel/race/retry, jobs, traces, IPC,
+and concurrent DAP have not been implemented.
+
+Checkpoint verification: full workspace tests (including Chrome and LSP/DAP protocol tests), Rust
+formatting, warning-free workspace Clippy, portable WASM check, Node/Ruby SDK tests and protocol
+conformance, extension compilation/package smoke, and the structured-execution CLI example.
+
 ## 1. Outcome
 
 Tests can express bounded parallelism, races, retries, and timeouts without leaking child work or losing cleanup. Every attempt and cancellation remains source-mapped in terminal output, traces, editor observations, DAP, and versioned machine output.

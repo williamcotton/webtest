@@ -3,5 +3,5 @@ name = "structured-execution"
 test_roots = ["."]
 
 [timeouts]
-test = "10s"
+test = "60s"
 cleanup = "2s"

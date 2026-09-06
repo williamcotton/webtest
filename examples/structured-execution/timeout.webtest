@@ -8,7 +8,6 @@ test "bounded child flow" {
     }
     expect message == "ready"
 }
-
 test "temporary resources follow the child scope" {
     timeout 2s {
         server {
