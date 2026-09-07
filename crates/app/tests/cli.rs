@@ -723,6 +723,155 @@ fn server_only_http_decode_and_assertion_runs_without_chrome() {
 }
 
 #[test]
+fn jobs_schedule_tests_across_files_before_waiting_for_either_file_to_finish() {
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let fixture = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut streams = Vec::new();
+        // Neither test can complete until both files have an active request.
+        while streams.len() < 2 && Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let mut request = Vec::new();
+                    let mut buffer = [0u8; 1024];
+                    while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                        let count = stream.read(&mut buffer).unwrap();
+                        assert!(count > 0, "request ended before its headers");
+                        request.extend_from_slice(&buffer[..count]);
+                        assert!(request.len() <= 16 * 1024, "oversized fixture request");
+                    }
+                    streams.push(stream);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(2))
+                }
+                Err(error) => panic!("accept: {error}"),
+            }
+        }
+        let admitted = streams.len();
+        for stream in &mut streams {
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            )
+            .unwrap();
+        }
+        admitted
+    });
+    let directory = tempfile::tempdir().unwrap();
+    for name in ["a", "b"] {
+        write(
+            &directory.path().join(format!("{name}.webtest")),
+            &format!(
+                r#"test "{name}" {{ server {{ let response = http.get("http://{address}/{name}") expect response.status == 200 }} }}"#
+            ),
+        );
+    }
+    let output = webtest(directory.path())
+        .args(["test", "--jobs", "2", "--reporter", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        fixture.join().unwrap(),
+        2,
+        "both files must be admitted before either response"
+    );
+    assert!(
+        output.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["summary"]["passed"], 2);
+    assert_eq!(report["files"][0]["tests"][0]["name"], "a");
+    assert_eq!(report["files"][1]["tests"][0]["name"], "b");
+}
+
+#[test]
+fn jobs_keep_all_failures_and_deterministic_final_reports() {
+    let directory = tempfile::tempdir().unwrap();
+    write(
+        &directory.path().join("a.webtest"),
+        r#"test "first" { retry 2 backoff 20ms { expect 101 == 102 } } test "second" { expect 201 == 202 }"#,
+    );
+    write(
+        &directory.path().join("b.webtest"),
+        r#"test "third" { expect 301 == 302 }"#,
+    );
+    for reporter in ["json", "events", "human", "concise", "junit"] {
+        let output = webtest(directory.path())
+            .args(["test", "--jobs", "2", "--reporter", reporter])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        if reporter == "json" {
+            let report: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(report["summary"]["failed"], 3);
+            assert_eq!(report["files"][0]["tests"][0]["name"], "first");
+            assert_eq!(report["files"][0]["tests"][1]["name"], "second");
+            assert_eq!(report["files"][1]["tests"][0]["name"], "third");
+        } else if reporter == "events" {
+            let names: Vec<_> = text
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .filter(|event| event["type"] == "test_result")
+                .map(|event| event["test"]["name"].as_str().unwrap().to_owned())
+                .collect();
+            assert_eq!(names, ["first", "second", "third"]);
+        } else {
+            // Human progress is observed order; the final failure details retain
+            // deterministic file/test order in every presentation adapter.
+            let labels = if reporter == "human" {
+                [
+                    "failure in test \"first\":",
+                    "failure in test \"second\":",
+                    "failure in test \"third\":",
+                ]
+            } else if reporter == "concise" {
+                ["test \"first\":", "test \"second\":", "test \"third\":"]
+            } else {
+                [
+                    "<testcase name=\"first\"",
+                    "<testcase name=\"second\"",
+                    "<testcase name=\"third\"",
+                ]
+            };
+            let positions = labels.map(|label| {
+                text.find(label)
+                    .unwrap_or_else(|| panic!("{reporter}: {text}"))
+            });
+            assert!(
+                positions[0] < positions[1] && positions[1] < positions[2],
+                "{reporter}: {text}"
+            );
+            if reporter == "human" {
+                for name in ["first", "second", "third"] {
+                    assert_eq!(
+                        text.matches(&format!("test {name:?} ... FAILED")).count(),
+                        1
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn browser_path_reports_environment_provenance() {
     let directory = tempfile::tempdir().expect("temp directory");
     let chrome = directory.path().join("chrome fixture");

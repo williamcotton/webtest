@@ -16,7 +16,7 @@ Milestone E changes how operations are scheduled, owned, cancelled, and observed
 
 ### Implementation progress — 2026-09-07
 
-Milestone E is **not complete**. The execution-tree, resource/wait foundations, timeout, public parallel, public race/result paths, and public retry are implemented:
+Milestone E is **not complete**. The execution-tree, resource/wait foundations, timeout, public parallel, public race/result paths, public retry, and isolated test-root jobs are implemented:
 
 - Tests and capability blocks lower through explicit `Sequence` nodes. Leaf operations exist only
   in that tree; diagnostic, debugger, and secret-checking traversal is a read-only projection.
@@ -71,7 +71,7 @@ Milestone E is **not complete**. The execution-tree, resource/wait foundations, 
 
 Remaining work includes complete resource ownership and explicit host interruption across HTTP,
 bridge/application startup and lifecycle, non-Unix process trees, and browser sessions;
-isolated `--jobs`; the authoritative event journal;
+the authoritative event journal;
 trace artifacts/viewer; observation IPC; concurrent DAP behavior; and their conformance/stress
 coverage. The acceptance criteria below remain normative and unsatisfied as a whole.
 
@@ -319,6 +319,53 @@ resource ownership and canonical examples. Provider descriptions explain explici
 The installed authoring skill, initializer parity assertions, and structured-execution examples are
 updated. Jobs, remaining host-resource conformance, the bounded authoritative journal, traces/viewer,
 observation IPC, and concurrent DAP remain pending; Milestone E is still incomplete.
+
+### Checkpoint 8 continuation — isolated test-root jobs — 2026-09-07
+
+Checkpoint 8 (`28cbf76`) is accepted. `webtest test --jobs N` now accepts 1–64 concurrent
+roots and defaults to 1. Invalid, zero, overflowing, and above-maximum values fail CLI argument
+validation before analysis or execution. The runtime's typed `JobLimit` carries the same bound.
+`run_jobs` accepts prepared file runs, admits their test roots in input/plan order, and returns
+file/test results in that order even when completion order differs. The CLI supplies deterministic
+project discovery order. Nested parallel/race/retry scheduling remains inside each test tree.
+
+Every concurrent root has its own branch state, resource/wait registries, pending observations,
+and browser session. Shared services are immutable providers, identity allocation, and event
+publication. No execution-state lock or detached task was introduced. A slot stays occupied until
+all root teardown finishes, including session close under the same cleanup deadline; session
+cleanup failure appears in the test outcome before its terminal event, preserving any primary
+failure. `--jobs 1` delegates to the existing sequential runner, preserving file-local session reuse.
+Shared native browser processes across test roots remain disabled.
+
+Primary infrastructure/internal failure signals reuse the existing branch notification service to
+stop admitting more tests in the affected file before slow teardown completes. Assertion failures
+continue admission; already admitted roots are awaited and retain every independent outcome.
+Explicit `RunControl` cancellation wakes active tests and preserves typed reasons including
+`FailFast`. No CLI fail-fast policy is exposed yet. Final run failure summaries select a stable
+source-ordered failure and retain cancellation whether it finishes before or after an independent
+abort, while the complete test/branch aggregates retain all failures.
+
+Observation collection is private to each root, merged in test order, and committed once per file
+through the existing latest-execution gate. Artifact names retain execution/test/step and attempt
+identity, including when different files use the same local IDs. Human progress correlates tests
+by `(ExecutionId, TestId)` and uses complete browser status lines during concurrent execution;
+final human, concise, JSON, events, and JUnit reports retain deterministic ordering. The existing
+plan format 9, runtime semantics 6, and report/event schema 6 already represent these root facts.
+
+Focused tests cover a global bound across files, teardown before slot reuse, independent bindings
+and observations, atomic publication, early failure notification, full infrastructure aggregates,
+typed cancellation and awaited cleanup, sequential session reuse, nested parallel independence,
+and artifact isolation. CLI tests include a two-file HTTP barrier, argument bounds, reporter
+ordering, and native Chrome storage isolation. The test declaration description, CLI help,
+installed authoring skill/parity assertions, and structured-execution example instructions are
+updated. Complete host-resource conformance, the authoritative journal, traces/viewer,
+observation IPC, and concurrent DAP remain pending; Milestone E is still incomplete.
+
+Checkpoint verification: `cargo test --workspace` passes with default test threading, including
+102 runtime lifecycle tests (10 focused jobs tests), native Chrome isolation, and LSP/DAP protocol
+tests. `cargo clippy --workspace --all-targets -- -D warnings`, Rust formatting, and the portable
+WASM check pass. All seven structured-execution examples pass with `--jobs 2`; their static and
+format checks and the updated test declaration description also pass.
 
 ## 1. Outcome
 

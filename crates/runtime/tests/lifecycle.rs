@@ -414,6 +414,9 @@ fn compile_source(source: &str) -> TestPlan {
     database.test_plan(file).unwrap().as_ref().clone()
 }
 
+#[path = "lifecycle/jobs.rs"]
+mod jobs;
+
 #[path = "lifecycle/retry.rs"]
 mod retry;
 

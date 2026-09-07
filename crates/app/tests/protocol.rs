@@ -1258,3 +1258,41 @@ fn parallel_browser_branches_use_isolated_native_contexts() {
         branches[1]["scope"]["execution_context"]["scope_id"]
     );
 }
+
+#[test]
+fn jobs_browser_roots_use_isolated_native_storage_across_files() {
+    let _runtime_test = runtime_protocol_lock();
+    let Some(chrome) = available_chrome() else {
+        return;
+    };
+    let Some(server) = fixture_server() else {
+        return;
+    };
+    let address = server.address;
+    let directory = tempfile::tempdir().unwrap();
+    for name in ["first", "second"] {
+        std::fs::write(directory.path().join(format!("{name}.webtest")), format!(r#"
+            test "{name}" {{ browser {{
+                open "http://{address}"
+                evaluate "if (localStorage.getItem('root') || document.cookie) throw new Error('shared test storage'); localStorage.setItem('root', '{name}'); document.cookie = 'root={name}'"
+                evaluate "if (localStorage.getItem('root') !== '{name}' || document.cookie !== 'root={name}') throw new Error('root lost storage')"
+            }} }}
+        "#)).unwrap();
+    }
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_webtest"))
+        .current_dir(directory.path())
+        .env("WEBTEST_CHROME_PATH", chrome)
+        .args(["test", "--jobs", "2", "--reporter", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["summary"]["passed"], 2);
+    assert_eq!(report["files"][0]["tests"][0]["name"], "first");
+    assert_eq!(report["files"][1]["tests"][0]["name"], "second");
+}

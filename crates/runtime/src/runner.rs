@@ -18,6 +18,9 @@ use crate::{
     execution::{ExecutedTest, emit_cleanup_failed, execute_test},
 };
 
+mod jobs;
+pub use jobs::{InvalidJobLimit, JobLimit, TestRun, run_jobs};
+
 pub struct Runner {
     observations: Arc<ObservationStore>,
     options: RunnerOptions,
@@ -184,6 +187,7 @@ impl Runner {
                     ids.clone(),
                     &resources,
                     &waits,
+                    Default::default(),
                 )
                 .await;
                 let terminal = match &result.outcome {

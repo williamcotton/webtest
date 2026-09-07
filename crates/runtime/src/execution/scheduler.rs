@@ -11,7 +11,7 @@ use webtest_host::{Cancellation, CancellationReason};
 /// not a container for mutable branch state. Ancestor schedulers can observe the
 /// same failure before nested scopes finish tearing down.
 #[derive(Clone)]
-pub(super) struct FailureSignal(tokio::sync::watch::Sender<Option<FailureClass>>);
+pub(crate) struct FailureSignal(tokio::sync::watch::Sender<Option<FailureClass>>);
 impl FailureSignal {
     pub fn channel() -> (Self, tokio::sync::watch::Receiver<Option<FailureClass>>) {
         let (sender, receiver) = tokio::sync::watch::channel(None);

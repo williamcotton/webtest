@@ -1186,7 +1186,9 @@ not become current diagnostics. CLI schema 6 marks the final winning branch. Pub
 now lowers to shared owned-child execution, with fresh attempt identity, repeatability validation, capped
 cancellation-aware backoff, awaited teardown, and separate attempt evidence. Compiler diagnostics
 reject unsafe operations and native captures; descriptions, formatting, and portable plans use the
-same contracts. Complete host/resource ownership, jobs,
+same contracts. `--jobs N` now schedules isolated test roots across files (1–64, default 1),
+with root-owned browser sessions, bounded cleanup before slot reuse, atomic observation batches,
+and source-ordered final reports. Complete host/resource ownership,
 the authoritative journal, traces, observation IPC, and concurrent DAP remain
 pending; see the milestone's implementation-progress section for the exact boundary.
 

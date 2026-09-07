@@ -47,6 +47,13 @@ mod wait;
 mod tests;
 
 pub(crate) use browser::{bounded_timeout, browser_locator, browser_state};
+pub(crate) use scheduler::FailureSignal;
+
+#[derive(Default)]
+pub(crate) struct RootExecutionPolicy {
+    pub close_session: bool,
+    pub primary_failure: Option<FailureSignal>,
+}
 
 #[cfg(test)]
 pub(crate) use failure::repair_hints_for_error;
@@ -113,6 +120,7 @@ pub(crate) async fn execute_test(
     ids: scopes::ExecutionIds,
     resources: &crate::ResourceRegistry,
     waits: &crate::WaitRegistry,
+    policy: RootExecutionPolicy,
 ) -> ExecutedTest {
     let test_started = StdInstant::now();
     let deadline = TestDeadline::new(options.test_timeout);
@@ -130,6 +138,7 @@ pub(crate) async fn execute_test(
     let root_scope = root.event.clone();
     let root_context = root.context.clone();
     let mut branch = branch::BranchState::new(options);
+    branch.failure_signals.extend(policy.primary_failure);
     branch.session = session.take();
     branch.scopes.start(&root, execution_id, events, event_sink);
     let services = ExecutionServices {
@@ -346,15 +355,17 @@ pub(crate) async fn execute_test(
             )
             .await,
     );
-    if matches!(
-        outcome,
-        ProvisionalTestOutcome::TimedOut { .. } | ProvisionalTestOutcome::Cancelled { .. }
-    ) && uses_browser
-        && let Some(mut tainted) = branch.session.take()
+    if (policy.close_session
+        || matches!(
+            outcome,
+            ProvisionalTestOutcome::TimedOut { .. } | ProvisionalTestOutcome::Cancelled { .. }
+        ))
+        && uses_browser
+        && let Some(mut owned_session) = branch.session.take()
         && let Err(error) = cleanup_deadline
             .run(
                 CleanupResource::BrowserSession,
-                tainted.close(),
+                owned_session.close(),
                 CleanupCause::Browser,
             )
             .await

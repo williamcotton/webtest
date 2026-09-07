@@ -51,6 +51,9 @@ pub(crate) enum Command {
         /// Show the Chrome window while tests run.
         #[arg(long)]
         headed: bool,
+        /// Maximum concurrent tests (1–64); 1 preserves sequential execution.
+        #[arg(long, default_value_t = webtest_runtime::JobLimit::default())]
+        jobs: webtest_runtime::JobLimit,
         #[arg(long, value_enum, default_value_t = TestReporter::Human)]
         reporter: TestReporter,
     },
@@ -184,6 +187,22 @@ mod tests {
         for arguments in cases {
             Cli::try_parse_from(*arguments).expect("command should parse");
         }
+    }
+
+    #[test]
+    fn jobs_limits_are_validated_before_execution() {
+        for value in ["0", "65", "18446744073709551616", "-1", "1.5", "many"] {
+            let error = Cli::try_parse_from(["webtest", "test", "--jobs", value]).unwrap_err();
+            assert_eq!(error.exit_code(), 2, "{value}");
+        }
+        for value in ["1", "2", "64"] {
+            let cli = Cli::try_parse_from(["webtest", "test", "--jobs", value]).unwrap();
+            assert!(
+                matches!(cli.command, Command::Test { jobs, .. } if jobs.get().to_string() == value)
+            );
+        }
+        let cli = Cli::try_parse_from(["webtest", "test"]).unwrap();
+        assert!(matches!(cli.command, Command::Test { jobs, .. } if jobs.get() == 1));
     }
 
     #[test]

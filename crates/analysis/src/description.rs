@@ -943,6 +943,35 @@ mod tests {
     }
 
     #[test]
+    fn test_description_explains_root_isolation_and_keeps_cli_flags_in_help() {
+        for query in ["declaration.test", "test"] {
+            let DescriptionResponse::Construct(test) =
+                response(DescriptionRequest::Query(query.into()))
+            else {
+                panic!("test declaration")
+            };
+            assert_eq!(test.id, "declaration.test");
+            assert!(
+                test.effects
+                    .iter()
+                    .any(|effect| effect.contains("isolated bindings")
+                        && effect.contains("teardown")
+                        && effect.contains("source order"))
+            );
+            assert!(
+                test.constraints
+                    .iter()
+                    .any(|constraint| constraint.code == "sequential_test_flow")
+            );
+            assert!(
+                !serde_json::to_string(&test.syntax_forms)
+                    .unwrap()
+                    .contains("--jobs")
+            );
+        }
+    }
+
+    #[test]
     fn index_exact_alias_category_search_and_failures_are_deterministic() {
         let DescriptionResponse::Index(index) = response(DescriptionRequest::Index) else {
             panic!("index")

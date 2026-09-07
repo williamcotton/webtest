@@ -1,9 +1,11 @@
 use std::{
+    collections::HashMap,
     io::{self, Write},
     sync::Mutex,
 };
 
-use webtest_observation::{ExecutionEvent, TestOutcomeKind};
+use webtest_model::TestId;
+use webtest_observation::{ExecutionEvent, ExecutionId, TestOutcomeKind};
 use webtest_runtime::RunEventSink;
 
 pub(crate) struct HumanTestProgress {
@@ -13,7 +15,8 @@ pub(crate) struct HumanTestProgress {
 struct ProgressState {
     output: Box<dyn Write + Send>,
     pending: PendingLine,
-    pending_test: Option<String>,
+    pending_tests: HashMap<(ExecutionId, TestId), String>,
+    concurrent: bool,
     browser_active: bool,
     error: Option<(io::ErrorKind, String)>,
 }
@@ -28,8 +31,14 @@ enum PendingLine {
 }
 
 impl HumanTestProgress {
-    pub(crate) fn stdout() -> Self {
-        Self::new(Box::new(io::stdout()))
+    pub(crate) fn stdout(concurrent: bool) -> Self {
+        let progress = Self::new(Box::new(io::stdout()));
+        progress
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .concurrent = concurrent;
+        progress
     }
 
     fn new(output: Box<dyn Write + Send>) -> Self {
@@ -37,7 +46,8 @@ impl HumanTestProgress {
             inner: Mutex::new(ProgressState {
                 output,
                 pending: PendingLine::None,
-                pending_test: None,
+                pending_tests: HashMap::new(),
+                concurrent: false,
                 browser_active: false,
                 error: None,
             }),
@@ -113,6 +123,13 @@ impl HumanTestProgress {
 
     pub(crate) fn starting_browser(&self, path: &str, headed: bool) -> io::Result<()> {
         self.write(|state| {
+            if state.concurrent {
+                return writeln!(
+                    state.output,
+                    "starting Chrome for {path} ({})",
+                    if headed { "headed" } else { "headless" }
+                );
+            }
             write!(
                 state.output,
                 "starting Chrome for {path} ({}) ... ",
@@ -125,6 +142,13 @@ impl HumanTestProgress {
 
     pub(crate) fn browser_started(&self, succeeded: bool) -> io::Result<()> {
         self.write(|state| {
+            if state.concurrent {
+                return writeln!(
+                    state.output,
+                    "Chrome start {}",
+                    if succeeded { "ready" } else { "FAILED" }
+                );
+            }
             if state.pending == PendingLine::BrowserStarting {
                 writeln!(
                     state.output,
@@ -140,6 +164,9 @@ impl HumanTestProgress {
 
     pub(crate) fn stopping_browser(&self) -> io::Result<()> {
         self.write(|state| {
+            if state.concurrent {
+                return writeln!(state.output, "stopping Chrome");
+            }
             if state.browser_active {
                 write!(state.output, "stopping Chrome ... ")?;
                 state.pending = PendingLine::BrowserStopping;
@@ -150,6 +177,13 @@ impl HumanTestProgress {
 
     pub(crate) fn browser_stopped(&self, succeeded: bool) -> io::Result<()> {
         self.write(|state| {
+            if state.concurrent {
+                return writeln!(
+                    state.output,
+                    "Chrome stop {}",
+                    if succeeded { "done" } else { "FAILED" }
+                );
+            }
             if state.pending == PendingLine::BrowserStopping {
                 writeln!(
                     state.output,
@@ -203,10 +237,21 @@ impl HumanTestProgress {
     fn publish_event(&self, event: &ExecutionEvent) -> io::Result<()> {
         self.write(|state| {
             match event {
-                ExecutionEvent::TestStarted { name, .. } => {
-                    state.pending_test = Some(name.clone());
+                ExecutionEvent::TestStarted {
+                    execution_id,
+                    test_id,
+                    name,
+                } => {
+                    state
+                        .pending_tests
+                        .insert((*execution_id, *test_id), name.clone());
                 }
-                ExecutionEvent::TestFinished { outcome, .. } => {
+                ExecutionEvent::TestFinished {
+                    execution_id,
+                    test_id,
+                    outcome,
+                    ..
+                } => {
                     let status = match outcome {
                         TestOutcomeKind::Passed => "ok",
                         TestOutcomeKind::Failed => "FAILED",
@@ -214,7 +259,7 @@ impl HumanTestProgress {
                         TestOutcomeKind::Cancelled => "CANCELLED",
                         TestOutcomeKind::Aborted => "ABORTED",
                     };
-                    if let Some(name) = state.pending_test.take() {
+                    if let Some(name) = state.pending_tests.remove(&(*execution_id, *test_id)) {
                         writeln!(state.output, "test {name:?} ... {status}")?;
                     }
                 }
@@ -352,5 +397,39 @@ mod tests {
             String::from_utf8(bytes).expect("UTF-8"),
             "starting Chrome for tests/login.webtest (headless) ... FAILED\n"
         );
+    }
+
+    #[test]
+    fn concurrent_progress_correlates_tests_by_execution_and_test_identity() {
+        let output = SharedOutput::default();
+        let progress = HumanTestProgress::new(Box::new(output.clone()));
+        for (execution_id, test_id, name) in [
+            (ExecutionId(1), TestId(0), "first"),
+            (ExecutionId(1), TestId(1), "second"),
+            (ExecutionId(2), TestId(0), "other file"),
+        ] {
+            progress.publish(&ExecutionEvent::TestStarted {
+                execution_id,
+                test_id,
+                name: name.into(),
+            });
+        }
+        for (execution_id, test_id, outcome) in [
+            (ExecutionId(2), TestId(0), TestOutcomeKind::Passed),
+            (ExecutionId(1), TestId(1), TestOutcomeKind::Failed),
+            (ExecutionId(1), TestId(0), TestOutcomeKind::Passed),
+        ] {
+            progress.publish(&ExecutionEvent::TestFinished {
+                execution_id,
+                test_id,
+                outcome,
+                failure_class: None,
+            });
+        }
+        assert_eq!(
+            String::from_utf8(output.0.lock().unwrap().clone()).unwrap(),
+            "test \"other file\" ... ok\ntest \"second\" ... FAILED\ntest \"first\" ... ok\n"
+        );
+        assert!(progress.inner.lock().unwrap().pending_tests.is_empty());
     }
 }

@@ -2,7 +2,7 @@ use std::{io, path::PathBuf, sync::Arc, time::Instant};
 
 use webtest_feedback::FailureClass;
 use webtest_observation::ObservationStore;
-use webtest_runtime::{RunError, RunOutcome, Runner, TestOutcome};
+use webtest_runtime::{JobLimit, RunError, RunOutcome, Runner, TestOutcome, TestRun, run_jobs};
 
 use crate::{
     chrome::LazyChromeHost,
@@ -28,6 +28,7 @@ pub(crate) async fn run_test(
     chrome_path: Option<PathBuf>,
     headed: bool,
     reporter: TestReporter,
+    jobs: JobLimit,
 ) -> Result<ExitClass, AppError> {
     let project = project(&paths)?;
     let mut report = base_report("test", &project);
@@ -36,7 +37,8 @@ pub(crate) async fn run_test(
     let runtime_providers = runtime_provider_registry(&project, &options)?;
     let application = runtime_application(&project, runtime_providers.app.clone());
     let providers = runtime_providers.registry;
-    let progress = (reporter == TestReporter::Human).then(|| Arc::new(HumanTestProgress::stdout()));
+    let progress = (reporter == TestReporter::Human)
+        .then(|| Arc::new(HumanTestProgress::stdout(jobs.get() > 1)));
     let browser = LazyChromeHost::new(project.clone(), chrome_path, show_browser, progress.clone());
     let mut progress_error = None;
 
@@ -83,6 +85,7 @@ pub(crate) async fn run_test(
     let mut app_started = false;
     let application_progress_message = application_progress_message(&project);
 
+    let mut runnable = Vec::new();
     for (file, analyzed, analysis_duration, has_static_errors) in prepared {
         let started = Instant::now();
         if has_static_errors {
@@ -169,7 +172,27 @@ pub(crate) async fn run_test(
             }
         }
         let file_browser = browser.for_file(file_report.path.clone());
-        let result = runner.run(&analyzed.plan, &file_browser).await;
+        runnable.push((
+            report.files.len(),
+            analyzed.source,
+            analyzed.plan,
+            runner,
+            file_browser,
+        ));
+        report.files.push(file_report);
+    }
+    let inputs: Vec<_> = runnable
+        .iter()
+        .map(|(_, _, plan, runner, browser)| TestRun {
+            runner,
+            plan,
+            browser,
+            control: None,
+        })
+        .collect();
+    let results = run_jobs(&inputs, jobs).await;
+    for ((index, source, plan, _, _), result) in runnable.iter().zip(results) {
+        let file_report = &mut report.files[*index];
         file_report.duration_nanos = nanos(result.duration);
         file_report.events = event_reports(&file_report.path, &result.events);
         let run_exit_class = match &result.outcome {
@@ -200,7 +223,7 @@ pub(crate) async fn run_test(
         file_report.tests = result
             .tests
             .into_iter()
-            .map(|test| test_report(test, &analyzed.source, &analyzed.plan))
+            .map(|test| test_report(test, source, plan))
             .collect();
         let tests_exit_class = file_report
             .tests
@@ -212,10 +235,6 @@ pub(crate) async fn run_test(
         if file_report.exit_class != ExitClass::Success {
             report.exit_class = report.exit_class.combine(file_report.exit_class);
         }
-        if file_report.duration_nanos == 0 {
-            file_report.duration_nanos = nanos(analysis_duration.saturating_add(started.elapsed()));
-        }
-        report.files.push(file_report);
     }
     if let Some(application) = application {
         if app_started && let Some(progress) = &progress {

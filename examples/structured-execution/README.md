@@ -11,6 +11,7 @@ target/debug/webtest describe control.race
 target/debug/webtest describe statement.provide
 target/debug/webtest check examples/structured-execution
 target/debug/webtest test examples/structured-execution
+target/debug/webtest test examples/structured-execution --jobs 2 --reporter json
 ```
 
 The first test demonstrates inherited bindings and nested deadlines. Child bindings remain
@@ -32,3 +33,10 @@ zero delay; omitting max keeps the delay constant. Retry requires repeatable ope
 calls need schema `retry_safe`, and browser assertions/waits are safe while mutations are rejected.
 Every attempt finishes teardown before backoff or another attempt. Cancellation and cleanup
 failures stop retry, and all attempt outcomes and evidence remain available in reports.
+
+`--jobs 2` admits up to two test roots across these files, including their teardown. It is
+independent of the nested `parallel`/`race` scheduler. Bindings, browser ownership, resources,
+observations, and artifact names stay isolated; final results retain file/test source order.
+The default is `--jobs 1`, with the existing sequential execution and browser-session reuse.
+The accepted range is 1–64. Assertion failures do not stop other tests; an infrastructure error
+stops admission in its file and every already admitted test is awaited.

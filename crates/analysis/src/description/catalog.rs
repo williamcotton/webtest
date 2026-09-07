@@ -161,6 +161,7 @@ fn declaration_test() -> ConstructDescription {
     value.produces_value = Some(false);
     value.requires_capabilities = vec![Capability::Test];
     value.allowed_contexts = vec!["source_file".into()];
+    value.effects = vec!["Test roots can be scheduled concurrently with isolated bindings, browser ownership, resources, observations, and evidence. A test keeps its scheduler slot until teardown finishes; final test results retain source order.".into()];
     value.constraints = vec![constraint(
         "sequential_test_flow",
         "runtime",

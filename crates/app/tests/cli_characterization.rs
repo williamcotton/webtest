@@ -47,7 +47,7 @@ fn help_surface_is_byte_stable() {
         ),
         (
             &["test", "--help"],
-            "Execute WebTest files in Chrome\n\nUsage: webtest test [OPTIONS] [PATHS]...\n\nArguments:\n  [PATHS]...  \n\nOptions:\n      --chrome-path <CHROME_PATH>  \n      --headed                     Show the Chrome window while tests run\n      --reporter <REPORTER>        [default: human] [possible values: human, concise, json, junit, events]\n  -h, --help                       Print help\n",
+            "Execute WebTest files in Chrome\n\nUsage: webtest test [OPTIONS] [PATHS]...\n\nArguments:\n  [PATHS]...  \n\nOptions:\n      --chrome-path <CHROME_PATH>  \n      --headed                     Show the Chrome window while tests run\n      --jobs <JOBS>                Maximum concurrent tests (1–64); 1 preserves sequential execution [default: 1]\n      --reporter <REPORTER>        [default: human] [possible values: human, concise, json, junit, events]\n  -h, --help                       Print help\n",
         ),
         (
             &["inspect", "--help"],

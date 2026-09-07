@@ -179,5 +179,12 @@ retry; cancellation, infrastructure errors, and cleanup failures stop execution.
 inside retry own fresh contexts, while read-only assertions inside an enclosing browser block
 reuse that context. Native handles cannot be captured across attempt boundaries. Reports retain
 every attempt's outcome and evidence even when a later attempt succeeds.
-Jobs, traces, and concurrent debugger stepping remain unfinished; discover those
+Use `webtest test <path> --jobs 2 --reporter json` to run independent test roots concurrently.
+`--jobs` accepts 1–64 and defaults to 1. Each concurrent root owns its bindings, browser session
+and contexts, resources, observations, and evidence; its slot stays occupied through teardown.
+Nested parallel/race branches use their own scheduler. Final reports retain file/test source
+order, while live progress shows completion order. Test failures are collected; an infrastructure
+failure stops new tests in its file while admitted tests finish. Configured application services
+remain project-owned, so tests must arrange independent application data when needed.
+Traces and concurrent debugger stepping remain unfinished; discover those
 features with the installed binary before using them.
