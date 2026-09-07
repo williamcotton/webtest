@@ -16,7 +16,7 @@ Milestone E changes how operations are scheduled, owned, cancelled, and observed
 
 ### Implementation progress — 2026-09-07
 
-Milestone E is **not complete**. The execution-tree, resource/wait foundations, timeout, public parallel, and public race/result paths are implemented:
+Milestone E is **not complete**. The execution-tree, resource/wait foundations, timeout, public parallel, public race/result paths, and internal retry execution are implemented:
 
 - Tests and capability blocks lower through explicit `Sequence` nodes. Leaf operations exist only
   in that tree; diagnostic, debugger, and secret-checking traversal is a read-only projection.
@@ -27,7 +27,7 @@ Milestone E is **not complete**. The execution-tree, resource/wait foundations, 
   occurrences. Browser acquisition is an explicit lexical `ResourceScope` in the plan; a test root includes test cleanup. Descendants interrupted
   by the existing test deadline record cancellation and its causing scope; the root records its
   final outcome after cleanup. Cancellation facts retain their typed reason and causing scope.
-- Plan format 8 and runtime semantics 5 version the tree and timeout behavior independently. Native builds fingerprint
+- Plan format 9 and runtime semantics 6 version the execution-tree shape and behavior independently. Native builds fingerprint
   resolved configuration, keeping configuration values out of the artifact. Shared validation
   checks tree structure, identities, revisions, capability requirements, and explicit execution
   inputs for detectable drift. There is still no CLI command to execute an emitted plan.
@@ -71,7 +71,7 @@ Milestone E is **not complete**. The execution-tree, resource/wait foundations, 
 
 Remaining work includes complete resource ownership and explicit host interruption across HTTP,
 bridge/application startup and lifecycle, non-Unix process trees, and browser sessions;
-retry syntax, semantics, and scheduling; isolated `--jobs`; the authoritative event journal;
+public retry syntax and compiler safety diagnostics; isolated `--jobs`; the authoritative event journal;
 trace artifacts/viewer; observation IPC; concurrent DAP behavior; and their conformance/stress
 coverage. The acceptance criteria below remain normative and unsatisfied as a whole.
 
@@ -234,6 +234,58 @@ successfully, and describes both public topics. The runtime lifecycle suite now 
 
 Milestone E remains incomplete: retry, isolated jobs, full host-resource conformance, the authoritative
 bounded event journal, traces/viewer, observation IPC, and concurrent DAP control remain pending.
+
+### Checkpoint 6 continuation — retry execution core — 2026-09-07
+
+Checkpoint 6 (`dfb7617`) is accepted. A distinct `Retry { child, settings }` plan node now executes
+through the existing tree. Plan format 9/runtime semantics 6 reject older contracts. Retry settings
+bound total attempts to 1–64, with deterministic exponential backoff capped by an explicit maximum
+(no greater than 24 hours); zero backoff is supported. Jitter is not implemented.
+
+The shared owned-child driver now serves both sibling branches and sequential attempts. Each attempt
+has a fresh `AttemptId`, explicit parent scope, independent transferable binding snapshot, and fresh
+generations for resources lexically inside it. Terminal cleanup and scope facts precede backoff and
+the next attempt. Proven observation-only browser work can exclusively reuse an enclosing context
+without acquiring or releasing it; that handle is handed to one awaited attempt at a time. No native
+resource handle is cloned into sibling futures. Nested attempt identities remain distinct from both
+their parent attempt and the reused static node/path.
+
+Portable resource/operation repeatability summaries reject unsafe retry plans. Provider calls require
+the schema-derived `retry_safe` contract; browser assertions and waits are repeatable, while browser
+mutations currently have no repeatability contract. Runtime eligibility is separately restricted to
+assertion failures, typed browser assertion/action timeouts, and explicitly retryable application
+errors. Decode/evaluation failures, cancellation, control timeouts, internal/infrastructure errors,
+and failed teardown cannot retry. Every unrecovered failure in a parallel/race aggregate must qualify;
+a retryable severity summary cannot hide another non-retryable child failure.
+
+Backoff uses the generic owned timer/wait registration with inherited absolute deadlines and typed
+cancellation. Attempt outcomes and nested branches remain in execution order in the existing child
+aggregate; scope facts carry their already-versioned attempt identity. A successful retry recovers
+its prior observations while retaining all result/event facts. `provide` transfers only a successful
+attempt's explicit value and redaction metadata to its enclosing race. Browser artifacts use an
+execution/attempt directory so repeated static steps cannot overwrite earlier evidence. The attempt
+bound and existing per-failure evidence limits bound retained attempt evidence; E's authoritative
+journal and trace-wide budgets remain pending.
+
+Focused tests cover bounds/serialization/identity, safe and unsafe effects, backoff saturation,
+exhaustion, nested attempts, bindings, recovery, all cancellation reasons during execution/backoff,
+lexical resource reacquisition, safe enclosing-context reuse, cleanup failure/expiry, prompt fatal
+signalling through a retry to sibling schedulers, mixed aggregate eligibility, winner transfer,
+separate evidence files, and terminal scope/wait ownership.
+
+Validation: `cargo test --workspace` passed with default threading, including Chrome and LSP/DAP
+protocol tests. The focused plan/runtime suites passed (91 runtime lifecycle tests, including 14
+new retry cases). Final plan repeatability-summary and validation-order refinements passed the plan
+suite. Workspace Clippy with `-D warnings`, Rust formatting, and the portable
+`wasm32-unknown-unknown` check also passed.
+
+This is execution-core progress. Public `retry`/`backoff`/`max` parsing, HIR/analysis and native-capture
+rules, lexical browser lowering inside public retry, canonical descriptions, formatter/editor/WASM
+coverage, and author-facing examples remain the next vertical slice. Tests currently replace explicit
+compiler-produced timeout recipe markers with Retry nodes; lexical resource tests use the existing
+parallel lowering to place browser contexts inside those recipes. Installed descriptions still do
+not advertise public retry. Jobs, remaining host-resource conformance, the bounded authoritative
+journal, traces, observation IPC, and concurrent DAP also remain pending.
 
 ## 1. Outcome
 

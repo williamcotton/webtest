@@ -1,0 +1,794 @@
+use super::*;
+use webtest_plan::{PlanNode, PlanNodeKind, RetryBackoff, RetryPolicy, RetrySettings};
+
+fn settings(attempts: u32) -> RetrySettings {
+    RetrySettings {
+        attempts,
+        backoff: RetryBackoff {
+            initial: Duration::from_millis(10),
+            max: Duration::from_millis(25),
+        },
+        policy: RetryPolicy::SafeFailures,
+    }
+}
+
+// Until public retry lowering lands, replace explicit test recipe markers with
+// the distinct node. Preserve the compiler's operations, origins and child paths.
+fn with_retry(mut plan: TestPlan, settings: RetrySettings) -> TestPlan {
+    fn convert(
+        node: &mut PlanNode,
+        test: webtest_model::PlanDeclarationId,
+        settings: RetrySettings,
+    ) {
+        match &mut node.kind {
+            PlanNodeKind::Sequence { children }
+            | PlanNodeKind::Parallel { children, .. }
+            | PlanNodeKind::Race { children, .. } => {
+                for child in children {
+                    convert(child, test, settings);
+                }
+            }
+            PlanNodeKind::ResourceScope { body: child, .. } | PlanNodeKind::Retry { child, .. } => {
+                convert(child, test, settings)
+            }
+            PlanNodeKind::Timeout {
+                child, duration, ..
+            } => {
+                convert(child, test, settings);
+                if *duration == Duration::from_secs(86400) {
+                    *node = PlanNode::retry(
+                        test,
+                        node.origin,
+                        node.source_revision,
+                        node.path.clone(),
+                        *child.clone(),
+                        settings,
+                    );
+                }
+            }
+            PlanNodeKind::Operation { .. } => {}
+        }
+    }
+    for test in &mut plan.tests {
+        convert(&mut test.body, test.declaration_id, settings);
+    }
+    plan.validate_tree().unwrap();
+    plan
+}
+
+struct AttemptProvider {
+    values: Mutex<VecDeque<Result<Value, ProviderError>>>,
+    calls: Mutex<Vec<tokio::time::Instant>>,
+}
+
+impl AttemptProvider {
+    fn new(values: impl IntoIterator<Item = Result<Value, ProviderError>>) -> Self {
+        Self {
+            values: Mutex::new(values.into_iter().collect()),
+            calls: Mutex::new(vec![]),
+        }
+    }
+}
+
+#[async_trait]
+impl ServerProvider for AttemptProvider {
+    fn schema(&self) -> ProviderSchema {
+        ProviderSchema {
+            name: ProviderName("attempt".into()),
+            operations: BTreeMap::from([(
+                "value".into(),
+                OperationSchema {
+                    name: OperationName("value".into()),
+                    parameters: vec![],
+                    result: Type::Int,
+                    capability: Capability::Server,
+                    documentation: String::new(),
+                    retry_safe: true,
+                },
+            )]),
+            schema_identity: None,
+        }
+    }
+    async fn call(&self, _: ProviderCall, _: CallContext) -> Result<ProviderResult, ProviderError> {
+        self.calls.lock().unwrap().push(tokio::time::Instant::now());
+        self.values
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("bounded attempts")
+            .map(|value| ProviderResult { value })
+    }
+}
+
+fn provider_plan(
+    source: &str,
+    provider: Arc<AttemptProvider>,
+    settings: RetrySettings,
+) -> (TestPlan, ProviderRegistry) {
+    let mut registry = ProviderRegistry::default();
+    registry.register(provider);
+    let mut db = webtest_analysis::AnalysisDatabase::with_provider_registry(registry.clone());
+    let file = db.open_file("attempts.webtest", source);
+    assert!(
+        db.diagnostics(file).unwrap().is_empty(),
+        "{:?}",
+        db.diagnostics(file)
+    );
+    (
+        with_retry(db.test_plan(file).unwrap().as_ref().clone(), settings),
+        registry,
+    )
+}
+
+fn assertion_error(actual: &str) -> BrowserError {
+    BrowserError::AssertionFailed {
+        locator: Locator::Text("ready".into()),
+        expected: LocatorState::Visible,
+        actual: actual.into(),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn retry_exhaustion_keeps_all_attempts_and_does_not_backoff_after_the_last() {
+    let plan = with_retry(
+        compile_source(r#"test "exhausted" { timeout 86400s { expect 1 == 2 } expect 9 == 9 }"#),
+        settings(3),
+    );
+    let observations = Arc::new(ObservationStore::default());
+    let started = tokio::time::Instant::now();
+    let result = Runner::new(observations.clone())
+        .run(&plan, &LifecycleHost(Arc::default()))
+        .await;
+    assert_eq!(started.elapsed(), Duration::from_millis(30));
+    assert_eq!(result.failed(), 1);
+    assert_eq!(result.tests[0].branches.len(), 3);
+    assert!(
+        result.tests[0]
+            .branches
+            .iter()
+            .all(|attempt| matches!(attempt.outcome, TestOutcome::Failed(_)))
+    );
+    assert_eq!(
+        observations
+            .observations_for(plan.file, plan.source_revision)
+            .len(),
+        3
+    );
+    assert_eq!(
+        result
+            .events
+            .iter()
+            .filter(|event| matches!(event, ExecutionEvent::StepStarted { .. }))
+            .count(),
+        3
+    );
+    let registered: BTreeSet<_> = result
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            ExecutionEvent::Wait { event, .. }
+                if event.kind == webtest_observation::WaitEventKind::Registered =>
+            {
+                Some(event.registration_id)
+            }
+            _ => None,
+        })
+        .collect();
+    let terminal: Vec<_> = result
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            ExecutionEvent::Wait { event, .. }
+                if event.kind != webtest_observation::WaitEventKind::Registered =>
+            {
+                Some(event.registration_id)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(registered.len(), terminal.len());
+    assert_eq!(registered, terminal.into_iter().collect());
+    assert_scopes_finish_once_after_children(&result.events);
+}
+
+#[tokio::test(start_paused = true)]
+async fn nested_retry_attempt_identity_is_distinct_from_its_parent_and_static_path() {
+    let provider = Arc::new(AttemptProvider::new(
+        [1, 2, 3, 4, 5].map(|n| Ok(Value::Int(n))),
+    ));
+    let (plan, registry) = provider_plan(
+        r#"test "nested attempts" { timeout 86400s { server {
+        timeout 86400s { let inner = attempt.value() expect inner >= 2 }
+        let outer = attempt.value()
+        expect outer == 5
+    } } }"#,
+        provider,
+        settings(3),
+    );
+    let result = Runner::new(Arc::default())
+        .with_provider_registry(registry)
+        .run(&plan, &LifecycleHost(Arc::default()))
+        .await;
+    assert_eq!(result.passed(), 1, "{:?}", result.tests[0].outcome);
+    let outer = &result.tests[0].branches;
+    assert_eq!(outer.len(), 2);
+    assert_eq!(outer[0].branches.len(), 2);
+    assert_eq!(outer[1].branches.len(), 1);
+    let ids: BTreeSet<_> = outer
+        .iter()
+        .chain(outer.iter().flat_map(|a| &a.branches))
+        .map(|a| a.scope.execution_context.attempt_id.unwrap())
+        .collect();
+    assert_eq!(ids.len(), 5);
+    assert_eq!(
+        outer[0].branches[0].scope.execution_context.plan_node_id,
+        outer[1].branches[0].scope.execution_context.plan_node_id
+    );
+    assert_scopes_finish_once_after_children(&result.events);
+}
+
+#[tokio::test(start_paused = true)]
+async fn retry_cleanup_expiry_is_terminal_and_never_grants_another_attempt() {
+    let state = Arc::new(LifecycleState::default());
+    state.record_waits.store(true, Ordering::SeqCst);
+    state
+        .locator_outcomes
+        .lock()
+        .unwrap()
+        .push_back(Err(assertion_error("primary")));
+    state
+        .context_close_delays
+        .lock()
+        .unwrap()
+        .insert(0, Duration::from_secs(1));
+    let plan = with_retry(
+        compile_source(
+            r#"test "cleanup expires" { parallel { timeout 86400s { browser { expect text("ready").visible } } } }"#,
+        ),
+        settings(3),
+    );
+    let started = tokio::time::Instant::now();
+    let result = Runner::new(Arc::default())
+        .with_options(RunnerOptions {
+            cleanup_timeout: Duration::from_millis(5),
+            ..Default::default()
+        })
+        .run(&plan, &LifecycleHost(state.clone()))
+        .await;
+    assert_eq!(started.elapsed(), Duration::from_millis(5));
+    assert_eq!(result.tests[0].branches[0].branches.len(), 1);
+    assert_eq!(state.next_context.load(Ordering::SeqCst), 1);
+    assert!(
+        matches!(&result.tests[0].branches[0].branches[0].outcome, TestOutcome::Aborted { prior_outcome: Some(prior), .. } if matches!(prior.as_ref(), PriorTestOutcome::Failed(_)))
+    );
+    assert_scopes_finish_once_after_children(&result.events);
+}
+
+#[tokio::test(start_paused = true)]
+async fn retry_attempts_have_distinct_identity_fresh_bindings_and_capped_backoff() {
+    let provider = Arc::new(AttemptProvider::new(
+        [1, 2, 3, 4, 5].map(|n| Ok(Value::Int(n))),
+    ));
+    let (plan, registry) = provider_plan(
+        r#"test "attempts" {
+        let seed = 5
+        timeout 86400s { server { let local = attempt.value() expect local == seed } }
+        expect seed == 5
+    }"#,
+        provider.clone(),
+        settings(5),
+    );
+    let observations = Arc::new(ObservationStore::default());
+    let started = tokio::time::Instant::now();
+    let result = Runner::new(observations.clone())
+        .with_provider_registry(registry)
+        .run(&plan, &LifecycleHost(Arc::default()))
+        .await;
+    assert_eq!(result.passed(), 1, "{:?}", result.tests[0].outcome);
+    assert_eq!(started.elapsed(), Duration::from_millis(80));
+    assert_eq!(
+        provider
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|at| at.duration_since(started).as_millis())
+            .collect::<Vec<_>>(),
+        [0, 10, 30, 55, 80]
+    );
+    assert_eq!(
+        result.tests[0].bindings,
+        BTreeMap::from([("seed".into(), Value::Int(5))])
+    );
+    let attempts = &result.tests[0].branches;
+    assert_eq!(attempts.len(), 5);
+    let ids: BTreeSet<_> = attempts
+        .iter()
+        .map(|a| a.scope.execution_context.attempt_id.unwrap())
+        .collect();
+    assert_eq!(ids.len(), 5);
+    assert!(
+        attempts[..4]
+            .iter()
+            .all(|a| matches!(a.outcome, TestOutcome::Failed(_)))
+    );
+    assert!(matches!(attempts[4].outcome, TestOutcome::Passed));
+    assert!(
+        attempts
+            .iter()
+            .all(|a| a.scope.execution_context.plan_node_id
+                == attempts[0].scope.execution_context.plan_node_id)
+    );
+    let operations: Vec<_> = result
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            ExecutionEvent::Scope { event, .. }
+                if event.outcome.is_none()
+                    && event.execution_context.operation_execution_id.is_some()
+                    && event.execution_context.attempt_id.is_some() =>
+            {
+                Some(&event.execution_context)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(operations.len(), 10);
+    assert_eq!(
+        operations
+            .iter()
+            .map(|e| e.operation_execution_id)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        10
+    );
+    assert!(
+        operations
+            .iter()
+            .all(|e| ids.contains(&e.attempt_id.unwrap()))
+    );
+    assert!(
+        observations
+            .observations_for(plan.file, plan.source_revision)
+            .is_empty()
+    );
+    assert_scopes_finish_once_after_children(&result.events);
+}
+
+#[tokio::test(start_paused = true)]
+async fn retry_reacquires_lexical_contexts_only_after_terminal_teardown_and_backoff() {
+    let state = Arc::new(LifecycleState::default());
+    state.record_waits.store(true, Ordering::SeqCst);
+    state.locator_outcomes.lock().unwrap().extend([
+        Err(assertion_error("first")),
+        Err(assertion_error("second")),
+        Ok(()),
+    ]);
+    state.context_close_delays.lock().unwrap().extend([
+        (0, Duration::from_millis(40)),
+        (1, Duration::from_millis(50)),
+    ]);
+    let plan = with_retry(
+        compile_source(
+            r#"test "fresh contexts" { parallel { timeout 86400s { browser { expect text("ready").visible } } } }"#,
+        ),
+        settings(3),
+    );
+    let started = tokio::time::Instant::now();
+    let result = Runner::new(Arc::default())
+        .run(&plan, &LifecycleHost(state.clone()))
+        .await;
+    assert_eq!(result.passed(), 1, "{:?}", result.tests[0].outcome);
+    assert_eq!(started.elapsed(), Duration::from_millis(120));
+    let log = state.log();
+    assert!(
+        log.iter()
+            .position(|v| v == "context_close_done:0")
+            .unwrap()
+            < log.iter().position(|v| v == "context_create:1:1").unwrap()
+    );
+    assert!(
+        log.iter()
+            .position(|v| v == "context_close_done:1")
+            .unwrap()
+            < log.iter().position(|v| v == "context_create:2:2").unwrap()
+    );
+    for id in 0..3 {
+        assert_eq!(
+            log.iter()
+                .filter(|v| *v == &format!("context_close:{id}"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            log.iter()
+                .filter(|v| *v == &format!("session_close:{id}"))
+                .count(),
+            1
+        );
+    }
+    let acquired: Vec<_> = result
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            ExecutionEvent::Resource { scope, event, .. }
+                if event.kind == webtest_observation::ResourceEventKind::Ready =>
+            {
+                Some((
+                    scope.execution_context.attempt_id,
+                    event.resource.key.generation_id,
+                ))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(acquired.len(), 3);
+    assert_eq!(
+        acquired
+            .iter()
+            .map(|(_, generation)| generation)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        3
+    );
+    assert!(acquired.iter().all(|(attempt, _)| attempt.is_some()));
+    assert_scopes_finish_once_after_children(&result.events);
+}
+
+#[tokio::test(start_paused = true)]
+async fn retry_observations_can_reuse_an_enclosing_context_without_releasing_it() {
+    let state = Arc::new(LifecycleState::default());
+    state.record_waits.store(true, Ordering::SeqCst);
+    state.locator_outcomes.lock().unwrap().extend([
+        Err(assertion_error("not yet")),
+        Ok(()),
+        Ok(()),
+    ]);
+    let plan = with_retry(
+        compile_source(
+            r#"test "same context" { browser {
+        timeout 86400s { expect text("ready").visible }
+        expect text("still ready").visible
+    } }"#,
+        ),
+        settings(3),
+    );
+    let result = Runner::new(Arc::default())
+        .run(&plan, &LifecycleHost(state.clone()))
+        .await;
+    assert_eq!(result.passed(), 1, "{:?}", result.tests[0].outcome);
+    assert_eq!(state.next_context.load(Ordering::SeqCst), 1);
+    let log = state.log();
+    assert_eq!(log.iter().filter(|v| *v == "wait:0").count(), 3);
+    assert_eq!(log.iter().filter(|v| *v == "context_close:0").count(), 1);
+    assert_scopes_finish_once_after_children(&result.events);
+}
+
+#[tokio::test(start_paused = true)]
+async fn retry_cleanup_failure_stops_attempts_and_preserves_the_primary_failure() {
+    let state = Arc::new(LifecycleState::default());
+    state.record_waits.store(true, Ordering::SeqCst);
+    state
+        .locator_outcomes
+        .lock()
+        .unwrap()
+        .push_back(Err(assertion_error("primary")));
+    state.context_close_failures.lock().unwrap().insert(0);
+    let plan = with_retry(
+        compile_source(
+            r#"test "cleanup" { parallel { timeout 86400s { browser { expect text("ready").visible } } } }"#,
+        ),
+        settings(3),
+    );
+    let result = Runner::new(Arc::default())
+        .run(&plan, &LifecycleHost(state.clone()))
+        .await;
+    assert_eq!(result.tests[0].branches[0].branches.len(), 1);
+    assert_eq!(state.next_context.load(Ordering::SeqCst), 1);
+    assert!(
+        matches!(&result.tests[0].branches[0].branches[0].outcome, TestOutcome::Aborted { prior_outcome: Some(prior), .. } if matches!(prior.as_ref(), PriorTestOutcome::Failed(_)))
+    );
+    assert_scopes_finish_once_after_children(&result.events);
+}
+
+#[tokio::test(start_paused = true)]
+async fn retry_deadline_cancels_registered_backoff_without_starting_another_attempt() {
+    let plan = with_retry(
+        compile_source(r#"test "deadline" { timeout 5ms { timeout 86400s { expect 1 == 2 } } }"#),
+        settings(3),
+    );
+    let started = tokio::time::Instant::now();
+    let result = Runner::new(Arc::default())
+        .run(&plan, &LifecycleHost(Arc::default()))
+        .await;
+    assert_eq!(started.elapsed(), Duration::from_millis(5));
+    assert!(matches!(
+        result.tests[0].outcome,
+        TestOutcome::TimedOut { .. }
+    ));
+    assert_eq!(result.tests[0].branches.len(), 1);
+    assert!(matches!(
+        result.tests[0].branches[0].outcome,
+        TestOutcome::Failed(_)
+    ));
+    assert!(result.events.iter().any(|event| matches!(event, ExecutionEvent::Wait { event, .. } if event.cancellation.is_some_and(|cause| cause.reason == CancellationReason::Timeout))));
+    assert_scopes_finish_once_after_children(&result.events);
+}
+
+#[tokio::test(start_paused = true)]
+async fn retry_only_recovers_provider_errors_explicitly_marked_retryable() {
+    for (error, expected) in [
+        (
+            ProviderError::Application {
+                code: "busy".into(),
+                message: "try again".into(),
+                retryable: true,
+                data: serde_json::Value::Null,
+            },
+            2,
+        ),
+        (
+            ProviderError::Application {
+                code: "denied".into(),
+                message: "stop".into(),
+                retryable: false,
+                data: serde_json::Value::Null,
+            },
+            1,
+        ),
+        (
+            ProviderError::InvalidArgument {
+                message: "bad request".into(),
+            },
+            1,
+        ),
+        (
+            ProviderError::BridgeSchemaDrift {
+                expected: "old".into(),
+                live: "new".into(),
+            },
+            1,
+        ),
+        (
+            ProviderError::BridgeHandshake {
+                code: "authentication".into(),
+                message: "denied".into(),
+            },
+            1,
+        ),
+        (
+            ProviderError::HttpTransport {
+                message: "disconnected".into(),
+            },
+            1,
+        ),
+    ] {
+        let provider = Arc::new(AttemptProvider::new([Err(error), Ok(Value::Int(1))]));
+        let (plan, registry) = provider_plan(
+            r#"test "policy" { timeout 86400s { server { let value = attempt.value() } } }"#,
+            provider.clone(),
+            settings(3),
+        );
+        let result = Runner::new(Arc::default())
+            .with_provider_registry(registry)
+            .run(&plan, &LifecycleHost(Arc::default()))
+            .await;
+        assert_eq!(provider.calls.lock().unwrap().len(), expected);
+        assert_eq!(result.tests[0].branches.len(), expected);
+        assert_eq!(result.passed(), usize::from(expected == 2));
+        assert_scopes_finish_once_after_children(&result.events);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn retry_checks_every_parallel_failure_instead_of_only_the_severity_summary() {
+    let plan = with_retry(
+        compile_source(
+            r#"test "mixed failures" { timeout 86400s { parallel {
+        server { expect 1 == 2 }
+        server { let value = 1 / 0 }
+    } } }"#,
+        ),
+        settings(3),
+    );
+    let result = Runner::new(Arc::default())
+        .run(&plan, &LifecycleHost(Arc::default()))
+        .await;
+    assert_eq!(result.tests[0].branches.len(), 1);
+    let failures = &result.tests[0].branches[0].branches;
+    assert_eq!(failures.len(), 2);
+    assert!(
+        matches!(&failures[0].outcome, TestOutcome::Failed(f) if matches!(f.error, StepError::Assertion(_)))
+    );
+    assert!(
+        matches!(&failures[1].outcome, TestOutcome::Failed(f) if matches!(f.error, StepError::Evaluation(_)))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn retry_can_provide_only_its_successful_attempt_to_an_enclosing_race() {
+    let provider = Arc::new(AttemptProvider::new([Ok(Value::Int(1)), Ok(Value::Int(2))]));
+    let (plan, registry) = provider_plan(
+        r#"test "provided" {
+        let selected = race { server { timeout 86400s {
+            let value = attempt.value()
+            expect value == 2
+            provide value
+        } } }
+        expect selected == 2
+    }"#,
+        provider,
+        settings(3),
+    );
+    let result = Runner::new(Arc::default())
+        .with_provider_registry(registry)
+        .run(&plan, &LifecycleHost(Arc::default()))
+        .await;
+    assert_eq!(result.passed(), 1, "{:?}", result.tests[0].outcome);
+    assert_eq!(
+        result.tests[0].bindings,
+        BTreeMap::from([("selected".into(), Value::Int(2))])
+    );
+    assert_eq!(result.tests[0].branches[0].branches.len(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn retry_preserves_every_cancellation_reason_during_attempts_and_backoff() {
+    struct CancelAt {
+        at: tokio::time::Instant,
+        reason: CancellationReason,
+        cancelled: AtomicBool,
+        hold_step: bool,
+    }
+    #[async_trait]
+    impl RunControl for CancelAt {
+        fn is_cancelled(&self) -> bool {
+            self.cancelled.load(Ordering::SeqCst)
+        }
+        fn cancellation_reason(&self) -> CancellationReason {
+            self.reason
+        }
+        async fn cancelled(&self) {
+            tokio::time::sleep_until(self.at).await;
+            self.cancelled.store(true, Ordering::SeqCst);
+        }
+        async fn before_step(&self, _: &PlannedTest, _: &PlannedStep) {
+            if self.hold_step {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+    let plan = with_retry(
+        compile_source(r#"test "cancel" { timeout 86400s { expect 1 == 2 } }"#),
+        settings(3),
+    );
+    for hold_step in [false, true] {
+        for reason in [
+            CancellationReason::ParentFailed,
+            CancellationReason::RaceLost,
+            CancellationReason::Timeout,
+            CancellationReason::FailFast,
+            CancellationReason::DebugDisconnect,
+            CancellationReason::UserCancelled,
+            CancellationReason::RunnerShutdown,
+        ] {
+            let started = tokio::time::Instant::now();
+            let control = CancelAt {
+                at: started + Duration::from_millis(5),
+                reason,
+                cancelled: AtomicBool::new(false),
+                hold_step,
+            };
+            let result = Runner::new(Arc::default())
+                .run_with_control(&plan, &LifecycleHost(Arc::default()), Some(&control))
+                .await;
+            assert_eq!(started.elapsed(), Duration::from_millis(5));
+            assert_eq!(result.tests[0].branches.len(), 1);
+            let attempt = &result.tests[0].branches[0];
+            if hold_step {
+                assert!(
+                    matches!(attempt.outcome, TestOutcome::Cancelled { reason: actual } if actual == reason)
+                );
+                assert_eq!(attempt.scope.cancellation.unwrap().reason, reason);
+            } else {
+                assert!(matches!(attempt.outcome, TestOutcome::Failed(_)));
+            }
+            assert!(result.events.iter().any(|event| matches!(event,
+                ExecutionEvent::Scope { event, .. } if event.outcome.is_some()
+                    && event.execution_context.plan_node_id == match &plan.tests[0].body.kind { PlanNodeKind::Sequence { children } => children[0].id, _ => unreachable!() }
+                    && event.cancellation.is_some_and(|cause| cause.reason == reason)
+            )));
+            assert_scopes_finish_once_after_children(&result.events);
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn retry_infrastructure_failure_notifies_siblings_before_attempt_teardown() {
+    let state = Arc::new(LifecycleState::default());
+    state.page_creation_failures.lock().unwrap().insert(0);
+    state
+        .context_close_delays
+        .lock()
+        .unwrap()
+        .insert(0, Duration::from_millis(100));
+    state
+        .page_delays
+        .lock()
+        .unwrap()
+        .insert("slow".into(), Duration::from_secs(10));
+    let plan = with_retry(
+        compile_source(
+            r#"test "unhealthy attempt" { parallel {
+        timeout 86400s { browser { expect text("ready").visible } }
+        browser { evaluate "slow" }
+    } }"#,
+        ),
+        settings(3),
+    );
+    let started = tokio::time::Instant::now();
+    let result = Runner::new(Arc::default())
+        .run(&plan, &LifecycleHost(state.clone()))
+        .await;
+    assert_eq!(started.elapsed(), Duration::from_millis(100));
+    assert_eq!(result.tests[0].branches[0].branches.len(), 1);
+    assert!(matches!(
+        result.tests[0].branches[1].outcome,
+        TestOutcome::Cancelled {
+            reason: CancellationReason::ParentFailed
+        }
+    ));
+    assert_scopes_finish_once_after_children(&result.events);
+}
+
+#[tokio::test]
+async fn retry_preserves_separate_artifact_files_for_every_failed_attempt() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = Arc::new(LifecycleState::default());
+    state.record_waits.store(true, Ordering::SeqCst);
+    state.locator_outcomes.lock().unwrap().extend([
+        Err(assertion_error("first")),
+        Err(assertion_error("second")),
+    ]);
+    state.page_evidence.lock().unwrap().dom_snapshot = Some("<p>bounded evidence</p>".into());
+    let plan = with_retry(
+        compile_source(
+            r#"test "evidence" { timeout 86400s { browser { expect text("ready").visible } } }"#,
+        ),
+        settings(2),
+    );
+    let result = Runner::new(Arc::default())
+        .with_options(RunnerOptions {
+            evidence: webtest_runtime::EvidenceOptions {
+                artifact_directory: directory.path().to_owned(),
+                dom_snapshot_on_failure: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .run(&plan, &LifecycleHost(state))
+        .await;
+    assert_eq!(result.failed(), 1);
+    let attempts = &result.tests[0].branches;
+    assert_eq!(attempts.len(), 2);
+    let mut paths = BTreeSet::new();
+    for attempt in attempts {
+        let TestOutcome::Failed(failure) = &attempt.outcome else {
+            panic!("{:?}", attempt.outcome);
+        };
+        assert_eq!(failure.artifacts.len(), 2);
+        for artifact in &failure.artifacts {
+            assert!(
+                paths.insert(artifact.path.clone()),
+                "attempt overwrote evidence"
+            );
+            assert!(artifact.path.is_file());
+            let owner = format!(
+                "execution-{}-attempt-{}",
+                result.execution_id.0,
+                attempt.scope.execution_context.attempt_id.unwrap().0
+            );
+            assert!(artifact.path.parent().unwrap().ends_with(owner));
+        }
+    }
+}

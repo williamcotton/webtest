@@ -30,10 +30,12 @@ use self::{
 
 mod branch;
 mod browser;
+mod child;
 mod concurrent;
 mod failure;
 mod provider;
 mod resource;
+mod retry;
 mod scheduler;
 pub(crate) mod scopes;
 mod state;
@@ -218,6 +220,7 @@ pub(crate) async fn execute_test(
                 execution_id,
                 pending: *pending,
                 artifact_deadline: deadline.at,
+                attempt_id: None,
                 options,
                 providers,
                 observations,
@@ -540,6 +543,9 @@ impl TreeExecution<'_, '_> {
     ) -> std::pin::Pin<Box<dyn Future<Output = TestBodyOutcome> + Send + 'a>> {
         Box::pin(async move {
             match &node.kind {
+                webtest_plan::PlanNodeKind::Retry { child, settings } => {
+                    self.retry_node(child, *settings, scope).await
+                }
                 webtest_plan::PlanNodeKind::Parallel { children, .. } => {
                     self.concurrent_node(children, scope, scheduler::SiblingPolicy::All, None)
                         .await

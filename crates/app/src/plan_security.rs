@@ -86,9 +86,9 @@ fn collect_bindings<'a>(
                 bindings.insert(result.id, values);
             }
         }
-        PlanNodeKind::Timeout { child, .. } | PlanNodeKind::ResourceScope { body: child, .. } => {
-            collect_bindings(child, bindings)
-        }
+        PlanNodeKind::Retry { child, .. }
+        | PlanNodeKind::Timeout { child, .. }
+        | PlanNodeKind::ResourceScope { body: child, .. } => collect_bindings(child, bindings),
     }
 }
 
@@ -105,9 +105,9 @@ fn provided_expressions<'a>(node: &'a webtest_plan::PlanNode, values: &mut Vec<&
                 provided_expressions(child, values);
             }
         }
-        PlanNodeKind::Timeout { child, .. } | PlanNodeKind::ResourceScope { body: child, .. } => {
-            provided_expressions(child, values)
-        }
+        PlanNodeKind::Retry { child, .. }
+        | PlanNodeKind::Timeout { child, .. }
+        | PlanNodeKind::ResourceScope { body: child, .. } => provided_expressions(child, values),
         PlanNodeKind::Parallel { .. } | PlanNodeKind::Race { .. } => {}
     }
 }

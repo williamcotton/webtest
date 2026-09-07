@@ -83,7 +83,9 @@ impl PlanNode {
             | PlanNodeKind::Race { children, .. } => {
                 merged(children.iter().flat_map(Self::required_resources))
             }
-            PlanNodeKind::Timeout { child, .. } => return child.required_resources(),
+            PlanNodeKind::Retry { child, .. } | PlanNodeKind::Timeout { child, .. } => {
+                return child.required_resources();
+            }
             PlanNodeKind::ResourceScope {
                 resource: ResourcePlan::BrowserContext,
                 body,

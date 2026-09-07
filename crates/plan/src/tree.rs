@@ -31,6 +31,10 @@ pub enum PlanNodeKind {
         resource: ResourcePlan,
         body: Box<PlanNode>,
     },
+    Retry {
+        child: Box<PlanNode>,
+        settings: crate::RetrySettings,
+    },
     Timeout {
         child: Box<PlanNode>,
         duration: std::time::Duration,
@@ -182,7 +186,8 @@ impl PlanNode {
                     child.rebase(test, path);
                 }
             }
-            PlanNodeKind::Timeout { child, .. }
+            PlanNodeKind::Retry { child, .. }
+            | PlanNodeKind::Timeout { child, .. }
             | PlanNodeKind::ResourceScope { body: child, .. } => {
                 let mut path = self.path.clone();
                 path.push(0);
@@ -191,6 +196,29 @@ impl PlanNode {
             PlanNodeKind::Operation { .. } => {}
         }
         self.assign_identity(test);
+    }
+
+    pub fn retry(
+        test: PlanDeclarationId,
+        origin: SyntaxOrigin,
+        revision: SourceRevision,
+        path: Vec<u32>,
+        child: Self,
+        settings: crate::RetrySettings,
+    ) -> Self {
+        let mut node = Self {
+            id: PlanNodeId([0; 32]),
+            path,
+            origin,
+            source_revision: revision,
+            required_capabilities: child.required_capabilities.clone(),
+            kind: PlanNodeKind::Retry {
+                child: Box::new(child),
+                settings,
+            },
+        };
+        node.assign_identity(test);
+        node
     }
 
     pub fn timeout(
@@ -274,6 +302,7 @@ impl PlanNode {
             PlanNodeKind::Race { .. } => "race/v2",
             PlanNodeKind::Sequence { .. } => "sequence/v1",
             PlanNodeKind::Timeout { .. } => "timeout/v1",
+            PlanNodeKind::Retry { .. } => "retry/v1",
             PlanNodeKind::Operation { step } => match &step.operation {
                 crate::TestOperation::EvaluatePure(_) => "eval/v1",
                 crate::TestOperation::Provide(_) => "provide/v1",
@@ -298,7 +327,9 @@ impl PlanNode {
     pub fn steps(&self) -> Vec<&PlannedStep> {
         match &self.kind {
             PlanNodeKind::ResourceScope { body, .. } => body.steps(),
-            PlanNodeKind::Timeout { child, .. } => child.steps(),
+            PlanNodeKind::Retry { child, .. } | PlanNodeKind::Timeout { child, .. } => {
+                child.steps()
+            }
             PlanNodeKind::Sequence { children }
             | PlanNodeKind::Parallel { children, .. }
             | PlanNodeKind::Race { children, .. } => {
@@ -311,7 +342,9 @@ impl PlanNode {
     pub fn steps_mut(&mut self) -> Vec<&mut PlannedStep> {
         match &mut self.kind {
             PlanNodeKind::ResourceScope { body, .. } => body.steps_mut(),
-            PlanNodeKind::Timeout { child, .. } => child.steps_mut(),
+            PlanNodeKind::Retry { child, .. } | PlanNodeKind::Timeout { child, .. } => {
+                child.steps_mut()
+            }
             PlanNodeKind::Sequence { children }
             | PlanNodeKind::Parallel { children, .. }
             | PlanNodeKind::Race { children, .. } => {
@@ -338,6 +371,7 @@ pub enum PlanTreeError {
     RootIsNotSequence,
     InvalidControlSetting,
     InvalidRaceResult,
+    UnsafeRetry,
     InvalidPath,
     InvalidIdentity,
     SourceRevisionMismatch,
@@ -413,6 +447,21 @@ impl PlanNode {
                 capabilities
             }
 
+            PlanNodeKind::Retry { child, settings } => {
+                if !settings.is_valid() {
+                    return Err(PlanTreeError::InvalidControlSetting);
+                }
+                if child.origin.file != self.origin.file {
+                    return Err(PlanTreeError::OriginMismatch);
+                }
+                let mut child_path = path.to_vec();
+                child_path.push(0);
+                child.validate(test, revision, &child_path, steps)?;
+                if !child.retry_safety_violations().is_empty() {
+                    return Err(PlanTreeError::UnsafeRetry);
+                }
+                child.required_capabilities.clone()
+            }
             PlanNodeKind::Timeout {
                 child,
                 duration,
@@ -499,7 +548,8 @@ impl PlanNode {
                 }
                 Ok(provided)
             }
-            PlanNodeKind::Timeout { child, .. }
+            PlanNodeKind::Retry { child, .. }
+            | PlanNodeKind::Timeout { child, .. }
             | PlanNodeKind::ResourceScope { body: child, .. } => {
                 child.validate_results(allowed, expected)
             }
@@ -662,11 +712,101 @@ pub fn declaration_identity(
 }
 
 #[cfg(test)]
-mod race_tests {
+mod control_tests {
     use super::*;
     use webtest_model::{StepId, Value};
     use webtest_text::{FileId, TextRange, TextSize};
 
+    #[test]
+    fn retry_nodes_validate_repeatability_bounds_identity_and_serialization() {
+        use crate::{RetryBackoff, RetryPolicy, RetrySettings, TestOperation};
+        let test = declaration_identity("retry.webtest", "retry", 0);
+        let origin = SyntaxOrigin::new(FileId::new(1), TextRange::default());
+        let revision = SourceRevision::of("retry");
+        let settings = RetrySettings {
+            attempts: 3,
+            backoff: RetryBackoff::default(),
+            policy: RetryPolicy::SafeFailures,
+        };
+        let child = branch(test, origin, revision, 0, false);
+        let mut node = PlanNode::retry(test, origin, revision, vec![0], child.clone(), settings);
+        node.validate(test, revision, &[0], &mut Default::default())
+            .unwrap();
+        let timeout = PlanNode::timeout(
+            test,
+            origin,
+            revision,
+            vec![0],
+            child,
+            std::time::Duration::from_secs(1),
+        );
+        assert_ne!(node.id, timeout.id);
+        assert_eq!(
+            serde_json::from_str::<PlanNode>(&serde_json::to_string(&node).unwrap()).unwrap(),
+            node
+        );
+        assert_eq!(node.steps()[0].origin, origin);
+        for attempts in [0, crate::MAX_RETRY_ATTEMPTS + 1] {
+            if let PlanNodeKind::Retry { settings, .. } = &mut node.kind {
+                settings.attempts = attempts;
+            }
+            assert_eq!(
+                node.validate(test, revision, &[0], &mut Default::default()),
+                Err(PlanTreeError::InvalidControlSetting)
+            );
+        }
+        let PlanNodeKind::Retry { child, settings } = &mut node.kind else {
+            unreachable!()
+        };
+        settings.attempts = 3;
+        let call = crate::ServerProviderCall {
+            provider: "test".into(),
+            operation: "call".into(),
+            arguments: Default::default(),
+            result_binding: None,
+            result_name: None,
+            result_type: webtest_model::Type::Null,
+            schema_hash: "schema".into(),
+            timeout: None,
+            redacted_arguments: vec![],
+            redacted_result_fields: vec![],
+            retry_safe: false,
+        };
+        **child = PlanNode::operation(
+            test,
+            revision,
+            vec![0, 0],
+            PlannedStep {
+                id: StepId(0),
+                origin,
+                operation: TestOperation::ServerProviderCall(call),
+            },
+        );
+        node.required_capabilities = vec![Capability::Server];
+        assert_eq!(
+            node.retry_safety_violations(),
+            [crate::RetrySafetyViolation { origin }]
+        );
+        assert_eq!(
+            node.validate(test, revision, &[0], &mut Default::default()),
+            Err(PlanTreeError::UnsafeRetry)
+        );
+        let TestOperation::ServerProviderCall(call) = &mut node.steps_mut()[0].operation else {
+            unreachable!()
+        };
+        call.retry_safe = true;
+        node.validate(test, revision, &[0], &mut Default::default())
+            .unwrap();
+        // A containing acquisition is repeatable; it does not make arbitrary
+        // browser mutations repeatable or hide them from the effect summary.
+        let mutation = branch(test, origin, revision, 0, true).with_browser_resource(test);
+        assert_eq!(mutation.retry_safety_violations().len(), 1);
+        let wait = TestOperation::Browser(crate::BrowserOperation::WaitForUrl {
+            url: crate::PlanExpr::Literal(Value::String("/ready".into())),
+            timeout: None,
+        });
+        assert!(wait.is_retry_safe());
+    }
     fn branch(
         test: PlanDeclarationId,
         origin: SyntaxOrigin,

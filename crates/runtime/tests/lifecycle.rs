@@ -46,6 +46,8 @@ struct LifecycleState {
     page_delays: Mutex<BTreeMap<String, Duration>>,
     operation_timeouts: Mutex<Vec<(String, Duration)>>,
     page_evidence: Mutex<PageEvidence>,
+    record_waits: AtomicBool,
+    locator_outcomes: Mutex<VecDeque<Result<(), BrowserError>>>,
 }
 
 impl LifecycleState {
@@ -266,6 +268,16 @@ impl Page for LifecyclePage {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(("wait".into(), timeout));
+        if self.state.record_waits.load(Ordering::SeqCst) {
+            self.state.push(format!("wait:{}", self.context_id));
+            return self
+                .state
+                .locator_outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(()));
+        }
         Ok(())
     }
 
@@ -401,6 +413,9 @@ fn compile_source(source: &str) -> TestPlan {
     assert!(diagnostics.is_empty(), "{diagnostics:?}");
     database.test_plan(file).unwrap().as_ref().clone()
 }
+
+#[path = "lifecycle/retry.rs"]
+mod retry;
 
 #[tokio::test(start_paused = true)]
 async fn nested_timeout_uses_the_earliest_deadline_and_preserves_its_causing_scope() {

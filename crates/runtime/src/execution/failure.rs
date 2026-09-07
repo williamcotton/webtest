@@ -75,6 +75,7 @@ pub(super) struct FailureInput<'a> {
     pub(super) execution_id: ExecutionId,
     pub(super) pending: PendingFailure,
     pub(super) artifact_deadline: tokio::time::Instant,
+    pub(super) attempt_id: Option<webtest_model::AttemptId>,
     pub(super) options: &'a RunnerOptions,
     pub(super) providers: &'a ProviderRegistry,
     pub(super) observations: &'a ObservationStore,
@@ -147,6 +148,7 @@ pub(super) async fn process_failure(input: FailureInput<'_>) -> Result<StepFailu
         execution_id,
         pending,
         artifact_deadline,
+        attempt_id,
         options,
         providers,
         observations,
@@ -177,6 +179,7 @@ pub(super) async fn process_failure(input: FailureInput<'_>) -> Result<StepFailu
         event_sink,
         elapsed_ms,
         artifact_deadline,
+        attempt_id,
     })
     .await
 }
@@ -197,6 +200,7 @@ struct FinishFailureInput<'a> {
     event_sink: Option<&'a dyn RunEventSink>,
     elapsed_ms: u64,
     artifact_deadline: tokio::time::Instant,
+    attempt_id: Option<webtest_model::AttemptId>,
 }
 
 async fn finish_failure(input: FinishFailureInput<'_>) -> Result<StepFailure, RunError> {
@@ -216,6 +220,7 @@ async fn finish_failure(input: FinishFailureInput<'_>) -> Result<StepFailure, Ru
         event_sink,
         elapsed_ms,
         artifact_deadline,
+        attempt_id,
     } = input;
     let failure_class = error.failure_class();
     let eligible_browser_failure =
@@ -236,8 +241,17 @@ async fn finish_failure(input: FinishFailureInput<'_>) -> Result<StepFailure, Ru
     let artifacts = if eligible_browser_failure
         && (options.evidence.screenshot_on_failure || options.evidence.dom_snapshot_on_failure)
     {
+        let directory = attempt_id.map_or_else(
+            || options.evidence.artifact_directory.clone(),
+            |attempt| {
+                options.evidence.artifact_directory.join(format!(
+                    "execution-{}-attempt-{}",
+                    execution_id.0, attempt.0
+                ))
+            },
+        );
         write_artifacts(
-            &options.evidence.artifact_directory,
+            &directory,
             execution_id,
             test_id,
             step.id,
@@ -566,6 +580,7 @@ mod tests {
             execution_id,
             pending,
             artifact_deadline: tokio::time::Instant::now(),
+            attempt_id: None,
             options: &options,
             providers: &providers,
             observations: &observations,

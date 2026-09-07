@@ -47,14 +47,19 @@ impl TestExecutionState {
             .map_err(|_| {
             crate::RunError::Internal("race winner value violates its result type".into())
         })?;
+        self.accept_transfer(transfer);
+        self.bind(binding.id, Some(&binding.name), value);
+        Ok(())
+    }
+
+    pub(super) fn accept_transfer(&mut self, transfer: ValueTransfer) -> Value {
         self.secrets.extend(transfer.secrets);
         self.secrets.sort();
         self.secrets.dedup();
         self.redacted_fields.extend(transfer.redacted_fields);
         self.redacted_fields.sort();
         self.redacted_fields.dedup();
-        self.bind(binding.id, Some(&binding.name), value);
-        Ok(())
+        transfer.value
     }
 
     pub(super) fn new(redacted_fields: Vec<String>, project_root: PathBuf) -> Self {

@@ -7,7 +7,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
-use webtest_model::{ExecutionScopeId, OperationExecutionId, TestExecutionId, TestId};
+use webtest_model::{AttemptId, ExecutionScopeId, OperationExecutionId, TestExecutionId, TestId};
 use webtest_observation::{
     ExecutionContext, ExecutionEvent, ExecutionId, ScopeEvent, ScopeOutcome,
 };
@@ -96,6 +96,13 @@ impl ScopeFactory {
             _ => None,
         };
         self.create(node, Some(parent), deadline, true)
+    }
+
+    pub fn attempt(&self, parent: &ExecutionScope, node: &PlanNode) -> ExecutionScope {
+        let mut scope = self.branch(parent, node);
+        scope.event.execution_context.attempt_id = Some(AttemptId(self.ids.next()));
+        scope.resource_owner.event = scope.event.clone();
+        scope
     }
 
     fn create(
