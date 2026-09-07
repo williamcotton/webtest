@@ -128,6 +128,21 @@ impl<'a> Parser<'a> {
                 self.braced_block(SyntaxKind::Block, domain);
                 self.finish();
             }
+            (_, SyntaxKind::RetryKw)
+                if matches!(
+                    self.nth_non_trivia(1),
+                    SyntaxKind::Int
+                        | SyntaxKind::Float
+                        | SyntaxKind::Duration
+                        | SyntaxKind::Minus
+                        | SyntaxKind::LBrace
+                        | SyntaxKind::BackoffKw
+                        | SyntaxKind::MaxKw
+                        | SyntaxKind::Eof
+                ) =>
+            {
+                self.retry_statement(domain)
+            }
             (_, SyntaxKind::TimeoutKw)
                 if matches!(
                     self.nth_non_trivia(1),
@@ -202,6 +217,36 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn retry_statement(&mut self, domain: BlockDomain) {
+        self.start(SyntaxKind::RetryStmt);
+        self.bump();
+        self.expect(
+            SyntaxKind::Int,
+            "syntax.expected_retry_attempts",
+            "expected total attempt count after `retry`",
+        );
+        self.eat_trivia();
+        if self.current() == SyntaxKind::BackoffKw {
+            self.bump();
+            self.expect(
+                SyntaxKind::Duration,
+                "syntax.expected_retry_backoff",
+                "expected duration after `backoff`",
+            );
+            self.eat_trivia();
+            if self.current() == SyntaxKind::MaxKw {
+                self.bump();
+                self.expect(
+                    SyntaxKind::Duration,
+                    "syntax.expected_retry_max",
+                    "expected duration after `max`",
+                );
+            }
+        }
+        self.braced_block(SyntaxKind::Block, domain);
+        self.finish();
+    }
+
     fn timeout_statement(&mut self, domain: BlockDomain) {
         self.start(SyntaxKind::TimeoutStmt);
         self.bump();
@@ -253,6 +298,9 @@ impl<'a> Parser<'a> {
                 | SyntaxKind::ParallelKw
                 | SyntaxKind::RaceKw
                 | SyntaxKind::ProvideKw
+                | SyntaxKind::RetryKw
+                | SyntaxKind::BackoffKw
+                | SyntaxKind::MaxKw
         ) {
             self.bump();
         } else {
@@ -796,6 +844,9 @@ impl<'a> Parser<'a> {
                 | SyntaxKind::ParallelKw
                 | SyntaxKind::RaceKw
                 | SyntaxKind::ProvideKw
+                | SyntaxKind::RetryKw
+                | SyntaxKind::BackoffKw
+                | SyntaxKind::MaxKw
                 | SyntaxKind::NameKw
                 | SyntaxKind::IdKw
                 | SyntaxKind::RoleKw

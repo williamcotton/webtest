@@ -516,11 +516,29 @@ test "optional" {
     }
 
     #[test]
+    fn public_retry_has_native_plan_parity_and_rejects_unsafe_effects() {
+        let source = r#"test "retry" { retry 3 backoff 20ms max 1s { browser { expect text("ready").visible } } }"#;
+        let portable = compile(source).plan.expect("portable retry");
+        let mut database = AnalysisDatabase::default();
+        let file = database.open_file("memory://document.webtest", source);
+        assert!(database.diagnostics(file).unwrap().is_empty());
+        assert_eq!(portable, *database.test_plan(file).unwrap());
+        portable.validate_tree().unwrap();
+        assert!(
+            compile(r#"test "unsafe" { retry 2 { browser { click text("Pay") } } }"#)
+                .plan
+                .is_none()
+        );
+    }
+
+    #[test]
     fn descriptions_and_static_repair_diagnostics_match_the_native_core() {
         for query in [
             "control.parallel",
             "parallel",
             "control.race",
+            "control.retry",
+            "retry",
             "race",
             "statement.provide",
             "provide",

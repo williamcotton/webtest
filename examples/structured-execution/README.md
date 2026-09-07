@@ -6,6 +6,7 @@ This project runs without an application server or Chrome. From the repository r
 cargo build
 target/debug/webtest describe control.timeout
 target/debug/webtest describe control.parallel
+target/debug/webtest describe control.retry
 target/debug/webtest describe control.race
 target/debug/webtest describe statement.provide
 target/debug/webtest check examples/structured-execution
@@ -23,4 +24,11 @@ The JSON/events reporters retain a typed `branches` aggregate in stable source o
 `race.webtest` demonstrates a failed alternative followed by a successful typed winner,
 and nested races whose local values do not escape. `provide` is the last statement of each
 value-producing branch. The report retains failed alternatives and marks `race_winner`;
-a recovered alternative does not make the test fail. Retry examples remain pending.
+a recovered alternative does not make the test fail.
+
+`retry.webtest` demonstrates local attempt bindings, capped backoff syntax, and a successful
+attempt providing a race result. The count includes the first execution. Omitting backoff uses
+zero delay; omitting max keeps the delay constant. Retry requires repeatable operations: provider
+calls need schema `retry_safe`, and browser assertions/waits are safe while mutations are rejected.
+Every attempt finishes teardown before backoff or another attempt. Cancellation and cleanup
+failures stop retry, and all attempt outcomes and evidence remain available in reports.

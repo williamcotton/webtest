@@ -1,60 +1,5 @@
 use super::*;
-use webtest_plan::{PlanNode, PlanNodeKind, RetryBackoff, RetryPolicy, RetrySettings};
-
-fn settings(attempts: u32) -> RetrySettings {
-    RetrySettings {
-        attempts,
-        backoff: RetryBackoff {
-            initial: Duration::from_millis(10),
-            max: Duration::from_millis(25),
-        },
-        policy: RetryPolicy::SafeFailures,
-    }
-}
-
-// Until public retry lowering lands, replace explicit test recipe markers with
-// the distinct node. Preserve the compiler's operations, origins and child paths.
-fn with_retry(mut plan: TestPlan, settings: RetrySettings) -> TestPlan {
-    fn convert(
-        node: &mut PlanNode,
-        test: webtest_model::PlanDeclarationId,
-        settings: RetrySettings,
-    ) {
-        match &mut node.kind {
-            PlanNodeKind::Sequence { children }
-            | PlanNodeKind::Parallel { children, .. }
-            | PlanNodeKind::Race { children, .. } => {
-                for child in children {
-                    convert(child, test, settings);
-                }
-            }
-            PlanNodeKind::ResourceScope { body: child, .. } | PlanNodeKind::Retry { child, .. } => {
-                convert(child, test, settings)
-            }
-            PlanNodeKind::Timeout {
-                child, duration, ..
-            } => {
-                convert(child, test, settings);
-                if *duration == Duration::from_secs(86400) {
-                    *node = PlanNode::retry(
-                        test,
-                        node.origin,
-                        node.source_revision,
-                        node.path.clone(),
-                        *child.clone(),
-                        settings,
-                    );
-                }
-            }
-            PlanNodeKind::Operation { .. } => {}
-        }
-    }
-    for test in &mut plan.tests {
-        convert(&mut test.body, test.declaration_id, settings);
-    }
-    plan.validate_tree().unwrap();
-    plan
-}
+use webtest_plan::PlanNodeKind;
 
 struct AttemptProvider {
     values: Mutex<VecDeque<Result<Value, ProviderError>>>,
@@ -100,11 +45,7 @@ impl ServerProvider for AttemptProvider {
     }
 }
 
-fn provider_plan(
-    source: &str,
-    provider: Arc<AttemptProvider>,
-    settings: RetrySettings,
-) -> (TestPlan, ProviderRegistry) {
+fn provider_plan(source: &str, provider: Arc<AttemptProvider>) -> (TestPlan, ProviderRegistry) {
     let mut registry = ProviderRegistry::default();
     registry.register(provider);
     let mut db = webtest_analysis::AnalysisDatabase::with_provider_registry(registry.clone());
@@ -114,10 +55,7 @@ fn provider_plan(
         "{:?}",
         db.diagnostics(file)
     );
-    (
-        with_retry(db.test_plan(file).unwrap().as_ref().clone(), settings),
-        registry,
-    )
+    (db.test_plan(file).unwrap().as_ref().clone(), registry)
 }
 
 fn assertion_error(actual: &str) -> BrowserError {
@@ -129,10 +67,49 @@ fn assertion_error(actual: &str) -> BrowserError {
 }
 
 #[tokio::test(start_paused = true)]
+async fn public_retry_lexical_contexts_coexist_with_an_enclosing_native_context() {
+    let state = Arc::new(LifecycleState::default());
+    state.record_waits.store(true, Ordering::SeqCst);
+    state
+        .locator_outcomes
+        .lock()
+        .unwrap()
+        .extend([Err(assertion_error("first")), Ok(()), Ok(())]);
+    let plan = compile_source(
+        r#"test "distinct owners" {
+        browser { open "https://example.test/before" }
+        retry 3 { browser { expect text("ready").visible } }
+        browser { expect text("after").visible }
+    }"#,
+    );
+    let result = Runner::new(Arc::default())
+        .run(&plan, &LifecycleHost(state.clone()))
+        .await;
+    assert_eq!(result.passed(), 1, "{:?}", result.tests[0].outcome);
+    assert_eq!(result.tests[0].branches.len(), 2);
+    let log = state.log();
+    assert_eq!(
+        log.iter()
+            .filter(|entry| entry.starts_with("wait:"))
+            .cloned()
+            .collect::<Vec<_>>(),
+        ["wait:1", "wait:2", "wait:0"]
+    );
+    for id in 0..3 {
+        assert_eq!(
+            log.iter()
+                .filter(|entry| *entry == &format!("context_close:{id}"))
+                .count(),
+            1
+        );
+    }
+    assert_scopes_finish_once_after_children(&result.events);
+}
+
+#[tokio::test(start_paused = true)]
 async fn retry_exhaustion_keeps_all_attempts_and_does_not_backoff_after_the_last() {
-    let plan = with_retry(
-        compile_source(r#"test "exhausted" { timeout 86400s { expect 1 == 2 } expect 9 == 9 }"#),
-        settings(3),
+    let plan = compile_source(
+        r#"test "exhausted" { retry 3 backoff 10ms max 25ms { expect 1 == 2 } expect 9 == 9 }"#,
     );
     let observations = Arc::new(ObservationStore::default());
     let started = tokio::time::Instant::now();
@@ -197,13 +174,12 @@ async fn nested_retry_attempt_identity_is_distinct_from_its_parent_and_static_pa
         [1, 2, 3, 4, 5].map(|n| Ok(Value::Int(n))),
     ));
     let (plan, registry) = provider_plan(
-        r#"test "nested attempts" { timeout 86400s { server {
-        timeout 86400s { let inner = attempt.value() expect inner >= 2 }
+        r#"test "nested attempts" { retry 3 backoff 10ms max 25ms { server {
+        retry 3 backoff 10ms max 25ms { let inner = attempt.value() expect inner >= 2 }
         let outer = attempt.value()
         expect outer == 5
     } } }"#,
         provider,
-        settings(3),
     );
     let result = Runner::new(Arc::default())
         .with_provider_registry(registry)
@@ -241,11 +217,8 @@ async fn retry_cleanup_expiry_is_terminal_and_never_grants_another_attempt() {
         .lock()
         .unwrap()
         .insert(0, Duration::from_secs(1));
-    let plan = with_retry(
-        compile_source(
-            r#"test "cleanup expires" { parallel { timeout 86400s { browser { expect text("ready").visible } } } }"#,
-        ),
-        settings(3),
+    let plan = compile_source(
+        r#"test "cleanup expires" { parallel { retry 3 backoff 10ms max 25ms { browser { expect text("ready").visible } } } }"#,
     );
     let started = tokio::time::Instant::now();
     let result = Runner::new(Arc::default())
@@ -272,11 +245,10 @@ async fn retry_attempts_have_distinct_identity_fresh_bindings_and_capped_backoff
     let (plan, registry) = provider_plan(
         r#"test "attempts" {
         let seed = 5
-        timeout 86400s { server { let local = attempt.value() expect local == seed } }
+        retry 5 backoff 10ms max 25ms { server { let local = attempt.value() expect local == seed } }
         expect seed == 5
     }"#,
         provider.clone(),
-        settings(5),
     );
     let observations = Arc::new(ObservationStore::default());
     let started = tokio::time::Instant::now();
@@ -368,11 +340,8 @@ async fn retry_reacquires_lexical_contexts_only_after_terminal_teardown_and_back
         (0, Duration::from_millis(40)),
         (1, Duration::from_millis(50)),
     ]);
-    let plan = with_retry(
-        compile_source(
-            r#"test "fresh contexts" { parallel { timeout 86400s { browser { expect text("ready").visible } } } }"#,
-        ),
-        settings(3),
+    let plan = compile_source(
+        r#"test "fresh contexts" { retry 3 backoff 10ms max 25ms { browser { expect text("ready").visible } } }"#,
     );
     let started = tokio::time::Instant::now();
     let result = Runner::new(Arc::default())
@@ -444,14 +413,11 @@ async fn retry_observations_can_reuse_an_enclosing_context_without_releasing_it(
         Ok(()),
         Ok(()),
     ]);
-    let plan = with_retry(
-        compile_source(
-            r#"test "same context" { browser {
-        timeout 86400s { expect text("ready").visible }
+    let plan = compile_source(
+        r#"test "same context" { browser {
+        retry 3 backoff 10ms max 25ms { expect text("ready").visible }
         expect text("still ready").visible
     } }"#,
-        ),
-        settings(3),
     );
     let result = Runner::new(Arc::default())
         .run(&plan, &LifecycleHost(state.clone()))
@@ -474,11 +440,8 @@ async fn retry_cleanup_failure_stops_attempts_and_preserves_the_primary_failure(
         .unwrap()
         .push_back(Err(assertion_error("primary")));
     state.context_close_failures.lock().unwrap().insert(0);
-    let plan = with_retry(
-        compile_source(
-            r#"test "cleanup" { parallel { timeout 86400s { browser { expect text("ready").visible } } } }"#,
-        ),
-        settings(3),
+    let plan = compile_source(
+        r#"test "cleanup" { parallel { retry 3 backoff 10ms max 25ms { browser { expect text("ready").visible } } } }"#,
     );
     let result = Runner::new(Arc::default())
         .run(&plan, &LifecycleHost(state.clone()))
@@ -493,9 +456,8 @@ async fn retry_cleanup_failure_stops_attempts_and_preserves_the_primary_failure(
 
 #[tokio::test(start_paused = true)]
 async fn retry_deadline_cancels_registered_backoff_without_starting_another_attempt() {
-    let plan = with_retry(
-        compile_source(r#"test "deadline" { timeout 5ms { timeout 86400s { expect 1 == 2 } } }"#),
-        settings(3),
+    let plan = compile_source(
+        r#"test "deadline" { timeout 5ms { retry 3 backoff 10ms max 25ms { expect 1 == 2 } } }"#,
     );
     let started = tokio::time::Instant::now();
     let result = Runner::new(Arc::default())
@@ -565,9 +527,8 @@ async fn retry_only_recovers_provider_errors_explicitly_marked_retryable() {
     ] {
         let provider = Arc::new(AttemptProvider::new([Err(error), Ok(Value::Int(1))]));
         let (plan, registry) = provider_plan(
-            r#"test "policy" { timeout 86400s { server { let value = attempt.value() } } }"#,
+            r#"test "policy" { retry 3 backoff 10ms max 25ms { server { let value = attempt.value() } } }"#,
             provider.clone(),
-            settings(3),
         );
         let result = Runner::new(Arc::default())
             .with_provider_registry(registry)
@@ -582,14 +543,11 @@ async fn retry_only_recovers_provider_errors_explicitly_marked_retryable() {
 
 #[tokio::test(start_paused = true)]
 async fn retry_checks_every_parallel_failure_instead_of_only_the_severity_summary() {
-    let plan = with_retry(
-        compile_source(
-            r#"test "mixed failures" { timeout 86400s { parallel {
+    let plan = compile_source(
+        r#"test "mixed failures" { retry 3 backoff 10ms max 25ms { parallel {
         server { expect 1 == 2 }
         server { let value = 1 / 0 }
     } } }"#,
-        ),
-        settings(3),
     );
     let result = Runner::new(Arc::default())
         .run(&plan, &LifecycleHost(Arc::default()))
@@ -610,7 +568,7 @@ async fn retry_can_provide_only_its_successful_attempt_to_an_enclosing_race() {
     let provider = Arc::new(AttemptProvider::new([Ok(Value::Int(1)), Ok(Value::Int(2))]));
     let (plan, registry) = provider_plan(
         r#"test "provided" {
-        let selected = race { server { timeout 86400s {
+        let selected = race { server { retry 3 backoff 10ms max 25ms {
             let value = attempt.value()
             expect value == 2
             provide value
@@ -618,7 +576,6 @@ async fn retry_can_provide_only_its_successful_attempt_to_an_enclosing_race() {
         expect selected == 2
     }"#,
         provider,
-        settings(3),
     );
     let result = Runner::new(Arc::default())
         .with_provider_registry(registry)
@@ -658,10 +615,8 @@ async fn retry_preserves_every_cancellation_reason_during_attempts_and_backoff()
             }
         }
     }
-    let plan = with_retry(
-        compile_source(r#"test "cancel" { timeout 86400s { expect 1 == 2 } }"#),
-        settings(3),
-    );
+    let plan =
+        compile_source(r#"test "cancel" { retry 3 backoff 10ms max 25ms { expect 1 == 2 } }"#);
     for hold_step in [false, true] {
         for reason in [
             CancellationReason::ParentFailed,
@@ -717,14 +672,11 @@ async fn retry_infrastructure_failure_notifies_siblings_before_attempt_teardown(
         .lock()
         .unwrap()
         .insert("slow".into(), Duration::from_secs(10));
-    let plan = with_retry(
-        compile_source(
-            r#"test "unhealthy attempt" { parallel {
-        timeout 86400s { browser { expect text("ready").visible } }
+    let plan = compile_source(
+        r#"test "unhealthy attempt" { parallel {
+        retry 3 backoff 10ms max 25ms { browser { expect text("ready").visible } }
         browser { evaluate "slow" }
     } }"#,
-        ),
-        settings(3),
     );
     let started = tokio::time::Instant::now();
     let result = Runner::new(Arc::default())
@@ -751,11 +703,8 @@ async fn retry_preserves_separate_artifact_files_for_every_failed_attempt() {
         Err(assertion_error("second")),
     ]);
     state.page_evidence.lock().unwrap().dom_snapshot = Some("<p>bounded evidence</p>".into());
-    let plan = with_retry(
-        compile_source(
-            r#"test "evidence" { timeout 86400s { browser { expect text("ready").visible } } }"#,
-        ),
-        settings(2),
+    let plan = compile_source(
+        r#"test "evidence" { retry 2 backoff 10ms max 25ms { browser { expect text("ready").visible } } }"#,
     );
     let result = Runner::new(Arc::default())
         .with_options(RunnerOptions {

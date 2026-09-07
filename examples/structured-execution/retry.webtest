@@ -1,0 +1,20 @@
+test "retry keeps attempt bindings local" {
+    let seed = 7
+    retry 3 backoff 20ms max 100ms {
+        server {
+            let local = seed + 1
+            expect local == 8
+        }
+    }
+    expect seed == 7
+}
+test "a successful retry provides its race result" {
+    let selected = race {
+        server {
+            retry 2 {
+                provide { answer: 7 }
+            }
+        }
+    }
+    expect selected.answer == 7
+}

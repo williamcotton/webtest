@@ -15,6 +15,10 @@ impl TreeExecution<'_, '_> {
             ..*self.services
         };
         self.branch.active_step = None;
+        let inherits_page = child
+            .required_resources()
+            .iter()
+            .any(|usage| usage.resource == webtest_plan::ResourceReference::BrowserContext);
         for ordinal in 0..settings.attempts {
             if let Some(cause) = parent.context.cancellation.cause() {
                 return cancelled(cause.reason);
@@ -24,9 +28,13 @@ impl TreeExecution<'_, '_> {
             // A sequential attempt may exclusively borrow a proven observation-only
             // browser context. Its lexical owner still controls interruption and
             // teardown. No sibling future receives this handle.
-            state.page = self.branch.page.take();
+            if inherits_page {
+                state.page = self.branch.page.take();
+            }
             let completion = child::execute_child(&services, child, scope, state).await;
-            self.branch.page = completion.page;
+            if inherits_page {
+                self.branch.page = completion.page;
+            }
             let passed = matches!(completion.result.outcome, TestOutcome::Passed);
             let retryable = match settings.policy {
                 RetryPolicy::SafeFailures => retryable_result(&completion.result),

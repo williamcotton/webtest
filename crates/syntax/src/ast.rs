@@ -32,6 +32,7 @@ ast_node!(ServerBlock, ServerBlock);
 ast_node!(BrowserBlock, BrowserBlock);
 ast_node!(LetStmt, LetStmt);
 ast_node!(TimeoutStmt, TimeoutStmt);
+ast_node!(RetryStmt, RetryStmt);
 ast_node!(ParallelStmt, ParallelStmt);
 ast_node!(RaceStmt, RaceStmt);
 ast_node!(ProvideStmt, ProvideStmt);
@@ -101,6 +102,12 @@ impl DurationToken {
         &self.0
     }
     pub fn value(&self) -> Option<Duration> {
+        self.nonnegative_value()
+            .filter(|duration| !duration.is_zero())
+    }
+    /// Retry delays may be zero; deadlines and ordinary duration expressions
+    /// continue to require a positive value through `value`.
+    pub fn nonnegative_value(&self) -> Option<Duration> {
         parse_duration(self.0.text())
     }
 }
@@ -172,6 +179,50 @@ impl BrowserBlock {
 impl ServerBlock {
     pub fn statements(&self) -> impl Iterator<Item = DomainStatement> + '_ {
         self.syntax.children().filter_map(DomainStatement::cast)
+    }
+}
+
+impl RetryStmt {
+    pub fn attempts(&self) -> Option<SyntaxToken> {
+        self.syntax
+            .children_with_tokens()
+            .filter_map(|child| child.into_token())
+            .find(|token| token.kind() == SyntaxKind::Int)
+    }
+    fn duration_after(&self, keyword: SyntaxKind) -> Option<DurationToken> {
+        let mut tokens = self
+            .syntax
+            .children_with_tokens()
+            .filter_map(|child| child.into_token());
+        tokens.find(|token| token.kind() == keyword)?;
+        tokens
+            .find(|token| !token.kind().is_trivia())
+            .and_then(DurationToken::cast)
+    }
+    pub fn backoff(&self) -> Option<DurationToken> {
+        self.duration_after(SyntaxKind::BackoffKw)
+    }
+    pub fn max_backoff(&self) -> Option<DurationToken> {
+        self.duration_after(SyntaxKind::MaxKw)
+    }
+    pub fn body(&self) -> Option<Block> {
+        self.syntax.children().find_map(Block::cast)
+    }
+    pub fn flow_statements(&self) -> impl Iterator<Item = FlowStatement> {
+        self.body().into_iter().flat_map(|body| {
+            body.syntax
+                .children()
+                .filter_map(FlowStatement::cast)
+                .collect::<Vec<_>>()
+        })
+    }
+    pub fn domain_statements(&self) -> impl Iterator<Item = DomainStatement> {
+        self.body().into_iter().flat_map(|body| {
+            body.syntax
+                .children()
+                .filter_map(DomainStatement::cast)
+                .collect::<Vec<_>>()
+        })
     }
 }
 
@@ -266,6 +317,9 @@ impl LetStmt {
                         | SyntaxKind::ParallelKw
                         | SyntaxKind::RaceKw
                         | SyntaxKind::ProvideKw
+                        | SyntaxKind::RetryKw
+                        | SyntaxKind::BackoffKw
+                        | SyntaxKind::MaxKw
                 )
             })
     }
@@ -421,6 +475,7 @@ pub enum BrowserOperation {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum FlowStatement {
     Timeout(TimeoutStmt),
+    Retry(RetryStmt),
     Parallel(ParallelStmt),
     Race(RaceStmt),
     Provide(ProvideStmt),
@@ -435,6 +490,7 @@ impl FlowStatement {
     fn cast(node: SyntaxNode) -> Option<Self> {
         match node.kind() {
             SyntaxKind::TimeoutStmt => TimeoutStmt::cast(node).map(Self::Timeout),
+            SyntaxKind::RetryStmt => RetryStmt::cast(node).map(Self::Retry),
             SyntaxKind::ParallelStmt => ParallelStmt::cast(node).map(Self::Parallel),
             SyntaxKind::RaceStmt => RaceStmt::cast(node).map(Self::Race),
             SyntaxKind::ProvideStmt => ProvideStmt::cast(node).map(Self::Provide),
@@ -451,6 +507,7 @@ impl FlowStatement {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum DomainStatement {
     Timeout(TimeoutStmt),
+    Retry(RetryStmt),
     Parallel(ParallelStmt),
     Race(RaceStmt),
     Provide(ProvideStmt),
@@ -464,6 +521,7 @@ impl DomainStatement {
     fn cast(node: SyntaxNode) -> Option<Self> {
         match node.kind() {
             SyntaxKind::TimeoutStmt => TimeoutStmt::cast(node).map(Self::Timeout),
+            SyntaxKind::RetryStmt => RetryStmt::cast(node).map(Self::Retry),
             SyntaxKind::ParallelStmt => ParallelStmt::cast(node).map(Self::Parallel),
             SyntaxKind::RaceStmt => RaceStmt::cast(node).map(Self::Race),
             SyntaxKind::ProvideStmt => ProvideStmt::cast(node).map(Self::Provide),
@@ -829,5 +887,5 @@ fn parse_duration(text: &str) -> Option<Duration> {
         (number, 60_000)
     };
     let number = number.parse::<u64>().ok()?;
-    (number > 0).then(|| Duration::from_millis(number.saturating_mul(multiplier)))
+    Some(Duration::from_millis(number.saturating_mul(multiplier)))
 }

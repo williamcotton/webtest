@@ -8,6 +8,7 @@ pub(super) fn core_constructs() -> BTreeMap<String, ConstructDescription> {
         scope_construct("browser", Capability::Browser),
         let_construct(),
         timeout_construct(),
+        retry_construct(),
         parallel_construct(),
         race_construct(),
         provide_construct(),
@@ -368,7 +369,7 @@ fn provide_construct() -> ConstructDescription {
         "lexical_result",
         "analysis",
         "expression",
-        "Provide must be the final statement of a race branch, possibly inside its timeout or capability block. A nested parallel branch cannot provide to an enclosing race. Provider calls must be evaluated in a let binding before provide.",
+        "Provide must be the final statement of a race branch, possibly inside its retry, timeout, or capability block. A nested parallel branch cannot provide to an enclosing race. Provider calls must be evaluated in a let binding before provide.",
     )];
     value.examples = vec![
         example(
@@ -456,6 +457,133 @@ fn timeout_construct() -> ConstructDescription {
     value.related = vec![
         "scope.server".into(),
         "scope.browser".into(),
+        "runtime.configuration".into(),
+    ];
+    value
+}
+
+fn retry_construct() -> ConstructDescription {
+    let mut value = base_construct(
+        "control.retry",
+        "retry",
+        "control",
+        "retry <Int> [backoff <Duration> [max <Duration>]] { <inherited_statement>* }",
+        "Repeat a safe child computation after eligible failures, with fresh attempt state and teardown before backoff.",
+    );
+    value.search_terms = vec![
+        "attempts".into(),
+        "backoff".into(),
+        "retry safety".into(),
+        "repeatability".into(),
+        "retryable provider".into(),
+    ];
+    value.parameters = vec![
+        parameter(
+            "attempts",
+            Type::Int,
+            true,
+            Some(0),
+            false,
+            "total maximum attempts",
+            "Int",
+        ),
+        parameter(
+            "backoff",
+            Type::Duration,
+            false,
+            None,
+            true,
+            "initial delay",
+            "Duration",
+        ),
+        parameter(
+            "max",
+            Type::Duration,
+            false,
+            None,
+            true,
+            "maximum delay",
+            "Duration",
+        ),
+    ];
+    value.parameters[0].documentation =
+        "An integer literal from 1 to 64, including the first execution.".into();
+    value.parameters[1].documentation = "Defaults to zero. Each retry doubles the initial delay up to max; a delay follows completed attempt teardown.".into();
+    value.parameters[2].documentation = "Defaults to the initial delay (constant backoff); requires backoff, must be at least the initial delay, and cannot exceed 24 hours.".into();
+    value.produces_value = Some(false);
+    value.allowed_contexts = vec![
+        "flow_block".into(),
+        "scope.server".into(),
+        "scope.browser".into(),
+    ];
+    value.effects = vec![
+        "Each attempt gets a fresh identity, local binding snapshot, and new generations for lexically owned resources. Attempt bindings do not escape.".into(),
+        "Browser contexts declared inside retry are acquired and torn down per attempt. Observation-only work can reuse an enclosing browser context. All teardown completes before cancellation-aware monotonic backoff or the next attempt.".into(),
+        "Retry assertion failures, browser assertion/action timeouts, and application errors marked retryable. Every unrecovered failure in a child aggregate must qualify; cancellation, control timeouts, decode/evaluation errors, internal/infrastructure errors, and cleanup failure stop retry.".into(),
+        "Retain ordered attempt outcomes and separate bounded evidence. A successful retry recovers prior editor observations while keeping result/event facts. A successful provide may complete an enclosing race branch.".into(),
+    ];
+    value.constraints = vec![
+        constraint(
+            "bounded_attempts",
+            "analysis",
+            "attempts",
+            "The literal is the total attempt limit, from 1 to 64, not a count of additional retries.",
+        ),
+        constraint(
+            "bounded_backoff",
+            "analysis",
+            "backoff",
+            "Durations are literal, non-negative, and at most 24 hours; max is at least backoff. Omitting both means zero delay. Jitter is not implemented.",
+        ),
+        constraint(
+            "repeatable_effects",
+            "analysis",
+            "body",
+            "Every resource and operation must have a repeatability contract. Provider calls require retry_safe in their schema. Browser assertions and waits are safe; browser mutations, navigation, and evaluate are rejected inside retry.",
+        ),
+        constraint(
+            "transferable_retry_captures",
+            "analysis",
+            "body",
+            "Only transferable outer bindings can enter a fresh attempt. Native response/process/temporary-resource handles cannot be captured.",
+        ),
+        constraint(
+            "inherited_deadlines",
+            "runtime",
+            "body",
+            "Retry and backoff never extend an enclosing deadline. Cleanup failure prevents any subsequent attempt.",
+        ),
+    ];
+    value.failure_modes = vec![
+        "Eligible failures retain their original typed codes if every attempt fails.".into(),
+        "cleanup_scope_failed".into(),
+        "test_timeout".into(),
+    ];
+    value.examples = vec![
+        example(
+            "bounded value computation",
+            "retry 3 backoff 20ms max 100ms { server { let value = 7 expect value == 7 } }",
+            "statement_fragment",
+            "flow_block",
+        ),
+        example(
+            "reuse an enclosing browser context",
+            "retry 3 backoff 200ms max 2s { expect text(\"processed\").visible }",
+            "statement_fragment",
+            "scope.browser",
+        ),
+        example(
+            "read-only provider operation",
+            "retry 3 { let response = http.get(\"https://example.test/ready\") expect response.status == 200 }",
+            "statement_fragment",
+            "scope.server",
+        ),
+    ];
+    value.related = vec![
+        "control.timeout".into(),
+        "control.parallel".into(),
+        "control.race".into(),
+        "statement.provide".into(),
         "runtime.configuration".into(),
     ];
     value
@@ -2216,8 +2344,8 @@ fn provider_construct(
         "Argument names, required status, static types, and capability are checked against this exact provider schema.",
     )];
     value.guidance = vec![GuidanceDescription {
-        code: "retry_metadata_only".into(),
-        summary: "retry_safe is schema metadata for callers; the sequential WebTest runtime does not automatically retry provider calls.".into(),
+        code: "explicit_retry_required".into(),
+        summary: "retry_safe authorizes the operation inside explicit retry blocks. Only eligible runtime failures trigger another attempt; calls outside retry execute once.".into(),
     }];
     if provider == "http" {
         value.constraints.push(constraint(

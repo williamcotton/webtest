@@ -932,6 +932,59 @@ fn public_race_reports_the_winner_and_retains_failed_alternatives() {
 }
 
 #[test]
+fn public_retry_reports_every_attempt_and_rejects_unsafe_work_before_execution() {
+    let directory = tempfile::tempdir().unwrap();
+    write(
+        &directory.path().join("retry.webtest"),
+        r#"test "attempts" { retry 2 backoff 0ms { expect 101 == 102 } }"#,
+    );
+    for reporter in ["json", "events", "junit", "human", "concise"] {
+        let output = webtest(directory.path())
+            .args(["test", "retry.webtest", "--reporter", reporter])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        if reporter == "json" {
+            let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+            let attempts = report["files"][0]["tests"][0]["branches"]
+                .as_array()
+                .unwrap();
+            assert_eq!(attempts.len(), 2);
+            assert_ne!(
+                attempts[0]["scope"]["execution_context"]["attempt_id"],
+                attempts[1]["scope"]["execution_context"]["attempt_id"]
+            );
+            assert!(
+                attempts
+                    .iter()
+                    .all(|attempt| attempt["result"]["outcome"] == "failed")
+            );
+        } else if matches!(reporter, "human" | "concise") {
+            assert_eq!(stdout.matches("attempt ID").count(), 2, "{stdout}");
+        } else {
+            assert!(stdout.contains("attempt_id"), "{stdout}");
+        }
+    }
+    write(
+        &directory.path().join("retry.webtest"),
+        r#"test "unsafe" { retry 2 { browser { click text("Pay") } } }"#,
+    );
+    let output = webtest(directory.path())
+        .args(["test", "retry.webtest", "--reporter", "json"])
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(report["files"][0]["tests"].as_array().unwrap().is_empty());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("semantic.unsafe_retry"));
+}
+
+#[test]
 fn emitted_plans_reject_literal_secrets_returned_through_any_race_alternative() {
     let directory = tempfile::tempdir().unwrap();
     write(

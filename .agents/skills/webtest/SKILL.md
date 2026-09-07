@@ -171,5 +171,13 @@ binds only the first successful branch's compatible transferable result, after e
 `provide` ends its branch and must be its final statement. Failed alternatives remain in the
 branch aggregate; `race_winner` identifies the winner. Losers receive typed `RaceLost`
 cancellation, and cleanup or infrastructure failures can still abort the race.
-Retry, jobs, traces, and concurrent debugger stepping remain unfinished; discover those
+Use `webtest describe control.retry` before repeating a computation.
+`retry 3 backoff 200ms max 2s { ... }` allows three total attempts, with local bindings and
+teardown before each capped backoff. Provider calls require schema `retry_safe`; browser
+assertions and waits are repeatable, while mutations are rejected. Only eligible failures
+retry; cancellation, infrastructure errors, and cleanup failures stop execution. Browser blocks
+inside retry own fresh contexts, while read-only assertions inside an enclosing browser block
+reuse that context. Native handles cannot be captured across attempt boundaries. Reports retain
+every attempt's outcome and evidence even when a later attempt succeeds.
+Jobs, traces, and concurrent debugger stepping remain unfinished; discover those
 features with the installed binary before using them.

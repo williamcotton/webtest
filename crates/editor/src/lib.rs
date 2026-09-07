@@ -326,6 +326,11 @@ impl EditorService {
             .filter_map(|token| {
                 let parent = token.parent().map(|node| node.kind());
                 let kind = match token.kind() {
+                    SyntaxKind::RetryKw | SyntaxKind::BackoffKw | SyntaxKind::MaxKw
+                        if parent == Some(SyntaxKind::RetryStmt) =>
+                    {
+                        SemanticTokenKind::Keyword
+                    }
                     SyntaxKind::RaceKw if parent == Some(SyntaxKind::RaceStmt) => {
                         SemanticTokenKind::Keyword
                     }
@@ -386,6 +391,9 @@ impl EditorService {
                     | SyntaxKind::ParallelKw
                     | SyntaxKind::RaceKw
                     | SyntaxKind::ProvideKw
+                    | SyntaxKind::RetryKw
+                    | SyntaxKind::BackoffKw
+                    | SyntaxKind::MaxKw
                         if matches!(parent, Some(SyntaxKind::LetStmt | SyntaxKind::NameExpr)) =>
                     {
                         SemanticTokenKind::Variable
@@ -395,6 +403,9 @@ impl EditorService {
                     | SyntaxKind::ParallelKw
                     | SyntaxKind::RaceKw
                     | SyntaxKind::ProvideKw
+                    | SyntaxKind::RetryKw
+                    | SyntaxKind::BackoffKw
+                    | SyntaxKind::MaxKw
                         if parent == Some(SyntaxKind::MemberExpr) =>
                     {
                         SemanticTokenKind::Property
@@ -964,6 +975,33 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(hover.contents.contains("Int"));
+    }
+
+    #[test]
+    fn retry_settings_and_contextual_names_use_cst_tokens_and_shared_type_facts() {
+        let editor = EditorService::new();
+        let source = "test \"é\" { let retry = 7 let backoff = 1 let max = 2 retry 3 backoff 20ms max 1s { expect retry > max } }";
+        let file = editor.open_document("file:///retry.webtest", source);
+        assert!(editor.diagnostics(file).unwrap().is_empty());
+        let tokens = editor.semantic_tokens(file).unwrap();
+        for name in ["retry", "backoff", "max"] {
+            for kind in [SemanticTokenKind::Keyword, SemanticTokenKind::Variable] {
+                assert!(tokens.iter().any(|token| &source
+                    [usize::from(token.range.start())..usize::from(token.range.end())]
+                    == name
+                    && token.kind == kind));
+            }
+        }
+        for (text, ty) in [("3 backoff", "Int"), ("20ms", "Duration")] {
+            let hover = editor
+                .hover(
+                    file,
+                    webtest_text::TextSize::from(source.find(text).unwrap() as u32),
+                )
+                .unwrap()
+                .unwrap();
+            assert!(hover.contents.contains(ty), "{}", hover.contents);
+        }
     }
 
     #[test]

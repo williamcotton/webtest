@@ -36,22 +36,23 @@ pub fn author_facing_language() -> AuthorFacingLanguage {
             ("flow_block", "{ <flow_statement>* }"),
             (
                 "flow_statement",
-                "<race_statement> | <provide_statement> | <parallel_statement> | <timeout_statement> | <let_binding> | <server_block> | <browser_block> | <value_assertion> | <expression_statement>",
+                "<retry_statement> | <race_statement> | <provide_statement> | <parallel_statement> | <timeout_statement> | <let_binding> | <server_block> | <browser_block> | <value_assertion> | <expression_statement>",
             ),
             ("let_binding", "let <Identifier> [: <Type>] = (<expression> | <race_statement>)"),
             ("server_block", "server { <server_statement>* }"),
             (
                 "server_statement",
-                "<race_statement> | <provide_statement> | <parallel_statement> | <timeout_statement> | <let_binding> | <value_assertion> | <expression_statement>",
+                "<retry_statement> | <race_statement> | <provide_statement> | <parallel_statement> | <timeout_statement> | <let_binding> | <value_assertion> | <expression_statement>",
             ),
             ("browser_block", "browser { <browser_statement>* }"),
             (
                 "browser_statement",
-                "<race_statement> | <provide_statement> | <parallel_statement> | <timeout_statement> | <let_binding> | <browser_operation> | <browser_assertion> | <value_assertion> | <expression_statement>",
+                "<retry_statement> | <race_statement> | <provide_statement> | <parallel_statement> | <timeout_statement> | <let_binding> | <browser_operation> | <browser_assertion> | <value_assertion> | <expression_statement>",
             ),
             ("race_statement", "race { <capability_or_control_block>+ }"),
             ("provide_statement", "provide <expression>"),
             ("parallel_statement", "parallel { <capability_or_control_block>+ }"),
+            ("retry_statement", "retry <Int> [backoff <Duration> [max <Duration>]] { <statement_in_inherited_domain>* }"),
             ("timeout_statement", "timeout <Duration> { <statement_in_inherited_domain>* }"),
             ("value_assertion", "expect <expression>"),
             (
@@ -130,7 +131,7 @@ pub fn author_facing_language() -> AuthorFacingLanguage {
         .map(|(key, value)| (key.into(), value.into()))
         .collect(),
         reserved_words: [
-            "test", "server", "browser", "timeout", "parallel", "race", "provide", "let", "open", "evaluate", "click", "fill",
+            "test", "server", "browser", "timeout", "parallel", "race", "provide", "retry", "backoff", "max", "let", "open", "evaluate", "click", "fill",
             "type", "press", "key", "with", "check", "uncheck", "select", "option",
             "hover", "wait", "expect", "within", "url", "id", "role", "name", "label",
             "text", "placeholder", "test_id", "css", "xpath", "visible", "hidden",
@@ -144,6 +145,7 @@ pub fn author_facing_language() -> AuthorFacingLanguage {
         composition: vec![
             "top-level declarations are tests".into(),
             "server and browser are capability scopes inside a test flow".into(),
+            "retry takes 1 to 64 total attempts and repeats only safe effects after eligible failures, with fresh local state and resource generations, awaited teardown, and bounded cancellable backoff; retry/backoff/max remain contextual names".into(),
             "timeout inherits its enclosing capability domain; its bindings remain local and its deadline cannot extend an ancestor deadline".into(),
             "race chooses the first completed successful child, cancels losers with RaceLost, and awaits teardown; a bound race requires compatible transferable provide results from every child".into(),
             "provide ends its race branch and must be its final statement; race and provide remain contextual binding/member names".into(),

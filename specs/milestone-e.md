@@ -16,7 +16,7 @@ Milestone E changes how operations are scheduled, owned, cancelled, and observed
 
 ### Implementation progress — 2026-09-07
 
-Milestone E is **not complete**. The execution-tree, resource/wait foundations, timeout, public parallel, public race/result paths, and internal retry execution are implemented:
+Milestone E is **not complete**. The execution-tree, resource/wait foundations, timeout, public parallel, public race/result paths, and public retry are implemented:
 
 - Tests and capability blocks lower through explicit `Sequence` nodes. Leaf operations exist only
   in that tree; diagnostic, debugger, and secret-checking traversal is a read-only projection.
@@ -71,7 +71,7 @@ Milestone E is **not complete**. The execution-tree, resource/wait foundations, 
 
 Remaining work includes complete resource ownership and explicit host interruption across HTTP,
 bridge/application startup and lifecycle, non-Unix process trees, and browser sessions;
-public retry syntax and compiler safety diagnostics; isolated `--jobs`; the authoritative event journal;
+isolated `--jobs`; the authoritative event journal;
 trace artifacts/viewer; observation IPC; concurrent DAP behavior; and their conformance/stress
 coverage. The acceptance criteria below remain normative and unsatisfied as a whole.
 
@@ -286,6 +286,39 @@ compiler-produced timeout recipe markers with Retry nodes; lexical resource test
 parallel lowering to place browser contexts inside those recipes. Installed descriptions still do
 not advertise public retry. Jobs, remaining host-resource conformance, the bounded authoritative
 journal, traces, observation IPC, and concurrent DAP also remain pending.
+
+### Checkpoint 7 continuation — public retry — 2026-09-07
+
+Checkpoint 7 (`f5fefc4`) is accepted. `retry <Int> [backoff <Duration> [max <Duration>]] { ... }`
+now lowers through contextual syntax, typed AST/HIR, analysis, and the existing Retry plan node.
+It inherits the enclosing capability domain, permits 1–64 total attempts, and keeps declarations
+local. Omitted backoff means zero delay; omitted max means constant delay. Explicit zero is legal
+for retry delays while ordinary duration values/deadlines remain positive. A supplied max must be
+at least the initial delay, and both are bounded to 24 hours. Settings have exact source origins and
+shared type facts for editor hover.
+
+Compiler checks reuse the plan's resource/operation repeatability summaries and provider schema
+`retry_safe` facts, with source-mapped errors and canonical reference queries. Native captures are
+rejected at attempt boundaries, including nested retries. Provider-schema changes invalidate these
+checks without source edits. Browser blocks declared inside retry lower to lexical resource scopes;
+observation-only work inside an enclosing browser block retains its context. Runtime handoff now
+consults explicit subtree resource requirements, so a retry with its own lexical context does not
+inherit an unrelated native context kept alive by an earlier browser block.
+
+The checkpoint 7 lifecycle suite now executes real retry source rather than rewriting timeout
+recipes. Additional coverage checks coexistence of outer and per-attempt contexts, contextual names,
+partial/invalid syntax, AST/HIR/plan origins and binding identities, bounds/defaults, unsafe effects,
+native captures, provider-schema invalidation, formatter idempotence, semantic tokens/hover, portable
+WASM parity, and all CLI reporters. Human/concise output identifies the attempt ID; structured
+reports retain the existing typed attempt scope and ordered outcomes. Plan format 9/runtime
+semantics 6 and report/event schema 6 remain unchanged because the execution contracts already
+represent retry.
+
+`control.retry` documents syntax, contexts, settings, safe effects, eligible failures, cancellation,
+resource ownership and canonical examples. Provider descriptions explain explicit retry eligibility.
+The installed authoring skill, initializer parity assertions, and structured-execution examples are
+updated. Jobs, remaining host-resource conformance, the bounded authoritative journal, traces/viewer,
+observation IPC, and concurrent DAP remain pending; Milestone E is still incomplete.
 
 ## 1. Outcome
 

@@ -25,6 +25,12 @@ pub(crate) fn collect(parsed: &Parse) -> Vec<Diagnostic> {
 fn syntax_reference_queries(parsed: &Parse, error: &webtest_syntax::SyntaxError) -> Vec<String> {
     let mut queries = vec!["grammar".into()];
     match error.code {
+        "syntax.expected_retry_attempts"
+        | "syntax.expected_retry_backoff"
+        | "syntax.expected_retry_max" => {
+            queries.push("control.retry".into());
+            return queries;
+        }
         "syntax.expected_server_statement" => queries.push("scope.server".into()),
         "syntax.expected_browser_statement" => queries.push("scope.browser".into()),
         _ => return queries,
@@ -64,18 +70,29 @@ fn invalid_duration_diagnostics(parsed: &Parse) -> Vec<Diagnostic> {
             if token.kind() != webtest_syntax::SyntaxKind::Duration {
                 return None;
             }
-            let valid = token
-                .text()
-                .strip_suffix("ms")
-                .or_else(|| token.text().strip_suffix('s'))
-                .or_else(|| token.text().strip_suffix('m'))
-                .and_then(|number| number.parse::<u64>().ok())
-                .is_some_and(|number| number > 0);
+            let retry_delay = token
+                .parent()
+                .is_some_and(|parent| parent.kind() == webtest_syntax::SyntaxKind::RetryStmt);
+            let duration = webtest_syntax::ast::DurationToken::cast(token.clone())?;
+            let valid = if retry_delay {
+                duration.nonnegative_value()
+            } else {
+                duration.value()
+            }
+            .is_some();
             (!valid).then(|| Diagnostic {
                 range: token.text_range(),
                 severity: DiagnosticSeverity::Error,
                 code: "semantic.invalid_duration",
-                message: format!("invalid positive duration `{}`", token.text()),
+                message: format!(
+                    "invalid {}duration `{}`",
+                    if retry_delay {
+                        "retry backoff "
+                    } else {
+                        "positive "
+                    },
+                    token.text()
+                ),
                 source: DiagnosticSource::Semantic,
                 semantic_details: Some(serde_json::json!({ "literal": token.text() })),
                 repair_hints: Vec::new(),
@@ -88,6 +105,31 @@ fn invalid_duration_diagnostics(parsed: &Parse) -> Vec<Diagnostic> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_delays_allow_zero_without_relaxing_duration_values_or_deadlines() {
+        let source =
+            r#"test "zero" { retry 3 backoff 0ms max 0ms {} let value = 0ms timeout 0ms {} }"#;
+        let diagnostics = collect(&webtest_syntax::parse(source));
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code == "semantic.invalid_duration")
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| usize::from(diagnostic.range.start())
+                    > source.find("let value").unwrap())
+        );
+        let diagnostics = collect(&webtest_syntax::parse("test \"x\" { retry 3 backoff"));
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .reference_queries
+                .contains(&"control.retry".into())
+        }));
+    }
 
     #[test]
     fn syntax_diagnostics_precede_duration_diagnostics_and_source_stays_lossless() {

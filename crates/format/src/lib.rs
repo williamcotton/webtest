@@ -148,10 +148,14 @@ pub fn format_file(parse: &Parse) -> String {
                         | SyntaxKind::HoverKw
                         | SyntaxKind::WaitKw
                         | SyntaxKind::ExpectKw
-                ) || (kind == SyntaxKind::TimeoutKw
+                ) || (kind == SyntaxKind::RetryKw
                     && token
                         .parent()
-                        .is_some_and(|parent| parent.kind() == SyntaxKind::TimeoutStmt))
+                        .is_some_and(|parent| parent.kind() == SyntaxKind::RetryStmt))
+                    || (kind == SyntaxKind::TimeoutKw
+                        && token
+                            .parent()
+                            .is_some_and(|parent| parent.kind() == SyntaxKind::TimeoutStmt))
                     || (kind == SyntaxKind::ParallelKw
                         && token
                             .parent()
@@ -257,6 +261,24 @@ mod tests {
 
 #[cfg(test)]
 mod race_tests {
+    #[test]
+    fn retry_headers_and_contextual_names_format_idempotently() {
+        let source = "test \"x\"{let retry={backoff:1,max:2}retry 3 backoff 20ms max 1s{expect retry.max>retry.backoff}}";
+        let formatted = super::format_file(&webtest_syntax::parse(source));
+        assert!(
+            formatted.contains("\n    retry 3 backoff 20ms max 1s {"),
+            "{formatted}"
+        );
+        assert!(
+            formatted.contains("retry.max > retry.backoff"),
+            "{formatted}"
+        );
+        assert!(webtest_syntax::parse(&formatted).errors().is_empty());
+        assert_eq!(
+            super::format_file(&webtest_syntax::parse(&formatted)),
+            formatted
+        );
+    }
     #[test]
     fn bound_race_and_contextual_names_format_losslessly_and_idempotently() {
         let source = "test \"x\" {let race=1 let provide=2 let selected=race{server{provide race}server{provide provide}}expect selected>0}";

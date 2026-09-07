@@ -57,6 +57,7 @@ impl Compiler<'_> {
                     domain,
                     child_path,
                 ),
+                HirStmt::Retry(block) => self.compile_retry(test, block, domain, child_path),
                 HirStmt::Timeout(block) => {
                     self.type_fact(
                         block.duration_origin.range,
@@ -110,7 +111,9 @@ impl Compiler<'_> {
                         Capability::Browser,
                         child_path,
                     );
-                    if self.concurrent_depth > 0 && !body.required_resources().is_empty() {
+                    if (self.concurrent_depth > 0 || self.retry_depth > 0)
+                        && !body.required_resources().is_empty()
+                    {
                         body.with_browser_resource(test)
                     } else {
                         body
@@ -135,6 +138,90 @@ impl Compiler<'_> {
             children.push(node);
         }
         webtest_plan::PlanNode::sequence(test, origin, self.revision, path, children)
+    }
+
+    fn compile_retry(
+        &mut self,
+        test: webtest_model::PlanDeclarationId,
+        block: &webtest_hir::HirRetry,
+        domain: Capability,
+        path: Vec<u32>,
+    ) -> webtest_plan::PlanNode {
+        self.type_fact(block.attempts_origin.range, Type::Int, Capability::Pure);
+        let attempts = block
+            .attempts
+            .filter(|n| (1..=webtest_plan::MAX_RETRY_ATTEMPTS).contains(n));
+        if attempts.is_none() {
+            self.error(
+                block.attempts_origin.range,
+                "semantic.invalid_retry_attempts",
+                format!(
+                    "retry requires 1 to {} total attempts",
+                    webtest_plan::MAX_RETRY_ATTEMPTS
+                ),
+            );
+        }
+        for (value, origin) in [
+            (block.backoff, block.backoff_origin),
+            (block.max_backoff, block.max_backoff_origin),
+        ] {
+            if let Some(origin) = origin {
+                self.type_fact(origin.range, Type::Duration, Capability::Pure);
+                if value.is_none_or(|value| value > webtest_plan::MAX_CONTROL_TIMEOUT) {
+                    self.error(
+                        origin.range,
+                        "semantic.invalid_retry_backoff",
+                        "retry backoff must be no greater than 24 hours".into(),
+                    );
+                }
+            }
+        }
+        let initial = block.backoff.unwrap_or_default();
+        let max = block.max_backoff.unwrap_or(initial);
+        if max < initial {
+            self.error(
+                block.max_backoff_origin.unwrap_or(block.origin).range,
+                "semantic.invalid_retry_backoff",
+                "maximum backoff must be at least the initial backoff".into(),
+            );
+        }
+        let bindings = self.bindings.clone();
+        let names = self.names.clone();
+        let captures = self.retry_captures.clone();
+        self.retry_captures.extend(
+            bindings
+                .iter()
+                .filter_map(|(id, binding)| (!binding.ty.is_transferable()).then_some(*id)),
+        );
+        self.retry_depth += 1;
+        let mut child_path = path.clone();
+        child_path.push(0);
+        let body = self.compile_sequence(
+            test,
+            block.body_origin,
+            &block.statements,
+            domain,
+            child_path,
+        );
+        self.retry_depth -= 1;
+        self.retry_captures = captures;
+        self.bindings = bindings;
+        self.names = names;
+        for violation in body.retry_safety_violations() {
+            self.error(violation.origin.range, "semantic.unsafe_retry", "operation or resource has no repeatability contract; provider calls require retry_safe and browser mutations cannot be retried".into());
+        }
+        webtest_plan::PlanNode::retry(
+            test,
+            block.origin,
+            self.revision,
+            path,
+            body,
+            webtest_plan::RetrySettings {
+                attempts: attempts.unwrap_or(1),
+                backoff: webtest_plan::RetryBackoff { initial, max },
+                policy: webtest_plan::RetryPolicy::SafeFailures,
+            },
+        )
     }
 
     fn compile_concurrent(
@@ -183,6 +270,7 @@ impl Compiler<'_> {
                 HirStmt::Server(block) => block.origin,
                 HirStmt::Browser(block) => block.origin,
                 HirStmt::Timeout(block) => block.origin,
+                HirStmt::Retry(block) => block.origin,
                 HirStmt::Parallel(block) => block.origin,
                 HirStmt::Race(block) => block.origin,
                 _ => {
@@ -308,7 +396,7 @@ impl Compiler<'_> {
         steps: &mut Vec<PlannedStep>,
     ) {
         match statement {
-            HirStmt::Timeout(_) | HirStmt::Parallel(_) | HirStmt::Race(_) => {
+            HirStmt::Timeout(_) | HirStmt::Retry(_) | HirStmt::Parallel(_) | HirStmt::Race(_) => {
                 unreachable!("control nodes compile through the execution tree")
             }
             HirStmt::Server(block) => {
@@ -604,6 +692,11 @@ pub(super) fn collect_binding_names(statement: &HirStmt, names: &mut HashSet<Str
                 collect_binding_names(statement, names);
             }
         }
+        HirStmt::Retry(block) => {
+            for statement in &block.statements {
+                collect_binding_names(statement, names);
+            }
+        }
         HirStmt::Timeout(block) => {
             for statement in &block.statements {
                 collect_binding_names(statement, names);
@@ -635,6 +728,7 @@ fn statement_provides(statement: &HirStmt) -> bool {
         HirStmt::Server(block) => block.statements.iter().any(statement_provides),
         HirStmt::Browser(block) => block.statements.iter().any(statement_provides),
         HirStmt::Timeout(block) => block.statements.iter().any(statement_provides),
+        HirStmt::Retry(block) => block.statements.iter().any(statement_provides),
         _ => false,
     }
 }

@@ -423,6 +423,10 @@ fn test_report(
             .into_iter()
             .map(|branch| {
                 let name = format!("branch {:?}", branch.scope.execution_context.task_path);
+                let name = branch.scope.execution_context.attempt_id.map_or_else(
+                    || name.clone(),
+                    |attempt| format!("{name} (attempt ID {})", attempt.0),
+                );
                 crate::report::BranchReport {
                     race_winner: branch.race_winner,
                     scope: branch.scope,

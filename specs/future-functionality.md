@@ -1182,10 +1182,11 @@ conformance coverage. Direct processes and command adapters share cancellation-a
 active bridge calls await terminal cancellation acknowledgement. Public `race` and `provide` use a distinct Race plan node and the shared sibling scheduler.
 Bound races require compatible transferable results, transfer only the winner with its redaction
 metadata, and cancel and join losers. Recovered failures remain in branch results/events but do
-not become current diagnostics. CLI schema 6 marks the final winning branch. An internal Retry node
-now shares owned-child execution, with fresh attempt identity, repeatability validation, capped
-cancellation-aware backoff, awaited teardown, and separate attempt evidence. Public retry syntax
-and compiler diagnostics, complete host/resource ownership, jobs,
+not become current diagnostics. CLI schema 6 marks the final winning branch. Public `retry`
+now lowers to shared owned-child execution, with fresh attempt identity, repeatability validation, capped
+cancellation-aware backoff, awaited teardown, and separate attempt evidence. Compiler diagnostics
+reject unsafe operations and native captures; descriptions, formatting, and portable plans use the
+same contracts. Complete host/resource ownership, jobs,
 the authoritative journal, traces, observation IPC, and concurrent DAP remain
 pending; see the milestone's implementation-progress section for the exact boundary.
 

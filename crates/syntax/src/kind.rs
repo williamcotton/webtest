@@ -131,6 +131,10 @@ pub enum SyntaxKind {
     RaceStmt,
     ProvideKw,
     ProvideStmt,
+    RetryKw,
+    BackoffKw,
+    MaxKw,
+    RetryStmt,
     Eof,
 }
 
@@ -357,7 +361,11 @@ impl Language for WebtestLanguage {
             125 => SyntaxKind::RaceStmt,
             126 => SyntaxKind::ProvideKw,
             127 => SyntaxKind::ProvideStmt,
-            128 => SyntaxKind::Eof,
+            128 => SyntaxKind::RetryKw,
+            129 => SyntaxKind::BackoffKw,
+            130 => SyntaxKind::MaxKw,
+            131 => SyntaxKind::RetryStmt,
+            132 => SyntaxKind::Eof,
             _ => SyntaxKind::Error,
         }
     }

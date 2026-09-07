@@ -27,6 +27,7 @@ pub struct HirTest {
 #[derive(Clone, Debug, PartialEq)]
 pub enum HirStmt {
     Timeout(HirTimeout),
+    Retry(HirRetry),
     Parallel(HirParallel),
     Race(HirRace),
     Provide(HirExpressionStmt),
@@ -56,6 +57,19 @@ pub struct HirResultBinding {
 #[derive(Clone, Debug, PartialEq)]
 pub struct HirParallel {
     pub branches: Vec<HirStmt>,
+    pub origin: SyntaxOrigin,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HirRetry {
+    pub attempts: Option<u32>,
+    pub attempts_origin: SyntaxOrigin,
+    pub backoff: Option<Duration>,
+    pub backoff_origin: Option<SyntaxOrigin>,
+    pub max_backoff: Option<Duration>,
+    pub max_backoff_origin: Option<SyntaxOrigin>,
+    pub statements: Vec<HirStmt>,
+    pub body_origin: SyntaxOrigin,
     pub origin: SyntaxOrigin,
 }
 
@@ -356,6 +370,9 @@ fn lower_flow_statement(context: &mut LowerContext, statement: FlowStatement) ->
         FlowStatement::Parallel(statement) => {
             lower_parallel(context, statement, true).map(HirStmt::Parallel)
         }
+        FlowStatement::Retry(statement) => {
+            lower_retry(context, statement, true).map(HirStmt::Retry)
+        }
         FlowStatement::Timeout(statement) => {
             lower_timeout(context, statement, true).map(HirStmt::Timeout)
         }
@@ -409,6 +426,9 @@ fn lower_domain_statement(
         })),
         DomainStatement::Parallel(statement) => {
             lower_parallel(context, statement, false).map(HirStmt::Parallel)
+        }
+        DomainStatement::Retry(statement) => {
+            lower_retry(context, statement, false).map(HirStmt::Retry)
         }
         DomainStatement::Timeout(statement) => {
             lower_timeout(context, statement, false).map(HirStmt::Timeout)
@@ -507,6 +527,47 @@ fn lower_race(
     Some(HirRace {
         binding,
         branches,
+        origin: origin(context.file, statement.syntax()),
+    })
+}
+
+fn lower_retry(
+    context: &mut LowerContext,
+    statement: ast::RetryStmt,
+    flow: bool,
+) -> Option<HirRetry> {
+    let attempts = statement.attempts()?;
+    let body = statement.body()?;
+    let bindings = context.bindings.clone();
+    let statements = if flow {
+        statement
+            .flow_statements()
+            .filter_map(|statement| lower_flow_statement(context, statement))
+            .collect()
+    } else {
+        statement
+            .domain_statements()
+            .filter_map(|statement| lower_domain_statement(context, statement))
+            .collect()
+    };
+    context.bindings = bindings;
+    Some(HirRetry {
+        attempts: attempts.text().parse().ok(),
+        attempts_origin: SyntaxOrigin::new(context.file, attempts.text_range()),
+        backoff: statement
+            .backoff()
+            .and_then(|token| token.nonnegative_value()),
+        backoff_origin: statement
+            .backoff()
+            .map(|token| SyntaxOrigin::new(context.file, token.syntax().text_range())),
+        max_backoff: statement
+            .max_backoff()
+            .and_then(|token| token.nonnegative_value()),
+        max_backoff_origin: statement
+            .max_backoff()
+            .map(|token| SyntaxOrigin::new(context.file, token.syntax().text_range())),
+        statements,
+        body_origin: origin(context.file, body.syntax()),
         origin: origin(context.file, statement.syntax()),
     })
 }
@@ -981,6 +1042,39 @@ mod race_tests {
         };
         assert!(matches!(
             &value.expression.kind,
+            HirExprKind::Name(HirNameRef::Binding {
+                id: BindingId(0),
+                ..
+            })
+        ));
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    #[test]
+    fn retry_preserves_setting_origins_and_keeps_body_bindings_lexical() {
+        let source = "test \"é\" { let seed = 7 retry 3 backoff 0ms max 1s { let local = seed } expect seed == 7 }";
+        let parsed = webtest_syntax::parse(source);
+        let file = lower(FileId::new(7), &parsed);
+        let HirStmt::Retry(retry) = &file.tests[0].body[1] else {
+            panic!("retry")
+        };
+        let slice = |origin: SyntaxOrigin| {
+            &source[usize::from(origin.range.start())..usize::from(origin.range.end())]
+        };
+        assert_eq!(slice(retry.attempts_origin), "3");
+        assert_eq!(slice(retry.backoff_origin.unwrap()), "0ms");
+        assert_eq!(slice(retry.max_backoff_origin.unwrap()), "1s");
+        assert_eq!(slice(retry.body_origin), " { let local = seed }");
+        assert_eq!(retry.backoff, Some(Duration::ZERO));
+        let HirStmt::Let(local) = &retry.statements[0] else {
+            panic!("let")
+        };
+        assert_eq!(local.id, BindingId(1));
+        assert!(matches!(
+            local.value.kind,
             HirExprKind::Name(HirNameRef::Binding {
                 id: BindingId(0),
                 ..

@@ -67,6 +67,8 @@ struct Compiler<'a> {
     next_step: u32,
     concurrent_captures: HashSet<BindingId>,
     concurrent_depth: usize,
+    retry_depth: usize,
+    retry_captures: HashSet<BindingId>,
     provide_types: Option<Vec<(Type, SyntaxOrigin)>>,
 }
 
@@ -102,6 +104,8 @@ impl<'a> Compiler<'a> {
             next_step: 0,
             concurrent_captures: HashSet::new(),
             concurrent_depth: 0,
+            retry_depth: 0,
+            retry_captures: HashSet::new(),
             provide_types: None,
         }
     }

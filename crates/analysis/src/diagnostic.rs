@@ -118,6 +118,10 @@ pub(crate) fn default_reference_queries(code: &str) -> Vec<String> {
         "semantic.provide_outside_race" | "semantic.unreachable_after_provide" => {
             vec!["statement.provide".into()]
         }
+        "semantic.invalid_retry_attempts"
+        | "semantic.invalid_retry_backoff"
+        | "semantic.unsafe_retry"
+        | "semantic.non_transferable_retry_capture" => vec!["control.retry".into()],
         "semantic.invalid_timeout" => vec!["control.timeout".into()],
         "semantic.unknown_provider" | "semantic.reserved_provider" => vec!["provider".into()],
         "semantic.unknown_provider_operation"

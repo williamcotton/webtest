@@ -22,6 +22,173 @@ fn analyze(source: &str) -> (Vec<Diagnostic>, TestPlan) {
 }
 
 #[test]
+fn retry_lowers_deterministically_with_exact_origins_and_backoff_defaults() {
+    use webtest_plan::PlanNodeKind;
+    let source = r#"test "é" { let seed = 7 retry 3 backoff 20ms max 1s { let local = seed expect local == 7 } expect seed == 7 }"#;
+    let (diagnostics, plan) = analyze(source);
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    plan.validate_tree().unwrap();
+    assert_eq!(plan, analyze(source).1);
+    let PlanNodeKind::Sequence { children } = &plan.tests[0].body.kind else {
+        panic!("sequence")
+    };
+    let node = &children[1];
+    let PlanNodeKind::Retry { child, settings } = &node.kind else {
+        panic!("retry")
+    };
+    assert_eq!(settings.attempts, 3);
+    assert_eq!(settings.backoff.initial.as_millis(), 20);
+    assert_eq!(settings.backoff.max.as_millis(), 1000);
+    assert_eq!(node.path, [1]);
+    assert_eq!(child.path, [1, 0]);
+    assert_eq!(
+        &source[usize::from(node.origin.range.start())..usize::from(node.origin.range.end())],
+        "retry 3 backoff 20ms max 1s { let local = seed expect local == 7 }"
+    );
+    assert_eq!(
+        plan.tests[0]
+            .steps()
+            .iter()
+            .map(|s| s.id.0)
+            .collect::<Vec<_>>(),
+        [0, 1, 2, 3]
+    );
+    for (header, initial, max) in [
+        ("retry 1", 0, 0),
+        ("retry 64 backoff 2s", 2000, 2000),
+        ("retry 3 backoff 0ms max 1s", 0, 1000),
+    ] {
+        let (diagnostics, plan) = analyze(&format!(
+            "test \"defaults\" {{ {header} {{ expect 1 == 1 }} }}"
+        ));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        plan.validate_tree().unwrap();
+        let PlanNodeKind::Sequence { children } = &plan.tests[0].body.kind else {
+            panic!("sequence")
+        };
+        let PlanNodeKind::Retry { settings, .. } = children[0].kind else {
+            panic!("retry")
+        };
+        assert_eq!(settings.backoff.initial.as_millis(), initial);
+        assert_eq!(settings.backoff.max.as_millis(), max);
+    }
+}
+
+#[test]
+fn retry_rejects_invalid_bounds_unsafe_effects_native_captures_and_escaping_locals() {
+    for (body, code, fragment) in [
+        ("retry 0 {}", "semantic.invalid_retry_attempts", "0"),
+        ("retry 65 {}", "semantic.invalid_retry_attempts", "65"),
+        (
+            "retry 999999999999999999999 {}",
+            "semantic.invalid_retry_attempts",
+            "999999999999999999999",
+        ),
+        (
+            "retry 3 backoff 1s max 1ms {}",
+            "semantic.invalid_retry_backoff",
+            "1ms",
+        ),
+        (
+            "retry 3 backoff 86401s {}",
+            "semantic.invalid_retry_backoff",
+            "86401s",
+        ),
+        (
+            "retry 3 backoff 1ms max 86401s {}",
+            "semantic.invalid_retry_backoff",
+            "86401s",
+        ),
+        (
+            "retry 3 { browser { evaluate \"mutate\" } }",
+            "semantic.unsafe_retry",
+            "\"mutate\"",
+        ),
+        (
+            "retry 3 { server { http.post(\"https://example.test\") } }",
+            "semantic.unsafe_retry",
+            "http.post(\"https://example.test\")",
+        ),
+        (
+            "server { let response = http.get(\"https://example.test\") retry 3 { expect response.status == 200 } }",
+            "semantic.non_transferable_retry_capture",
+            "response",
+        ),
+        (
+            "retry 3 { let local = 1 } expect local == 1",
+            "semantic.use_before_definition",
+            "local",
+        ),
+        (
+            "let selected = race { server { retry 2 { provide 1 } expect 1 == 1 } }",
+            "semantic.unreachable_after_provide",
+            "1 == 1 ",
+        ),
+    ] {
+        let source = format!("test \"invalid\" {{ {body} }}");
+        let (diagnostics, _) = analyze(&source);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|d| d.code == code)
+            .unwrap_or_else(|| panic!("{body}: {diagnostics:?}"));
+        assert_eq!(
+            &source[usize::from(diagnostic.range.start())..usize::from(diagnostic.range.end())],
+            fragment,
+            "{body}"
+        );
+        if code.contains("retry") {
+            assert!(
+                diagnostic
+                    .reference_queries
+                    .iter()
+                    .any(|q| q == "control.retry")
+            );
+        }
+    }
+}
+
+#[test]
+fn retry_uses_lexical_browser_ownership_and_shared_concurrency_capture_rules() {
+    for source in [
+        r#"test "local" { retry 3 { browser { expect text("ready").visible } } }"#,
+        r#"test "enclosing" { browser { open "/" retry 3 { expect text("ready").visible } } }"#,
+        r#"test "nested" { parallel { retry 2 { server { retry 3 { expect 1 == 1 } } } } }"#,
+        r#"test "names" { let retry = { backoff: 1, max: 2 } let backoff = retry.backoff let max = retry.max retry 2 { expect max > backoff } }"#,
+    ] {
+        let (diagnostics, plan) = analyze(source);
+        assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
+        plan.validate_tree().unwrap();
+    }
+}
+
+#[test]
+fn changing_provider_repeatability_invalidates_retry_analysis_without_source_changes() {
+    let source = r#"test "contract" { retry 2 { server { http.get("https://example.test") } } }"#;
+    let mut database = AnalysisDatabase::default();
+    let file = database.open_file("retry.webtest", source);
+    assert!(database.diagnostics(file).unwrap().is_empty());
+    let original = database.test_plan(file).unwrap();
+    for retry_safe in [false, true, false] {
+        let mut registry = ProviderRegistry::built_in_schemas();
+        let mut schema = registry.schema("http").unwrap().clone();
+        schema.operations.get_mut("get").unwrap().retry_safe = retry_safe;
+        registry.register_schema(schema);
+        database.set_provider_registry(registry);
+        let diagnostics = database.diagnostics(file).unwrap();
+        assert_eq!(
+            diagnostics
+                .iter()
+                .any(|d| d.code == "semantic.unsafe_retry"),
+            !retry_safe
+        );
+        assert_eq!(
+            database.test_plan(file).unwrap().source_revision,
+            original.source_revision
+        );
+    }
+}
+
+#[test]
 fn timeout_remains_a_contextual_name() {
     let source = r#"test "names" { let timeout = { timeout: 2s } timeout.timeout expect timeout.timeout == 2s timeout 1s { expect timeout.timeout == 2s } server { http.get("https://example.test", timeout: timeout.timeout) } }"#;
     let parsed = webtest_syntax::parse(source);

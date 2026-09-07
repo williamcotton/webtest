@@ -355,3 +355,50 @@ mod race_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use rowan::ast::AstNode;
+
+    #[test]
+    fn retry_is_lossless_in_every_domain_and_keywords_remain_contextual() {
+        for source in [
+            r#"test "x" { retry 3 backoff 20ms max 1s { server { expect 1 == 1 } } }"#,
+            r#"test "x" { server { retry 1 { expect 1 == 1 } } browser { retry 2 backoff 0ms { expect text("ready").visible } } }"#,
+            r#"test "x" { let retry = { backoff: 1, max: 2 } let backoff = retry.backoff let max = retry.max expect max > backoff }"#,
+        ] {
+            let parsed = parse(source);
+            assert_eq!(parsed.syntax().text().to_string(), source);
+            assert!(
+                parsed.errors().is_empty(),
+                "{source}: {:?}",
+                parsed.errors()
+            );
+        }
+        for source in [
+            "test \"x\" { retry",
+            "test \"x\" { retry 3 backoff",
+            "test \"x\" { retry 3 backoff 1s max",
+            "test \"x\" { retry 3 {",
+            "test \"x\" { retry {} }",
+            "test \"x\" { retry -1 {} }",
+            "test \"x\" { retry 1.5 {} }",
+            "test \"x\" { retry 3 max 1s {} }",
+        ] {
+            let parsed = parse(source);
+            assert_eq!(parsed.syntax().text().to_string(), source);
+            assert!(!parsed.errors().is_empty(), "{source}");
+        }
+        let parsed = parse("test \"é\" { retry 3 backoff 20ms max 1s { expect 1 == 1 } }");
+        let retry = parsed
+            .syntax()
+            .descendants()
+            .find_map(ast::RetryStmt::cast)
+            .unwrap();
+        assert_eq!(retry.attempts().unwrap().text(), "3");
+        assert_eq!(retry.backoff().unwrap().syntax().text(), "20ms");
+        assert_eq!(retry.max_backoff().unwrap().syntax().text(), "1s");
+        assert_eq!(retry.flow_statements().count(), 1);
+    }
+}
