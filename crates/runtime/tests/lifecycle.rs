@@ -379,7 +379,7 @@ fn test_capabilities(
             TestOperation::Assertion(webtest_plan::AssertionOperation::Value { .. }) => {
                 capabilities.insert(Capability::Test);
             }
-            TestOperation::EvaluatePure(_) => {}
+            TestOperation::EvaluatePure(_) | TestOperation::Provide(_) => {}
         }
     }
     if capabilities.is_empty() && plan_capabilities.contains(&Capability::Pure) {
@@ -3959,41 +3959,6 @@ async fn nested_parallel_primary_failure_notifies_ancestor_scheduler_before_tear
     assert_scopes_finish_once_after_children(&result.events);
 }
 
-// Until race syntax and result lowering are exposed, exercise its distinct plan
-// node with the same compiler-produced branch scopes and resource recipes.
-fn race_plan(source: &str) -> TestPlan {
-    fn convert(node: &mut webtest_plan::PlanNode, test: webtest_model::PlanDeclarationId) {
-        use webtest_plan::{PlanNode, PlanNodeKind};
-        if let PlanNodeKind::Parallel { children, .. } = &node.kind {
-            *node = PlanNode::race(
-                test,
-                node.origin,
-                node.source_revision,
-                node.path.clone(),
-                children.clone(),
-            );
-        }
-        match &mut node.kind {
-            PlanNodeKind::Sequence { children }
-            | PlanNodeKind::Parallel { children, .. }
-            | PlanNodeKind::Race { children } => {
-                for child in children {
-                    convert(child, test);
-                }
-            }
-            PlanNodeKind::Timeout { child, .. }
-            | PlanNodeKind::ResourceScope { body: child, .. } => convert(child, test),
-            PlanNodeKind::Operation { .. } => {}
-        }
-    }
-    let mut plan = compile_source(source);
-    for test in &mut plan.tests {
-        convert(&mut test.body, test.declaration_id);
-    }
-    plan.validate_tree().unwrap();
-    plan
-}
-
 #[tokio::test(start_paused = true)]
 async fn race_recovers_failed_alternatives_without_publishing_their_diagnostics_or_bindings() {
     for later_failure in [false, true] {
@@ -4010,7 +3975,7 @@ async fn race_recovers_failed_alternatives_without_publishing_their_diagnostics_
         let source = format!(
             r#"test "race" {{
             let seed = 7
-            parallel {{
+            race {{
                 server {{ let local = seed expect local == 8 }}
                 browser {{ evaluate "winner" }}
                 browser {{ evaluate "loser" evaluate "must not run" }}
@@ -4019,7 +3984,7 @@ async fn race_recovers_failed_alternatives_without_publishing_their_diagnostics_
         }}"#,
             if later_failure { 8 } else { 7 }
         );
-        let plan = race_plan(&source);
+        let plan = compile_source(&source);
         let observations = Arc::new(ObservationStore::default());
         let started = tokio::time::Instant::now();
         let result = Runner::new(observations.clone())
@@ -4082,9 +4047,9 @@ async fn race_selects_success_only_after_branch_teardown_finishes() {
         .lock()
         .unwrap()
         .insert(0, Duration::from_millis(50));
-    let plan = race_plan(
+    let plan = compile_source(
         r#"test "teardown is completion" {
-        parallel { browser { evaluate "early body" } browser { evaluate "winner" } }
+        race { browser { evaluate "early body" } browser { evaluate "winner" } }
     }"#,
     );
     let started = tokio::time::Instant::now();
@@ -4120,9 +4085,9 @@ async fn race_all_failures_remain_in_source_order_with_each_observation() {
             }
         }
     }
-    let plan = race_plan(
+    let plan = compile_source(
         r#"test "all failed" {
-        parallel { server { expect 1 == 2 } server { expect 3 == 4 } }
+        race { server { expect 1 == 2 } server { expect 3 == 4 } }
     }"#,
     );
     let observations = Arc::new(ObservationStore::default());
@@ -4174,9 +4139,9 @@ async fn race_infrastructure_failure_cancels_before_teardown_and_cannot_be_recov
         .lock()
         .unwrap()
         .insert(0, Duration::from_millis(100));
-    let plan = race_plan(
+    let plan = compile_source(
         r#"test "unhealthy" {
-        parallel { browser { evaluate "broken" } browser { evaluate "could succeed" } }
+        race { browser { evaluate "broken" } browser { evaluate "could succeed" } }
     }"#,
     );
     let result = Runner::new(Arc::default())
@@ -4213,9 +4178,9 @@ async fn race_loser_cleanup_failure_overrides_success_without_losing_race_loss_c
         ("loser".into(), Duration::from_secs(10)),
     ]);
     state.context_close_failures.lock().unwrap().insert(1);
-    let plan = race_plan(
+    let plan = compile_source(
         r#"test "cleanup fails" {
-        parallel { browser { evaluate "winner" } browser { evaluate "loser" } }
+        race { browser { evaluate "winner" } browser { evaluate "loser" } }
     }"#,
     );
     let result = Runner::new(Arc::default())
@@ -4251,9 +4216,9 @@ async fn race_timeout_before_a_winner_retains_completed_failures_and_cancels_liv
         .lock()
         .unwrap()
         .insert("pending".into(), Duration::from_secs(10));
-    let plan = race_plan(
+    let plan = compile_source(
         r#"test "race expires" {
-        timeout 20ms { parallel { server { expect 1 == 2 } browser { evaluate "pending" } } }
+        timeout 20ms { race { server { expect 1 == 2 } browser { evaluate "pending" } } }
     }"#,
     );
     let observations = Arc::new(ObservationStore::default());
@@ -4295,9 +4260,9 @@ async fn race_timeout_during_loser_teardown_does_not_overwrite_the_first_cancell
         .lock()
         .unwrap()
         .insert(1, Duration::from_millis(100));
-    let plan = race_plan(
+    let plan = compile_source(
         r#"test "cleanup outlasts deadline" {
-        timeout 20ms { parallel { browser { evaluate "winner" } browser { evaluate "loser" } } }
+        timeout 20ms { race { browser { evaluate "winner" } browser { evaluate "loser" } } }
     }"#,
     );
     let started = tokio::time::Instant::now();
@@ -4334,9 +4299,9 @@ async fn race_loser_teardown_uses_the_inherited_cleanup_deadline_and_records_exp
         .lock()
         .unwrap()
         .insert(1, Duration::from_secs(10));
-    let plan = race_plan(
+    let plan = compile_source(
         r#"test "bounded loser cleanup" {
-        parallel { browser { evaluate "winner" } browser { evaluate "loser" } }
+        race { browser { evaluate "winner" } browser { evaluate "loser" } }
     }"#,
     );
     let started = tokio::time::Instant::now();
@@ -4389,10 +4354,10 @@ async fn nested_race_primary_failure_cancels_outer_alternatives_before_inner_tea
         .lock()
         .unwrap()
         .insert(0, Duration::from_millis(100));
-    let plan = race_plan(
+    let plan = compile_source(
         r#"test "nested race" {
-        parallel {
-            parallel { browser { evaluate "broken" } browser { evaluate "pending" } }
+        race {
+            race { browser { evaluate "broken" } browser { evaluate "pending" } }
             browser { evaluate "pending" }
         }
     }"#,
@@ -4423,4 +4388,97 @@ async fn nested_race_primary_failure_cancels_outer_alternatives_before_inner_tea
                 .unwrap()
     );
     assert_scopes_finish_once_after_children(&result.events);
+}
+
+#[tokio::test(start_paused = true)]
+async fn public_race_binds_only_the_selected_value_after_all_loser_cleanup() {
+    let state = Arc::new(LifecycleState::default());
+    state.page_delays.lock().unwrap().extend([
+        ("slow".into(), Duration::from_secs(10)),
+        ("fast".into(), Duration::from_millis(10)),
+    ]);
+    state
+        .context_close_delays
+        .lock()
+        .unwrap()
+        .insert(0, Duration::from_millis(50));
+    let plan = compile_source(
+        r#"test "winner value" {
+        let seed = 7
+        let selected: { answer: Int } = race {
+            browser { evaluate "slow" provide { answer: 1 } }
+            browser { evaluate "fast" let local = seed provide { answer: local } }
+        }
+        expect selected.answer == seed
+    }"#,
+    );
+    let started = tokio::time::Instant::now();
+    let result = Runner::new(Arc::default())
+        .run(&plan, &LifecycleHost(state))
+        .await;
+    assert_eq!(result.passed(), 1, "{:?}", result.tests[0].outcome);
+    assert_eq!(started.elapsed(), Duration::from_millis(60));
+    assert_eq!(result.tests[0].bindings.len(), 2);
+    assert!(!result.tests[0].branches[0].race_winner);
+    assert!(result.tests[0].branches[1].race_winner);
+    assert_scopes_finish_once_after_children(&result.events);
+}
+
+#[tokio::test(start_paused = true)]
+async fn nested_bound_races_and_timeout_provide_preserve_lexical_result_ownership() {
+    let plan = compile_source(
+        r#"test "nested values" {
+        let selected = race {
+            server {
+                let inner = race { timeout 1s { let local = 7 provide local } }
+                provide inner + 1
+            }
+        }
+        expect selected == 8
+    }"#,
+    );
+    let result = Runner::new(Arc::default())
+        .run(&plan, &LifecycleHost(Arc::default()))
+        .await;
+    assert_eq!(result.passed(), 1, "{:?}", result.tests[0].outcome);
+    assert_eq!(
+        result.tests[0].bindings,
+        BTreeMap::from([("selected".into(), Value::Int(8))])
+    );
+    assert!(result.tests[0].branches[0].race_winner);
+    assert!(result.tests[0].branches[0].branches[0].race_winner);
+    assert_scopes_finish_once_after_children(&result.events);
+}
+
+#[tokio::test]
+async fn race_winner_transfer_preserves_provider_redaction_metadata() {
+    let provider = Arc::new(RecordingProvider::new(Ok(Value::Record(
+        [("token".into(), Value::String("winner-private-token".into()))]
+            .into_iter()
+            .collect(),
+    ))));
+    let mut providers = ProviderRegistry::default();
+    providers.register(provider);
+    let source = r#"test "redacted winner" {
+        let selected = race { server {
+            let raw = fake.call()
+            let response: { token: String } = raw
+            provide response.token
+        } }
+        expect selected == selected
+    }"#;
+    let mut db = webtest_analysis::AnalysisDatabase::with_provider_registry(providers.clone());
+    let file = db.open_file("redacted-race.webtest", source);
+    assert!(db.diagnostics(file).unwrap().is_empty());
+    let plan = db.test_plan(file).unwrap();
+    let result = Runner::new(Arc::default())
+        .with_provider_registry(providers)
+        .run(&plan, &LifecycleHost(Arc::default()))
+        .await;
+    assert_eq!(result.passed(), 1, "{:?}", result.tests[0].outcome);
+    assert_eq!(
+        result.tests[0].bindings["selected"],
+        Value::String("[redacted]".into())
+    );
+    assert!(!format!("{:?}", result).contains("winner-private-token"));
 }

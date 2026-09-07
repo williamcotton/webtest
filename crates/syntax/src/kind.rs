@@ -127,6 +127,10 @@ pub enum SyntaxKind {
     TimeoutStmt,
     ParallelKw,
     ParallelStmt,
+    RaceKw,
+    RaceStmt,
+    ProvideKw,
+    ProvideStmt,
     Eof,
 }
 
@@ -141,6 +145,8 @@ impl SyntaxKind {
             Self::TestKw
                 | Self::TimeoutKw
                 | Self::ParallelKw
+                | Self::RaceKw
+                | Self::ProvideKw
                 | Self::BrowserKw
                 | Self::OpenKw
                 | Self::EvaluateKw
@@ -347,7 +353,11 @@ impl Language for WebtestLanguage {
             121 => SyntaxKind::TimeoutStmt,
             122 => SyntaxKind::ParallelKw,
             123 => SyntaxKind::ParallelStmt,
-            124 => SyntaxKind::Eof,
+            124 => SyntaxKind::RaceKw,
+            125 => SyntaxKind::RaceStmt,
+            126 => SyntaxKind::ProvideKw,
+            127 => SyntaxKind::ProvideStmt,
+            128 => SyntaxKind::Eof,
             _ => SyntaxKind::Error,
         }
     }

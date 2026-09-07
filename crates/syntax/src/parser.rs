@@ -116,10 +116,14 @@ impl<'a> Parser<'a> {
 
     fn statement(&mut self, domain: BlockDomain) {
         match (domain, self.current()) {
-            (_, SyntaxKind::ParallelKw)
+            (_, SyntaxKind::ParallelKw | SyntaxKind::RaceKw)
                 if matches!(self.nth_non_trivia(1), SyntaxKind::LBrace | SyntaxKind::Eof) =>
             {
-                self.start(SyntaxKind::ParallelStmt);
+                self.start(if self.current() == SyntaxKind::RaceKw {
+                    SyntaxKind::RaceStmt
+                } else {
+                    SyntaxKind::ParallelStmt
+                });
                 self.bump();
                 self.braced_block(SyntaxKind::Block, domain);
                 self.finish();
@@ -138,7 +142,16 @@ impl<'a> Parser<'a> {
             (BlockDomain::Test, SyntaxKind::BrowserKw) => {
                 self.capability_block(SyntaxKind::BrowserBlock, BlockDomain::Browser)
             }
-            (_, SyntaxKind::LetKw) => self.let_statement(),
+            (_, SyntaxKind::ProvideKw)
+                if self.expression_start(self.nth_non_trivia(1))
+                    || matches!(self.nth_non_trivia(1), SyntaxKind::RBrace | SyntaxKind::Eof) =>
+            {
+                self.start(SyntaxKind::ProvideStmt);
+                self.bump();
+                self.require_expression("expected result expression after `provide`");
+                self.finish();
+            }
+            (_, SyntaxKind::LetKw) => self.let_statement(domain),
             (BlockDomain::Browser, SyntaxKind::OpenKw) => self.open_statement(),
             (BlockDomain::Browser, SyntaxKind::EvaluateKw) => self.evaluate_statement(),
             (BlockDomain::Browser, SyntaxKind::ClickKw) => {
@@ -229,13 +242,17 @@ impl<'a> Parser<'a> {
         self.finish();
     }
 
-    fn let_statement(&mut self) {
+    fn let_statement(&mut self, domain: BlockDomain) {
         self.start(SyntaxKind::LetStmt);
         self.bump();
         self.eat_trivia();
         if matches!(
             self.current(),
-            SyntaxKind::Ident | SyntaxKind::TimeoutKw | SyntaxKind::ParallelKw
+            SyntaxKind::Ident
+                | SyntaxKind::TimeoutKw
+                | SyntaxKind::ParallelKw
+                | SyntaxKind::RaceKw
+                | SyntaxKind::ProvideKw
         ) {
             self.bump();
         } else {
@@ -254,7 +271,14 @@ impl<'a> Parser<'a> {
             "syntax.expected_equal",
             "expected `=` in binding",
         );
-        self.require_expression("expected expression after `=`");
+        self.eat_trivia();
+        if self.current() == SyntaxKind::RaceKw
+            && matches!(self.nth_non_trivia(1), SyntaxKind::LBrace | SyntaxKind::Eof)
+        {
+            self.statement(domain);
+        } else {
+            self.require_expression("expected expression after `=`");
+        }
         self.finish();
     }
 
@@ -770,6 +794,8 @@ impl<'a> Parser<'a> {
             SyntaxKind::Ident
                 | SyntaxKind::TimeoutKw
                 | SyntaxKind::ParallelKw
+                | SyntaxKind::RaceKw
+                | SyntaxKind::ProvideKw
                 | SyntaxKind::NameKw
                 | SyntaxKind::IdKw
                 | SyntaxKind::RoleKw

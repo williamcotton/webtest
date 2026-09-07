@@ -14,9 +14,9 @@ identity, and the existing revision-safe observations and DAP `RunControl` hook.
 
 Milestone E changes how operations are scheduled, owned, cancelled, and observed. It must preserve the same compiler, plan, runner, provider, browser, editor, and debugger paths used by sequential execution, while establishing generic execution-scope, resource-lifecycle, cancellation, deadline, wait, and event-journal abstractions that later milestones can extend without introducing another runtime architecture. [`milestone-f.md`](./milestone-f.md), [`milestone-h.md`](./milestone-h.md), and [`milestone-i.md`](./milestone-i.md) are forward-compatibility constraints, not dependencies and not authorization to implement their public features early.
 
-### Implementation progress — 2026-09-06
+### Implementation progress — 2026-09-07
 
-Milestone E is **not complete**. The execution-tree, resource/wait foundations, timeout, and public parallel path are implemented:
+Milestone E is **not complete**. The execution-tree, resource/wait foundations, timeout, public parallel, and public race/result paths are implemented:
 
 - Tests and capability blocks lower through explicit `Sequence` nodes. Leaf operations exist only
   in that tree; diagnostic, debugger, and secret-checking traversal is a read-only projection.
@@ -27,11 +27,11 @@ Milestone E is **not complete**. The execution-tree, resource/wait foundations, 
   occurrences. Browser acquisition is an explicit lexical `ResourceScope` in the plan; a test root includes test cleanup. Descendants interrupted
   by the existing test deadline record cancellation and its causing scope; the root records its
   final outcome after cleanup. Cancellation facts retain their typed reason and causing scope.
-- Plan format 7 and runtime semantics 4 version the tree and timeout behavior independently. Native builds fingerprint
+- Plan format 8 and runtime semantics 5 version the tree and timeout behavior independently. Native builds fingerprint
   resolved configuration, keeping configuration values out of the artifact. Shared validation
   checks tree structure, identities, revisions, capability requirements, and explicit execution
   inputs for detectable drift. There is still no CLI command to execute an emitted plan.
-- CLI report/event schema 5 includes typed scope facts, shared typed cancellation reasons, and ordered branch aggregates. This remains the existing event stream,
+- CLI report/event schema 6 includes typed scope facts, shared typed cancellation reasons, and ordered branch aggregates. This remains the existing event stream,
   not yet E's authoritative bounded journal with replay-safe event identity.
 - Runtime observations accumulate privately and commit as a complete batch. Starting another
   run clears prior observations and prevents an older in-flight run from overwriting the newer
@@ -71,7 +71,7 @@ Milestone E is **not complete**. The execution-tree, resource/wait foundations, 
 
 Remaining work includes complete resource ownership and explicit host interruption across HTTP,
 bridge/application startup and lifecycle, non-Unix process trees, and browser sessions;
-race/retry syntax, semantics, and scheduling; isolated `--jobs`; the authoritative event journal;
+retry syntax, semantics, and scheduling; isolated `--jobs`; the authoritative event journal;
 trace artifacts/viewer; observation IPC; concurrent DAP behavior; and their conformance/stress
 coverage. The acceptance criteria below remain normative and unsatisfied as a whole.
 
@@ -188,6 +188,52 @@ formatter, editor and portable compiler coverage remain the next vertical slice.
 construct the distinct plan node from compiler-produced parallel branch recipes; the parser and
 `describe` still correctly reject/do not advertise the unimplemented public syntax. Retry, jobs,
 remaining host-resource conformance, journal, traces, IPC, and concurrent DAP remain pending.
+
+### Checkpoint 5 continuation — public race and winner values — 2026-09-07
+
+Checkpoint 5 (`1f2997f`) is accepted. Public `race { ... }`, `provide <expression>`, and
+`let selected [: Type] = race { ... }` now run through the shared contextual lexer/parser, typed
+AST, independently scoped HIR, analysis, plan, and execution paths. `provide` evaluates a pure
+transferable expression and terminates its branch; it must be the final statement, including through
+nested timeout/capability blocks. Provider calls use an ordinary local `let` before `provide`.
+Nested parallel branches cannot provide to an enclosing race. Nested races bind their own result
+locally and can explicitly provide it to an outer branch.
+
+Bound races require every direct branch to provide a compatible transferable type. Explicit
+annotations constrain every result; inference preserves compatible numeric, nullable and compound
+types. Captures and browser ownership use parallel's existing generic conflict checks and lexical
+contexts. The parent binds only the final winner value after all sibling teardown. Native handle
+results are rejected, and runtime transfer carries redaction metadata alongside the value so parent
+bindings and debugger views cannot reveal provider secrets. Losing values never enter the parent
+environment. The emitted-plan secret checker follows all possible winner expressions, including
+nested result bindings, so race cannot bypass literal-secret rejection.
+
+Plan format 8/runtime semantics 5 represent explicit `Provide` operations and typed race result
+bindings; readers reject the earlier contracts. CLI report/event schema 6 and DAP branch projections
+mark `race_winner` on the final selected branch. All alternatives retain ordered typed outcomes and
+cleanup facts. The existing first-success scheduler, cancellation causality, observation recovery,
+and bounded structured teardown remain shared with parallel.
+
+Canonical `control.race` and `statement.provide` descriptions include constraints, result rules,
+contexts, examples and search/category membership. CST formatting and semantic tokens preserve
+contextual names; hover and portable WASM compilation use the same result-type facts and plan.
+The installed authoring skill and initializer parity checks are updated. The passing
+`examples/structured-execution/race.webtest` demonstrates compatible records and nested values.
+
+Focused coverage now includes lossless partial syntax, AST/HIR/plan origins and binding identity,
+invalid result flow/type/native captures, runtime winner-only value transfer and redaction, nested
+race/timeout results, plan-result validation, all CLI reporters, emitted-secret rejection, formatter
+idempotence, semantic tokens/hover, and native/WASM parity. The checkpoint 5 scheduler tests now
+execute actual race source through the public compiler path.
+
+Validation: `cargo test --workspace` passed with default threading, including Chrome and LSP/DAP
+protocol tests. The final diagnostic-range refinement also passed the analysis suite. Workspace
+Clippy with `-D warnings`, Rust formatting, and the portable `wasm32-unknown-unknown` check passed.
+The rebuilt CLI checks and formats all three structured-execution files, runs all five tests
+successfully, and describes both public topics. The runtime lifecycle suite now has 77 passing tests.
+
+Milestone E remains incomplete: retry, isolated jobs, full host-resource conformance, the authoritative
+bounded event journal, traces/viewer, observation IPC, and concurrent DAP control remain pending.
 
 ## 1. Outcome
 

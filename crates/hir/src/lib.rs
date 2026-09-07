@@ -28,12 +28,29 @@ pub struct HirTest {
 pub enum HirStmt {
     Timeout(HirTimeout),
     Parallel(HirParallel),
+    Race(HirRace),
+    Provide(HirExpressionStmt),
     Server(HirServerBlock),
     Browser(HirBrowserBlock),
     Let(HirLet),
     Expression(HirExpressionStmt),
     Expect(HirExpectation),
     BrowserOperation(HirBrowserOp),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HirRace {
+    pub branches: Vec<HirStmt>,
+    pub binding: Option<HirResultBinding>,
+    pub origin: SyntaxOrigin,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HirResultBinding {
+    pub id: BindingId,
+    pub name: String,
+    pub annotation: Option<HirType>,
+    pub name_origin: SyntaxOrigin,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -329,6 +346,13 @@ fn lower_test(
 
 fn lower_flow_statement(context: &mut LowerContext, statement: FlowStatement) -> Option<HirStmt> {
     match statement {
+        FlowStatement::Race(statement) => {
+            lower_race(context, statement, true, None).map(HirStmt::Race)
+        }
+        FlowStatement::Provide(statement) => Some(HirStmt::Provide(HirExpressionStmt {
+            expression: lower_expr(context, statement.expression()?)?,
+            origin: origin(context.file, statement.syntax()),
+        })),
         FlowStatement::Parallel(statement) => {
             lower_parallel(context, statement, true).map(HirStmt::Parallel)
         }
@@ -355,7 +379,13 @@ fn lower_flow_statement(context: &mut LowerContext, statement: FlowStatement) ->
                 origin: origin(context.file, block.syntax()),
             }))
         }
-        FlowStatement::Let(statement) => lower_let(context, statement).map(HirStmt::Let),
+        FlowStatement::Let(statement) => {
+            if let Some(race) = statement.race() {
+                lower_race(context, race, true, Some(statement)).map(HirStmt::Race)
+            } else {
+                lower_let(context, statement).map(HirStmt::Let)
+            }
+        }
         FlowStatement::Expression(statement) => {
             lower_expression_statement(context, statement).map(HirStmt::Expression)
         }
@@ -370,13 +400,26 @@ fn lower_domain_statement(
     statement: DomainStatement,
 ) -> Option<HirStmt> {
     match statement {
+        DomainStatement::Race(statement) => {
+            lower_race(context, statement, false, None).map(HirStmt::Race)
+        }
+        DomainStatement::Provide(statement) => Some(HirStmt::Provide(HirExpressionStmt {
+            expression: lower_expr(context, statement.expression()?)?,
+            origin: origin(context.file, statement.syntax()),
+        })),
         DomainStatement::Parallel(statement) => {
             lower_parallel(context, statement, false).map(HirStmt::Parallel)
         }
         DomainStatement::Timeout(statement) => {
             lower_timeout(context, statement, false).map(HirStmt::Timeout)
         }
-        DomainStatement::Let(statement) => lower_let(context, statement).map(HirStmt::Let),
+        DomainStatement::Let(statement) => {
+            if let Some(race) = statement.race() {
+                lower_race(context, race, false, Some(statement)).map(HirStmt::Race)
+            } else {
+                lower_let(context, statement).map(HirStmt::Let)
+            }
+        }
         DomainStatement::Expression(statement) => {
             lower_expression_statement(context, statement).map(HirStmt::Expression)
         }
@@ -415,6 +458,54 @@ fn lower_parallel(
     };
     context.bindings = bindings;
     Some(HirParallel {
+        branches,
+        origin: origin(context.file, statement.syntax()),
+    })
+}
+
+fn lower_race(
+    context: &mut LowerContext,
+    statement: ast::RaceStmt,
+    flow: bool,
+    binding: Option<ast::LetStmt>,
+) -> Option<HirRace> {
+    statement.body()?;
+    let bindings = context.bindings.clone();
+    let branches = if flow {
+        statement
+            .flow_statements()
+            .filter_map(|child| {
+                context.bindings = bindings.clone();
+                lower_flow_statement(context, child)
+            })
+            .collect()
+    } else {
+        statement
+            .domain_statements()
+            .filter_map(|child| {
+                context.bindings = bindings.clone();
+                lower_domain_statement(context, child)
+            })
+            .collect()
+    };
+    context.bindings = bindings;
+    let binding = binding.and_then(|binding| {
+        let token = binding.name()?;
+        let name = token.text().to_owned();
+        let id = BindingId(context.next_binding);
+        context.next_binding += 1;
+        context.bindings.entry(name.clone()).or_insert(id);
+        Some(HirResultBinding {
+            id,
+            name,
+            name_origin: SyntaxOrigin::new(context.file, token.text_range()),
+            annotation: binding
+                .annotation()
+                .and_then(|ty| lower_type(context.file, ty)),
+        })
+    });
+    Some(HirRace {
+        binding,
         branches,
         origin: origin(context.file, statement.syntax()),
     })
@@ -863,5 +954,37 @@ mod tests {
             &source[usize::from(range.start())..usize::from(range.end())],
             "{ id: Int, email: String }"
         );
+    }
+}
+
+#[cfg(test)]
+mod race_tests {
+    use super::*;
+    #[test]
+    fn race_binding_is_allocated_after_independent_branch_environments_and_origins_are_exact() {
+        let source = "test \"x\" { let selected = race { server { let local = 7 provide local } server { provide 8 } } expect selected == 7 }";
+        let file = lower(FileId::new(1), &webtest_syntax::parse(source));
+        let HirStmt::Race(race) = &file.tests[0].body[0] else {
+            panic!("race")
+        };
+        assert_eq!(race.binding.as_ref().unwrap().id, BindingId(1));
+        let range = race.origin.range;
+        assert_eq!(
+            &source[u32::from(range.start()) as usize..u32::from(range.end()) as usize],
+            "race { server { let local = 7 provide local } server { provide 8 } }"
+        );
+        let HirStmt::Server(first) = &race.branches[0] else {
+            panic!("server")
+        };
+        let HirStmt::Provide(value) = &first.statements[1] else {
+            panic!("provide")
+        };
+        assert!(matches!(
+            &value.expression.kind,
+            HirExprKind::Name(HirNameRef::Binding {
+                id: BindingId(0),
+                ..
+            })
+        ));
     }
 }

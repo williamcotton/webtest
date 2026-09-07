@@ -464,7 +464,7 @@ fn check_without_paths_discovers_configured_tests_in_order() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON report");
-    assert_eq!(report["schema_version"], 5);
+    assert_eq!(report["schema_version"], 6);
     let paths = report["files"]
         .as_array()
         .expect("files")
@@ -600,8 +600,8 @@ fn build_emits_a_versioned_typed_plan_deterministically() {
     let first_bytes = fs::read(&first).expect("first plan");
     assert_eq!(first_bytes, fs::read(&second).expect("second plan"));
     let plan: serde_json::Value = serde_json::from_slice(&first_bytes).expect("plan JSON");
-    assert_eq!(plan["format_version"], 7);
-    assert_eq!(plan["runtime_semantics_version"], 4);
+    assert_eq!(plan["format_version"], 8);
+    assert_eq!(plan["runtime_semantics_version"], 5);
     assert_eq!(plan["required_host_capabilities"][0], "server");
     assert_eq!(
         plan["tests"][0]["required_host_capabilities"],
@@ -843,7 +843,7 @@ fn parallel_reports_every_branch_failure_in_deterministic_source_order() {
         if reporter == "json" || reporter == "events" {
             let test = if reporter == "json" {
                 let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-                assert_eq!(value["schema_version"], 5);
+                assert_eq!(value["schema_version"], 6);
                 value["files"][0]["tests"][0].clone()
             } else {
                 let events: Vec<serde_json::Value> = text
@@ -854,7 +854,7 @@ fn parallel_reports_every_branch_failure_in_deterministic_source_order() {
                     .iter()
                     .find(|event| event["type"] == "test_result")
                     .unwrap();
-                assert_eq!(aggregate["schema_version"], 5);
+                assert_eq!(aggregate["schema_version"], 6);
                 aggregate["test"].clone()
             };
             assert_eq!(test["outcome"], "failed");
@@ -888,4 +888,69 @@ fn parallel_reports_every_branch_failure_in_deterministic_source_order() {
             }
         }
     }
+}
+
+#[test]
+fn public_race_reports_the_winner_and_retains_failed_alternatives() {
+    let directory = tempfile::tempdir().unwrap();
+    write(
+        &directory.path().join("race.webtest"),
+        r#"test "choice" {
+        let selected = race {
+            server { expect 1 == 2 provide "failed" }
+            server { provide "winner" }
+        }
+        expect selected == "winner"
+    }"#,
+    );
+    for reporter in ["json", "events", "junit", "human", "concise"] {
+        let output = webtest(directory.path())
+            .args(["test", "race.webtest", "--reporter", reporter])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{reporter}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        if reporter == "json" {
+            let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+            assert_eq!(report["schema_version"], 6);
+            let test = &report["files"][0]["tests"][0];
+            assert_eq!(test["outcome"], "passed");
+            assert_eq!(test["branches"][0]["race_winner"], false);
+            assert_eq!(test["branches"][0]["result"]["outcome"], "failed");
+            assert_eq!(test["branches"][1]["race_winner"], true);
+        } else if reporter == "events" || reporter == "junit" {
+            assert!(stdout.contains("race_winner"), "{stdout}");
+        } else {
+            assert!(stdout.contains("race winner"), "{stdout}");
+        }
+    }
+}
+
+#[test]
+fn emitted_plans_reject_literal_secrets_returned_through_any_race_alternative() {
+    let directory = tempfile::tempdir().unwrap();
+    write(
+        &directory.path().join("secret.webtest"),
+        r#"test "secret" {
+        let credential = race {
+            server { provide "do-not-emit" }
+            server { provide "other-secret" }
+        }
+        server { http.post("http://example.test/login", json: { password: credential }) }
+    }"#,
+    );
+    let output = webtest(directory.path())
+        .args(["build", "secret.webtest", "--emit", "plan.json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(!directory.path().join("plan.json").exists());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("literal secret"), "{stderr}");
+    assert!(!stderr.contains("do-not-emit"));
 }

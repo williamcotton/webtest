@@ -759,3 +759,118 @@ fn parallel_rejects_invalid_children_escaping_locals_native_captures_and_shared_
             .any(|diagnostic| diagnostic.code == "semantic.invalid_parallel")
     );
 }
+
+#[test]
+fn race_result_binding_and_provide_have_deterministic_ids_types_and_precise_origins() {
+    let source = r#"test "typed race" {
+        let seed = 7
+        let selected: Int = race {
+            server { let local = seed provide local }
+            server { provide 8 }
+        }
+        expect selected == seed
+    }"#;
+    let (diagnostics, plan) = analyze(source);
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    assert_eq!(plan, analyze(source).1);
+    plan.validate_tree().unwrap();
+    let steps = plan.tests[0].steps();
+    assert_eq!(
+        steps.iter().map(|step| step.id.0).collect::<Vec<_>>(),
+        [0, 1, 2, 3, 4]
+    );
+    assert!(matches!(steps[2].operation, TestOperation::Provide(_)));
+    let range = steps[2].origin.range;
+    assert_eq!(
+        &source[u32::from(range.start()) as usize..u32::from(range.end()) as usize],
+        "local"
+    );
+    let webtest_plan::PlanNodeKind::Sequence { children } = &plan.tests[0].body.kind else {
+        panic!("sequence")
+    };
+    let webtest_plan::PlanNodeKind::Race {
+        children: branches,
+        result: Some(binding),
+    } = &children[1].kind
+    else {
+        panic!("race")
+    };
+    assert_eq!(binding.name, "selected");
+    assert_eq!(binding.ty, Type::Int);
+    assert_eq!(binding.id, BindingId(2));
+    assert_eq!(branches[0].path, [1, 0]);
+    assert_eq!(branches[1].path, [1, 1]);
+}
+
+#[test]
+fn race_rejects_invalid_result_flow_and_preserves_lexical_bindings() {
+    for (body, code) in [
+        ("provide 1", "semantic.provide_outside_race"),
+        ("race {}", "semantic.invalid_race"),
+        ("race { expect 1 == 1 }", "semantic.expected_race_block"),
+        (
+            "let x = race { server { provide 1 } server { expect 1 == 1 } }",
+            "semantic.missing_race_result",
+        ),
+        (
+            "let x = race { server { provide 1 } server { provide true } }",
+            "semantic.type_mismatch",
+        ),
+        (
+            "let x: String = race { server { provide 1 } }",
+            "semantic.type_mismatch",
+        ),
+        (
+            "let x: StatusCode = race { server { provide 200 } }",
+            "semantic.non_transferable_race_result",
+        ),
+        (
+            "race { server { provide 1 expect 1 == 1 } }",
+            "semantic.unreachable_after_provide",
+        ),
+        (
+            "race { timeout 1s { provide 1 } } expect local == 1",
+            "semantic.unknown_name",
+        ),
+        (
+            "race { server { let local = 1 provide local } server { provide local } }",
+            "semantic.use_before_definition",
+        ),
+        (
+            "race { parallel { server { provide 1 } } }",
+            "semantic.provide_outside_race",
+        ),
+        (
+            "let x = race { server { let x = x provide x } }",
+            "semantic.use_before_definition",
+        ),
+        (
+            "race { server { let handle = fs.temp_dir() provide handle } }",
+            "semantic.non_transferable_race_result",
+        ),
+    ] {
+        let source = format!("test \"invalid race\" {{ {body} }}");
+        let mut db = AnalysisDatabase::default();
+        let file = db.open_file("file:///race.webtest", source);
+        let diagnostics = db.diagnostics(file).unwrap();
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic.code == code),
+            "{body}: {diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn race_infers_numeric_and_nullable_compatible_types_in_either_branch_order() {
+    for values in [
+        "provide 1 } server { provide 2.5",
+        "provide 2.5 } server { provide 1",
+        "provide null } server { provide 2.5",
+    ] {
+        let (diagnostics, plan) = analyze(&format!(
+            "test \"compatible\" {{ let value = race {{ server {{ {values} }} }} }}"
+        ));
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        plan.validate_tree().unwrap();
+    }
+}

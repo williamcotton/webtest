@@ -303,3 +303,55 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod race_tests {
+    use super::*;
+    use rowan::ast::AstNode;
+    #[test]
+    fn race_and_provide_are_lossless_contextual_and_recover_partial_input() {
+        for source in [
+            "test \"x\" { let selected: String = race { server { provide \"a\" } server { provide \"b\" } } expect selected == \"a\" }",
+            "test \"x\" { let race = 1 let provide = { race: 2 } expect provide.race == race }",
+            "test \"x\" { server { race { timeout 1s { provide 1 } timeout 1s { provide 2 } } } }",
+        ] {
+            let parsed = parse(source);
+            assert_eq!(parsed.syntax().text().to_string(), source);
+            assert!(
+                parsed.errors().is_empty(),
+                "{source}: {:?}",
+                parsed.errors()
+            );
+        }
+        for source in [
+            "test \"x\" { race",
+            "test \"x\" { let value = race { server { provide",
+            "test \"x\" { race { server { provide } } }",
+        ] {
+            let parsed = parse(source);
+            assert_eq!(parsed.syntax().text().to_string(), source);
+            assert!(!parsed.errors().is_empty(), "{source}");
+        }
+        let source = "test \"x\" { let value = race { server { provide 42 } } }";
+        let parsed = parse(source);
+        let binding = parsed
+            .syntax()
+            .descendants()
+            .find_map(ast::LetStmt::cast)
+            .unwrap();
+        let race = binding.race().unwrap();
+        assert_eq!(
+            race.syntax().text().to_string(),
+            "race { server { provide 42 } }"
+        );
+        let provide = race
+            .syntax()
+            .descendants()
+            .find_map(ast::ProvideStmt::cast)
+            .unwrap();
+        assert_eq!(
+            provide.expression().unwrap().syntax().text().to_string(),
+            "42"
+        );
+    }
+}

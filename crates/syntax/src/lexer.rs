@@ -185,6 +185,8 @@ pub(crate) fn lex(source: &str) -> Vec<Token> {
                     "server" => SyntaxKind::ServerKw,
                     "timeout" => SyntaxKind::TimeoutKw,
                     "parallel" => SyntaxKind::ParallelKw,
+                    "race" => SyntaxKind::RaceKw,
+                    "provide" => SyntaxKind::ProvideKw,
                     "let" => SyntaxKind::LetKw,
                     "true" => SyntaxKind::TrueKw,
                     "false" => SyntaxKind::FalseKw,

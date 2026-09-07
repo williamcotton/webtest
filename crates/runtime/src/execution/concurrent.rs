@@ -8,6 +8,7 @@ impl TreeExecution<'_, '_> {
         children: &[PlanNode],
         parent: &scopes::ExecutionScope,
         policy: scheduler::SiblingPolicy,
+        binding: Option<&webtest_plan::RaceBinding>,
     ) -> TestBodyOutcome {
         let mut observations = ObservationProjection::new(self.services);
         let services = ExecutionServices {
@@ -30,18 +31,23 @@ impl TreeExecution<'_, '_> {
             })
             .collect();
         let first = self.branch.completed_branches.len();
+        let mut transfers = std::collections::BTreeMap::new();
         let winner = scheduler::schedule(
             &parent.context,
             policy,
             children,
-            |result| match &result.outcome {
+            |completion| match &completion.result.outcome {
                 TestOutcome::Passed => scheduler::Completion::Passed,
                 outcome => outcome.failure_class().map_or(
                     scheduler::Completion::Cancelled,
                     scheduler::Completion::Failed,
                 ),
             },
-            |_, result| {
+            |ordinal, completion| {
+                if let Some(value) = completion.provided {
+                    transfers.insert(ordinal, value);
+                }
+                let result = completion.result;
                 // Persist completed children in the parent's own state as they
                 // finish. An enclosing interrupted wait cannot discard them.
                 self.branch.completed_branches.push(result);
@@ -55,7 +61,22 @@ impl TreeExecution<'_, '_> {
                 .task_path
                 .cmp(&b.scope.execution_context.task_path)
         });
-        if winner.is_some() {
+        if let Some(winner) = winner {
+            if let Some(binding) = binding {
+                let Some(transfer) = transfers.remove(&winner) else {
+                    return TestBodyOutcome::Provisional(ProvisionalTestOutcome::Aborted {
+                        failure: RunError::Internal(
+                            "race winner did not provide its required result".into(),
+                        ),
+                    });
+                };
+                if let Err(failure) = self.branch.bindings.bind_transfer(binding, transfer) {
+                    return TestBodyOutcome::Provisional(ProvisionalTestOutcome::Aborted {
+                        failure,
+                    });
+                }
+            }
+            results[winner].race_winner = true;
             observations.recovered = true;
             return TestBodyOutcome::Provisional(ProvisionalTestOutcome::Passed);
         }
@@ -119,12 +140,17 @@ fn severity(outcome: &TestOutcome) -> u8 {
     }
 }
 
+struct BranchCompletion {
+    result: BranchResult,
+    provided: Option<state::ValueTransfer>,
+}
+
 async fn execute_branch(
     services: &ExecutionServices<'_>,
     node: &PlanNode,
     scope: scopes::ExecutionScope,
     mut branch: branch::BranchState,
-) -> BranchResult {
+) -> BranchCompletion {
     let started = StdInstant::now();
     let cleanup_timeout = scope.cleanup_timeout(services.options.cleanup_timeout);
     branch.scopes.start(
@@ -289,11 +315,23 @@ async fn execute_branch(
             .task_path
             .cmp(&b.scope.execution_context.task_path)
     });
-    BranchResult {
-        scope: event,
-        outcome,
-        duration: started.elapsed(),
-        branches: branch.completed_branches,
+    let provided = if matches!(outcome, TestOutcome::Passed) {
+        branch
+            .provided
+            .take()
+            .map(|value| branch.bindings.transfer(value))
+    } else {
+        None
+    };
+    BranchCompletion {
+        provided,
+        result: BranchResult {
+            race_winner: false,
+            scope: event,
+            outcome,
+            duration: started.elapsed(),
+            branches: branch.completed_branches,
+        },
     }
 }
 

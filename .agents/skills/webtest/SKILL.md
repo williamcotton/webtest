@@ -165,5 +165,11 @@ flow domain acquire independent contexts. Do not capture native resource handles
 inherited browser context concurrently. Test failures are collected in source order; an
 infrastructure/internal primary failure cancels siblings promptly and every teardown is awaited.
 Inspect the report's typed `branches` aggregate as well as its summary outcome.
-Race, retry, jobs, traces, and concurrent debugger stepping remain unfinished; discover those
+Use `webtest describe control.race` and `webtest describe statement.provide` for alternatives.
+`let choice: String = race { server { provide "left" } server { provide "right" } }`
+binds only the first successful branch's compatible transferable result, after every teardown.
+`provide` ends its branch and must be its final statement. Failed alternatives remain in the
+branch aggregate; `race_winner` identifies the winner. Losers receive typed `RaceLost`
+cancellation, and cleanup or infrastructure failures can still abort the race.
+Retry, jobs, traces, and concurrent debugger stepping remain unfinished; discover those
 features with the installed binary before using them.

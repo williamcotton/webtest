@@ -33,6 +33,8 @@ ast_node!(BrowserBlock, BrowserBlock);
 ast_node!(LetStmt, LetStmt);
 ast_node!(TimeoutStmt, TimeoutStmt);
 ast_node!(ParallelStmt, ParallelStmt);
+ast_node!(RaceStmt, RaceStmt);
+ast_node!(ProvideStmt, ProvideStmt);
 ast_node!(ExprStmt, ExprStmt);
 ast_node!(ExpectExprStmt, ExpectExprStmt);
 ast_node!(OpenStmt, OpenStmt);
@@ -220,7 +222,38 @@ impl ParallelStmt {
     }
 }
 
+impl RaceStmt {
+    pub fn body(&self) -> Option<Block> {
+        self.syntax.children().find_map(Block::cast)
+    }
+    pub fn flow_statements(&self) -> impl Iterator<Item = FlowStatement> {
+        self.body().into_iter().flat_map(|body| {
+            body.syntax
+                .children()
+                .filter_map(FlowStatement::cast)
+                .collect::<Vec<_>>()
+        })
+    }
+    pub fn domain_statements(&self) -> impl Iterator<Item = DomainStatement> {
+        self.body().into_iter().flat_map(|body| {
+            body.syntax
+                .children()
+                .filter_map(DomainStatement::cast)
+                .collect::<Vec<_>>()
+        })
+    }
+}
+
+impl ProvideStmt {
+    pub fn expression(&self) -> Option<Expr> {
+        self.syntax.children().find_map(Expr::cast)
+    }
+}
+
 impl LetStmt {
+    pub fn race(&self) -> Option<RaceStmt> {
+        self.syntax.children().find_map(RaceStmt::cast)
+    }
     pub fn name(&self) -> Option<SyntaxToken> {
         self.syntax
             .children_with_tokens()
@@ -228,7 +261,11 @@ impl LetStmt {
             .find(|token| {
                 matches!(
                     token.kind(),
-                    SyntaxKind::Ident | SyntaxKind::TimeoutKw | SyntaxKind::ParallelKw
+                    SyntaxKind::Ident
+                        | SyntaxKind::TimeoutKw
+                        | SyntaxKind::ParallelKw
+                        | SyntaxKind::RaceKw
+                        | SyntaxKind::ProvideKw
                 )
             })
     }
@@ -385,6 +422,8 @@ pub enum BrowserOperation {
 pub enum FlowStatement {
     Timeout(TimeoutStmt),
     Parallel(ParallelStmt),
+    Race(RaceStmt),
+    Provide(ProvideStmt),
     Server(ServerBlock),
     Browser(BrowserBlock),
     Let(LetStmt),
@@ -397,6 +436,8 @@ impl FlowStatement {
         match node.kind() {
             SyntaxKind::TimeoutStmt => TimeoutStmt::cast(node).map(Self::Timeout),
             SyntaxKind::ParallelStmt => ParallelStmt::cast(node).map(Self::Parallel),
+            SyntaxKind::RaceStmt => RaceStmt::cast(node).map(Self::Race),
+            SyntaxKind::ProvideStmt => ProvideStmt::cast(node).map(Self::Provide),
             SyntaxKind::ServerBlock => ServerBlock::cast(node).map(Self::Server),
             SyntaxKind::BrowserBlock => BrowserBlock::cast(node).map(Self::Browser),
             SyntaxKind::LetStmt => LetStmt::cast(node).map(Self::Let),
@@ -411,6 +452,8 @@ impl FlowStatement {
 pub enum DomainStatement {
     Timeout(TimeoutStmt),
     Parallel(ParallelStmt),
+    Race(RaceStmt),
+    Provide(ProvideStmt),
     Let(LetStmt),
     Expression(ExprStmt),
     Expect(ExpectExprStmt),
@@ -422,6 +465,8 @@ impl DomainStatement {
         match node.kind() {
             SyntaxKind::TimeoutStmt => TimeoutStmt::cast(node).map(Self::Timeout),
             SyntaxKind::ParallelStmt => ParallelStmt::cast(node).map(Self::Parallel),
+            SyntaxKind::RaceStmt => RaceStmt::cast(node).map(Self::Race),
+            SyntaxKind::ProvideStmt => ProvideStmt::cast(node).map(Self::Provide),
             SyntaxKind::LetStmt => LetStmt::cast(node).map(Self::Let),
             SyntaxKind::ExprStmt => ExprStmt::cast(node).map(Self::Expression),
             SyntaxKind::ExpectExprStmt => ExpectExprStmt::cast(node).map(Self::Expect),

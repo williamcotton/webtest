@@ -111,6 +111,13 @@ pub(crate) fn default_reference_queries(code: &str) -> Vec<String> {
         | "semantic.expected_parallel_block"
         | "semantic.non_transferable_capture"
         | "semantic.concurrent_resource_conflict" => vec!["control.parallel".into()],
+        "semantic.invalid_race"
+        | "semantic.expected_race_block"
+        | "semantic.missing_race_result"
+        | "semantic.non_transferable_race_result" => vec!["control.race".into()],
+        "semantic.provide_outside_race" | "semantic.unreachable_after_provide" => {
+            vec!["statement.provide".into()]
+        }
         "semantic.invalid_timeout" => vec!["control.timeout".into()],
         "semantic.unknown_provider" | "semantic.reserved_provider" => vec!["provider".into()],
         "semantic.unknown_provider_operation"

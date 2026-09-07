@@ -21,6 +21,7 @@ pub enum PlanNodeKind {
     /// First successfully completed child wins; every loser is cancelled and joined.
     Race {
         children: Vec<PlanNode>,
+        result: Option<crate::RaceBinding>,
     },
     Parallel {
         children: Vec<PlanNode>,
@@ -110,7 +111,10 @@ impl PlanNode {
             origin,
             source_revision: revision,
             required_capabilities,
-            kind: PlanNodeKind::Race { children },
+            kind: PlanNodeKind::Race {
+                children,
+                result: None,
+            },
         };
         node.assign_identity(test);
         node
@@ -171,7 +175,7 @@ impl PlanNode {
         match &mut self.kind {
             PlanNodeKind::Sequence { children }
             | PlanNodeKind::Parallel { children, .. }
-            | PlanNodeKind::Race { children } => {
+            | PlanNodeKind::Race { children, .. } => {
                 for (ordinal, child) in children.iter_mut().enumerate() {
                     let mut path = self.path.clone();
                     path.push(ordinal as u32);
@@ -267,11 +271,12 @@ impl PlanNode {
         match &self.kind {
             PlanNodeKind::ResourceScope { .. } => "resource/browser-context/v1",
             PlanNodeKind::Parallel { .. } => "parallel/v1",
-            PlanNodeKind::Race { .. } => "race/v1",
+            PlanNodeKind::Race { .. } => "race/v2",
             PlanNodeKind::Sequence { .. } => "sequence/v1",
             PlanNodeKind::Timeout { .. } => "timeout/v1",
             PlanNodeKind::Operation { step } => match &step.operation {
                 crate::TestOperation::EvaluatePure(_) => "eval/v1",
+                crate::TestOperation::Provide(_) => "provide/v1",
                 crate::TestOperation::ServerProviderCall(_) => "provider/v1",
                 crate::TestOperation::Browser(_) => "browser/v1",
                 crate::TestOperation::Assertion(_) => "assert/v1",
@@ -296,7 +301,9 @@ impl PlanNode {
             PlanNodeKind::Timeout { child, .. } => child.steps(),
             PlanNodeKind::Sequence { children }
             | PlanNodeKind::Parallel { children, .. }
-            | PlanNodeKind::Race { children } => children.iter().flat_map(Self::steps).collect(),
+            | PlanNodeKind::Race { children, .. } => {
+                children.iter().flat_map(Self::steps).collect()
+            }
             PlanNodeKind::Operation { step } => vec![step],
         }
     }
@@ -307,7 +314,7 @@ impl PlanNode {
             PlanNodeKind::Timeout { child, .. } => child.steps_mut(),
             PlanNodeKind::Sequence { children }
             | PlanNodeKind::Parallel { children, .. }
-            | PlanNodeKind::Race { children } => {
+            | PlanNodeKind::Race { children, .. } => {
                 children.iter_mut().flat_map(Self::steps_mut).collect()
             }
             PlanNodeKind::Operation { step } => vec![step],
@@ -318,7 +325,7 @@ impl PlanNode {
 fn operation_capabilities(operation: &crate::TestOperation) -> Vec<Capability> {
     use crate::{AssertionOperation, TestOperation};
     match operation {
-        TestOperation::EvaluatePure(_) => vec![],
+        TestOperation::EvaluatePure(_) | TestOperation::Provide(_) => vec![],
         TestOperation::ServerProviderCall(_) => vec![Capability::Server],
         TestOperation::Browser(_) => vec![Capability::Browser],
         TestOperation::Assertion(AssertionOperation::Value { .. }) => vec![Capability::Test],
@@ -330,6 +337,7 @@ fn operation_capabilities(operation: &crate::TestOperation) -> Vec<Capability> {
 pub enum PlanTreeError {
     RootIsNotSequence,
     InvalidControlSetting,
+    InvalidRaceResult,
     InvalidPath,
     InvalidIdentity,
     SourceRevisionMismatch,
@@ -369,7 +377,7 @@ impl PlanNode {
         if self.id != self.derived_identity(test) {
             return Err(PlanTreeError::InvalidIdentity);
         }
-        if let PlanNodeKind::Parallel { children, .. } | PlanNodeKind::Race { children } =
+        if let PlanNodeKind::Parallel { children, .. } | PlanNodeKind::Race { children, .. } =
             &self.kind
         {
             if children.is_empty() || children.len() > MAX_PARALLEL_BRANCHES {
@@ -427,7 +435,7 @@ impl PlanNode {
             }
             PlanNodeKind::Sequence { children }
             | PlanNodeKind::Parallel { children, .. }
-            | PlanNodeKind::Race { children } => {
+            | PlanNodeKind::Race { children, .. } => {
                 for (ordinal, child) in children.iter().enumerate() {
                     if child.origin.file != self.origin.file {
                         return Err(PlanTreeError::OriginMismatch);
@@ -460,6 +468,67 @@ impl PlanNode {
     }
 }
 
+impl PlanNode {
+    /// Result flow is lexical; nested concurrency cannot provide into its parent branch.
+    fn validate_results(
+        &self,
+        allowed: bool,
+        expected: Option<&webtest_model::Type>,
+    ) -> Result<bool, PlanTreeError> {
+        match &self.kind {
+            PlanNodeKind::Operation { step } => {
+                if let crate::TestOperation::Provide(value) = &step.operation {
+                    if !allowed
+                        || !value.result_type.is_transferable()
+                        || expected.is_some_and(|ty| !ty.accepts(&value.result_type))
+                    {
+                        return Err(PlanTreeError::InvalidRaceResult);
+                    }
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
+            PlanNodeKind::Sequence { children } => {
+                let mut provided = false;
+                for child in children {
+                    if provided {
+                        return Err(PlanTreeError::InvalidRaceResult);
+                    }
+                    provided = child.validate_results(allowed, expected)?;
+                }
+                Ok(provided)
+            }
+            PlanNodeKind::Timeout { child, .. }
+            | PlanNodeKind::ResourceScope { body: child, .. } => {
+                child.validate_results(allowed, expected)
+            }
+            PlanNodeKind::Parallel { children, .. } => {
+                for child in children {
+                    child.validate_results(false, None)?;
+                }
+                Ok(false)
+            }
+            PlanNodeKind::Race { children, result } => {
+                if result
+                    .as_ref()
+                    .is_some_and(|binding| !binding.ty.is_transferable() || binding.name.is_empty())
+                {
+                    return Err(PlanTreeError::InvalidRaceResult);
+                }
+                for child in children {
+                    let provided =
+                        child.validate_results(true, result.as_ref().map(|binding| &binding.ty))?;
+                    if result.is_some() && !provided {
+                        return Err(PlanTreeError::InvalidRaceResult);
+                    }
+                }
+                Ok(false)
+            }
+        }
+    }
+}
+
 impl crate::TestPlan {
     pub fn validate_tree(&self) -> Result<(), PlanTreeError> {
         let mut steps = std::collections::BTreeSet::new();
@@ -477,6 +546,7 @@ impl crate::TestPlan {
             }
             test.body
                 .validate(test.declaration_id, self.source_revision, &[], &mut steps)?;
+            test.body.validate_results(false, None)?;
             if !test.body.required_resources().is_empty() {
                 return Err(PlanTreeError::MissingResourceScope);
             }
@@ -517,6 +587,7 @@ impl crate::PlanEnvelope {
             }
             test.body
                 .validate(test.declaration_id, source.revision, &[], &mut steps)?;
+            test.body.validate_results(false, None)?;
             if !test.body.required_resources().is_empty() {
                 return Err(PlanTreeError::MissingResourceScope);
             }
@@ -654,6 +725,49 @@ mod race_tests {
         race.validate(test, revision, &[0], &mut Default::default())
             .unwrap();
         assert_eq!(race.origin, origin);
+    }
+
+    #[test]
+    fn race_plan_validation_enforces_lexical_provide_and_bound_result_types() {
+        let test = declaration_identity("race.webtest", "race", 0);
+        let origin = SyntaxOrigin::new(FileId::new(1), TextRange::default());
+        let revision = SourceRevision::of("race");
+        let mut child = branch(test, origin, revision, 0, false);
+        let PlanNodeKind::Operation { step } = &mut child.kind else {
+            panic!("operation")
+        };
+        step.operation = crate::TestOperation::Provide(crate::ProvideOperation {
+            expression: crate::PlanExpr::Literal(Value::Int(7)),
+            result_type: webtest_model::Type::Int,
+        });
+        assert_eq!(
+            child.validate_results(false, None),
+            Err(PlanTreeError::InvalidRaceResult)
+        );
+        let mut node = PlanNode::race(test, origin, revision, vec![0], vec![child]);
+        node.validate_results(false, None).unwrap();
+        if let PlanNodeKind::Race { result, .. } = &mut node.kind {
+            *result = Some(crate::RaceBinding {
+                id: webtest_model::BindingId(0),
+                name: "selected".into(),
+                ty: webtest_model::Type::String,
+            });
+        }
+        assert_eq!(
+            node.validate_results(false, None),
+            Err(PlanTreeError::InvalidRaceResult)
+        );
+        if let PlanNodeKind::Race { result, .. } = &mut node.kind {
+            result.as_mut().unwrap().ty = webtest_model::Type::Int;
+        }
+        node.validate_results(false, None).unwrap();
+        if let PlanNodeKind::Race { children, .. } = &mut node.kind {
+            children.push(branch(test, origin, revision, 1, false));
+        }
+        assert_eq!(
+            node.validate_results(false, None),
+            Err(PlanTreeError::InvalidRaceResult)
+        );
     }
 
     #[test]

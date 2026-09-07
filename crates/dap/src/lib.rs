@@ -724,7 +724,7 @@ fn branch_output_data(branches: &[webtest_runtime::BranchResult]) -> Value {
             TestOutcome::Skipped { reason, failure_class } => ("skipped", json!({"reason": reason, "failure_class": failure_class})),
             TestOutcome::Aborted { failure, prior_outcome } => ("aborted", aborted_failure_output_data(failure, prior_outcome.as_deref())),
         };
-        json!({ "scope": branch.scope, "outcome": outcome, "data": data, "duration_ms": branch.duration.as_millis(), "branches": branch_output_data(&branch.branches) })
+        json!({ "scope": branch.scope, "race_winner": branch.race_winner, "outcome": outcome, "data": data, "duration_ms": branch.duration.as_millis(), "branches": branch_output_data(&branch.branches) })
     }).collect())
 }
 
@@ -1537,6 +1537,7 @@ fn debug_bytes_value(bytes: &[u8]) -> webtest_model::Value {
 
 fn operation_name(operation: &TestOperation) -> String {
     match operation {
+        TestOperation::Provide(_) => "provide".into(),
         TestOperation::EvaluatePure(operation) => operation.result_binding.map_or_else(
             || "evaluate expression".into(),
             |binding| format!("let binding_{}", binding.0),

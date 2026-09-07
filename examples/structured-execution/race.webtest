@@ -1,0 +1,27 @@
+test "race selects a compatible result" {
+    let selected: { name: String, id: Int } = race {
+        server {
+            expect 1 == 2
+            provide { name: "unavailable", id: 0 }
+        }
+        server {
+            let local = 7
+            provide { name: "available", id: local }
+        }
+    }
+    expect selected.name == "available"
+    expect selected.id == 7
+}
+test "nested winner values remain lexical" {
+    let selected = race {
+        server {
+            let inner = race {
+                timeout 1s {
+                    provide 7
+                }
+            }
+            provide inner + 1
+        }
+    }
+    expect selected == 8
+}

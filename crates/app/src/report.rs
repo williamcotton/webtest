@@ -12,7 +12,7 @@ use webtest_project::Project;
 
 use crate::{error::AppError, project_context::normalized_path};
 
-pub(crate) const REPORT_SCHEMA_VERSION: u32 = 5;
+pub(crate) const REPORT_SCHEMA_VERSION: u32 = 6;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -124,6 +124,7 @@ pub struct TestReport {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct BranchReport {
+    pub race_winner: bool,
     pub scope: webtest_observation::ScopeEvent,
     pub result: TestReport,
 }
@@ -132,9 +133,14 @@ fn write_branches(output: &mut dyn Write, path: &str, branches: &[BranchReport])
     for branch in branches {
         writeln!(
             output,
-            "  {}: {}",
+            "  {}: {}{}",
             branch.result.name,
-            test_status(&branch.result)
+            test_status(&branch.result),
+            if branch.race_winner {
+                " (race winner)"
+            } else {
+                ""
+            }
         )?;
         if let Some(failure) = &branch.result.failure {
             if let Some(span) = &failure.span {
@@ -1208,7 +1214,7 @@ mod tests {
         assert_eq!(value["exit_class"], "test_failure");
         assert_eq!(
             String::from_utf8(json).expect("UTF-8 JSON"),
-            include_str!("../tests/fixtures/report-v5.json")
+            include_str!("../tests/fixtures/report-v6.json")
         );
 
         let mut events = Vec::new();
@@ -1220,7 +1226,7 @@ mod tests {
             let value: serde_json::Value = serde_json::from_str(line).expect("json line");
             assert_eq!(value["schema_version"], REPORT_SCHEMA_VERSION);
         }
-        assert_eq!(events, include_str!("../tests/fixtures/report-v5.jsonl"));
+        assert_eq!(events, include_str!("../tests/fixtures/report-v6.jsonl"));
     }
 
     #[test]
@@ -1239,23 +1245,23 @@ mod tests {
         for (reporter, expected) in [
             (
                 Reporter::Human,
-                include_str!("../tests/fixtures/cancellation-v5.txt"),
+                include_str!("../tests/fixtures/cancellation-v6.txt"),
             ),
             (
                 Reporter::Concise,
-                include_str!("../tests/fixtures/cancellation-concise-v5.txt"),
+                include_str!("../tests/fixtures/cancellation-concise-v6.txt"),
             ),
             (
                 Reporter::Json,
-                include_str!("../tests/fixtures/cancellation-v5.json"),
+                include_str!("../tests/fixtures/cancellation-v6.json"),
             ),
             (
                 Reporter::Events,
-                include_str!("../tests/fixtures/cancellation-v5.jsonl"),
+                include_str!("../tests/fixtures/cancellation-v6.jsonl"),
             ),
             (
                 Reporter::Junit,
-                include_str!("../tests/fixtures/cancellation-v5.xml"),
+                include_str!("../tests/fixtures/cancellation-v6.xml"),
             ),
         ] {
             let mut output = Vec::new();

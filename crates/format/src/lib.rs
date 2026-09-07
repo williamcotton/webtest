@@ -155,7 +155,18 @@ pub fn format_file(parse: &Parse) -> String {
                     || (kind == SyntaxKind::ParallelKw
                         && token
                             .parent()
-                            .is_some_and(|parent| parent.kind() == SyntaxKind::ParallelStmt));
+                            .is_some_and(|parent| parent.kind() == SyntaxKind::ParallelStmt))
+                    || (kind == SyntaxKind::ProvideKw
+                        && token
+                            .parent()
+                            .is_some_and(|parent| parent.kind() == SyntaxKind::ProvideStmt))
+                    || (kind == SyntaxKind::RaceKw
+                        && token.parent().is_some_and(|parent| {
+                            parent.kind() == SyntaxKind::RaceStmt
+                                && parent
+                                    .parent()
+                                    .is_none_or(|node| node.kind() != SyntaxKind::LetStmt)
+                        }));
                 if starts_statement && !line_start {
                     output.push('\n');
                     line_start = true;
@@ -241,5 +252,21 @@ mod tests {
         let formatted = format_file(&webtest_syntax::parse(source));
         assert_eq!(formatted, expected);
         assert_eq!(format_file(&webtest_syntax::parse(&formatted)), expected);
+    }
+}
+
+#[cfg(test)]
+mod race_tests {
+    #[test]
+    fn bound_race_and_contextual_names_format_losslessly_and_idempotently() {
+        let source = "test \"x\" {let race=1 let provide=2 let selected=race{server{provide race}server{provide provide}}expect selected>0}";
+        let formatted = super::format_file(&webtest_syntax::parse(source));
+        assert!(formatted.contains("let selected = race {"), "{formatted}");
+        assert!(formatted.contains("provide race"));
+        assert!(webtest_syntax::parse(&formatted).errors().is_empty());
+        assert_eq!(
+            super::format_file(&webtest_syntax::parse(&formatted)),
+            formatted
+        );
     }
 }

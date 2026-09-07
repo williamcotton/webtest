@@ -541,12 +541,17 @@ impl TreeExecution<'_, '_> {
         Box::pin(async move {
             match &node.kind {
                 webtest_plan::PlanNodeKind::Parallel { children, .. } => {
-                    self.concurrent_node(children, scope, scheduler::SiblingPolicy::All)
+                    self.concurrent_node(children, scope, scheduler::SiblingPolicy::All, None)
                         .await
                 }
-                webtest_plan::PlanNodeKind::Race { children } => {
-                    self.concurrent_node(children, scope, scheduler::SiblingPolicy::FirstSuccess)
-                        .await
+                webtest_plan::PlanNodeKind::Race { children, result } => {
+                    self.concurrent_node(
+                        children,
+                        scope,
+                        scheduler::SiblingPolicy::FirstSuccess,
+                        result.as_ref(),
+                    )
+                    .await
                 }
                 webtest_plan::PlanNodeKind::ResourceScope { resource, body } => {
                     self.resource_node(*resource, body, scope).await
@@ -559,6 +564,7 @@ impl TreeExecution<'_, '_> {
                             outcome,
                             TestBodyOutcome::Provisional(ProvisionalTestOutcome::Passed)
                         ) || !self.branch.cleanup_failures.is_empty()
+                            || self.branch.provided.is_some()
                         {
                             break;
                         }
@@ -957,6 +963,13 @@ impl TreeExecution<'_, '_> {
             host_context.clone(),
         )
         .await;
+        let completion = match completion {
+            Ok(steps::StepCompletion::Provided(value)) => {
+                self.branch.provided = Some(value);
+                Ok(steps::StepCompletion::Completed)
+            }
+            other => other,
+        };
         if let Err(error) = self.branch.temporary.adopt(
             state,
             &scope.resource_owner.event,
@@ -986,7 +999,7 @@ impl TreeExecution<'_, '_> {
                     ),
                 });
             }
-            Ok(steps::StepCompletion::Completed) => {
+            Ok(steps::StepCompletion::Completed | steps::StepCompletion::Provided(_)) => {
                 if host_context.cancellation.cause().is_some() {
                     if let TestOperation::ServerProviderCall(call) = &step.operation {
                         state.accept_provider_result_metadata(call);

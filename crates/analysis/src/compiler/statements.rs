@@ -11,6 +11,13 @@ use webtest_plan::{
 };
 use webtest_text::SyntaxOrigin;
 
+struct ConcurrentInput<'a> {
+    branches: &'a [HirStmt],
+    origin: SyntaxOrigin,
+    race: bool,
+    binding: Option<&'a webtest_hir::HirResultBinding>,
+}
+
 impl Compiler<'_> {
     pub(super) fn compile_sequence(
         &mut self,
@@ -21,11 +28,35 @@ impl Compiler<'_> {
         path: Vec<u32>,
     ) -> webtest_plan::PlanNode {
         let mut children = Vec::new();
+        let mut provided = false;
         for (ordinal, statement) in statements.iter().enumerate() {
+            let unreachable = provided;
+            provided |= statement_provides(statement);
             let mut child_path = path.clone();
             child_path.push(ordinal as u32);
             let node = match statement {
-                HirStmt::Parallel(block) => self.compile_parallel(test, block, domain, child_path),
+                HirStmt::Parallel(block) => self.compile_concurrent(
+                    test,
+                    ConcurrentInput {
+                        branches: &block.branches,
+                        origin: block.origin,
+                        race: false,
+                        binding: None,
+                    },
+                    domain,
+                    child_path,
+                ),
+                HirStmt::Race(block) => self.compile_concurrent(
+                    test,
+                    ConcurrentInput {
+                        branches: &block.branches,
+                        origin: block.origin,
+                        race: true,
+                        binding: block.binding.as_ref(),
+                    },
+                    domain,
+                    child_path,
+                ),
                 HirStmt::Timeout(block) => {
                     self.type_fact(
                         block.duration_origin.range,
@@ -94,28 +125,46 @@ impl Compiler<'_> {
                     webtest_plan::PlanNode::operation(test, self.revision, child_path, step)
                 }
             };
+            if unreachable {
+                self.error(
+                    node.origin.range,
+                    "semantic.unreachable_after_provide",
+                    "provide must be the final statement of its race branch".into(),
+                );
+            }
             children.push(node);
         }
         webtest_plan::PlanNode::sequence(test, origin, self.revision, path, children)
     }
 
-    fn compile_parallel(
+    fn compile_concurrent(
         &mut self,
         test: webtest_model::PlanDeclarationId,
-        block: &webtest_hir::HirParallel,
+        block: ConcurrentInput<'_>,
         domain: Capability,
         path: Vec<u32>,
     ) -> webtest_plan::PlanNode {
         if block.branches.is_empty() || block.branches.len() > webtest_plan::MAX_PARALLEL_BRANCHES {
             self.error(
                 block.origin.range,
-                "semantic.invalid_parallel",
+                if block.race {
+                    "semantic.invalid_race"
+                } else {
+                    "semantic.invalid_parallel"
+                },
                 format!(
-                    "parallel requires 1 to {} direct child blocks",
+                    "{} requires 1 to {} direct child blocks",
+                    if block.race { "race" } else { "parallel" },
                     webtest_plan::MAX_PARALLEL_BRANCHES
                 ),
             );
         }
+        let outer_provides = self.provide_types.take();
+        let annotation = block
+            .binding
+            .and_then(|binding| binding.annotation.as_ref())
+            .map(|ty| self.lower_type(ty));
+        let mut result_types = Vec::new();
         let bindings = self.bindings.clone();
         let names = self.names.clone();
         let outer_captures = self.concurrent_captures.clone();
@@ -127,6 +176,7 @@ impl Compiler<'_> {
         self.concurrent_depth += 1;
         let mut children = Vec::new();
         for (ordinal, branch) in block.branches.iter().enumerate() {
+            self.provide_types = block.race.then(Vec::new);
             self.bindings = bindings.clone();
             self.names = names.clone();
             let origin = match branch {
@@ -134,11 +184,16 @@ impl Compiler<'_> {
                 HirStmt::Browser(block) => block.origin,
                 HirStmt::Timeout(block) => block.origin,
                 HirStmt::Parallel(block) => block.origin,
+                HirStmt::Race(block) => block.origin,
                 _ => {
                     self.error(
                         block.origin.range,
-                        "semantic.expected_parallel_block",
-                        "each parallel branch must be a capability or control block".into(),
+                        if block.race {
+                            "semantic.expected_race_block"
+                        } else {
+                            "semantic.expected_parallel_block"
+                        },
+                        "each concurrent branch must be a capability or control block".into(),
                     );
                     continue;
                 }
@@ -155,8 +210,18 @@ impl Compiler<'_> {
             if !child.required_resources().is_empty() && domain == Capability::Browser {
                 self.error(origin.range, "semantic.concurrent_resource_conflict", "concurrent browser operations require a lexical browser block in a flow domain; the enclosing browser context is exclusive".into());
             }
+            let provides = self.provide_types.take().unwrap_or_default();
+            if block.binding.is_some() && provides.is_empty() {
+                self.error(
+                    origin.range,
+                    "semantic.missing_race_result",
+                    "every branch of a bound race must provide a result".into(),
+                );
+            }
+            result_types.extend(provides);
             children.push(child);
         }
+        self.provide_types = outer_provides;
         self.bindings = bindings;
         self.names = names;
         self.concurrent_captures = outer_captures;
@@ -169,10 +234,71 @@ impl Compiler<'_> {
             self.error(
                 block.origin.range,
                 "semantic.concurrent_resource_conflict",
-                "parallel branches cannot share an exclusive resource".into(),
+                "concurrent branches cannot share an exclusive resource".into(),
             );
         }
-        webtest_plan::PlanNode::parallel(test, block.origin, self.revision, path, children)
+        if !block.race {
+            return webtest_plan::PlanNode::parallel(
+                test,
+                block.origin,
+                self.revision,
+                path,
+                children,
+            );
+        }
+        let mut node =
+            webtest_plan::PlanNode::race(test, block.origin, self.revision, path, children);
+        if let Some(binding) = block.binding {
+            let mut ty = annotation.clone().unwrap_or(Type::Unknown);
+            for (actual, origin) in &result_types {
+                if ty == Type::Unknown {
+                    ty = actual.clone();
+                } else if !ty.accepts(actual) {
+                    if let Some(joined) = annotation
+                        .is_none()
+                        .then(|| compatible_result_type(&ty, actual))
+                        .flatten()
+                    {
+                        ty = joined;
+                    } else {
+                        self.type_mismatch(origin.range, &ty, actual);
+                    }
+                }
+            }
+            if !ty.is_transferable() {
+                self.error(
+                    binding.name_origin.range,
+                    "semantic.non_transferable_race_result",
+                    "a race binding must have a transferable result type".into(),
+                );
+            }
+            if self.names.contains_key(&binding.name) {
+                self.error(
+                    binding.name_origin.range,
+                    "semantic.duplicate_binding",
+                    format!("binding `{}` is already declared", binding.name),
+                );
+            }
+            self.names.insert(binding.name.clone(), binding.name_origin);
+            self.bindings.insert(
+                binding.id,
+                BindingState {
+                    name: binding.name.clone(),
+                    ty: ty.clone(),
+                    domain,
+                    provider_operation: None,
+                },
+            );
+            self.type_fact(binding.name_origin.range, ty.clone(), domain);
+            if let webtest_plan::PlanNodeKind::Race { result, .. } = &mut node.kind {
+                *result = Some(webtest_plan::RaceBinding {
+                    id: binding.id,
+                    name: binding.name.clone(),
+                    ty,
+                });
+            }
+        }
+        node
     }
 
     pub(super) fn compile_statement(
@@ -182,7 +308,7 @@ impl Compiler<'_> {
         steps: &mut Vec<PlannedStep>,
     ) {
         match statement {
-            HirStmt::Timeout(_) | HirStmt::Parallel(_) => {
+            HirStmt::Timeout(_) | HirStmt::Parallel(_) | HirStmt::Race(_) => {
                 unreachable!("control nodes compile through the execution tree")
             }
             HirStmt::Server(block) => {
@@ -196,6 +322,33 @@ impl Compiler<'_> {
                 }
             }
             HirStmt::Let(binding) => self.compile_let(binding, domain, steps),
+            HirStmt::Provide(statement) => {
+                let value = self.infer_expr(&statement.expression, domain, None);
+                if !value.ty.is_transferable() {
+                    self.error(
+                        statement.expression.origin.range,
+                        "semantic.non_transferable_race_result",
+                        "race results must be transferable values".into(),
+                    );
+                }
+                if let Some(provides) = &mut self.provide_types {
+                    provides.push((value.ty.clone(), statement.expression.origin));
+                } else {
+                    self.error(
+                        statement.origin.range,
+                        "semantic.provide_outside_race",
+                        "provide is only valid inside a race branch".into(),
+                    );
+                }
+                self.push_step(
+                    steps,
+                    statement.expression.origin,
+                    TestOperation::Provide(webtest_plan::ProvideOperation {
+                        expression: value.expression,
+                        result_type: value.ty,
+                    }),
+                );
+            }
             HirStmt::Expression(statement) => {
                 if let Some(call) = self.provider_call(&statement.expression, domain) {
                     self.push_step(
@@ -438,6 +591,14 @@ impl Compiler<'_> {
 
 pub(super) fn collect_binding_names(statement: &HirStmt, names: &mut HashSet<String>) {
     match statement {
+        HirStmt::Race(block) => {
+            if let Some(binding) = &block.binding {
+                names.insert(binding.name.clone());
+            }
+            for statement in &block.branches {
+                collect_binding_names(statement, names);
+            }
+        }
         HirStmt::Parallel(block) => {
             for statement in &block.branches {
                 collect_binding_names(statement, names);
@@ -461,6 +622,41 @@ pub(super) fn collect_binding_names(statement: &HirStmt, names: &mut HashSet<Str
         HirStmt::Let(binding) => {
             names.insert(binding.name.clone());
         }
-        HirStmt::Expression(_) | HirStmt::Expect(_) | HirStmt::BrowserOperation(_) => {}
+        HirStmt::Provide(_)
+        | HirStmt::Expression(_)
+        | HirStmt::Expect(_)
+        | HirStmt::BrowserOperation(_) => {}
+    }
+}
+
+fn statement_provides(statement: &HirStmt) -> bool {
+    match statement {
+        HirStmt::Provide(_) => true,
+        HirStmt::Server(block) => block.statements.iter().any(statement_provides),
+        HirStmt::Browser(block) => block.statements.iter().any(statement_provides),
+        HirStmt::Timeout(block) => block.statements.iter().any(statement_provides),
+        _ => false,
+    }
+}
+
+fn compatible_result_type(left: &Type, right: &Type) -> Option<Type> {
+    if left.accepts(right) {
+        return Some(left.clone());
+    }
+    if right.accepts(left) {
+        return Some(right.clone());
+    }
+    match (left, right) {
+        (Type::Null, ty) | (ty, Type::Null) => Some(Type::Option(Box::new(ty.clone()))),
+        (Type::Option(left), Type::Option(right)) => {
+            compatible_result_type(left, right).map(|ty| Type::Option(Box::new(ty)))
+        }
+        (Type::List(left), Type::List(right)) => {
+            compatible_result_type(left, right).map(|ty| Type::List(Box::new(ty)))
+        }
+        (Type::Option(inner), other) | (other, Type::Option(inner)) => {
+            compatible_result_type(inner, other).map(|ty| Type::Option(Box::new(ty)))
+        }
+        _ => None,
     }
 }

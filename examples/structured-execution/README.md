@@ -6,6 +6,8 @@ This project runs without an application server or Chrome. From the repository r
 cargo build
 target/debug/webtest describe control.timeout
 target/debug/webtest describe control.parallel
+target/debug/webtest describe control.race
+target/debug/webtest describe statement.provide
 target/debug/webtest check examples/structured-execution
 target/debug/webtest test examples/structured-execution
 ```
@@ -18,4 +20,7 @@ the following assertion. `[timeouts].cleanup` supplies the separate teardown bud
 `parallel.webtest` demonstrates independent branch snapshots under an enclosing deadline.
 Both branches finish before the parent continues; their local declarations stay local.
 The JSON/events reporters retain a typed `branches` aggregate in stable source order.
-Race and retry examples will be added with their implementations.
+`race.webtest` demonstrates a failed alternative followed by a successful typed winner,
+and nested races whose local values do not escape. `provide` is the last statement of each
+value-producing branch. The report retains failed alternatives and marks `race_winner`;
+a recovered alternative does not make the test fail. Retry examples remain pending.

@@ -326,6 +326,12 @@ impl EditorService {
             .filter_map(|token| {
                 let parent = token.parent().map(|node| node.kind());
                 let kind = match token.kind() {
+                    SyntaxKind::RaceKw if parent == Some(SyntaxKind::RaceStmt) => {
+                        SemanticTokenKind::Keyword
+                    }
+                    SyntaxKind::ProvideKw if parent == Some(SyntaxKind::ProvideStmt) => {
+                        SemanticTokenKind::Keyword
+                    }
                     SyntaxKind::ParallelKw if parent == Some(SyntaxKind::ParallelStmt) => {
                         SemanticTokenKind::Keyword
                     }
@@ -375,12 +381,20 @@ impl EditorService {
                     | SyntaxKind::UrlKw => SemanticTokenKind::Function,
                     SyntaxKind::String => SemanticTokenKind::String,
                     SyntaxKind::LineComment => SemanticTokenKind::Comment,
-                    SyntaxKind::Ident | SyntaxKind::TimeoutKw | SyntaxKind::ParallelKw
+                    SyntaxKind::Ident
+                    | SyntaxKind::TimeoutKw
+                    | SyntaxKind::ParallelKw
+                    | SyntaxKind::RaceKw
+                    | SyntaxKind::ProvideKw
                         if matches!(parent, Some(SyntaxKind::LetStmt | SyntaxKind::NameExpr)) =>
                     {
                         SemanticTokenKind::Variable
                     }
-                    SyntaxKind::Ident | SyntaxKind::TimeoutKw | SyntaxKind::ParallelKw
+                    SyntaxKind::Ident
+                    | SyntaxKind::TimeoutKw
+                    | SyntaxKind::ParallelKw
+                    | SyntaxKind::RaceKw
+                    | SyntaxKind::ProvideKw
                         if parent == Some(SyntaxKind::MemberExpr) =>
                     {
                         SemanticTokenKind::Property
@@ -924,6 +938,32 @@ mod tests {
         assert!(rendered.contains(&("text", SemanticTokenKind::Function)));
         assert!(rendered.contains(&("visible", SemanticTokenKind::Keyword)));
         assert!(rendered.contains(&("\"submit\"", SemanticTokenKind::String)));
+    }
+
+    #[test]
+    fn race_keywords_contextual_names_and_winner_type_use_shared_semantic_facts() {
+        let editor = EditorService::new();
+        let source = "test \"x\" { let race = 1 let provide = 2 let selected = race { server { provide race } server { provide provide } } expect selected > 0 }";
+        let file = editor.open_document("file:///race.webtest", source);
+        assert!(editor.diagnostics(file).unwrap().is_empty());
+        let tokens = editor.semantic_tokens(file).unwrap();
+        for name in ["race", "provide"] {
+            for kind in [SemanticTokenKind::Keyword, SemanticTokenKind::Variable] {
+                assert!(tokens.iter().any(|token| {
+                    let start = u32::from(token.range.start()) as usize;
+                    let end = u32::from(token.range.end()) as usize;
+                    &source[start..end] == name && token.kind == kind
+                }));
+            }
+        }
+        let hover = editor
+            .hover(
+                file,
+                webtest_text::TextSize::from(source.rfind("selected").unwrap() as u32 + 1),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(hover.contents.contains("Int"));
     }
 
     #[test]

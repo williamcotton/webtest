@@ -12,12 +12,8 @@ pub(crate) fn reject_literal_secrets(
 ) -> Result<(), AppError> {
     for test in &envelope.tests {
         let mut bindings = HashMap::new();
+        collect_bindings(&test.body, &mut bindings);
         for step in test.steps() {
-            if let TestOperation::EvaluatePure(operation) = &step.operation
-                && let Some(binding) = operation.result_binding
-            {
-                bindings.insert(binding, &operation.expression);
-            }
             let TestOperation::ServerProviderCall(call) = &step.operation else {
                 continue;
             };
@@ -59,28 +55,87 @@ pub(crate) fn reject_literal_secrets(
     Ok(())
 }
 
+fn collect_bindings<'a>(
+    node: &'a webtest_plan::PlanNode,
+    bindings: &mut HashMap<BindingId, Vec<&'a PlanExpr>>,
+) {
+    use webtest_plan::PlanNodeKind;
+    match &node.kind {
+        PlanNodeKind::Operation { step } => {
+            if let TestOperation::EvaluatePure(value) = &step.operation
+                && let Some(id) = value.result_binding
+            {
+                bindings.insert(id, vec![&value.expression]);
+            }
+        }
+        PlanNodeKind::Sequence { children }
+        | PlanNodeKind::Parallel { children, .. }
+        | PlanNodeKind::Race { children, .. } => {
+            for child in children {
+                collect_bindings(child, bindings);
+            }
+            if let PlanNodeKind::Race {
+                result: Some(result),
+                ..
+            } = &node.kind
+            {
+                let mut values = Vec::new();
+                for child in children {
+                    provided_expressions(child, &mut values);
+                }
+                bindings.insert(result.id, values);
+            }
+        }
+        PlanNodeKind::Timeout { child, .. } | PlanNodeKind::ResourceScope { body: child, .. } => {
+            collect_bindings(child, bindings)
+        }
+    }
+}
+
+fn provided_expressions<'a>(node: &'a webtest_plan::PlanNode, values: &mut Vec<&'a PlanExpr>) {
+    use webtest_plan::PlanNodeKind;
+    match &node.kind {
+        PlanNodeKind::Operation { step } => {
+            if let TestOperation::Provide(value) = &step.operation {
+                values.push(&value.expression);
+            }
+        }
+        PlanNodeKind::Sequence { children } => {
+            for child in children {
+                provided_expressions(child, values);
+            }
+        }
+        PlanNodeKind::Timeout { child, .. } | PlanNodeKind::ResourceScope { body: child, .. } => {
+            provided_expressions(child, values)
+        }
+        PlanNodeKind::Parallel { .. } | PlanNodeKind::Race { .. } => {}
+    }
+}
+
 fn secret_plan_error(provider: &str, operation: &str, argument: &str) -> AppError {
     AppError::usage(format!(
         "cannot emit a plan containing a literal secret in `{provider}.{operation}` argument `{argument}`; use a late-bound secret source"
     ))
 }
 
-fn has_literal_value(expression: &PlanExpr, bindings: &HashMap<BindingId, &PlanExpr>) -> bool {
+fn has_literal_value(expression: &PlanExpr, bindings: &HashMap<BindingId, Vec<&PlanExpr>>) -> bool {
     has_literal_value_inner(expression, bindings, &mut HashSet::new())
 }
 
 fn has_literal_value_inner(
     expression: &PlanExpr,
-    bindings: &HashMap<BindingId, &PlanExpr>,
+    bindings: &HashMap<BindingId, Vec<&PlanExpr>>,
     visiting: &mut HashSet<BindingId>,
 ) -> bool {
     match expression {
         PlanExpr::Literal(_) => true,
         PlanExpr::Binding(binding) => {
             visiting.insert(*binding)
-                && bindings
-                    .get(binding)
-                    .is_some_and(|value| has_literal_value_inner(value, bindings, visiting))
+                && bindings.get(binding).is_some_and(|values| {
+                    values
+                        .iter()
+                        .any(|value| has_literal_value_inner(value, bindings, visiting))
+                })
         }
         PlanExpr::List(values) => values
             .iter()
@@ -106,7 +161,7 @@ fn has_literal_value_inner(
 fn has_sensitive_record_literal(
     expression: &PlanExpr,
     sensitive_fields: &[String],
-    bindings: &HashMap<BindingId, &PlanExpr>,
+    bindings: &HashMap<BindingId, Vec<&PlanExpr>>,
 ) -> bool {
     has_sensitive_record_literal_inner(expression, sensitive_fields, bindings, &mut HashSet::new())
 }
@@ -114,14 +169,21 @@ fn has_sensitive_record_literal(
 fn has_sensitive_record_literal_inner(
     expression: &PlanExpr,
     sensitive_fields: &[String],
-    bindings: &HashMap<BindingId, &PlanExpr>,
+    bindings: &HashMap<BindingId, Vec<&PlanExpr>>,
     visiting: &mut HashSet<BindingId>,
 ) -> bool {
     match expression {
         PlanExpr::Binding(binding) => {
             visiting.insert(*binding)
-                && bindings.get(binding).is_some_and(|value| {
-                    has_sensitive_record_literal_inner(value, sensitive_fields, bindings, visiting)
+                && bindings.get(binding).is_some_and(|values| {
+                    values.iter().any(|value| {
+                        has_sensitive_record_literal_inner(
+                            value,
+                            sensitive_fields,
+                            bindings,
+                            visiting,
+                        )
+                    })
                 })
         }
         PlanExpr::Record(values) => values.iter().any(|(name, value)| {
@@ -200,11 +262,11 @@ mod tests {
     fn bindings_find_literals_and_cycles_terminate() {
         let literal = literal();
         let reference = PlanExpr::Binding(BindingId(1));
-        let bindings = HashMap::from([(BindingId(1), &literal)]);
+        let bindings = HashMap::from([(BindingId(1), vec![&literal])]);
         assert!(has_literal_value(&reference, &bindings));
 
         let cycle = PlanExpr::Binding(BindingId(1));
-        let bindings = HashMap::from([(BindingId(1), &cycle)]);
+        let bindings = HashMap::from([(BindingId(1), vec![&cycle])]);
         assert!(!has_literal_value(&cycle, &bindings));
     }
 

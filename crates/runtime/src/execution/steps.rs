@@ -9,6 +9,7 @@ use super::{browser::execute_browser, provider::execute_provider, state::TestExe
 
 pub(super) enum StepCompletion {
     Completed,
+    Provided(webtest_model::Value),
     Cancelled,
 }
 
@@ -25,6 +26,20 @@ pub(super) async fn execute_step(
         page.set_operation_context(Some(context.clone()));
     }
     match &step.operation {
+        TestOperation::Provide(operation) => {
+            let value = evaluate(&operation.expression, state.environment())?;
+            if !crate::evaluation::runtime_transferable(&value) {
+                return Err(StepError::Internal(
+                    "provided race value is not transferable".into(),
+                ));
+            }
+            let value =
+                crate::evaluation::decode_value(&value, &operation.result_type, "provide", None)
+                    .map_err(|_| {
+                        StepError::Internal("provided value violates its plan result type".into())
+                    })?;
+            Ok(StepCompletion::Provided(value))
+        }
         TestOperation::EvaluatePure(operation) => {
             let value = evaluate(&operation.expression, state.environment())?;
             if let Some(binding) = operation.result_binding {

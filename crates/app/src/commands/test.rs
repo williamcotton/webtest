@@ -424,6 +424,7 @@ fn test_report(
             .map(|branch| {
                 let name = format!("branch {:?}", branch.scope.execution_context.task_path);
                 crate::report::BranchReport {
+                    race_winner: branch.race_winner,
                     scope: branch.scope,
                     result: test_report(
                         webtest_runtime::TestResult {

@@ -505,10 +505,25 @@ test "optional" {
     }
 
     #[test]
+    fn race_winner_bindings_and_provide_have_portable_plan_parity() {
+        let source = r#"test "race" { let selected = race { server { provide 1 } browser { open "/" provide 2 } } expect selected > 0 }"#;
+        let portable = compile(source).plan.expect("portable race");
+        let mut database = AnalysisDatabase::default();
+        let file = database.open_file("memory://document.webtest", source);
+        assert!(database.diagnostics(file).unwrap().is_empty());
+        assert_eq!(portable, *database.test_plan(file).unwrap());
+        portable.validate_tree().unwrap();
+    }
+
+    #[test]
     fn descriptions_and_static_repair_diagnostics_match_the_native_core() {
         for query in [
             "control.parallel",
             "parallel",
+            "control.race",
+            "race",
+            "statement.provide",
+            "provide",
             "control.timeout",
             "timeout",
             "controls",

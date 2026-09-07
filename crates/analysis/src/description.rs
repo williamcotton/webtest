@@ -965,9 +965,9 @@ mod tests {
         assert!(!index.categories.contains_key("cli_commands"));
         assert!(!index.categories.contains_key("configuration"));
         assert!(
-            !serde_json::to_string(&index)
+            serde_json::to_string(&index)
                 .expect("index JSON")
-                .contains("race")
+                .contains("control.race")
         );
 
         let DescriptionResponse::Construct(role) =
@@ -1036,6 +1036,8 @@ mod tests {
         for (query, expected) in [
             ("timeout", "control.timeout"),
             ("parallel", "control.parallel"),
+            ("race", "control.race"),
+            ("provide", "statement.provide"),
             ("integer overflow", "type.Int"),
             ("optional member", "type.Record"),
             ("passive locator observation", "browser.wait.locator"),
@@ -1226,6 +1228,8 @@ mod tests {
             "declaration.test",
             "control.timeout",
             "control.parallel",
+            "control.race",
+            "statement.provide",
             "scope.server",
             "scope.browser",
             "statement.let",
@@ -1297,10 +1301,7 @@ mod tests {
             assert_eq!(construct.provenance.content_trust, "installed");
         }
         assert!(core.keys().all(|id| {
-            !id.contains("race")
-                && !id.contains("pattern")
-                && !id.contains("module")
-                && !id.contains("trace")
+            !id.contains("pattern") && !id.contains("module") && !id.contains("trace")
         }));
         let serialized =
             serde_json::to_string(&core.values().collect::<Vec<_>>()).expect("reference JSON");

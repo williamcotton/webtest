@@ -23,7 +23,40 @@ pub(super) struct TestExecutionState {
     owned_temporary_directories: BTreeSet<PathBuf>,
 }
 
+pub(super) struct ValueTransfer {
+    value: Value,
+    secrets: Vec<String>,
+    redacted_fields: Vec<String>,
+}
+
 impl TestExecutionState {
+    pub(super) fn transfer(&self, value: Value) -> ValueTransfer {
+        ValueTransfer {
+            value,
+            secrets: self.secrets.clone(),
+            redacted_fields: self.redacted_fields.clone(),
+        }
+    }
+
+    pub(super) fn bind_transfer(
+        &mut self,
+        binding: &webtest_plan::RaceBinding,
+        transfer: ValueTransfer,
+    ) -> Result<(), crate::RunError> {
+        let value = crate::evaluation::decode_value(&transfer.value, &binding.ty, "winner", None)
+            .map_err(|_| {
+            crate::RunError::Internal("race winner value violates its result type".into())
+        })?;
+        self.secrets.extend(transfer.secrets);
+        self.secrets.sort();
+        self.secrets.dedup();
+        self.redacted_fields.extend(transfer.redacted_fields);
+        self.redacted_fields.sort();
+        self.redacted_fields.dedup();
+        self.bind(binding.id, Some(&binding.name), value);
+        Ok(())
+    }
+
     pub(super) fn new(redacted_fields: Vec<String>, project_root: PathBuf) -> Self {
         Self {
             environment: HashMap::new(),

@@ -9,6 +9,8 @@ pub(super) fn core_constructs() -> BTreeMap<String, ConstructDescription> {
         let_construct(),
         timeout_construct(),
         parallel_construct(),
+        race_construct(),
+        provide_construct(),
         typed_json_decode(),
     ] {
         constructs.insert(construct.id.clone(), construct);
@@ -259,6 +261,130 @@ fn parallel_construct() -> ConstructDescription {
         "scope.browser".into(),
         "runtime.configuration".into(),
     ];
+    value
+}
+
+fn race_construct() -> ConstructDescription {
+    let mut value = base_construct(
+        "control.race",
+        "race",
+        "control",
+        "[let <name> [: <Type>] =] race { <capability_or_control_block>+ }",
+        "Select the first successfully completed branch, cancel losers, and await every teardown.",
+    );
+    value.result_rule = Some("Unbound races discard branch values. A bound race has the annotation type, or the compatible inferred type shared by all provided results.".into());
+    value.search_terms = vec![
+        "first success".into(),
+        "winner".into(),
+        "alternatives".into(),
+        "race".into(),
+        "result binding".into(),
+    ];
+    value.allowed_contexts = vec![
+        "flow_block".into(),
+        "scope.server".into(),
+        "scope.browser".into(),
+    ];
+    value.produces_value = Some(true);
+    value.effects = vec!["Run 1 to 64 direct child blocks with immutable transferable snapshots and independent lexical browser contexts.".into(), "A successful child wins only after its teardown. Cancel unfinished losers with RaceLost and await all cleanup. Infrastructure/internal primary failures cancel siblings with ParentFailed; cleanup failures can abort the race.".into(), "Keep every branch outcome in source order and identify the selected race_winner. Failed alternatives remain in results/events; recovered failures do not become current editor diagnostics.".into()];
+    value.failure_modes = vec![
+        "All alternatives failing retains their typed, source-ordered failures.".into(),
+        "cleanup_scope_failed".into(),
+    ];
+    value.constraints = vec![
+        constraint(
+            "compatible_results",
+            "analysis",
+            "result",
+            "A bound race requires every branch to end with provide and compatible transferable result types. An optional annotation constrains every result. Only the selected value is bound after teardown; branch locals never merge.",
+        ),
+        constraint(
+            "exclusive_resources",
+            "analysis",
+            "body",
+            "Use lexical browser blocks in a flow domain for concurrent browser work. Inherited exclusive resources and non-transferable outer captures cannot be shared.",
+        ),
+        constraint(
+            "computation",
+            "runtime",
+            "body",
+            "Race executes child computations; it does not subscribe to event sources.",
+        ),
+    ];
+    value.examples = vec![
+        example(
+            "winner value",
+            "let selected: String = race { server { provide \"left\" } server { provide \"right\" } } expect [\"left\", \"right\"] contains selected",
+            "statement_fragment",
+            "flow_block",
+        ),
+        example(
+            "recover an alternative",
+            "race { server { expect 1 == 2 } server { expect 2 == 2 } }",
+            "statement_fragment",
+            "flow_block",
+        ),
+        example(
+            "bounded inherited domain",
+            "let selected = race { timeout 1s { provide 1 } timeout 1s { provide 2 } }",
+            "statement_fragment",
+            "scope.server",
+        ),
+    ];
+    value.related = vec![
+        "statement.provide".into(),
+        "control.parallel".into(),
+        "control.timeout".into(),
+        "statement.let".into(),
+    ];
+    value
+}
+
+fn provide_construct() -> ConstructDescription {
+    let mut value = base_construct(
+        "statement.provide",
+        "provide",
+        "statement",
+        "provide <expression>",
+        "Complete the current race branch with a transferable result value.",
+    );
+    value.parameters = vec![parameter(
+        "expression",
+        Type::Unknown,
+        true,
+        None,
+        false,
+        "value",
+        "expression",
+    )];
+    value.result_rule = Some("The inferred transferable expression type; a bound race additionally requires compatible types across all branches.".into());
+    value.search_terms = vec!["provide".into(), "return".into(), "winner value".into()];
+    value.allowed_contexts = vec!["race_branch".into()];
+    value.produces_value = Some(true);
+    value.effects = vec!["Evaluate one pure expression in the branch environment, then finish lexical teardown before the branch can win.".into(), "Transfer only the winner value and its redaction metadata to a bound race; discarded and losing values never enter parent bindings.".into()];
+    value.failure_modes =
+        vec!["Expression evaluation retains its structured typed failure.".into()];
+    value.constraints = vec![constraint(
+        "lexical_result",
+        "analysis",
+        "expression",
+        "Provide must be the final statement of a race branch, possibly inside its timeout or capability block. A nested parallel branch cannot provide to an enclosing race. Provider calls must be evaluated in a let binding before provide.",
+    )];
+    value.examples = vec![
+        example(
+            "scalar result",
+            "test \"choice\" { let value = race { server { provide 7 } } expect value == 7 }",
+            "source_file",
+            "source_file",
+        ),
+        example(
+            "record result",
+            "test \"record\" { let value = race { timeout 1s { let local = 7 provide { id: local } } } expect value.id == 7 }",
+            "source_file",
+            "source_file",
+        ),
+    ];
+    value.related = vec!["control.race".into(), "statement.let".into()];
     value
 }
 

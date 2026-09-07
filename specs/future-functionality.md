@@ -1175,14 +1175,15 @@ lexical browser contexts, prompt infrastructure-failure cancellation, bounded te
 typed child results. Descriptions, native/WASM plans, and CLI/DAP result projections share that path.
 
 Status: in progress. The execution-tree foundation, structural node identities,
-parented scope/operation events, plan format 7/runtime semantics 4 compatibility metadata, and atomic runtime
+parented scope/operation events, plan format 8/runtime semantics 5 compatibility metadata, and atomic runtime
 observation commits are implemented. Generic resource/lease/wait contracts, browser-context
 lifecycle integration, inherited cancellation/deadline contexts, and bounded cleanup now have
 conformance coverage. Direct processes and command adapters share cancellation-aware capture;
-active bridge calls await terminal cancellation acknowledgement. An internal `Race` plan node shares
-the sibling scheduler, selects completed success, cancels and joins losers, and keeps recovered
-failures out of current diagnostics while preserving branch results/events. Complete host/resource ownership,
-public race/provide/result bindings, retry constructs, jobs,
+active bridge calls await terminal cancellation acknowledgement. Public `race` and `provide` use a distinct Race plan node and the shared sibling scheduler.
+Bound races require compatible transferable results, transfer only the winner with its redaction
+metadata, and cancel and join losers. Recovered failures remain in branch results/events but do
+not become current diagnostics. CLI schema 6 marks the final winning branch. Complete host/resource ownership,
+retry constructs, jobs,
 the authoritative journal, traces, observation IPC, and concurrent DAP remain
 pending; see the milestone's implementation-progress section for the exact boundary.
 

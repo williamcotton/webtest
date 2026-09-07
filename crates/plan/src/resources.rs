@@ -80,7 +80,7 @@ impl PlanNode {
             }
             PlanNodeKind::Sequence { children }
             | PlanNodeKind::Parallel { children, .. }
-            | PlanNodeKind::Race { children } => {
+            | PlanNodeKind::Race { children, .. } => {
                 merged(children.iter().flat_map(Self::required_resources))
             }
             PlanNodeKind::Timeout { child, .. } => return child.required_resources(),

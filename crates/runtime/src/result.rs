@@ -35,6 +35,7 @@ pub struct TestResult {
 
 #[derive(Clone, Debug)]
 pub struct BranchResult {
+    pub race_winner: bool,
     pub scope: webtest_observation::ScopeEvent,
     pub outcome: TestOutcome,
     pub duration: Duration,
