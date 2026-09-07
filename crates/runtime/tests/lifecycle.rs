@@ -3958,3 +3958,469 @@ async fn nested_parallel_primary_failure_notifies_ancestor_scheduler_before_tear
     );
     assert_scopes_finish_once_after_children(&result.events);
 }
+
+// Until race syntax and result lowering are exposed, exercise its distinct plan
+// node with the same compiler-produced branch scopes and resource recipes.
+fn race_plan(source: &str) -> TestPlan {
+    fn convert(node: &mut webtest_plan::PlanNode, test: webtest_model::PlanDeclarationId) {
+        use webtest_plan::{PlanNode, PlanNodeKind};
+        if let PlanNodeKind::Parallel { children, .. } = &node.kind {
+            *node = PlanNode::race(
+                test,
+                node.origin,
+                node.source_revision,
+                node.path.clone(),
+                children.clone(),
+            );
+        }
+        match &mut node.kind {
+            PlanNodeKind::Sequence { children }
+            | PlanNodeKind::Parallel { children, .. }
+            | PlanNodeKind::Race { children } => {
+                for child in children {
+                    convert(child, test);
+                }
+            }
+            PlanNodeKind::Timeout { child, .. }
+            | PlanNodeKind::ResourceScope { body: child, .. } => convert(child, test),
+            PlanNodeKind::Operation { .. } => {}
+        }
+    }
+    let mut plan = compile_source(source);
+    for test in &mut plan.tests {
+        convert(&mut test.body, test.declaration_id);
+    }
+    plan.validate_tree().unwrap();
+    plan
+}
+
+#[tokio::test(start_paused = true)]
+async fn race_recovers_failed_alternatives_without_publishing_their_diagnostics_or_bindings() {
+    for later_failure in [false, true] {
+        let state = Arc::new(LifecycleState::default());
+        state.page_delays.lock().unwrap().extend([
+            ("winner".into(), Duration::from_millis(10)),
+            ("loser".into(), Duration::from_secs(10)),
+        ]);
+        state
+            .context_close_delays
+            .lock()
+            .unwrap()
+            .insert(1, Duration::from_millis(100));
+        let source = format!(
+            r#"test "race" {{
+            let seed = 7
+            parallel {{
+                server {{ let local = seed expect local == 8 }}
+                browser {{ evaluate "winner" }}
+                browser {{ evaluate "loser" evaluate "must not run" }}
+            }}
+            expect seed == {}
+        }}"#,
+            if later_failure { 8 } else { 7 }
+        );
+        let plan = race_plan(&source);
+        let observations = Arc::new(ObservationStore::default());
+        let started = tokio::time::Instant::now();
+        let result = Runner::new(observations.clone())
+            .run(&plan, &LifecycleHost(state.clone()))
+            .await;
+        assert_eq!(started.elapsed(), Duration::from_millis(110));
+        assert_eq!(result.failed(), usize::from(later_failure));
+        assert_eq!(
+            result.tests[0].bindings,
+            BTreeMap::from([("seed".into(), Value::Int(7))])
+        );
+        let branches = &result.tests[0].branches;
+        assert_eq!(branches.len(), 3);
+        assert!(matches!(branches[0].outcome, TestOutcome::Failed(_)));
+        assert!(matches!(branches[1].outcome, TestOutcome::Passed));
+        assert!(matches!(
+            branches[2].outcome,
+            TestOutcome::Cancelled {
+                reason: CancellationReason::RaceLost
+            }
+        ));
+        let cause = branches[2].scope.cancellation.unwrap();
+        assert_eq!(
+            Some(cause.causing_scope_id),
+            branches[1].scope.execution_context.parent_scope_id
+        );
+        assert_eq!(
+            observations
+                .observations_for(plan.file, plan.source_revision)
+                .len(),
+            usize::from(later_failure)
+        );
+        assert_eq!(
+            result
+                .events
+                .iter()
+                .filter(|event| matches!(event, ExecutionEvent::StepFailed { .. }))
+                .count(),
+            1 + usize::from(later_failure)
+        );
+        assert!(
+            !state
+                .log()
+                .iter()
+                .any(|entry| entry.contains("must not run"))
+        );
+        assert_scopes_finish_once_after_children(&result.events);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn race_selects_success_only_after_branch_teardown_finishes() {
+    let state = Arc::new(LifecycleState::default());
+    state.page_delays.lock().unwrap().extend([
+        ("early body".into(), Duration::from_millis(1)),
+        ("winner".into(), Duration::from_millis(10)),
+    ]);
+    state
+        .context_close_delays
+        .lock()
+        .unwrap()
+        .insert(0, Duration::from_millis(50));
+    let plan = race_plan(
+        r#"test "teardown is completion" {
+        parallel { browser { evaluate "early body" } browser { evaluate "winner" } }
+    }"#,
+    );
+    let started = tokio::time::Instant::now();
+    let result = Runner::new(Arc::default())
+        .run(&plan, &LifecycleHost(state))
+        .await;
+    assert_eq!(started.elapsed(), Duration::from_millis(51));
+    assert_eq!(result.passed(), 1);
+    assert_eq!(
+        result.tests[0].branches[0]
+            .scope
+            .cancellation
+            .unwrap()
+            .reason,
+        CancellationReason::RaceLost
+    );
+    assert!(matches!(
+        result.tests[0].branches[1].outcome,
+        TestOutcome::Passed
+    ));
+    assert!(result.tests[0].branches[1].scope.cancellation.is_none());
+    assert_scopes_finish_once_after_children(&result.events);
+}
+
+#[tokio::test(start_paused = true)]
+async fn race_all_failures_remain_in_source_order_with_each_observation() {
+    struct DelayFirst;
+    #[async_trait]
+    impl RunControl for DelayFirst {
+        async fn before_step(&self, _: &PlannedTest, step: &PlannedStep) {
+            if step.id == StepId(0) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+    let plan = race_plan(
+        r#"test "all failed" {
+        parallel { server { expect 1 == 2 } server { expect 3 == 4 } }
+    }"#,
+    );
+    let observations = Arc::new(ObservationStore::default());
+    let result = Runner::new(observations.clone())
+        .run_with_control(&plan, &LifecycleHost(Arc::default()), Some(&DelayFirst))
+        .await;
+    assert_eq!(result.failed(), 1);
+    assert!(
+        matches!(&result.tests[0].outcome, TestOutcome::Failed(failure) if failure.step.id == StepId(0))
+    );
+    for (ordinal, branch) in result.tests[0].branches.iter().enumerate() {
+        assert!(
+            matches!(&branch.outcome, TestOutcome::Failed(failure) if failure.step.id == StepId(ordinal as u32))
+        );
+        assert!(branch.scope.cancellation.is_none());
+    }
+    assert_eq!(
+        observations
+            .observations_for(plan.file, plan.source_revision)
+            .len(),
+        2
+    );
+    let failure_order = result
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            ExecutionEvent::StepFailed { step_id, .. } => Some(step_id.0),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(failure_order, [1, 0]);
+    assert_scopes_finish_once_after_children(&result.events);
+}
+
+#[tokio::test(start_paused = true)]
+async fn race_infrastructure_failure_cancels_before_teardown_and_cannot_be_recovered() {
+    let state = Arc::new(LifecycleState::default());
+    state.page_delays.lock().unwrap().extend([
+        ("broken".into(), Duration::from_millis(1)),
+        ("could succeed".into(), Duration::from_millis(10)),
+    ]);
+    state
+        .page_errors
+        .lock()
+        .unwrap()
+        .insert("broken".into(), BrowserError::BrowserDisconnected);
+    state
+        .context_close_delays
+        .lock()
+        .unwrap()
+        .insert(0, Duration::from_millis(100));
+    let plan = race_plan(
+        r#"test "unhealthy" {
+        parallel { browser { evaluate "broken" } browser { evaluate "could succeed" } }
+    }"#,
+    );
+    let result = Runner::new(Arc::default())
+        .run(&plan, &LifecycleHost(state.clone()))
+        .await;
+    assert!(matches!(
+        result.tests[0].outcome,
+        TestOutcome::Aborted { .. }
+    ));
+    assert!(matches!(
+        result.tests[0].branches[1].outcome,
+        TestOutcome::Cancelled {
+            reason: CancellationReason::ParentFailed
+        }
+    ));
+    let log = state.log();
+    assert!(
+        log.iter()
+            .position(|entry| entry == "context_close:1")
+            .unwrap()
+            < log
+                .iter()
+                .position(|entry| entry == "context_close_done:0")
+                .unwrap()
+    );
+    assert_scopes_finish_once_after_children(&result.events);
+}
+
+#[tokio::test(start_paused = true)]
+async fn race_loser_cleanup_failure_overrides_success_without_losing_race_loss_cause() {
+    let state = Arc::new(LifecycleState::default());
+    state.page_delays.lock().unwrap().extend([
+        ("winner".into(), Duration::from_millis(10)),
+        ("loser".into(), Duration::from_secs(10)),
+    ]);
+    state.context_close_failures.lock().unwrap().insert(1);
+    let plan = race_plan(
+        r#"test "cleanup fails" {
+        parallel { browser { evaluate "winner" } browser { evaluate "loser" } }
+    }"#,
+    );
+    let result = Runner::new(Arc::default())
+        .run(&plan, &LifecycleHost(state))
+        .await;
+    assert!(matches!(
+        result.tests[0].outcome,
+        TestOutcome::Aborted { .. }
+    ));
+    assert!(matches!(
+        result.tests[0].branches[0].outcome,
+        TestOutcome::Passed
+    ));
+    assert!(
+        matches!(&result.tests[0].branches[1].outcome, TestOutcome::Aborted { prior_outcome: Some(prior), .. } if matches!(prior.as_ref(), PriorTestOutcome::Cancelled { reason: CancellationReason::RaceLost }))
+    );
+    assert_eq!(
+        result.tests[0].branches[1]
+            .scope
+            .cancellation
+            .unwrap()
+            .reason,
+        CancellationReason::RaceLost
+    );
+    assert_scopes_finish_once_after_children(&result.events);
+}
+
+#[tokio::test(start_paused = true)]
+async fn race_timeout_before_a_winner_retains_completed_failures_and_cancels_live_alternatives() {
+    let state = Arc::new(LifecycleState::default());
+    state
+        .page_delays
+        .lock()
+        .unwrap()
+        .insert("pending".into(), Duration::from_secs(10));
+    let plan = race_plan(
+        r#"test "race expires" {
+        timeout 20ms { parallel { server { expect 1 == 2 } browser { evaluate "pending" } } }
+    }"#,
+    );
+    let observations = Arc::new(ObservationStore::default());
+    let result = Runner::new(observations.clone())
+        .run(&plan, &LifecycleHost(state))
+        .await;
+    assert!(matches!(
+        result.tests[0].outcome,
+        TestOutcome::TimedOut { .. }
+    ));
+    assert!(matches!(
+        result.tests[0].branches[0].outcome,
+        TestOutcome::Failed(_)
+    ));
+    assert!(matches!(
+        result.tests[0].branches[1].outcome,
+        TestOutcome::Cancelled {
+            reason: CancellationReason::Timeout
+        }
+    ));
+    assert_eq!(
+        observations
+            .observations_for(plan.file, plan.source_revision)
+            .len(),
+        2
+    );
+    assert_scopes_finish_once_after_children(&result.events);
+}
+
+#[tokio::test(start_paused = true)]
+async fn race_timeout_during_loser_teardown_does_not_overwrite_the_first_cancellation_cause() {
+    let state = Arc::new(LifecycleState::default());
+    state.page_delays.lock().unwrap().extend([
+        ("winner".into(), Duration::from_millis(10)),
+        ("loser".into(), Duration::from_secs(10)),
+    ]);
+    state
+        .context_close_delays
+        .lock()
+        .unwrap()
+        .insert(1, Duration::from_millis(100));
+    let plan = race_plan(
+        r#"test "cleanup outlasts deadline" {
+        timeout 20ms { parallel { browser { evaluate "winner" } browser { evaluate "loser" } } }
+    }"#,
+    );
+    let started = tokio::time::Instant::now();
+    let result = Runner::new(Arc::default())
+        .run(&plan, &LifecycleHost(state))
+        .await;
+    assert_eq!(started.elapsed(), Duration::from_millis(110));
+    assert!(matches!(
+        result.tests[0].outcome,
+        TestOutcome::TimedOut { .. }
+    ));
+    assert!(matches!(
+        result.tests[0].branches[0].outcome,
+        TestOutcome::Passed
+    ));
+    assert!(matches!(
+        result.tests[0].branches[1].outcome,
+        TestOutcome::Cancelled {
+            reason: CancellationReason::RaceLost
+        }
+    ));
+    assert_scopes_finish_once_after_children(&result.events);
+}
+
+#[tokio::test(start_paused = true)]
+async fn race_loser_teardown_uses_the_inherited_cleanup_deadline_and_records_expiry() {
+    let state = Arc::new(LifecycleState::default());
+    state.page_delays.lock().unwrap().extend([
+        ("winner".into(), Duration::from_millis(10)),
+        ("loser".into(), Duration::from_secs(10)),
+    ]);
+    state
+        .context_close_delays
+        .lock()
+        .unwrap()
+        .insert(1, Duration::from_secs(10));
+    let plan = race_plan(
+        r#"test "bounded loser cleanup" {
+        parallel { browser { evaluate "winner" } browser { evaluate "loser" } }
+    }"#,
+    );
+    let started = tokio::time::Instant::now();
+    let result = Runner::new(Arc::default())
+        .with_options(RunnerOptions {
+            cleanup_timeout: Duration::from_millis(25),
+            ..RunnerOptions::default()
+        })
+        .run(&plan, &LifecycleHost(state))
+        .await;
+    assert_eq!(started.elapsed(), Duration::from_millis(35));
+    assert!(matches!(
+        result.tests[0].outcome,
+        TestOutcome::Aborted { .. }
+    ));
+    assert_eq!(result.tests[0].branches.len(), 2);
+    assert!(matches!(
+        result.tests[0].branches[0].outcome,
+        TestOutcome::Passed
+    ));
+    assert!(matches!(
+        result.tests[0].branches[1].outcome,
+        TestOutcome::Aborted { .. }
+    ));
+    assert_eq!(
+        result.tests[0].branches[1]
+            .scope
+            .cancellation
+            .unwrap()
+            .reason,
+        CancellationReason::RaceLost
+    );
+    assert_scopes_finish_once_after_children(&result.events);
+}
+
+#[tokio::test(start_paused = true)]
+async fn nested_race_primary_failure_cancels_outer_alternatives_before_inner_teardown() {
+    let state = Arc::new(LifecycleState::default());
+    state.page_delays.lock().unwrap().extend([
+        ("broken".into(), Duration::from_millis(1)),
+        ("pending".into(), Duration::from_secs(10)),
+    ]);
+    state
+        .page_errors
+        .lock()
+        .unwrap()
+        .insert("broken".into(), BrowserError::BrowserDisconnected);
+    state
+        .context_close_delays
+        .lock()
+        .unwrap()
+        .insert(0, Duration::from_millis(100));
+    let plan = race_plan(
+        r#"test "nested race" {
+        parallel {
+            parallel { browser { evaluate "broken" } browser { evaluate "pending" } }
+            browser { evaluate "pending" }
+        }
+    }"#,
+    );
+    let result = Runner::new(Arc::default())
+        .run(&plan, &LifecycleHost(state.clone()))
+        .await;
+    assert!(matches!(
+        result.tests[0].outcome,
+        TestOutcome::Aborted { .. }
+    ));
+    let branches = &result.tests[0].branches;
+    assert_eq!(branches[0].branches.len(), 2);
+    assert!(matches!(
+        branches[1].outcome,
+        TestOutcome::Cancelled {
+            reason: CancellationReason::ParentFailed
+        }
+    ));
+    let log = state.log();
+    assert!(
+        log.iter()
+            .position(|entry| entry == "context_close:2")
+            .unwrap()
+            < log
+                .iter()
+                .position(|entry| entry == "context_close_done:0")
+                .unwrap()
+    );
+    assert_scopes_finish_once_after_children(&result.events);
+}

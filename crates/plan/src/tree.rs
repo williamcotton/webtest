@@ -18,6 +18,10 @@ pub struct PlanNode {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PlanNodeKind {
+    /// First successfully completed child wins; every loser is cancelled and joined.
+    Race {
+        children: Vec<PlanNode>,
+    },
     Parallel {
         children: Vec<PlanNode>,
         failure_policy: ParallelFailurePolicy,
@@ -87,6 +91,31 @@ impl PlanNode {
         node
     }
 
+    pub fn race(
+        test: PlanDeclarationId,
+        origin: SyntaxOrigin,
+        revision: SourceRevision,
+        path: Vec<u32>,
+        children: Vec<Self>,
+    ) -> Self {
+        let required_capabilities = children
+            .iter()
+            .flat_map(|child| child.required_capabilities.iter().copied())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let mut node = Self {
+            id: PlanNodeId([0; 32]),
+            path,
+            origin,
+            source_revision: revision,
+            required_capabilities,
+            kind: PlanNodeKind::Race { children },
+        };
+        node.assign_identity(test);
+        node
+    }
+
     pub fn resource_scope(
         test: PlanDeclarationId,
         origin: SyntaxOrigin,
@@ -140,7 +169,9 @@ impl PlanNode {
     fn rebase(&mut self, test: PlanDeclarationId, path: Vec<u32>) {
         self.path = path;
         match &mut self.kind {
-            PlanNodeKind::Sequence { children } | PlanNodeKind::Parallel { children, .. } => {
+            PlanNodeKind::Sequence { children }
+            | PlanNodeKind::Parallel { children, .. }
+            | PlanNodeKind::Race { children } => {
                 for (ordinal, child) in children.iter_mut().enumerate() {
                     let mut path = self.path.clone();
                     path.push(ordinal as u32);
@@ -236,6 +267,7 @@ impl PlanNode {
         match &self.kind {
             PlanNodeKind::ResourceScope { .. } => "resource/browser-context/v1",
             PlanNodeKind::Parallel { .. } => "parallel/v1",
+            PlanNodeKind::Race { .. } => "race/v1",
             PlanNodeKind::Sequence { .. } => "sequence/v1",
             PlanNodeKind::Timeout { .. } => "timeout/v1",
             PlanNodeKind::Operation { step } => match &step.operation {
@@ -262,9 +294,9 @@ impl PlanNode {
         match &self.kind {
             PlanNodeKind::ResourceScope { body, .. } => body.steps(),
             PlanNodeKind::Timeout { child, .. } => child.steps(),
-            PlanNodeKind::Sequence { children } | PlanNodeKind::Parallel { children, .. } => {
-                children.iter().flat_map(Self::steps).collect()
-            }
+            PlanNodeKind::Sequence { children }
+            | PlanNodeKind::Parallel { children, .. }
+            | PlanNodeKind::Race { children } => children.iter().flat_map(Self::steps).collect(),
             PlanNodeKind::Operation { step } => vec![step],
         }
     }
@@ -273,7 +305,9 @@ impl PlanNode {
         match &mut self.kind {
             PlanNodeKind::ResourceScope { body, .. } => body.steps_mut(),
             PlanNodeKind::Timeout { child, .. } => child.steps_mut(),
-            PlanNodeKind::Sequence { children } | PlanNodeKind::Parallel { children, .. } => {
+            PlanNodeKind::Sequence { children }
+            | PlanNodeKind::Parallel { children, .. }
+            | PlanNodeKind::Race { children } => {
                 children.iter_mut().flat_map(Self::steps_mut).collect()
             }
             PlanNodeKind::Operation { step } => vec![step],
@@ -335,7 +369,9 @@ impl PlanNode {
         if self.id != self.derived_identity(test) {
             return Err(PlanTreeError::InvalidIdentity);
         }
-        if let PlanNodeKind::Parallel { children, .. } = &self.kind {
+        if let PlanNodeKind::Parallel { children, .. } | PlanNodeKind::Race { children } =
+            &self.kind
+        {
             if children.is_empty() || children.len() > MAX_PARALLEL_BRANCHES {
                 return Err(PlanTreeError::InvalidControlSetting);
             }
@@ -389,7 +425,9 @@ impl PlanNode {
                 child.validate(test, revision, &child_path, steps)?;
                 child.required_capabilities.clone()
             }
-            PlanNodeKind::Sequence { children } | PlanNodeKind::Parallel { children, .. } => {
+            PlanNodeKind::Sequence { children }
+            | PlanNodeKind::Parallel { children, .. }
+            | PlanNodeKind::Race { children } => {
                 for (ordinal, child) in children.iter().enumerate() {
                     if child.origin.file != self.origin.file {
                         return Err(PlanTreeError::OriginMismatch);
@@ -550,4 +588,110 @@ pub fn declaration_identity(
         ))
         .as_bytes(),
     )
+}
+
+#[cfg(test)]
+mod race_tests {
+    use super::*;
+    use webtest_model::{StepId, Value};
+    use webtest_text::{FileId, TextRange, TextSize};
+
+    fn branch(
+        test: PlanDeclarationId,
+        origin: SyntaxOrigin,
+        revision: SourceRevision,
+        ordinal: u32,
+        browser: bool,
+    ) -> PlanNode {
+        PlanNode::operation(
+            test,
+            revision,
+            vec![0, ordinal],
+            PlannedStep {
+                id: StepId(ordinal),
+                origin,
+                operation: if browser {
+                    crate::TestOperation::Browser(crate::BrowserOperation::Evaluate {
+                        expression: "ok".into(),
+                    })
+                } else {
+                    crate::TestOperation::EvaluatePure(crate::EvaluatePureOperation {
+                        expression: crate::PlanExpr::Literal(Value::Null),
+                        result_binding: None,
+                        result_name: None,
+                        result_type: webtest_model::Type::Null,
+                    })
+                },
+            },
+        )
+    }
+
+    #[test]
+    fn race_has_distinct_stable_identity_round_trips_and_projects_steps_in_source_order() {
+        let test = declaration_identity("race.webtest", "race", 0);
+        let origin = SyntaxOrigin::new(
+            FileId::new(1),
+            TextRange::new(TextSize::from(2), TextSize::from(20)),
+        );
+        let revision = SourceRevision::of("race source");
+        let children: Vec<_> = (0..2)
+            .map(|ordinal| branch(test, origin, revision, ordinal, false))
+            .collect();
+        let race = PlanNode::race(test, origin, revision, vec![0], children.clone());
+        let parallel = PlanNode::parallel(test, origin, revision, vec![0], children.clone());
+        assert_ne!(race.id, parallel.id);
+        assert_eq!(
+            race,
+            PlanNode::race(test, origin, revision, vec![0], children)
+        );
+        assert_eq!(
+            race.steps().iter().map(|step| step.id).collect::<Vec<_>>(),
+            [StepId(0), StepId(1)]
+        );
+        let json = serde_json::to_value(&race).unwrap();
+        assert_eq!(json["kind"]["kind"], "race");
+        assert_eq!(serde_json::from_value::<PlanNode>(json).unwrap(), race);
+        race.validate(test, revision, &[0], &mut Default::default())
+            .unwrap();
+        assert_eq!(race.origin, origin);
+    }
+
+    #[test]
+    fn race_reuses_concurrency_bounds_and_requires_branch_local_exclusive_resources() {
+        let test = declaration_identity("race.webtest", "race", 0);
+        let origin = SyntaxOrigin::new(FileId::new(1), TextRange::default());
+        let revision = SourceRevision::of("race source");
+        for count in [0, MAX_PARALLEL_BRANCHES + 1] {
+            let children = (0..count)
+                .map(|ordinal| branch(test, origin, revision, ordinal as u32, false))
+                .collect();
+            let node = PlanNode::race(test, origin, revision, vec![0], children);
+            assert_eq!(
+                node.validate(test, revision, &[0], &mut Default::default()),
+                Err(PlanTreeError::InvalidControlSetting)
+            );
+        }
+        for count in [1, 2] {
+            let children: Vec<_> = (0..count)
+                .map(|ordinal| branch(test, origin, revision, ordinal, true))
+                .collect();
+            let node = PlanNode::race(test, origin, revision, vec![0], children.clone());
+            assert_eq!(
+                node.validate(test, revision, &[0], &mut Default::default()),
+                Err(if count == 1 {
+                    PlanTreeError::MissingResourceScope
+                } else {
+                    PlanTreeError::ResourceAccessConflict
+                })
+            );
+            let owned = children
+                .into_iter()
+                .map(|child| child.with_browser_resource(test))
+                .collect();
+            let node = PlanNode::race(test, origin, revision, vec![0], owned);
+            node.validate(test, revision, &[0], &mut Default::default())
+                .unwrap();
+            assert!(node.required_resources().is_empty());
+        }
+    }
 }

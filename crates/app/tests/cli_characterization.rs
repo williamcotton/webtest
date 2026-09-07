@@ -242,8 +242,8 @@ fn build_is_deterministic_and_description_json_remains_machine_clean() {
     );
     let plan: serde_json::Value =
         serde_json::from_slice(&fs::read(first).expect("plan")).expect("plan JSON");
-    assert_eq!(plan["format_version"], 6);
-    assert_eq!(plan["runtime_semantics_version"], 3);
+    assert_eq!(plan["format_version"], 7);
+    assert_eq!(plan["runtime_semantics_version"], 4);
     assert_eq!(plan["tests"][0]["id"], 0);
     assert_eq!(
         plan["tests"][0]["required_host_capabilities"],

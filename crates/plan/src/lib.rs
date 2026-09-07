@@ -23,8 +23,8 @@ pub use tree::{
 mod compatibility;
 pub use compatibility::{PlanCompatibilityError, PlanExecutionInputs};
 
-pub const PLAN_FORMAT_VERSION: u32 = 6;
-pub const RUNTIME_SEMANTICS_VERSION: u32 = 3;
+pub const PLAN_FORMAT_VERSION: u32 = 7;
+pub const RUNTIME_SEMANTICS_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PlanEnvelope {
@@ -437,7 +437,7 @@ mod tests {
         let encoded = serde_json::to_string(&envelope).expect("serialize plan");
         let decoded: PlanEnvelope = serde_json::from_str(&encoded).expect("deserialize plan");
         assert_eq!(decoded, envelope);
-        for version in [1, 2, 3, 4, 5, PLAN_FORMAT_VERSION + 1] {
+        for version in [1, 2, 3, 4, 5, 6, PLAN_FORMAT_VERSION + 1] {
             let mut unsupported = decoded.clone();
             unsupported.format_version = version;
             assert!(unsupported.validate_version().is_err());

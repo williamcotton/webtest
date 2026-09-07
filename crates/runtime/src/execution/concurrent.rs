@@ -3,12 +3,17 @@ use crate::BranchResult;
 use webtest_plan::PlanNode;
 
 impl TreeExecution<'_, '_> {
-    pub(super) async fn parallel_node(
+    pub(super) async fn concurrent_node(
         &mut self,
         children: &[PlanNode],
         parent: &scopes::ExecutionScope,
+        policy: scheduler::SiblingPolicy,
     ) -> TestBodyOutcome {
-        let services = self.services;
+        let mut observations = ObservationProjection::new(self.services);
+        let services = ExecutionServices {
+            observations: &observations.pending,
+            ..*self.services
+        };
         self.branch.active_step = None;
         let children = children
             .iter()
@@ -20,15 +25,22 @@ impl TreeExecution<'_, '_> {
                 (
                     scope.context.clone(),
                     receiver,
-                    execute_branch(services, node, scope, state),
+                    execute_branch(&services, node, scope, state),
                 )
             })
             .collect();
         let first = self.branch.completed_branches.len();
-        scheduler::parallel(
+        let winner = scheduler::schedule(
             &parent.context,
+            policy,
             children,
-            |result| result.outcome.failure_class(),
+            |result| match &result.outcome {
+                TestOutcome::Passed => scheduler::Completion::Passed,
+                outcome => outcome.failure_class().map_or(
+                    scheduler::Completion::Cancelled,
+                    scheduler::Completion::Failed,
+                ),
+            },
             |_, result| {
                 // Persist completed children in the parent's own state as they
                 // finish. An enclosing interrupted wait cannot discard them.
@@ -43,6 +55,10 @@ impl TreeExecution<'_, '_> {
                 .task_path
                 .cmp(&b.scope.execution_context.task_path)
         });
+        if winner.is_some() {
+            observations.recovered = true;
+            return TestBodyOutcome::Provisional(ProvisionalTestOutcome::Passed);
+        }
         let mut summary = &TestOutcome::Passed;
         for child in results {
             if severity(&child.outcome) > severity(summary) {
@@ -55,6 +71,40 @@ impl TreeExecution<'_, '_> {
             TestBodyOutcome::Provisional(ProvisionalTestOutcome::Finalized(Box::new(
                 summary.clone(),
             )))
+        }
+    }
+}
+
+/// Failed alternatives remain in events and branch results. Only unrecovered
+/// failures become current editor diagnostics. Dropping an interrupted subtree
+/// still publishes the observations it already collected.
+struct ObservationProjection<'a> {
+    pending: ObservationStore,
+    parent: &'a ObservationStore,
+    plan: &'a TestPlan,
+    recovered: bool,
+}
+
+impl<'a> ObservationProjection<'a> {
+    fn new(services: &ExecutionServices<'a>) -> Self {
+        Self {
+            pending: ObservationStore::default(),
+            parent: services.observations,
+            plan: services.plan,
+            recovered: false,
+        }
+    }
+}
+
+impl Drop for ObservationProjection<'_> {
+    fn drop(&mut self) {
+        if !self.recovered {
+            for observation in self
+                .pending
+                .observations_for(self.plan.file, self.plan.source_revision)
+            {
+                self.parent.record(observation);
+            }
         }
     }
 }

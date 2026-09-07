@@ -438,6 +438,7 @@ async fn execute_test_body(
 
 /// Shared immutable inputs and run services. No bindings, page handles, active
 /// operation, or mutable scope cursor is stored here.
+#[derive(Clone, Copy)]
 struct ExecutionServices<'a> {
     plan: &'a TestPlan,
     observations: &'a ObservationStore,
@@ -540,7 +541,12 @@ impl TreeExecution<'_, '_> {
         Box::pin(async move {
             match &node.kind {
                 webtest_plan::PlanNodeKind::Parallel { children, .. } => {
-                    self.parallel_node(children, scope).await
+                    self.concurrent_node(children, scope, scheduler::SiblingPolicy::All)
+                        .await
+                }
+                webtest_plan::PlanNodeKind::Race { children } => {
+                    self.concurrent_node(children, scope, scheduler::SiblingPolicy::FirstSuccess)
+                        .await
                 }
                 webtest_plan::PlanNodeKind::ResourceScope { resource, body } => {
                     self.resource_node(*resource, body, scope).await

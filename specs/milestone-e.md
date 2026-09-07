@@ -27,7 +27,7 @@ Milestone E is **not complete**. The execution-tree, resource/wait foundations, 
   occurrences. Browser acquisition is an explicit lexical `ResourceScope` in the plan; a test root includes test cleanup. Descendants interrupted
   by the existing test deadline record cancellation and its causing scope; the root records its
   final outcome after cleanup. Cancellation facts retain their typed reason and causing scope.
-- Plan format 6 and runtime semantics 3 version the tree and timeout behavior independently. Native builds fingerprint
+- Plan format 7 and runtime semantics 4 version the tree and timeout behavior independently. Native builds fingerprint
   resolved configuration, keeping configuration values out of the artifact. Shared validation
   checks tree structure, identities, revisions, capability requirements, and explicit execution
   inputs for detectable drift. There is still no CLI command to execute an emitted plan.
@@ -150,6 +150,44 @@ futures within each test.
 Race, retry, jobs, full host-resource coverage, the bounded authoritative journal, traces, observation
 IPC, and concurrent DAP control remain unimplemented. The acceptance criteria below are still
 unsatisfied as a whole.
+
+### Checkpoint 4 continuation — race execution core
+
+Checkpoint 4 (`04008e1`) preserves the accepted branch-local architecture and the passing default
+workspace test command. The next slice introduces a distinct `Race` plan node and shared sibling
+scheduling policies for all-success and first-success completion. Plan format 7/runtime semantics 4
+reject older execution contracts rather than silently interpreting the new node as parallel.
+
+A successful child can win only after its resource and branch teardown finishes. Selection cancels
+unfinished alternatives with `RaceLost`, preserves the first cancellation cause, and awaits every
+child under the existing inherited cleanup deadline. A failed alternative cannot win while another
+can succeed; all-failed races retain the source-ordered aggregate. Infrastructure/internal primary
+signals still propagate immediately through nested schedulers. Signals published while polling a
+completed sibling are checked before awarding success, and cleanup failure prevents a successful
+race outcome even after a provisional winner has been selected.
+
+Recovered alternative failures remain in branch results and execution events. A lexical observation
+projection keeps them out of current editor diagnostics without deleting unrelated failures before
+or after the race. Interrupted projections preserve already collected observations. Parallel uses
+the same completion, ownership, resource, cancellation, and observation paths.
+
+Focused plan and paused-clock scheduler/lifecycle tests cover distinct identity and serialization,
+resource conflicts and bounds, first-winner stability, primary signalling during the same poll as
+success, every parent cancellation reason, late loser cleanup failure, cleanup expiry, enclosing
+timeout before and after selection, nested unhealthy branches, deterministic all-failure reporting,
+and recovered diagnostics and binding isolation.
+
+Validation: `cargo test --workspace` passed with default threading, including Chrome and protocol
+tests; workspace Clippy with `-D warnings`, Rust formatting, and the portable
+`wasm32-unknown-unknown` check passed. Fourteen new focused tests cover the race core; the runtime
+lifecycle suite now has 74 passing tests.
+
+This is execution-core progress, not a public language claim. Public `race`/`provide` syntax,
+compatible result-type analysis, explicit winner-value binding and reporting, and their description,
+formatter, editor and portable compiler coverage remain the next vertical slice. Race tests currently
+construct the distinct plan node from compiler-produced parallel branch recipes; the parser and
+`describe` still correctly reject/do not advertise the unimplemented public syntax. Retry, jobs,
+remaining host-resource conformance, journal, traces, IPC, and concurrent DAP remain pending.
 
 ## 1. Outcome
 

@@ -78,7 +78,9 @@ impl PlanNode {
                 }
                 return Vec::new();
             }
-            PlanNodeKind::Sequence { children } | PlanNodeKind::Parallel { children, .. } => {
+            PlanNodeKind::Sequence { children }
+            | PlanNodeKind::Parallel { children, .. }
+            | PlanNodeKind::Race { children } => {
                 merged(children.iter().flat_map(Self::required_resources))
             }
             PlanNodeKind::Timeout { child, .. } => return child.required_resources(),
