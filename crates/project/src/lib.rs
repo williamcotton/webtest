@@ -3,6 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     fs,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -39,6 +40,7 @@ pub struct ProjectConfig {
     pub project: ProjectSection,
     pub browser: BrowserSection,
     pub timeouts: TimeoutSection,
+    pub journal: JournalSection,
     pub artifacts: ArtifactSection,
     pub evidence: EvidenceSection,
     pub server: ServerSection,
@@ -87,6 +89,21 @@ pub struct TimeoutSection {
     pub provider_call: Duration,
     pub test: Duration,
     pub cleanup: Duration,
+}
+
+/// Authoritative native event retention for each file execution.
+#[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct JournalSection {
+    /// Includes the reserved terminal record. Exhaustion aborts the affected run.
+    pub max_events: NonZeroUsize,
+}
+
+impl Default for JournalSection {
+    fn default() -> Self {
+        Self {
+            max_events: const { NonZeroUsize::new(100_000).unwrap() },
+        }
+    }
 }
 
 #[derive(serde::Serialize, Clone, Debug)]
@@ -238,6 +255,7 @@ impl Default for ProjectConfig {
                 test: Duration::from_secs(60),
                 cleanup: Duration::from_secs(5),
             },
+            journal: JournalSection::default(),
             artifacts: ArtifactSection {
                 directory: PathBuf::from(".webtest/artifacts"),
             },
@@ -333,6 +351,8 @@ struct RawConfig {
     #[serde(default)]
     timeouts: RawTimeouts,
     #[serde(default)]
+    journal: RawJournal,
+    #[serde(default)]
     artifacts: RawArtifacts,
     #[serde(default)]
     evidence: RawEvidence,
@@ -387,6 +407,13 @@ struct RawTimeouts {
     provider_call: Option<String>,
     test: Option<String>,
     cleanup: Option<String>,
+    #[serde(flatten)]
+    extra: toml::Table,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawJournal {
+    max_events: Option<usize>,
     #[serde(flatten)]
     extra: toml::Table,
 }
@@ -660,6 +687,7 @@ fn parse_config(
     collect_unknown(&mut warnings, "project", &raw.project.extra);
     collect_unknown(&mut warnings, "browser", &raw.browser.extra);
     collect_unknown(&mut warnings, "timeouts", &raw.timeouts.extra);
+    collect_unknown(&mut warnings, "journal", &raw.journal.extra);
     collect_unknown(&mut warnings, "artifacts", &raw.artifacts.extra);
     collect_unknown(&mut warnings, "evidence", &raw.evidence.extra);
     collect_unknown(&mut warnings, "server", &raw.server.extra);
@@ -862,6 +890,15 @@ fn parse_config(
             message: format!("evidence.{key} must be `off` or `on-failure`, got `{value}`"),
         }),
     };
+    let journal_max_events = NonZeroUsize::new(
+        raw.journal
+            .max_events
+            .unwrap_or(defaults.journal.max_events.get()),
+    )
+    .ok_or_else(|| ProjectError::InvalidConfig {
+        path: path.to_path_buf(),
+        message: "journal.max_events must be positive".into(),
+    })?;
     if raw.evidence.max_dom_bytes == Some(0) {
         return Err(ProjectError::InvalidConfig {
             path: path.to_path_buf(),
@@ -935,6 +972,9 @@ fn parse_config(
                     .unwrap_or(defaults.browser.test_id_attribute),
             },
             timeouts: resolved_timeouts,
+            journal: JournalSection {
+                max_events: journal_max_events,
+            },
             artifacts: ArtifactSection {
                 directory: raw
                     .artifacts
@@ -1475,6 +1515,28 @@ mod tests {
         )
         .expect_err("mixed roots");
         assert!(matches!(error, ProjectError::MultipleProjects { .. }));
+    }
+
+    #[test]
+    fn journal_budget_is_positive_typed_and_unknown_keys_remain_warnings() {
+        let path = Path::new("webtest.toml");
+        let (default, warnings) = parse_config(path, "").unwrap();
+        assert_eq!(default.journal.max_events.get(), 100_000);
+        assert!(warnings.is_empty());
+        let (configured, warnings) =
+            parse_config(path, "[journal]\nmax_events = 1\nfuture = true\n").unwrap();
+        assert_eq!(configured.journal.max_events.get(), 1);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].key, "journal.future");
+        for value in ["0", "-1", "1.5", "true", "\"100\"", "18446744073709551616"] {
+            assert!(
+                matches!(
+                    parse_config(path, &format!("[journal]\nmax_events = {value}\n")),
+                    Err(ProjectError::InvalidConfig { .. })
+                ),
+                "accepted {value}"
+            );
+        }
     }
 
     #[test]

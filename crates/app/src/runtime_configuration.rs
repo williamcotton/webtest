@@ -51,7 +51,7 @@ pub(crate) fn runner_options(project: &Project) -> RunnerOptions {
             },
         },
         inspection: inspection_options(project),
-        journal_max_events: RunnerOptions::default().journal_max_events,
+        journal_max_events: project.config.journal.max_events,
     }
 }
 
@@ -129,6 +129,7 @@ pub(crate) fn resolved_runtime_configuration(project: &Project) -> ResolvedRunti
         test_timeout_ms: duration_millis(project.config.timeouts.test),
         provider_call_timeout_ms: duration_millis(project.config.timeouts.provider_call),
         cleanup_timeout_ms: duration_millis(project.config.timeouts.cleanup),
+        journal_max_events: project.config.journal.max_events.get(),
     }
 }
 
@@ -177,6 +178,27 @@ fn secret_argument_name(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_and_project_journal_defaults_agree_and_overrides_reach_all_projections() {
+        let mut project = Project {
+            root: ".".into(),
+            config_path: None,
+            config: Default::default(),
+            warnings: vec![],
+            files: vec![],
+        };
+        assert_eq!(
+            runner_options(&project).journal_max_events,
+            RunnerOptions::default().journal_max_events
+        );
+        project.config.journal.max_events = std::num::NonZeroUsize::new(17).unwrap();
+        assert_eq!(runner_options(&project).journal_max_events.get(), 17);
+        assert_eq!(
+            resolved_runtime_configuration(&project).journal_max_events,
+            17
+        );
+    }
 
     #[test]
     fn resolved_configuration_redacts_secret_like_arguments() {

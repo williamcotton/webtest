@@ -48,6 +48,7 @@ pub struct ResolvedRuntimeConfiguration {
     pub test_timeout_ms: u64,
     pub provider_call_timeout_ms: u64,
     pub cleanup_timeout_ms: u64,
+    pub journal_max_events: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1641,6 +1642,35 @@ mod tests {
     }
 
     #[test]
+    fn journal_configuration_guidance_is_discoverable_by_alias() {
+        let registry = ProviderRegistry::built_in_schemas();
+        let DescriptionResponse::Construct(topic) = describe(
+            &registry,
+            DescriptionRequest::Query("resolved.configuration".into()),
+            None,
+            DescriptionLimits::default(),
+        ) else {
+            panic!("configuration alias")
+        };
+        assert_eq!(topic.id, "runtime.configuration");
+        let guidance = topic
+            .guidance
+            .iter()
+            .find(|entry| entry.code == "runtime_configuration_journal")
+            .unwrap();
+        for fact in [
+            "[journal].max_events",
+            "positive integer",
+            "100000",
+            "one file run",
+            "journal_capacity_exceeded",
+            "awaits teardown",
+        ] {
+            assert!(guidance.summary.contains(fact), "missing {fact}");
+        }
+    }
+
+    #[test]
     fn runtime_configuration_attaches_only_to_its_project_query() {
         let resolved = ResolvedRuntimeConfiguration {
             selected_adapter: Some("bridge".into()),
@@ -1656,6 +1686,7 @@ mod tests {
             test_timeout_ms: 60_000,
             provider_call_timeout_ms: 60_000,
             cleanup_timeout_ms: 5_000,
+            journal_max_events: 1234,
         };
         let project = DescriptionProject {
             root: "/project".into(),
@@ -1672,6 +1703,10 @@ mod tests {
         };
         assert_eq!(configuration.resolved_configuration, Some(resolved));
         let serialized = serde_json::to_value(configuration).expect("configuration JSON");
+        assert_eq!(
+            serialized["resolved_configuration"]["journal_max_events"],
+            1234
+        );
         assert_eq!(
             serialized["resolved_configuration"]["resolved_command"],
             "node"

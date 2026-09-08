@@ -461,6 +461,35 @@ fixture in the editor Chrome test that could block behind an idle preconnection.
 The fixture now handles connections independently with owned, awaited tasks, and
 keeps an idle connection open deliberately during both browser runs as a regression.
 
+### Project journal budget continuation — 2026-09-08
+
+`webtest.toml` now accepts `[journal].max_events`, a positive integer with default
+100000. Project validation rejects zero, negative, non-integer, and overflowing
+values before execution; unknown journal keys remain ordinary configuration warnings.
+The resolved nonzero count flows through the existing composition root to CLI tests,
+worker options, LSP, and DAP. It retains the prior per-file native journal semantics:
+all roots, branches, and attempts in one file share the budget, including one reserved
+terminal record. Exhaustion stops admission in that file, cancels active roots, and
+awaits owned teardown while preserving original results and the explicit missing interval.
+
+`webtest describe runtime.configuration` reports `journal_max_events` and explains
+configuration, defaults, overflow, and recovery through shared native/WASM guidance.
+The setting also participates in serialized project-input fingerprints without changing
+source revisions or lowered test bodies. Canonical agent guidance, initializer parity
+assertions, the structured-execution example, and current repository status now describe
+the implemented budget rather than leaving it as a native-API-only setting.
+
+Focused coverage exercises invalid configuration, default parity, resolved descriptions
+and discovery, CLI overflow and successful reruns under jobs 1 and 2, and configuration
+fingerprints. This completes project configuration for native count budgets; serialized
+byte budgets, complete event envelopes/context and vocabulary, durable cross-process
+execution identity, traces, IPC, and concurrent DAP remain pending. No plan/runtime/report
+schema versions change in this slice.
+
+Verification: `cargo test --workspace`, warning-free workspace Clippy, Rust formatting,
+and portable WASM compilation pass. The structured-execution example passes all seven
+tests with jobs 2 and its documented journal configuration.
+
 ## 1. Outcome
 
 Tests can express bounded parallelism, races, retries, and timeouts without leaking child work or losing cleanup. Every attempt and cancellation remains source-mapped in terminal output, traces, editor observations, DAP, and versioned machine output.

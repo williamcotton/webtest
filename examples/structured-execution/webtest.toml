@@ -5,3 +5,7 @@ test_roots = ["."]
 [timeouts]
 test = "60s"
 cleanup = "2s"
+
+# Per-file native journal count, including the reserved final run record.
+[journal]
+max_events = 100000

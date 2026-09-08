@@ -40,3 +40,10 @@ observations, and artifact names stay isolated; final results retain file/test s
 The default is `--jobs 1`, with the existing sequential execution and browser-session reuse.
 The accepted range is 1–64. Assertion failures do not stop other tests; an infrastructure error
 stops admission in its file and every already admitted test is awaited.
+
+`[journal].max_events` sets the positive native event-count limit for each file run (default
+100000), shared by its tests, branches, and attempts. Inspect the resolved value with
+`webtest describe runtime.configuration --project examples/structured-execution`.
+Exhaustion reports `journal_capacity_exceeded`, cancels active roots, and awaits cleanup.
+Original test outcomes and the final run record survive; the reported missing interval marks
+an incomplete journal. Increase the budget and rerun when appropriate. This is not trace export.

@@ -192,6 +192,7 @@ fn describe_bootstraps_exact_alias_category_and_search_without_source_files() {
     );
     assert_eq!(resolved["browser_base_url"], "http://127.0.0.1:3000");
     assert_eq!(resolved["server_base_url"], "http://127.0.0.1:3001");
+    assert_eq!(resolved["journal_max_events"], 100_000);
     assert_eq!(resolved["application_owned"], true);
     assert_eq!(resolved["application_health_configured"], false);
     assert!(!runtime_configuration.to_string().contains("do-not-report"));
@@ -230,6 +231,8 @@ fn init_creates_a_checkable_idempotent_application_bridge_scaffold() {
     assert!(skill.contains("webtest describe app.schema"));
     assert!(skill.contains("webtest describe app.configuration"));
     assert!(skill.contains("webtest describe runtime.configuration"));
+    assert!(skill.contains("[journal]"));
+    assert!(skill.contains("journal_capacity_exceeded"));
     assert!(skill.contains("webtest describe app.bridge"));
     assert!(skill.contains("webtest describe app.protocol"));
     assert!(skill.contains("webtest describe app.bridge.example"));
@@ -1156,4 +1159,137 @@ fn emitted_plans_reject_literal_secrets_returned_through_any_race_alternative() 
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("literal secret"), "{stderr}");
     assert!(!stderr.contains("do-not-emit"));
+}
+
+#[test]
+fn journal_configuration_controls_sequential_and_job_runs_and_resolved_description() {
+    let directory = tempfile::tempdir().unwrap();
+    for file in ["one.webtest", "two.webtest"] {
+        write(
+            &directory.path().join(file),
+            r#"
+            test "branches" { parallel {
+                server { expect 1 == 1 }
+                server { retry 2 { expect 2 == 2 } }
+            } }
+            test "next" { server { expect 3 == 3 } }
+        "#,
+        );
+    }
+    for jobs in ["1", "2"] {
+        for capacity in [1, 1000] {
+            write(
+                &directory.path().join("webtest.toml"),
+                &format!("[journal]\nmax_events = {capacity}\n"),
+            );
+            let described = webtest(directory.path())
+                .args(["describe", "runtime.configuration", "--reporter", "json"])
+                .output()
+                .unwrap();
+            assert!(described.status.success(), "{:?}", described);
+            let described: serde_json::Value = serde_json::from_slice(&described.stdout).unwrap();
+            assert_eq!(
+                described["resolved_configuration"]["journal_max_events"],
+                capacity
+            );
+            let run = webtest(directory.path())
+                .args([
+                    "test",
+                    "one.webtest",
+                    "two.webtest",
+                    "--jobs",
+                    jobs,
+                    "--reporter",
+                    "json",
+                ])
+                .output()
+                .unwrap();
+            let report: serde_json::Value = serde_json::from_slice(&run.stdout).unwrap();
+            assert_eq!(
+                run.status.code(),
+                Some(if capacity == 1 { 3 } else { 0 }),
+                "{report}"
+            );
+            assert!(report["warnings"].as_array().unwrap().is_empty());
+            assert_eq!(report["summary"]["tests"], 4);
+            if capacity == 1 {
+                assert_eq!(report["summary"]["skipped"], 4);
+                assert_eq!(report["summary"]["infrastructure_errors"], 2);
+                for file in report["files"].as_array().unwrap() {
+                    assert_eq!(file["outcome"], "aborted");
+                    let failure = &file["execution_error"]["failure"];
+                    assert_eq!(failure["code"], "runtime.journal_capacity_exceeded");
+                    let gap = &failure["semantic_details"]["overflow"];
+                    assert_eq!(gap["capacity"], 1);
+                    assert_eq!(gap["first_rejected"]["event_sequence"], 0);
+                    assert!(gap["rejected_events"].as_u64().unwrap() > 0);
+                }
+            } else {
+                assert_eq!(report["summary"]["passed"], 4);
+                assert_eq!(report["summary"]["infrastructure_errors"], 0);
+                assert!(
+                    report["files"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|file| file["execution_error"].is_null())
+                );
+            }
+        }
+    }
+    let search = webtest(directory.path())
+        .args([
+            "describe",
+            "--search",
+            "journal max_events",
+            "--reporter",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    let search: serde_json::Value = serde_json::from_slice(&search.stdout).unwrap();
+    assert_eq!(search["results"][0]["id"], "runtime.configuration");
+    write(
+        &directory.path().join("webtest.toml"),
+        "[journal]\nmax_events = 0\n",
+    );
+    let invalid = webtest(directory.path())
+        .args(["test", "one.webtest"])
+        .output()
+        .unwrap();
+    assert_eq!(invalid.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&invalid.stderr).contains("journal.max_events must be positive")
+    );
+}
+
+#[test]
+fn journal_configuration_changes_the_build_fingerprint_without_changing_test_plans() {
+    let directory = tempfile::tempdir().unwrap();
+    write(
+        &directory.path().join("test.webtest"),
+        r#"test "one" { server { expect 1 == 1 } }"#,
+    );
+    let mut plans = Vec::new();
+    for capacity in [10, 1000] {
+        write(
+            &directory.path().join("webtest.toml"),
+            &format!("[journal]\nmax_events = {capacity}\n"),
+        );
+        let output = directory.path().join("plan.json");
+        let built = webtest(directory.path())
+            .args(["build", "test.webtest", "--emit"])
+            .arg(&output)
+            .output()
+            .unwrap();
+        assert!(built.status.success(), "{:?}", built);
+        plans
+            .push(serde_json::from_slice::<serde_json::Value>(&fs::read(output).unwrap()).unwrap());
+    }
+    assert_ne!(
+        plans[0]["project_input_fingerprint"],
+        plans[1]["project_input_fingerprint"]
+    );
+    assert_eq!(plans[0]["tests"], plans[1]["tests"]);
+    assert_eq!(plans[0]["source_files"], plans[1]["source_files"]);
 }

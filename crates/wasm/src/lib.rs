@@ -534,6 +534,7 @@ test "optional" {
     #[test]
     fn descriptions_and_static_repair_diagnostics_match_the_native_core() {
         for query in [
+            "runtime.configuration",
             "control.parallel",
             "parallel",
             "control.race",

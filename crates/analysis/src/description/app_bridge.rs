@@ -621,6 +621,7 @@ fn runtime_configuration_reference() -> ConstructDescription {
         "working directory schema path".into(),
         "browser base URL server base URL".into(),
         "per-test deadline provider call timeout cleanup budget".into(),
+        "journal max_events retention event budget journal_capacity_exceeded".into(),
         "configuration debugging".into(),
         "inspect project startup owned health".into(),
     ];
@@ -641,7 +642,11 @@ fn runtime_configuration_reference() -> ConstructDescription {
     value.guidance = vec![
         guidance(
             "runtime_configuration_fields",
-            "The machine-readable `resolved_configuration` object reports selected adapter and transport, resolved command and arguments, working directory, schema path, application ownership and whether health is configured, browser and server base URLs, the per-test deadline, the distinct provider-call default, and the separate bounded cleanup timeout. Absent optional configuration is represented as null or an empty argument list; timeout values are integer milliseconds.",
+            "The machine-readable `resolved_configuration` object reports selected adapter and transport, resolved command and arguments, working directory, schema path, application ownership and whether health is configured, browser and server base URLs, the per-test deadline, the distinct provider-call default, the separate bounded cleanup timeout, and `journal_max_events`, the per-file native event count limit. Absent optional configuration is represented as null or an empty argument list; timeout values are integer milliseconds.",
+        ),
+        guidance(
+            "runtime_configuration_journal",
+            "`[journal].max_events` is a positive integer (default 100000) shared by all tests in one file run, including nested branches and attempts. It includes a reserved final run record. Exceeding the count aborts that file with `journal_capacity_exceeded`, stops admission, cancels active roots, and awaits teardown. The report retains original outcomes and an explicit missing-event interval; the journal is incomplete. Inspect the resolved limit, then increase it and rerun if appropriate. This is an event count, not a byte budget or a trace-export setting.",
         ),
         guidance(
             "runtime_configuration_inspect_startup",

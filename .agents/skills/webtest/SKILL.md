@@ -189,5 +189,12 @@ starts and reuses a separate app process. The app must bind `WEBTEST_APP_URL` (o
 `WEBTEST_WORKER_ID` identifies the worker. Use relative browser/HTTP URLs so they route to that app.
 Socket bridges and HTTP adapters receive worker-specific connections. External databases still need
 worker-specific configuration; unowned apps remain shared. Owned command/stdio adapters require jobs 1.
+Use `webtest describe runtime.configuration` to inspect `journal_max_events`.
+`[journal].max_events` (default 100000) configures the positive event-count budget for each file run;
+all tests, branches, and attempts in that file share it. `journal_capacity_exceeded` is an
+infrastructure failure: WebTest stops admission, cancels active roots, awaits cleanup, and
+reports the omitted event interval. The reserved final run record and original test outcomes
+remain available, but the journal is incomplete. Increase the budget and rerun when appropriate.
+This setting controls native event retention; it does not enable trace export.
 Traces and concurrent debugger stepping remain unfinished; discover those
 features with the installed binary before using them.

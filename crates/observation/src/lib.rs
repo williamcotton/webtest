@@ -289,6 +289,7 @@ impl RuntimeFailureCode {
 
     pub const fn default_reference_queries(self) -> &'static [&'static str] {
         match self {
+            Self::JournalCapacityExceeded => &["runtime.configuration"],
             Self::AppBridgeHandshake
             | Self::AppBridgeProtocol
             | Self::AppBridgeTransport
