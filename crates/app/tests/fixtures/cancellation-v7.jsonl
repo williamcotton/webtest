@@ -1,0 +1,9 @@
+{"command":"test","project_root":"/project","schema_version":7,"type":"command_started"}
+{"schema_version":7,"type":"run_started","file":"tests/cancel.webtest","execution_id":7}
+{"schema_version":7,"type":"test_started","file":"tests/cancel.webtest","execution_id":7,"test_id":0,"name":"active"}
+{"schema_version":7,"type":"test_finished","file":"tests/cancel.webtest","execution_id":7,"test_id":0,"outcome":"cancelled","exit_class":"test_failure"}
+{"schema_version":7,"type":"test_skipped","file":"tests/cancel.webtest","execution_id":7,"test_id":1,"name":"later","outcome":"skipped","reason":"run_cancelled","exit_class":"test_failure"}
+{"schema_version":7,"type":"run_finished","file":"tests/cancel.webtest","execution_id":7,"outcome":"cancelled","exit_class":"test_failure"}
+{"file":"tests/cancel.webtest","schema_version":7,"source_revision":"cancelled","test":{"duration_nanos":5,"exit_class":"test_failure","failure":null,"name":"active","outcome":"cancelled","reason":"user_cancelled"},"type":"test_result"}
+{"file":"tests/cancel.webtest","schema_version":7,"source_revision":"cancelled","test":{"duration_nanos":0,"exit_class":"test_failure","failure":null,"name":"later","outcome":"skipped","reason":"run_cancelled"},"type":"test_result"}
+{"command":"test","exit_class":"test_failure","exit_code":1,"schema_version":7,"summary":{"aborted":0,"cancelled":1,"diagnostics":0,"duration_nanos":5,"failed":0,"files":1,"infrastructure_errors":0,"internal_errors":0,"passed":0,"skipped":1,"tests":2,"timed_out":0},"type":"command_finished"}

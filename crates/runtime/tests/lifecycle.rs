@@ -814,13 +814,15 @@ fn event_names(events: &[ExecutionEvent]) -> Vec<&'static str> {
         .filter(|event| {
             !matches!(
                 event,
-                ExecutionEvent::Scope { .. }
+                ExecutionEvent::Attempt { .. }
+                    | ExecutionEvent::Scope { .. }
                     | ExecutionEvent::Resource { .. }
                     | ExecutionEvent::Wait { .. }
             )
         })
         .map(|event| match event {
-            ExecutionEvent::Scope { .. }
+            ExecutionEvent::Attempt { .. }
+            | ExecutionEvent::Scope { .. }
             | ExecutionEvent::Resource { .. }
             | ExecutionEvent::Wait { .. } => {
                 unreachable!("scope events are tested separately")

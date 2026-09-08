@@ -31,7 +31,7 @@ Milestone E is **not complete**. The execution-tree, resource/wait foundations, 
   resolved configuration, keeping configuration values out of the artifact. Shared validation
   checks tree structure, identities, revisions, capability requirements, and explicit execution
   inputs for detectable drift. There is still no CLI command to execute an emitted plan.
-- CLI report/event schema 6 includes typed scope facts, shared typed cancellation reasons, and ordered branch aggregates. This remains the existing event stream,
+- CLI report/event schema 7 includes explicit retry-attempt lifecycle and typed scope facts, shared typed cancellation reasons, and ordered branch aggregates. This remains the existing event stream,
   not yet E's authoritative bounded journal with replay-safe event identity.
 - Runtime observations accumulate privately and commit as a complete batch. Starting another
   run clears prior observations and prevents an older in-flight run from overwriting the newer
@@ -523,6 +523,37 @@ remain pending.
 Verification: full workspace tests (including native Chrome and LSP/DAP), warning-free
 workspace Clippy, Rust formatting, and portable WASM compilation pass. Existing journal
 retention/subscriber tests and CLI payload compatibility checks also pass unchanged.
+
+### Explicit retry-attempt event continuation — 2026-09-08
+
+Native journal schema 3 and CLI report/event schema 7 add `attempt_started` and
+`attempt_finished`. Each carries a one-based ordinal and total `max_attempts`, plus
+the attempt root's explicit scope, parentage, source, and occurrence identity.
+Only attempt roots emit this lifecycle; descendant scopes retain their inherited
+AttemptId without duplicating attempt facts. Nested retries number attempts within
+their own invocation. Existing scope/operation and individual failure events remain.
+
+Attempt lifecycle publication uses branch-local scope bookkeeping. Start precedes
+scope entry; finish follows descendant/resource teardown and the terminal scope fact,
+before backoff or the next attempt. Terminal facts retain the final typed outcome
+and cancellation cause, including aborted cleanup; recovered failures remain in the
+journal and result tree. The existing collector budget and subscription policies
+apply to these records, including explicit loss on journal exhaustion. No scheduler,
+resource ownership, cancellation, or plan/runtime semantic contract is redesigned.
+
+Focused fake-clock coverage checks exact teardown/backoff timing, one start/finish
+pair per occurrence, locally consecutive ordinals, nested identities, resource/wait
+ordering, every cancellation reason, cleanup failure/expiry, exhaustion and recovery,
+and native replay/context agreement. CLI coverage checks the serialized attempt
+payloads; shared descriptions, search, canonical agent guidance, initializer parity,
+and the structured-execution example document the new facts. Prior schema fixtures
+remain archived alongside the schema 7 projections. Plan format 9 and runtime
+semantics 6 are unchanged. Complete event vocabulary/serialization, durable
+cross-process identity, trace export, IPC, and concurrent DAP remain pending.
+
+Verification: `cargo test --workspace` passes, including all 114 runtime lifecycle
+tests and CLI/LSP/DAP integration tests. Warning-free workspace Clippy, Rust
+formatting, portable WASM compilation, and focused retry checks also pass.
 
 ## 1. Outcome
 

@@ -512,3 +512,33 @@ async fn journal_timeout_summary_keeps_the_timeout_range_and_test_occurrence() {
             .is_none()
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn journal_exhaustion_on_attempt_events_preserves_explicit_gaps_and_stops_retry() {
+    let plan =
+        compile_source(r#"test "attempt capacity" { retry 3 backoff 10ms { expect 1 == 2 } }"#);
+    let host = LifecycleHost(Arc::default());
+    let baseline = bounded_runner(1000).run(&plan, &host).await;
+    // Reject either boundary of the first attempt: no second attempt may start,
+    // and a missing terminal fact must be accompanied by the collector's gap.
+    for cutoff in baseline
+        .journal
+        .iter()
+        .enumerate()
+        .filter_map(|(index, record)| match &record.event {
+            ExecutionEvent::Attempt { event, .. } if event.ordinal == 1 => Some(index),
+            _ => None,
+        })
+    {
+        let result = bounded_runner(cutoff + 1).run(&plan, &host).await;
+        assert_overflow(&result, cutoff + 1);
+        assert_eq!(result.tests[0].branches.len(), 1);
+        assert!(!result.events.iter().any(
+            |event| matches!(event, ExecutionEvent::Attempt { event, .. } if event.ordinal > 1)
+        ));
+        assert_eq!(
+            result.journal.last().unwrap().timestamp.elapsed,
+            Duration::ZERO
+        );
+    }
+}

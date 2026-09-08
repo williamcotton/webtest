@@ -56,3 +56,11 @@ impl ScopeEvent {
         }
     }
 }
+
+/// One-based position within a retry invocation. This belongs only to the
+/// attempt root; descendant scopes inherit its AttemptId, not another lifecycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttemptEvent {
+    pub ordinal: u32,
+    pub max_attempts: u32,
+}

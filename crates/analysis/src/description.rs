@@ -1069,6 +1069,8 @@ mod tests {
             ("race", "control.race"),
             ("retry", "control.retry"),
             ("backoff", "control.retry"),
+            ("attempt_started", "control.retry"),
+            ("attempt_finished", "control.retry"),
             ("provide", "statement.provide"),
             ("integer overflow", "type.Int"),
             ("optional member", "type.Record"),
@@ -1251,6 +1253,25 @@ mod tests {
                     source
                 );
             }
+        }
+    }
+
+    #[test]
+    fn retry_describes_explicit_attempt_lifecycle_and_terminal_teardown() {
+        let DescriptionResponse::Construct(retry) =
+            response(DescriptionRequest::Query("control.retry".into()))
+        else {
+            panic!("retry description")
+        };
+        let effects = retry.effects.join(" ");
+        for fact in [
+            "attempt_started",
+            "attempt_finished",
+            "one-based ordinal",
+            "max_attempts",
+            "outcome/cancellation after teardown",
+        ] {
+            assert!(effects.contains(fact), "missing retry event fact: {fact}");
         }
     }
 

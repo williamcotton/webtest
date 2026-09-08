@@ -24,7 +24,9 @@ impl TreeExecution<'_, '_> {
             if let Some(cause) = parent.context.cancellation.cause() {
                 return cancelled(cause.reason);
             }
-            let scope = services.scopes.attempt(parent, child);
+            let scope = services
+                .scopes
+                .attempt(parent, child, ordinal + 1, settings.attempts);
             let mut state = self.branch.fork();
             // A sequential attempt may exclusively borrow a proven observation-only
             // browser context. Its lexical owner still controls interruption and

@@ -104,6 +104,7 @@ async fn public_retry_lexical_contexts_coexist_with_an_enclosing_native_context(
         );
     }
     assert_scopes_finish_once_after_children(&result.events);
+    assert_attempt_events(&result);
 }
 
 #[tokio::test(start_paused = true)]
@@ -166,6 +167,7 @@ async fn retry_exhaustion_keeps_all_attempts_and_does_not_backoff_after_the_last
     assert_eq!(registered.len(), terminal.len());
     assert_eq!(registered, terminal.into_iter().collect());
     assert_scopes_finish_once_after_children(&result.events);
+    assert_attempt_events(&result);
 }
 
 #[tokio::test(start_paused = true)]
@@ -201,6 +203,7 @@ async fn nested_retry_attempt_identity_is_distinct_from_its_parent_and_static_pa
         outer[1].branches[0].scope.execution_context.plan_node_id
     );
     assert_scopes_finish_once_after_children(&result.events);
+    assert_attempt_events(&result);
 }
 
 #[tokio::test(start_paused = true)]
@@ -235,6 +238,7 @@ async fn retry_cleanup_expiry_is_terminal_and_never_grants_another_attempt() {
         matches!(&result.tests[0].branches[0].branches[0].outcome, TestOutcome::Aborted { prior_outcome: Some(prior), .. } if matches!(prior.as_ref(), PriorTestOutcome::Failed(_)))
     );
     assert_scopes_finish_once_after_children(&result.events);
+    assert_attempt_events(&result);
 }
 
 #[tokio::test(start_paused = true)]
@@ -325,6 +329,7 @@ async fn retry_attempts_have_distinct_identity_fresh_bindings_and_capped_backoff
             .is_empty()
     );
     assert_scopes_finish_once_after_children(&result.events);
+    assert_attempt_events(&result);
 }
 
 #[tokio::test(start_paused = true)]
@@ -349,6 +354,30 @@ async fn retry_reacquires_lexical_contexts_only_after_terminal_teardown_and_back
         .await;
     assert_eq!(result.passed(), 1, "{:?}", result.tests[0].outcome);
     assert_eq!(started.elapsed(), Duration::from_millis(120));
+    let timings: Vec<_> = result
+        .journal
+        .iter()
+        .filter_map(|record| match &record.event {
+            ExecutionEvent::Attempt { scope, event, .. } => Some((
+                event.ordinal,
+                scope.outcome.is_some(),
+                record.timestamp.elapsed.as_millis(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        timings,
+        [
+            (1, false, 0),
+            (1, true, 40),
+            (2, false, 50),
+            (2, true, 100),
+            (3, false, 120),
+            (3, true, 120)
+        ]
+    );
+
     let log = state.log();
     assert!(
         log.iter()
@@ -402,6 +431,7 @@ async fn retry_reacquires_lexical_contexts_only_after_terminal_teardown_and_back
     );
     assert!(acquired.iter().all(|(attempt, _)| attempt.is_some()));
     assert_scopes_finish_once_after_children(&result.events);
+    assert_attempt_events(&result);
 }
 
 #[tokio::test(start_paused = true)]
@@ -428,6 +458,7 @@ async fn retry_observations_can_reuse_an_enclosing_context_without_releasing_it(
     assert_eq!(log.iter().filter(|v| *v == "wait:0").count(), 3);
     assert_eq!(log.iter().filter(|v| *v == "context_close:0").count(), 1);
     assert_scopes_finish_once_after_children(&result.events);
+    assert_attempt_events(&result);
 }
 
 #[tokio::test(start_paused = true)]
@@ -452,6 +483,7 @@ async fn retry_cleanup_failure_stops_attempts_and_preserves_the_primary_failure(
         matches!(&result.tests[0].branches[0].branches[0].outcome, TestOutcome::Aborted { prior_outcome: Some(prior), .. } if matches!(prior.as_ref(), PriorTestOutcome::Failed(_)))
     );
     assert_scopes_finish_once_after_children(&result.events);
+    assert_attempt_events(&result);
 }
 
 #[tokio::test(start_paused = true)]
@@ -475,6 +507,7 @@ async fn retry_deadline_cancels_registered_backoff_without_starting_another_atte
     ));
     assert!(result.events.iter().any(|event| matches!(event, ExecutionEvent::Wait { event, .. } if event.cancellation.is_some_and(|cause| cause.reason == CancellationReason::Timeout))));
     assert_scopes_finish_once_after_children(&result.events);
+    assert_attempt_events(&result);
 }
 
 #[tokio::test(start_paused = true)]
@@ -538,6 +571,7 @@ async fn retry_only_recovers_provider_errors_explicitly_marked_retryable() {
         assert_eq!(result.tests[0].branches.len(), expected);
         assert_eq!(result.passed(), usize::from(expected == 2));
         assert_scopes_finish_once_after_children(&result.events);
+        assert_attempt_events(&result);
     }
 }
 
@@ -654,6 +688,7 @@ async fn retry_preserves_every_cancellation_reason_during_attempts_and_backoff()
                     && event.cancellation.is_some_and(|cause| cause.reason == reason)
             )));
             assert_scopes_finish_once_after_children(&result.events);
+            assert_attempt_events(&result);
         }
     }
 }
@@ -691,6 +726,7 @@ async fn retry_infrastructure_failure_notifies_siblings_before_attempt_teardown(
         }
     ));
     assert_scopes_finish_once_after_children(&result.events);
+    assert_attempt_events(&result);
 }
 
 #[tokio::test]
@@ -740,4 +776,160 @@ async fn retry_preserves_separate_artifact_files_for_every_failed_attempt() {
             assert!(artifact.path.parent().unwrap().ends_with(owner));
         }
     }
+}
+
+/// Attempt facts surround the same explicit owned scope, including cancellation
+/// and teardown failures. Descendants must not masquerade as extra attempts.
+fn assert_attempt_events(result: &webtest_runtime::RunResult) {
+    use webtest_observation::{AttemptEvent, EventMetadata, ReplayJournal, ScopeEvent};
+    let mut replay = ReplayJournal::new(std::num::NonZeroUsize::new(result.journal.len()).unwrap());
+    for record in result.journal.iter().rev() {
+        replay.insert(record.clone()).unwrap();
+    }
+    let mut active = BTreeMap::new();
+    let mut ordinals = BTreeMap::new();
+    let mut completed = BTreeSet::new();
+    for (index, record) in result.journal.iter().enumerate() {
+        let ExecutionEvent::Attempt {
+            scope,
+            event: attempt,
+            ..
+        } = &record.event
+        else {
+            continue;
+        };
+        assert_eq!(record.metadata, EventMetadata::from(scope));
+        assert_eq!(
+            serde_json::from_value::<AttemptEvent>(serde_json::to_value(attempt).unwrap()).unwrap(),
+            *attempt
+        );
+        let id = scope.execution_context.scope_id;
+        assert!(scope.execution_context.attempt_id.is_some());
+        if scope.outcome.is_none() {
+            assert!(!completed.contains(&id));
+            assert!(active.insert(id, (index, scope, attempt)).is_none());
+            let ordinal = ordinals
+                .entry(scope.execution_context.parent_scope_id.unwrap())
+                .or_insert((0, attempt.max_attempts));
+            ordinal.0 += 1;
+            assert_eq!(*ordinal, (attempt.ordinal, attempt.max_attempts));
+            assert!(attempt.ordinal <= attempt.max_attempts);
+        } else {
+            let (start, started, settings) = active.remove(&id).expect("attempt started once");
+            assert_eq!(settings, attempt);
+            assert_eq!(started.execution_context, scope.execution_context);
+            assert_eq!(started.origin, scope.origin);
+            assert!(completed.insert(id));
+            let scopes: Vec<&ScopeEvent> = result.journal[start + 1..index]
+                .iter()
+                .filter_map(|record| match &record.event {
+                    ExecutionEvent::Scope { event, .. }
+                        if event.execution_context.scope_id == id =>
+                    {
+                        Some(event)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(scopes, [started, scope]);
+            // Every fact belonging to this attempt's inherited identity, including
+            // wait and resource release terminals, falls inside its lifecycle.
+            for (position, fact) in result.journal.iter().enumerate() {
+                if !matches!(fact.event, ExecutionEvent::Attempt { .. })
+                    && fact.metadata.execution_context.attempt_id
+                        == scope.execution_context.attempt_id
+                {
+                    assert!(
+                        position > start && position < index,
+                        "fact outside attempt lifecycle: {:?}",
+                        fact.event
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        active.is_empty(),
+        "attempts missing terminal facts: {active:?}"
+    );
+    assert!(!completed.is_empty());
+    fn verify_results(
+        branches: &[webtest_runtime::BranchResult],
+        completed: &mut BTreeSet<webtest_model::ExecutionScopeId>,
+        events: &[ExecutionEvent],
+    ) {
+        for branch in branches {
+            let context = &branch.scope.execution_context;
+            let parent_attempt = events
+                .iter()
+                .find_map(|event| match event {
+                    ExecutionEvent::Scope { event, .. }
+                        if Some(event.execution_context.scope_id) == context.parent_scope_id =>
+                    {
+                        Some(event.execution_context.attempt_id)
+                    }
+                    _ => None,
+                })
+                .expect("explicit parent scope");
+            if context.attempt_id.is_some() && context.attempt_id != parent_attempt {
+                assert!(
+                    completed.remove(&context.scope_id),
+                    "attempt result missing lifecycle events"
+                );
+                let terminal = events
+                    .iter()
+                    .find_map(|event| match event {
+                        ExecutionEvent::Attempt { scope, .. }
+                            if scope.outcome.is_some()
+                                && scope.execution_context.scope_id
+                                    == branch.scope.execution_context.scope_id =>
+                        {
+                            Some(scope)
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(terminal, &branch.scope);
+            }
+            verify_results(&branch.branches, completed, events);
+        }
+    }
+    for test in &result.tests {
+        verify_results(&test.branches, &mut completed, &result.events);
+    }
+    assert!(
+        completed.is_empty(),
+        "attempt outcomes missing from results"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn concurrent_retries_keep_local_attempt_ordinals_despite_interleaved_completion() {
+    let plan = compile_source(
+        r#"test "interleaved attempts" { parallel {
+        retry 2 backoff 20ms { expect 1 == 2 }
+        retry 3 backoff 5ms { expect 3 == 4 }
+    } }"#,
+    );
+    let result = Runner::new(Arc::default())
+        .run(&plan, &LifecycleHost(Arc::default()))
+        .await;
+    assert_eq!(result.failed(), 1);
+    assert_eq!(result.tests[0].branches[0].branches.len(), 2);
+    assert_eq!(result.tests[0].branches[1].branches.len(), 3);
+    assert_attempt_events(&result);
+    let mut starts = BTreeMap::<_, Vec<_>>::new();
+    for record in &result.journal {
+        if let ExecutionEvent::Attempt { scope, .. } = &record.event
+            && scope.outcome.is_none()
+        {
+            starts
+                .entry(scope.execution_context.parent_scope_id)
+                .or_default()
+                .push(record.timestamp.elapsed.as_millis());
+        }
+    }
+    let mut timings: Vec<_> = starts.into_values().collect();
+    timings.sort();
+    assert_eq!(timings, [vec![0, 5, 10], vec![0, 20]]);
 }

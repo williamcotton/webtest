@@ -328,6 +328,27 @@ pub(crate) fn event_reports(path: &str, events: &[ExecutionEvent]) -> Vec<EventR
     events
         .iter()
         .map(|event| match event {
+            ExecutionEvent::Attempt {
+                execution_id,
+                scope,
+                event: attempt,
+            } => {
+                let kind = if scope.outcome.is_some() {
+                    "attempt_finished"
+                } else {
+                    "attempt_started"
+                };
+                let mut event = event_report(
+                    path,
+                    kind,
+                    Some(execution_id.0),
+                    Some(scope.execution_context.test_id.0),
+                    None,
+                );
+                event.scope = Some(scope.clone());
+                event.attempt = Some(*attempt);
+                event
+            }
             ExecutionEvent::Wait {
                 execution_id,
                 scope,
@@ -661,6 +682,7 @@ fn event_report(
     step_id: Option<u32>,
 ) -> EventReport {
     EventReport {
+        attempt: None,
         resource_lifecycle: None,
         wait: None,
         scope: None,

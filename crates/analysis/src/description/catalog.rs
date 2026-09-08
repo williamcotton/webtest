@@ -477,6 +477,8 @@ fn retry_construct() -> ConstructDescription {
         "retry safety".into(),
         "repeatability".into(),
         "retryable provider".into(),
+        "attempt_started".into(),
+        "attempt_finished".into(),
     ];
     value.parameters = vec![
         parameter(
@@ -521,7 +523,7 @@ fn retry_construct() -> ConstructDescription {
         "Each attempt gets a fresh identity, local binding snapshot, and new generations for lexically owned resources. Attempt bindings do not escape.".into(),
         "Browser contexts declared inside retry are acquired and torn down per attempt. Observation-only work can reuse an enclosing browser context. All teardown completes before cancellation-aware monotonic backoff or the next attempt.".into(),
         "Retry assertion failures, browser assertion/action timeouts, and application errors marked retryable. Every unrecovered failure in a child aggregate must qualify; cancellation, control timeouts, decode/evaluation errors, internal/infrastructure errors, and cleanup failure stop retry.".into(),
-        "Retain ordered attempt outcomes and separate bounded evidence. A successful retry recovers prior editor observations while keeping result/event facts. A successful provide may complete an enclosing race branch.".into(),
+        "Emit attempt_started and attempt_finished with one-based ordinal, max_attempts, explicit scope/source identity, and terminal outcome/cancellation after teardown. Retain ordered attempt outcomes and separate bounded evidence. A successful retry recovers prior editor observations while keeping result/event facts. A successful provide may complete an enclosing race branch.".into(),
     ];
     value.constraints = vec![
         constraint(

@@ -12,7 +12,7 @@ use webtest_project::Project;
 
 use crate::{error::AppError, project_context::normalized_path};
 
-pub(crate) const REPORT_SCHEMA_VERSION: u32 = 6;
+pub(crate) const REPORT_SCHEMA_VERSION: u32 = 7;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -279,6 +279,8 @@ pub struct SummaryReport {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct EventReport {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<webtest_observation::AttemptEvent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_lifecycle: Option<webtest_observation::ResourceEvent>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1214,7 +1216,7 @@ mod tests {
         assert_eq!(value["exit_class"], "test_failure");
         assert_eq!(
             String::from_utf8(json).expect("UTF-8 JSON"),
-            include_str!("../tests/fixtures/report-v6.json")
+            include_str!("../tests/fixtures/report-v7.json")
         );
 
         let mut events = Vec::new();
@@ -1226,7 +1228,7 @@ mod tests {
             let value: serde_json::Value = serde_json::from_str(line).expect("json line");
             assert_eq!(value["schema_version"], REPORT_SCHEMA_VERSION);
         }
-        assert_eq!(events, include_str!("../tests/fixtures/report-v6.jsonl"));
+        assert_eq!(events, include_str!("../tests/fixtures/report-v7.jsonl"));
     }
 
     #[test]
@@ -1253,11 +1255,11 @@ mod tests {
             ),
             (
                 Reporter::Json,
-                include_str!("../tests/fixtures/cancellation-v6.json"),
+                include_str!("../tests/fixtures/cancellation-v7.json"),
             ),
             (
                 Reporter::Events,
-                include_str!("../tests/fixtures/cancellation-v6.jsonl"),
+                include_str!("../tests/fixtures/cancellation-v7.jsonl"),
             ),
             (
                 Reporter::Junit,

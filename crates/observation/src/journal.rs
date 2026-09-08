@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, num::NonZeroUsize, time::Duration};
 
 use crate::{ExecutionEvent, ExecutionId};
 
-pub const EVENT_JOURNAL_SCHEMA_VERSION: u32 = 2;
+pub const EVENT_JOURNAL_SCHEMA_VERSION: u32 = 3;
 
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,

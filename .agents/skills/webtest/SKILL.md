@@ -172,6 +172,8 @@ binds only the first successful branch's compatible transferable result, after e
 branch aggregate; `race_winner` identifies the winner. Losers receive typed `RaceLost`
 cancellation, and cleanup or infrastructure failures can still abort the race.
 Use `webtest describe control.retry` before repeating a computation.
+Event output includes `attempt_started` / `attempt_finished` with one-based ordinal,
+`max_attempts`, scope identity, and the final outcome/cancellation after teardown.
 `retry 3 backoff 200ms max 2s { ... }` allows three total attempts, with local bindings and
 teardown before each capped backoff. Provider calls require schema `retry_safe`; browser
 assertions and waits are repeatable, while mutations are rejected. Only eligible failures

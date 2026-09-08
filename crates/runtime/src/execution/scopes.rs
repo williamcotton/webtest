@@ -9,7 +9,7 @@ use std::{
 };
 use webtest_model::{AttemptId, ExecutionScopeId, OperationExecutionId, TestExecutionId, TestId};
 use webtest_observation::{
-    ExecutionContext, ExecutionEvent, ExecutionId, ScopeEvent, ScopeOutcome,
+    AttemptEvent, ExecutionContext, ExecutionEvent, ExecutionId, ScopeEvent, ScopeOutcome,
 };
 use webtest_plan::{PlanNode, PlanNodeKind};
 
@@ -33,6 +33,7 @@ pub(super) struct ResourceOwner {
 /// sibling happens to be running, suspended, or finishing.
 #[derive(Clone)]
 pub(super) struct ExecutionScope {
+    attempt: Option<AttemptEvent>,
     pub event: ScopeEvent,
     pub context: ScopeContext,
     pub resource_owner: ResourceOwner,
@@ -98,8 +99,18 @@ impl ScopeFactory {
         self.create(node, Some(parent), deadline, true)
     }
 
-    pub fn attempt(&self, parent: &ExecutionScope, node: &PlanNode) -> ExecutionScope {
+    pub fn attempt(
+        &self,
+        parent: &ExecutionScope,
+        node: &PlanNode,
+        ordinal: u32,
+        max_attempts: u32,
+    ) -> ExecutionScope {
         let mut scope = self.branch(parent, node);
+        scope.attempt = Some(AttemptEvent {
+            ordinal,
+            max_attempts,
+        });
         scope.event.execution_context.attempt_id = Some(AttemptId(self.ids.next()));
         scope.resource_owner.event = scope.event.clone();
         scope
@@ -163,6 +174,7 @@ impl ScopeFactory {
             (inherited, local) => inherited.or(local),
         };
         ExecutionScope {
+            attempt: None,
             cleanup_timeout,
             event,
             context,
@@ -188,6 +200,17 @@ impl BranchScopes {
         sink: Option<&dyn RunEventSink>,
     ) {
         self.active.insert(scope.id(), scope.clone());
+        if let Some(attempt) = scope.attempt {
+            emit_event(
+                events,
+                sink,
+                ExecutionEvent::Attempt {
+                    execution_id,
+                    scope: scope.event.clone(),
+                    event: attempt,
+                },
+            );
+        }
         emit_event(
             events,
             sink,
@@ -227,9 +250,20 @@ impl BranchScopes {
             sink,
             ExecutionEvent::Scope {
                 execution_id,
-                event,
+                event: event.clone(),
             },
         );
+        if let Some(attempt) = scope.attempt {
+            emit_event(
+                events,
+                sink,
+                ExecutionEvent::Attempt {
+                    execution_id,
+                    scope: event,
+                    event: attempt,
+                },
+            );
+        }
     }
 
     pub fn subtree_ids(&self, scope: &ExecutionScope) -> BTreeSet<ExecutionScopeId> {

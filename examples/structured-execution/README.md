@@ -12,6 +12,7 @@ target/debug/webtest describe statement.provide
 target/debug/webtest check examples/structured-execution
 target/debug/webtest test examples/structured-execution
 target/debug/webtest test examples/structured-execution --jobs 2 --reporter json
+target/debug/webtest test examples/structured-execution/retry.webtest --reporter events
 ```
 
 The first test demonstrates inherited bindings and nested deadlines. Child bindings remain
@@ -47,3 +48,8 @@ stops admission in its file and every already admitted test is awaited.
 Exhaustion reports `journal_capacity_exceeded`, cancels active roots, and awaits cleanup.
 Original test outcomes and the final run record survive; the reported missing interval marks
 an incomplete journal. Increase the budget and rerun when appropriate. This is not trace export.
+
+Retry event output includes `attempt_started` and `attempt_finished`, carrying the
+one-based ordinal and `max_attempts` alongside scope/source identity. The terminal
+event records the final outcome and any cancellation cause after owned teardown;
+it precedes backoff and the next attempt. Nested retries number their attempts locally.

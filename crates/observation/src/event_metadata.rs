@@ -62,7 +62,9 @@ impl ExecutionEvent {
     pub fn scope(&self) -> Option<&ScopeEvent> {
         match self {
             Self::Scope { event, .. } => Some(event),
-            Self::Wait { scope, .. } | Self::Resource { scope, .. } => Some(scope),
+            Self::Attempt { scope, .. }
+            | Self::Wait { scope, .. }
+            | Self::Resource { scope, .. } => Some(scope),
             _ => None,
         }
     }
@@ -70,9 +72,9 @@ impl ExecutionEvent {
     pub const fn test_id(&self) -> Option<TestId> {
         match self {
             Self::Scope { event, .. } => Some(event.execution_context.test_id),
-            Self::Wait { scope, .. } | Self::Resource { scope, .. } => {
-                Some(scope.execution_context.test_id)
-            }
+            Self::Attempt { scope, .. }
+            | Self::Wait { scope, .. }
+            | Self::Resource { scope, .. } => Some(scope.execution_context.test_id),
             Self::TestStarted { test_id, .. }
             | Self::StepStarted { test_id, .. }
             | Self::StepPassed { test_id, .. }

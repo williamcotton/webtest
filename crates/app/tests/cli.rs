@@ -467,7 +467,7 @@ fn check_without_paths_discovers_configured_tests_in_order() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON report");
-    assert_eq!(report["schema_version"], 6);
+    assert_eq!(report["schema_version"], 7);
     let paths = report["files"]
         .as_array()
         .expect("files")
@@ -996,7 +996,7 @@ fn parallel_reports_every_branch_failure_in_deterministic_source_order() {
         if reporter == "json" || reporter == "events" {
             let test = if reporter == "json" {
                 let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-                assert_eq!(value["schema_version"], 6);
+                assert_eq!(value["schema_version"], 7);
                 value["files"][0]["tests"][0].clone()
             } else {
                 let events: Vec<serde_json::Value> = text
@@ -1007,7 +1007,7 @@ fn parallel_reports_every_branch_failure_in_deterministic_source_order() {
                     .iter()
                     .find(|event| event["type"] == "test_result")
                     .unwrap();
-                assert_eq!(aggregate["schema_version"], 6);
+                assert_eq!(aggregate["schema_version"], 7);
                 aggregate["test"].clone()
             };
             assert_eq!(test["outcome"], "failed");
@@ -1070,7 +1070,7 @@ fn public_race_reports_the_winner_and_retains_failed_alternatives() {
         let stdout = String::from_utf8(output.stdout).unwrap();
         if reporter == "json" {
             let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-            assert_eq!(report["schema_version"], 6);
+            assert_eq!(report["schema_version"], 7);
             let test = &report["files"][0]["tests"][0];
             assert_eq!(test["outcome"], "passed");
             assert_eq!(test["branches"][0]["race_winner"], false);
@@ -1087,10 +1087,8 @@ fn public_race_reports_the_winner_and_retains_failed_alternatives() {
 #[test]
 fn public_retry_reports_every_attempt_and_rejects_unsafe_work_before_execution() {
     let directory = tempfile::tempdir().unwrap();
-    write(
-        &directory.path().join("retry.webtest"),
-        r#"test "attempts" { retry 2 backoff 0ms { expect 101 == 102 } }"#,
-    );
+    let source = r#"test "attempts" { retry 2 backoff 0ms { expect 101 == 102 } }"#;
+    write(&directory.path().join("retry.webtest"), source);
     for reporter in ["json", "events", "junit", "human", "concise"] {
         let output = webtest(directory.path())
             .args(["test", "retry.webtest", "--reporter", reporter])
@@ -1118,6 +1116,44 @@ fn public_retry_reports_every_attempt_and_rejects_unsafe_work_before_execution()
                     .iter()
                     .all(|attempt| attempt["result"]["outcome"] == "failed")
             );
+        } else if reporter == "events" {
+            let events: Vec<serde_json::Value> = stdout
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let attempts: Vec<_> = events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event["type"].as_str(),
+                        Some("attempt_started" | "attempt_finished")
+                    )
+                })
+                .collect();
+            assert_eq!(attempts.len(), 4);
+            for (index, attempt) in attempts.iter().enumerate() {
+                assert_eq!(attempt["schema_version"], 7);
+                assert_eq!(
+                    attempt["attempt"],
+                    serde_json::json!({"ordinal": index / 2 + 1, "max_attempts": 2})
+                );
+                assert!(attempt["scope"]["execution_context"]["attempt_id"].is_number());
+                assert_eq!(
+                    attempt["scope"]["source_revision"],
+                    serde_json::to_value(webtest_text::SourceRevision::of(source)).unwrap()
+                );
+                if index % 2 == 0 {
+                    assert_eq!(attempt["type"], "attempt_started");
+                    assert!(attempt["scope"].get("outcome").is_none());
+                } else {
+                    assert_eq!(attempt["type"], "attempt_finished");
+                    assert_eq!(attempt["scope"]["outcome"], "failed");
+                    assert_eq!(
+                        attempt["scope"]["execution_context"],
+                        attempts[index - 1]["scope"]["execution_context"]
+                    );
+                }
+            }
         } else if matches!(reporter, "human" | "concise") {
             assert_eq!(stdout.matches("attempt ID").count(), 2, "{stdout}");
         } else {

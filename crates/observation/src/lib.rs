@@ -14,7 +14,7 @@ pub use resource::{
     AcquisitionState, ResourceAccess, ResourceEvent, ResourceEventKind, ResourceKey, ResourceKind,
     RuntimeResourceEntry, TeardownState,
 };
-pub use scope::{ExecutionContext, ScopeCancellation, ScopeEvent, ScopeOutcome};
+pub use scope::{AttemptEvent, ExecutionContext, ScopeCancellation, ScopeEvent, ScopeOutcome};
 pub use wait::{WaitEvent, WaitEventKind};
 
 use std::{
@@ -686,6 +686,11 @@ impl RuntimeFailure {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExecutionEvent {
+    Attempt {
+        execution_id: ExecutionId,
+        scope: ScopeEvent,
+        event: AttemptEvent,
+    },
     Wait {
         execution_id: ExecutionId,
         scope: ScopeEvent,
@@ -795,7 +800,8 @@ pub enum ExecutionEvent {
 impl ExecutionEvent {
     pub const fn execution_id(&self) -> ExecutionId {
         match self {
-            Self::Wait { execution_id, .. }
+            Self::Attempt { execution_id, .. }
+            | Self::Wait { execution_id, .. }
             | Self::Resource { execution_id, .. }
             | Self::Scope { execution_id, .. }
             | Self::RunStarted { execution_id }
@@ -819,7 +825,8 @@ impl ExecutionEvent {
             Self::ProviderCallFailed { code, .. } | Self::CleanupFailed { code, .. } => Some(*code),
             Self::StepFailed { failure, .. } => Some(failure.code()),
             Self::TestTimedOut { .. } => Some(RuntimeFailureCode::TestTimeout),
-            Self::Wait { .. }
+            Self::Attempt { .. }
+            | Self::Wait { .. }
             | Self::Resource { .. }
             | Self::Scope { .. }
             | Self::RunStarted { .. }
