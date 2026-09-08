@@ -652,6 +652,7 @@ mod tests {
         assert!(WEBTEST_SKILL.contains("webtest describe statement.provide"));
         assert!(WEBTEST_SKILL.contains("webtest describe control.retry"));
         assert!(WEBTEST_SKILL.contains("webtest test <path> --jobs 2 --reporter json"));
+        assert!(WEBTEST_SKILL.contains("WEBTEST_APP_URL"));
         assert!(WEBTEST_SKILL.contains("webtest describe app.bridge"));
         assert!(WEBTEST_SKILL.contains("webtest describe app.protocol"));
         assert!(WEBTEST_SKILL.contains("webtest describe app.bridge.example"));

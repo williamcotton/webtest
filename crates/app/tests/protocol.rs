@@ -1296,3 +1296,142 @@ fn jobs_browser_roots_use_isolated_native_storage_across_files() {
     assert_eq!(report["files"][0]["tests"][0]["name"], "first");
     assert_eq!(report["files"][1]["tests"][0]["name"], "second");
 }
+
+#[test]
+fn worker_applications_share_bridge_http_browser_state_only_with_their_own_tests() {
+    let _runtime_test = runtime_protocol_lock();
+    let Some(chrome) = available_chrome() else {
+        return;
+    };
+    if std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    std::fs::write(
+        root.join("app-schema.json"),
+        include_str!("../../../protocol/conformance/app-schema.json"),
+    )
+    .unwrap();
+    let sdk = url::Url::from_file_path(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../sdks/node/src/index.js")
+            .canonicalize()
+            .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(root.join("app.mjs"), r#"
+        import http from 'node:http';
+        import fs from 'node:fs';
+        import { AppBridge } from __SDK__;
+        const worker = process.env.WEBTEST_WORKER_ID;
+        if (process.env.WEBTEST_TEST_FAIL_WORKER === worker) process.exit(12);
+        const log = (event) => fs.appendFileSync('workers.jsonl', JSON.stringify({event, worker, port: Number(process.env.WEBTEST_APP_PORT)}) + '\n');
+        let value = '';
+        const bridge = new AppBridge(JSON.parse(fs.readFileSync('app-schema.json')));
+        bridge.register('echo_string', async (args) => {
+            value = args.value;
+            log('call');
+            await new Promise(resolve => setTimeout(resolve, 25));
+            return value;
+        });
+        const server = http.createServer((req, res) => {
+            res.setHeader('Content-Type', req.url === '/state' ? 'application/json' : 'text/html');
+            res.end(req.url === '/state' ? JSON.stringify({value}) : `<p>${value}</p>`);
+        });
+        await new Promise(resolve => server.listen(Number(process.env.WEBTEST_APP_PORT), '127.0.0.1', resolve));
+        log('start');
+        await bridge.connectFromEnv();
+        await new Promise(resolve => server.close(resolve));
+        log('stop');
+    "#.replace("__SDK__", &serde_json::to_string(sdk.as_str()).unwrap())).unwrap();
+    std::fs::write(
+        root.join("webtest.toml"),
+        r#"
+        [app]
+        command = "node"
+        args = ["app.mjs"]
+        [app.health]
+        url = "http://127.0.0.1:5055/health"
+        [server.app]
+        adapter = "bridge"
+        transport = "tcp"
+        schema = "app-schema.json"
+        startup_timeout = "3s"
+        [browser]
+        base_url = "http://127.0.0.1:5055"
+        [server]
+        base_url = "http://127.0.0.1:5055"
+    "#,
+    )
+    .unwrap();
+    for test in 0..4 {
+        std::fs::write(
+            root.join(format!("{test}.webtest")),
+            format!(
+                r#"
+            test "test {test}" {{
+                server {{
+                    let echoed = app.echo_string(value: "worker test {test}")
+                    expect echoed == "worker test {test}"
+                    let response = http.get("/state")
+                    let state: {{ value: String }} = response.json
+                    expect state.value == "worker test {test}"
+                }}
+                browser {{ open "/" expect text("worker test {test}").visible }}
+            }}
+        "#
+            ),
+        )
+        .unwrap();
+    }
+    for failure in [false, true] {
+        std::fs::write(root.join("workers.jsonl"), "").unwrap();
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_webtest"))
+            .current_dir(root)
+            .env("WEBTEST_CHROME_PATH", &chrome)
+            .env(
+                "WEBTEST_TEST_FAIL_WORKER",
+                if failure { "1" } else { "none" },
+            )
+            .args(["test", "--jobs", "2", "--reporter", "json"])
+            .output()
+            .unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(if failure { 3 } else { 0 }),
+            "{report}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(report["summary"]["passed"], if failure { 0 } else { 4 });
+        let events: Vec<serde_json::Value> = std::fs::read_to_string(root.join("workers.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let starts: Vec<_> = events
+            .iter()
+            .filter(|event| event["event"] == "start")
+            .collect();
+        assert_eq!(starts.len(), if failure { 1 } else { 2 });
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["event"] == "call")
+                .count(),
+            if failure { 0 } else { 4 }
+        );
+        for start in starts {
+            let port = start["port"].as_u64().unwrap() as u16;
+            assert!(
+                std::net::TcpStream::connect(("127.0.0.1", port)).is_err(),
+                "worker outlived the run"
+            );
+        }
+    }
+}

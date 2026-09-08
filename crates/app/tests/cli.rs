@@ -737,6 +737,7 @@ fn jobs_schedule_tests_across_files_before_waiting_for_either_file_to_finish() {
         while streams.len() < 2 && Instant::now() < deadline {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_secs(2)))
                         .unwrap();

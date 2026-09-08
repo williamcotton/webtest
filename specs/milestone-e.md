@@ -367,6 +367,58 @@ tests. `cargo clippy --workspace --all-targets -- -D warnings`, Rust formatting,
 WASM check pass. All seven structured-execution examples pass with `--jobs 2`; their static and
 format checks and the updated test declaration description also pass.
 
+### Worker-owned application continuation — 2026-09-07
+
+For concurrent runs with owned `[app]`, the composition root now starts up to one application
+per job and lends each worker's provider registry and runtime URL options to one test root at a
+time. The worker remains occupied through test teardown and reuses its application for later
+tests. Each process receives `WEBTEST_WORKER_ID`, `WEBTEST_APP_PORT`, and `WEBTEST_APP_URL`;
+applications must bind the injected endpoint. Matching loopback browser/server/HTTP-adapter and
+health URLs are rebased to that endpoint with their paths preserved. Socket bridges use independent
+existing authenticated lifecycles. No execution-state sharing or nested scheduling change is added.
+All applications are shut down after the roots finish, including workers started before another
+worker's startup failure. Jobs 1 retains the existing application lifecycle. Unowned applications
+remain shared; owned command/stdio adapters are explicitly rejected for concurrent workers.
+Absolute source URLs and external databases are not rewritten/provisioned.
+
+A native regression exercises bridge writes, HTTP reads, browser reads, application reuse, and
+closed worker listeners after both success and partial startup failure. The F# demo now reads
+`WEBTEST_APP_URL` with its existing 5055 fallback; after rebuilding with .NET 9, its original
+18-test suite passes with `--jobs 5`.
+
+Worker continuation verification: full workspace tests, warning-free workspace Clippy, Rust
+formatting, and portable WASM compilation pass, including the native worker routing and partial
+startup cleanup regression.
+
+### Native journal identity continuation — 2026-09-07
+
+The runtime collector now retains `RecordedEvent` facts with native envelope version 1,
+typed `(ExecutionId, EventSequence)` identity, separate wall-clock/monotonic elapsed timestamps,
+and the original typed event payload. Sequences start at zero independently for each execution
+and represent observed collection order. The collector assigns and retains each record before
+publishing it, releases its append lock before invoking a sink, and does not share branch state.
+`RunResult.journal` exposes these authoritative native records; existing `RunResult.events` is
+now a compatibility projection of their payloads. Record-aware sinks can consume the assigned
+identity; existing sinks retain their previous callback through a default projection.
+
+The observation crate owns a bounded replay index. It accepts out-of-order delivery, keeps each
+execution in sequence order, treats exact duplicates idempotently without consuming capacity,
+and rejects conflicting payloads/timestamps, mismatched execution identities, unsupported native
+record versions, and capacity overflow without changing already accepted facts. Deterministic tests
+cover these rules, backwards wall clocks, parallel producers, publication after retention, and
+agreement between native records and existing events during multi-file jobs.
+
+This is the identity/replay foundation, not completion of section 9. Authoritative retention
+budgets and their infrastructure failure policy, bounded live subscribers, the complete serialized
+envelope/context projection, and the expanded event vocabulary remain pending. CLI report/event
+schema 6 is unchanged. Execution IDs still use the current process-local allocator; durable
+cross-process identity must be settled before serialized replay/IPC is exposed. Traces, IPC,
+and concurrent DAP remain later slices.
+
+Journal identity verification: full workspace tests (including Chrome, worker application
+isolation, and LSP/DAP), warning-free workspace Clippy, Rust formatting, and portable WASM
+compilation pass. Existing report compatibility fixtures remain unchanged and pass.
+
 ## 1. Outcome
 
 Tests can express bounded parallelism, races, retries, and timeouts without leaking child work or losing cleanup. Every attempt and cancellation remains source-mapped in terminal output, traces, editor observations, DAP, and versioned machine output.

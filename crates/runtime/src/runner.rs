@@ -19,7 +19,7 @@ use crate::{
 };
 
 mod jobs;
-pub use jobs::{InvalidJobLimit, JobLimit, TestRun, run_jobs};
+pub use jobs::{InvalidJobLimit, JobLimit, TestRun, TestWorker, run_jobs, run_jobs_on_workers};
 
 pub struct Runner {
     observations: Arc<ObservationStore>,
@@ -378,11 +378,13 @@ fn finish_run(
             failure_class,
         },
     );
+    let journal = events.into_records();
     RunResult {
         execution_id,
         outcome,
         tests,
-        events: events.into_events(),
+        events: journal.iter().map(|record| record.event.clone()).collect(),
+        journal,
         duration: started.elapsed(),
     }
 }

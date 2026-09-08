@@ -35,7 +35,9 @@ pub use result::{
     BranchResult, PriorRunOutcome, PriorTestOutcome, RunOutcome, RunResult, StepFailure,
     TestOutcome, TestResult,
 };
-pub use runner::{InvalidJobLimit, JobLimit, Runner, TestRun, run_jobs};
+pub use runner::{
+    InvalidJobLimit, JobLimit, Runner, TestRun, TestWorker, run_jobs, run_jobs_on_workers,
+};
 pub use url::resolve_browser_url;
 pub use waits::{
     TimerWait, WaitCleanupFailure, WaitCleanupPhase, WaitCompletion, WaitInvariant, WaitOutcome,

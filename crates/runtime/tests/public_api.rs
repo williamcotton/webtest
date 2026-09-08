@@ -171,6 +171,7 @@ fn defaults_and_result_counts_are_exact() {
     let execution_id = ExecutionId::next();
     let result = RunResult {
         execution_id,
+        journal: Vec::new(),
         outcome: RunOutcome::Completed,
         tests: vec![
             test_result(TestOutcome::Passed),

@@ -37,6 +37,12 @@ fn configuration_reference() -> ConstructDescription {
             "`[server.app]` owns provider adapter, transport, schema, limits, and compatibility-adapter settings. `[app]` owns an optionally runner-managed application process, its arguments, working directory, environment, ownership, and health check.",
         ),
         constraint(
+            "app_worker_isolation",
+            "runtime",
+            "owned application",
+            "Concurrent test workers each start and reuse an owned application process. The application must bind WEBTEST_APP_URL (or WEBTEST_APP_PORT); WEBTEST_WORKER_ID identifies its worker. Matching loopback browser, HTTP-provider, HTTP-adapter, and health URLs retain their paths and use that worker's port. Socket bridges get separate authenticated connections. Each worker runs one test at a time through teardown. Absolute URLs in source and external databases are not rewritten or provisioned. Unowned applications remain shared; owned command/stdio adapters require sequential execution.",
+        ),
+        constraint(
             "app_configuration_inspect_lifecycle",
             "inspection",
             "URL mode",

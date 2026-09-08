@@ -2,7 +2,9 @@ use std::{io, path::PathBuf, sync::Arc, time::Instant};
 
 use webtest_feedback::FailureClass;
 use webtest_observation::ObservationStore;
-use webtest_runtime::{JobLimit, RunError, RunOutcome, Runner, TestOutcome, TestRun, run_jobs};
+use webtest_runtime::{
+    JobLimit, RunError, RunOutcome, Runner, TestOutcome, TestRun, run_jobs, run_jobs_on_workers,
+};
 
 use crate::{
     chrome::LazyChromeHost,
@@ -35,7 +37,12 @@ pub(crate) async fn run_test(
     let show_browser = headed || !project.config.browser.headless;
     let options = runner_options(&project);
     let runtime_providers = runtime_provider_registry(&project, &options)?;
-    let application = runtime_application(&project, runtime_providers.app.clone());
+    let worker_mode = jobs.get() > 1 && project.config.app.as_ref().is_some_and(|app| app.owned);
+    let application = if worker_mode {
+        None
+    } else {
+        runtime_application(&project, runtime_providers.app.clone())
+    };
     let providers = runtime_providers.registry;
     let progress = (reporter == TestReporter::Human)
         .then(|| Arc::new(HumanTestProgress::stdout(jobs.get() > 1)));
@@ -81,9 +88,44 @@ pub(crate) async fn run_test(
         );
     }
 
-    let mut app_start_attempted = false;
-    let mut app_started = false;
-    let application_progress_message = application_progress_message(&project);
+    let mut worker_applications = if worker_mode && runnable_tests > 0 {
+        Some(crate::worker_applications::WorkerApplications::prepare(
+            &project,
+            jobs.get().min(runnable_tests),
+        )?)
+    } else {
+        None
+    };
+    let app_started =
+        runnable_files > 0 && (application.is_some() || worker_applications.is_some());
+    let startup_failure = if app_started {
+        if let Some(progress) = &progress {
+            record_progress_error(
+                progress.starting_application(if worker_mode {
+                    "starting worker applications and verifying app bridges"
+                } else {
+                    application_progress_message(&project)
+                }),
+                &mut progress_error,
+            );
+        }
+        let result = if let Some(pool) = &mut worker_applications {
+            pool.start().await
+        } else if let Some(application) = &application {
+            application.start(&project).await
+        } else {
+            Ok(())
+        };
+        if let Some(progress) = &progress {
+            record_progress_error(
+                progress.application_started(result.is_ok()),
+                &mut progress_error,
+            );
+        }
+        result.err()
+    } else {
+        None
+    };
 
     let mut runnable = Vec::new();
     for (file, analyzed, analysis_duration, has_static_errors) in prepared {
@@ -124,52 +166,30 @@ pub(crate) async fn run_test(
             execution_error: None,
             events: Vec::new(),
         };
-        if let Some(application) = &application {
-            let first_attempt = !app_start_attempted;
-            if first_attempt {
-                app_start_attempted = true;
-                if let Some(progress) = &progress {
-                    record_progress_error(
-                        progress.starting_application(application_progress_message),
-                        &mut progress_error,
-                    );
-                }
-            }
-            if let Err(error) = application.start(&project).await {
-                if first_attempt && let Some(progress) = &progress {
-                    record_progress_error(progress.application_started(false), &mut progress_error);
-                }
-                file_report.execution_error = Some(ExecutionFailureReport {
-                    class: FailureClass::Infrastructure,
-                    failure: FailureReport {
-                        diagnostic_schema_version: webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
-                        repair_hint_schema_version: webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
-                        code: webtest_observation::RuntimeFailureCode::from(&error)
-                            .diagnostic_code()
-                            .into(),
-                        message: error.to_string(),
-                        span: None,
-                        diff: None,
-                        artifacts: Vec::new(),
-                        semantic_details: None,
-                        repair_hints: Vec::new(),
-                        page: None,
-                        secondary: Vec::new(),
-                    },
-                });
-                file_report.duration_nanos =
-                    nanos(analysis_duration.saturating_add(started.elapsed()));
-                file_report.exit_class = ExitClass::Infrastructure;
-                report.exit_class = report.exit_class.combine(ExitClass::Infrastructure);
-                report.files.push(file_report);
-                continue;
-            }
-            if first_attempt {
-                app_started = true;
-                if let Some(progress) = &progress {
-                    record_progress_error(progress.application_started(true), &mut progress_error);
-                }
-            }
+        if let Some(error) = &startup_failure {
+            file_report.execution_error = Some(ExecutionFailureReport {
+                class: FailureClass::Infrastructure,
+                failure: FailureReport {
+                    diagnostic_schema_version: webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
+                    repair_hint_schema_version: webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
+                    code: webtest_observation::RuntimeFailureCode::from(error)
+                        .diagnostic_code()
+                        .into(),
+                    message: error.to_string(),
+                    span: None,
+                    diff: None,
+                    artifacts: Vec::new(),
+                    semantic_details: None,
+                    repair_hints: Vec::new(),
+                    page: None,
+                    secondary: Vec::new(),
+                },
+            });
+            file_report.duration_nanos = nanos(analysis_duration.saturating_add(started.elapsed()));
+            file_report.exit_class = ExitClass::Infrastructure;
+            report.exit_class = report.exit_class.combine(ExitClass::Infrastructure);
+            report.files.push(file_report);
+            continue;
         }
         let file_browser = browser.for_file(file_report.path.clone());
         runnable.push((
@@ -190,7 +210,18 @@ pub(crate) async fn run_test(
             control: None,
         })
         .collect();
-    let results = run_jobs(&inputs, jobs).await;
+    let results = if let Some(pool) = &worker_applications {
+        // Pool size is constructed from a validated jobs limit and nonzero test count.
+        match run_jobs_on_workers(&inputs, &pool.workers).await {
+            Ok(results) => results,
+            Err(error) => {
+                let _ = pool.shutdown().await;
+                return Err(AppError::internal(error));
+            }
+        }
+    } else {
+        run_jobs(&inputs, jobs).await
+    };
     for ((index, source, plan, _, _), result) in runnable.iter().zip(results) {
         let file_report = &mut report.files[*index];
         file_report.duration_nanos = nanos(result.duration);
@@ -236,22 +267,31 @@ pub(crate) async fn run_test(
             report.exit_class = report.exit_class.combine(file_report.exit_class);
         }
     }
-    if let Some(application) = application {
-        if app_started && let Some(progress) = &progress {
+    if app_started {
+        if let Some(progress) = &progress {
             record_progress_error(progress.stopping_application(), &mut progress_error);
         }
-        let shutdown = application.shutdown().await;
-        if app_started && let Some(progress) = &progress {
+        let failures = if let Some(pool) = &worker_applications {
+            pool.shutdown().await
+        } else if let Some(application) = &application {
+            application.shutdown().await.err().into_iter().collect()
+        } else {
+            Vec::new()
+        };
+        if let Some(progress) = &progress {
             record_progress_error(
-                progress.application_stopped(shutdown.is_ok()),
+                progress.application_stopped(failures.is_empty()),
                 &mut progress_error,
             );
         }
-        if let Err(error) = shutdown {
+        for error in failures {
             report.exit_class = report.exit_class.combine(ExitClass::Infrastructure);
             report.warnings.push(WarningReport {
                 code: "app.teardown".into(),
-                key: application.configuration_key().into(),
+                key: application
+                    .as_ref()
+                    .map_or("app", |app| app.configuration_key())
+                    .into(),
                 message: error.to_string(),
             });
         }

@@ -93,6 +93,16 @@ async fn jobs_bound_live_roots_across_files_and_preserve_source_order() {
     for result in &results {
         assert_terminal_event_invariants(&result.events);
         assert_scopes_finish_once_after_children(&result.events);
+        assert_eq!(result.events.len(), result.journal.len());
+        for (ordinal, (event, record)) in result.events.iter().zip(&result.journal).enumerate() {
+            assert_eq!(&record.event, event);
+            assert_eq!(record.identity.execution_id, result.execution_id);
+            assert_eq!(record.identity.event_sequence.0, ordinal as u64);
+            assert_eq!(
+                record.schema_version,
+                webtest_observation::EVENT_JOURNAL_SCHEMA_VERSION
+            );
+        }
     }
     let events = sink.events.lock().unwrap();
     let finished: Vec<_> = events

@@ -1,8 +1,13 @@
 //! Structured execution events and revision-safe source observations.
 
+mod journal;
 mod resource;
 mod scope;
 mod wait;
+pub use journal::{
+    EVENT_JOURNAL_SCHEMA_VERSION, EventIdentity, EventJournal, EventSequence, EventTime,
+    RecordedEvent, ReplayError, ReplayJournal, ReplayOutcome,
+};
 pub use resource::{
     AcquisitionState, ResourceAccess, ResourceEvent, ResourceEventKind, ResourceKey, ResourceKind,
     RuntimeResourceEntry, TeardownState,
@@ -418,7 +423,9 @@ pub enum ValueDiff {
 
 static NEXT_EXECUTION_ID: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct ExecutionId(pub u64);
 
 impl ExecutionId {
@@ -779,6 +786,27 @@ pub enum ExecutionEvent {
 }
 
 impl ExecutionEvent {
+    pub const fn execution_id(&self) -> ExecutionId {
+        match self {
+            Self::Wait { execution_id, .. }
+            | Self::Resource { execution_id, .. }
+            | Self::Scope { execution_id, .. }
+            | Self::RunStarted { execution_id }
+            | Self::TestStarted { execution_id, .. }
+            | Self::StepStarted { execution_id, .. }
+            | Self::StepPassed { execution_id, .. }
+            | Self::ProviderCallStarted { execution_id, .. }
+            | Self::ProviderCallFinished { execution_id, .. }
+            | Self::ProviderCallFailed { execution_id, .. }
+            | Self::StepFailed { execution_id, .. }
+            | Self::TestTimedOut { execution_id, .. }
+            | Self::CleanupFailed { execution_id, .. }
+            | Self::TestFinished { execution_id, .. }
+            | Self::TestSkipped { execution_id, .. }
+            | Self::RunFinished { execution_id, .. } => *execution_id,
+        }
+    }
+
     pub fn failure_code(&self) -> Option<RuntimeFailureCode> {
         match self {
             Self::ProviderCallFailed { code, .. } | Self::CleanupFailed { code, .. } => Some(*code),

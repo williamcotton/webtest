@@ -143,6 +143,8 @@ pub struct RunResult {
     pub execution_id: ExecutionId,
     pub outcome: RunOutcome,
     pub tests: Vec<TestResult>,
+    /// Authoritative native records; `events` is the compatibility projection.
+    pub journal: Vec<webtest_observation::RecordedEvent>,
     pub events: Vec<ExecutionEvent>,
     pub duration: Duration,
 }

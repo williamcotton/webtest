@@ -184,7 +184,10 @@ Use `webtest test <path> --jobs 2 --reporter json` to run independent test roots
 and contexts, resources, observations, and evidence; its slot stays occupied through teardown.
 Nested parallel/race branches use their own scheduler. Final reports retain file/test source
 order, while live progress shows completion order. Test failures are collected; an infrastructure
-failure stops new tests in its file while admitted tests finish. Configured application services
-remain project-owned, so tests must arrange independent application data when needed.
+failure stops new tests in its file while admitted tests finish. With an owned `[app]`, each worker
+starts and reuses a separate app process. The app must bind `WEBTEST_APP_URL` (or `WEBTEST_APP_PORT`);
+`WEBTEST_WORKER_ID` identifies the worker. Use relative browser/HTTP URLs so they route to that app.
+Socket bridges and HTTP adapters receive worker-specific connections. External databases still need
+worker-specific configuration; unowned apps remain shared. Owned command/stdio adapters require jobs 1.
 Traces and concurrent debugger stepping remain unfinished; discover those
 features with the installed binary before using them.

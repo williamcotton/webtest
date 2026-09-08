@@ -73,6 +73,21 @@ pub struct TestRun<'a> {
     pub control: Option<&'a dyn RunControl>,
 }
 
+/// Runtime services bound to one reusable application worker. A worker is lent
+/// to one test root at a time, including all descendant work and teardown.
+pub struct TestWorker {
+    pub options: crate::RunnerOptions,
+    pub providers: ProviderRegistry,
+}
+
+pub async fn run_jobs_on_workers(
+    inputs: &[TestRun<'_>],
+    workers: &[TestWorker],
+) -> Result<Vec<RunResult>, InvalidJobLimit> {
+    let jobs = JobLimit::new(workers.len())?;
+    Ok(run_scheduled(inputs, jobs, Some(workers)).await)
+}
+
 struct FileServices {
     execution_id: ExecutionId,
     events: EventBuffer,
@@ -111,6 +126,14 @@ pub async fn run_jobs(inputs: &[TestRun<'_>], jobs: JobLimit) -> Vec<RunResult> 
         return results;
     }
 
+    run_scheduled(inputs, jobs, None).await
+}
+
+async fn run_scheduled(
+    inputs: &[TestRun<'_>],
+    jobs: JobLimit,
+    workers: Option<&[TestWorker]>,
+) -> Vec<RunResult> {
     let services: Vec<_> = inputs
         .iter()
         .map(|input| {
@@ -171,9 +194,10 @@ pub async fn run_jobs(inputs: &[TestRun<'_>], jobs: JobLimit) -> Vec<RunResult> 
         .iter()
         .enumerate()
         .flat_map(|(file, input)| (0..input.plan.tests.len()).map(move |test| (file, test)));
+    let mut available: std::collections::VecDeque<_> = (0..jobs.get()).collect();
     let mut pending = FuturesUnordered::new();
     loop {
-        while pending.len() < jobs.get() {
+        while let Some(&worker) = available.front() {
             let Some((file, test)) = roots.next() else {
                 break;
             };
@@ -212,12 +236,21 @@ pub async fn run_jobs(inputs: &[TestRun<'_>], jobs: JobLimit) -> Vec<RunResult> 
                 );
                 state.tests[test] = skipped.pop();
             } else {
-                pending.push(run_root(file, test, input, &services[file]));
+                available.pop_front();
+                pending.push(run_root(
+                    file,
+                    test,
+                    worker,
+                    input,
+                    &services[file],
+                    workers.map(|workers| &workers[worker]),
+                ));
             }
         }
-        let Some((file, test, result, observations)) = pending.next().await else {
+        let Some((file, test, worker, result, observations)) = pending.next().await else {
             break;
         };
+        available.push_back(worker);
         let state = &mut files[file];
         // Every failure remains in its source-ordered test result. The run
         // outcome is only a summary and never replaces the test aggregate.
@@ -306,9 +339,11 @@ pub async fn run_jobs(inputs: &[TestRun<'_>], jobs: JobLimit) -> Vec<RunResult> 
 async fn run_root(
     file: usize,
     test: usize,
+    worker: usize,
     input: &TestRun<'_>,
     service: &FileServices,
-) -> (usize, usize, TestResult, Vec<RuntimeObservation>) {
+    runtime: Option<&TestWorker>,
+) -> (usize, usize, usize, TestResult, Vec<RuntimeObservation>) {
     // All mutable runtime and native resource state belongs to this future.
     let mut session = None;
     let observations = ObservationStore::default();
@@ -323,8 +358,8 @@ async fn run_root(
         input.browser,
         &mut session,
         input.control,
-        &input.runner.options,
-        &service.providers,
+        runtime.map_or(&input.runner.options, |worker| &worker.options),
+        runtime.map_or(&service.providers, |worker| &worker.providers),
         &observations,
         service.ids.clone(),
         &resources,
@@ -338,6 +373,7 @@ async fn run_root(
     (
         file,
         test,
+        worker,
         result,
         observations.observations_for(input.plan.file, input.plan.source_revision),
     )

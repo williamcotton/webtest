@@ -14,6 +14,7 @@ mod runtime_configuration;
 mod runtime_output;
 mod source_output;
 mod test_progress;
+mod worker_applications;
 
 use std::process::ExitCode;
 
