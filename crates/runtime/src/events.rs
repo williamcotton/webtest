@@ -6,8 +6,10 @@ use std::{
     num::NonZeroUsize,
     sync::{Arc, Mutex},
 };
-use webtest_model::ExecutionScopeId;
+use webtest_model::{ExecutionScopeId, StepId, TestId};
 use webtest_observation::{EventIdentity, EventJournal, EventTime, ExecutionEvent, RecordedEvent};
+use webtest_observation::{EventMetadata, ScopeEvent};
+use webtest_text::{SourceRevision, SyntaxOrigin};
 
 /// An authoritative journal gap. Execution stops admitting work and awaits all
 /// owned teardown. The reserved final record reports an infrastructure outcome.
@@ -34,6 +36,25 @@ pub trait RunEventSink: Send + Sync {
 }
 
 pub(crate) fn emit_event(
+    events: &EventBuffer,
+    sink: Option<&dyn RunEventSink>,
+    event: ExecutionEvent,
+) {
+    let metadata = events.metadata(&event);
+    emit_event_with_metadata(metadata, events, sink, event);
+}
+
+pub(crate) fn emit_event_in_scope(
+    scope: &ScopeEvent,
+    events: &EventBuffer,
+    sink: Option<&dyn RunEventSink>,
+    event: ExecutionEvent,
+) {
+    emit_event_with_metadata(EventMetadata::from(scope), events, sink, event);
+}
+
+pub(crate) fn emit_event_with_metadata(
+    metadata: EventMetadata,
     events: &EventBuffer,
     sink: Option<&dyn RunEventSink>,
     event: ExecutionEvent,
@@ -67,7 +88,7 @@ pub(crate) fn emit_event(
             }
             None
         } else {
-            let record = state.journal.record(
+            let record = state.journal.record_with_metadata(
                 event,
                 EventTime {
                     since_unix_epoch: std::time::SystemTime::now()
@@ -75,6 +96,7 @@ pub(crate) fn emit_event(
                         .unwrap_or_default(),
                     elapsed: events.started.elapsed(),
                 },
+                metadata,
             );
             if !events.subscribers.is_empty() {
                 let record = Arc::new(record.clone());
@@ -104,6 +126,9 @@ pub(crate) struct EventBuffer {
     started: tokio::time::Instant,
     capacity: NonZeroUsize,
     subscribers: Vec<SubscriptionSender>,
+    source_revision: Option<SourceRevision>,
+    tests: BTreeMap<TestId, SyntaxOrigin>,
+    steps: BTreeMap<(TestId, StepId), SyntaxOrigin>,
 }
 
 impl Default for EventBuffer {
@@ -122,8 +147,37 @@ impl EventBuffer {
             started: tokio::time::Instant::now(),
             capacity,
             subscribers,
+            source_revision: None,
+            tests: BTreeMap::new(),
+            steps: BTreeMap::new(),
         }
     }
+    pub(crate) fn for_plan(mut self, plan: &webtest_plan::TestPlan) -> Self {
+        self.source_revision = Some(plan.source_revision);
+        for test in &plan.tests {
+            self.tests.insert(test.id, test.origin);
+            for step in test.steps() {
+                self.steps.insert((test.id, step.id), step.origin);
+            }
+        }
+        self
+    }
+
+    fn metadata(&self, event: &ExecutionEvent) -> EventMetadata {
+        let mut metadata = event.metadata();
+        if event.scope().is_none() {
+            metadata.source_revision = self.source_revision;
+            metadata.origin = event.test_id().and_then(|test| {
+                event
+                    .step_id()
+                    .and_then(|step| self.steps.get(&(test, step)))
+                    .or_else(|| self.tests.get(&test))
+                    .copied()
+            });
+        }
+        metadata
+    }
+
     pub(crate) fn overflow(&self) -> Option<JournalOverflow> {
         self.journal
             .lock()

@@ -90,7 +90,13 @@ pub(super) async fn execute_child(
         .map_or(result.primary, crate::WaitCompletion::Ready);
     let provisional = match primary {
         crate::WaitCompletion::Ready(body) => {
-            finalize_body(services, body, scope.event.execution_context.attempt_id).await
+            finalize_body(
+                services,
+                body,
+                &scope.event,
+                branch.active_operation.as_ref(),
+            )
+            .await
         }
         crate::WaitCompletion::Cancelled(cause)
             if cause.reason == webtest_host::CancellationReason::Timeout
@@ -107,7 +113,8 @@ pub(super) async fn execute_child(
                     active_step: branch.active_step,
                     origin: Some(node.origin),
                 }),
-                scope.event.execution_context.attempt_id,
+                &scope.event,
+                branch.active_operation.as_ref(),
             )
             .await
         }
@@ -206,6 +213,7 @@ pub(super) async fn execute_child(
             services.event_sink,
             services.execution_id,
             Some(services.test.id),
+            Some(&scope.event),
             failure,
         );
     }
@@ -256,7 +264,8 @@ pub(super) async fn execute_child(
 async fn finalize_body(
     services: &ExecutionServices<'_>,
     body: TestBodyOutcome,
-    attempt_id: Option<webtest_model::AttemptId>,
+    scope: &webtest_observation::ScopeEvent,
+    active_operation: Option<&webtest_observation::ScopeEvent>,
 ) -> ProvisionalTestOutcome {
     match body {
         TestBodyOutcome::PendingFailure(pending) => match process_failure(FailureInput {
@@ -265,7 +274,7 @@ async fn finalize_body(
             execution_id: services.execution_id,
             pending: *pending,
             artifact_deadline: services.deadline.at,
-            attempt_id,
+            attempt_id: scope.execution_context.attempt_id,
             options: services.options,
             providers: services.providers,
             observations: services.observations,
@@ -285,6 +294,8 @@ async fn finalize_body(
             let active = active_step
                 .and_then(|id| services.test.steps().into_iter().find(|step| step.id == id));
             emit_test_timeout(
+                scope,
+                active_operation,
                 services.plan,
                 services.test,
                 active,

@@ -146,7 +146,8 @@ async fn run_scheduled(
             let events = EventBuffer::new(
                 input.runner.options.journal_max_events,
                 input.runner.subscribers.clone(),
-            );
+            )
+            .for_plan(input.plan);
             emit_event(
                 &events,
                 input.runner.event_sink.as_deref(),

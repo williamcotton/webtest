@@ -1,6 +1,8 @@
 //! Structured execution events and revision-safe source observations.
 
+mod event_metadata;
 mod journal;
+pub use event_metadata::{EventContext, EventMetadata};
 mod resource;
 mod scope;
 mod wait;

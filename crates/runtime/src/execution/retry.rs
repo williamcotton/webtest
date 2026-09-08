@@ -15,6 +15,7 @@ impl TreeExecution<'_, '_> {
             ..*self.services
         };
         self.branch.active_step = None;
+        self.branch.active_operation = None;
         let inherits_page = child
             .required_resources()
             .iter()

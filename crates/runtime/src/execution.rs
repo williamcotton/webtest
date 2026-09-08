@@ -1,4 +1,4 @@
-use crate::events::EventBuffer;
+use crate::events::{EventBuffer, emit_event_in_scope, emit_event_with_metadata};
 use std::{
     future::Future,
     time::{Duration, Instant as StdInstant},
@@ -125,7 +125,9 @@ pub(crate) async fn execute_test(
     let test_started = StdInstant::now();
     let deadline = TestDeadline::new(options.test_timeout);
     let scope_factory = scopes::ScopeFactory::new(ids, test.id);
-    emit_event(
+    let root = scope_factory.root(&test.body, deadline.at);
+    emit_event_in_scope(
+        &root.event,
         events,
         event_sink,
         ExecutionEvent::TestStarted {
@@ -134,7 +136,6 @@ pub(crate) async fn execute_test(
             name: test.name.clone(),
         },
     );
-    let root = scope_factory.root(&test.body, deadline.at);
     let root_scope = root.event.clone();
     let root_context = root.context.clone();
     let _journal_root = events.register_root(&root_context);
@@ -251,6 +252,8 @@ pub(crate) async fn execute_test(
             let active =
                 active_step.and_then(|id| test.steps().into_iter().find(|step| step.id == id));
             emit_test_timeout(
+                &root_scope,
+                branch.active_operation.as_ref(),
                 plan,
                 test,
                 active,
@@ -295,6 +298,8 @@ pub(crate) async fn execute_test(
                 control.after_test_timeout(test, active);
             }
             emit_test_timeout(
+                &root_scope,
+                branch.active_operation.as_ref(),
                 plan,
                 test,
                 active,
@@ -383,7 +388,14 @@ pub(crate) async fn execute_test(
         .bindings
         .final_transferable_bindings(&options.redacted_json_fields);
     for failure in &branch.cleanup_failures {
-        emit_cleanup_failed(events, event_sink, execution_id, Some(test.id), failure);
+        emit_cleanup_failed(
+            events,
+            event_sink,
+            execution_id,
+            Some(test.id),
+            Some(&root_scope),
+            failure,
+        );
     }
     let outcome = combine_test_outcome(outcome, branch.cleanup_failures);
     let scope_outcome = scope_outcome(&outcome);
@@ -395,7 +407,8 @@ pub(crate) async fn execute_test(
         .finish(&root, scope_outcome, execution_id, events, event_sink);
     let outcome_kind = outcome.finished_kind();
     let failure_class = outcome.failure_class();
-    emit_event(
+    emit_event_in_scope(
+        &root.event,
         events,
         event_sink,
         ExecutionEvent::TestFinished {
@@ -901,6 +914,7 @@ impl TreeExecution<'_, '_> {
         let active_step = &mut self.branch.active_step;
 
         *active_step = Some(step.id);
+        self.branch.active_operation = Some(scope.event.clone());
         if host_context.cancellation.cause().is_some()
             || control.is_some_and(RunControl::is_cancelled)
         {
@@ -943,7 +957,8 @@ impl TreeExecution<'_, '_> {
                 });
             }
         }
-        emit_event(
+        emit_event_in_scope(
+            &scope.event,
             events,
             event_sink,
             ExecutionEvent::StepStarted {
@@ -953,7 +968,8 @@ impl TreeExecution<'_, '_> {
             },
         );
         if let TestOperation::ServerProviderCall(call) = &step.operation {
-            emit_event(
+            emit_event_in_scope(
+                &scope.event,
                 events,
                 event_sink,
                 ExecutionEvent::ProviderCallStarted {
@@ -1036,7 +1052,8 @@ impl TreeExecution<'_, '_> {
                 }
                 if let TestOperation::ServerProviderCall(call) = &step.operation {
                     state.accept_provider_result_metadata(call);
-                    emit_event(
+                    emit_event_in_scope(
+                        &scope.event,
                         events,
                         event_sink,
                         ExecutionEvent::ProviderCallFinished {
@@ -1051,7 +1068,8 @@ impl TreeExecution<'_, '_> {
                         },
                     );
                 }
-                emit_event(
+                emit_event_in_scope(
+                    &scope.event,
                     events,
                     event_sink,
                     ExecutionEvent::StepPassed {
@@ -1086,6 +1104,7 @@ impl TreeExecution<'_, '_> {
                     self.branch.primary_failure = Some(TestBodyOutcome::PendingFailure(Box::new(
                         PendingFailure::primary(
                             step,
+                            &scope.event,
                             error.clone(),
                             duration_millis(step_started.elapsed()),
                         ),
@@ -1104,6 +1123,7 @@ impl TreeExecution<'_, '_> {
                 }
                 let pending = prepare_failure(PrepareFailureInput {
                     step,
+                    scope: &scope.event,
                     error,
                     page,
                     options,
@@ -1120,12 +1140,15 @@ impl TreeExecution<'_, '_> {
         }
 
         *active_step = None;
+        self.branch.active_operation = None;
         TestBodyOutcome::Provisional(ProvisionalTestOutcome::Passed)
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn emit_test_timeout(
+    scope: &webtest_observation::ScopeEvent,
+    active_operation: Option<&webtest_observation::ScopeEvent>,
     plan: &TestPlan,
     test: &PlannedTest,
     active_step: Option<&PlannedStep>,
@@ -1138,7 +1161,12 @@ fn emit_test_timeout(
     origin: Option<webtest_text::SyntaxOrigin>,
 ) {
     let timeout_ms = duration_millis(timeout);
-    emit_event(
+    let mut metadata = webtest_observation::EventMetadata::from(scope);
+    metadata.origin = origin
+        .or_else(|| active_step.map(|step| step.origin))
+        .or(Some(test.origin));
+    emit_event_with_metadata(
+        metadata.clone(),
         events,
         event_sink,
         ExecutionEvent::TestTimedOut {
@@ -1149,8 +1177,13 @@ fn emit_test_timeout(
         },
     );
     if let Some(step) = active_step {
+        if let Some(operation) = active_operation {
+            metadata = operation.into();
+        }
+        metadata.origin = Some(step.origin);
         if let TestOperation::ServerProviderCall(call) = &step.operation {
-            emit_event(
+            emit_event_with_metadata(
+                metadata.clone(),
                 events,
                 event_sink,
                 ExecutionEvent::ProviderCallFailed {
@@ -1167,7 +1200,8 @@ fn emit_test_timeout(
                 },
             );
         }
-        emit_event(
+        emit_event_with_metadata(
+            metadata.clone(),
             events,
             event_sink,
             ExecutionEvent::StepFailed {
@@ -1275,20 +1309,22 @@ pub(crate) fn emit_cleanup_failed(
     event_sink: Option<&dyn RunEventSink>,
     execution_id: ExecutionId,
     test_id: Option<TestId>,
+    scope: Option<&webtest_observation::ScopeEvent>,
     failure: &CleanupFailure,
 ) {
-    emit_event(
-        events,
-        event_sink,
-        ExecutionEvent::CleanupFailed {
-            execution_id,
-            test_id,
-            resource: failure.resource.clone(),
-            failure_class: failure.failure_class(),
-            code: failure.code(),
-            message: failure.message(),
-        },
-    );
+    let event = ExecutionEvent::CleanupFailed {
+        execution_id,
+        test_id,
+        resource: failure.resource.clone(),
+        failure_class: failure.failure_class(),
+        code: failure.code(),
+        message: failure.message(),
+    };
+    if let Some(scope) = scope {
+        emit_event_in_scope(scope, events, event_sink, event);
+    } else {
+        emit_event(events, event_sink, event);
+    }
 }
 
 pub(crate) fn duration_millis(duration: Duration) -> u64 {

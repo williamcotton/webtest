@@ -288,3 +288,227 @@ async fn collector_failure_closes_even_a_fast_projection_with_a_typed_journal_ga
     assert_eq!(gap.capacity, 2);
     assert!(subscriber.next().await.is_none());
 }
+
+fn assert_source_and_operation_metadata(plan: &TestPlan, result: &webtest_runtime::RunResult) {
+    use webtest_observation::{EventMetadata, ReplayJournal, ReplayOutcome};
+    let mut replay = ReplayJournal::new(NonZeroUsize::new(result.journal.len()).unwrap());
+    for record in result.journal.iter().rev() {
+        assert_eq!(
+            record.metadata.source_revision,
+            Some(plan.source_revision),
+            "{:?}",
+            record.event
+        );
+        assert_eq!(replay.insert(record.clone()), Ok(ReplayOutcome::Inserted));
+        if let Some(scope) = record.event.scope() {
+            assert_eq!(record.metadata, EventMetadata::from(scope));
+        }
+        if matches!(
+            record.event,
+            ExecutionEvent::TestStarted { .. } | ExecutionEvent::TestFinished { .. }
+        ) {
+            let context = &record.metadata.execution_context;
+            assert!(context.test_execution_id.is_some());
+            assert!(context.scope_id.is_some());
+            assert!(context.parent_scope_id.is_none());
+            assert!(context.operation_execution_id.is_none());
+        }
+        if let ExecutionEvent::StepStarted {
+            test_id, step_id, ..
+        }
+        | ExecutionEvent::StepPassed {
+            test_id, step_id, ..
+        }
+        | ExecutionEvent::StepFailed {
+            test_id, step_id, ..
+        }
+        | ExecutionEvent::ProviderCallStarted {
+            test_id, step_id, ..
+        }
+        | ExecutionEvent::ProviderCallFinished {
+            test_id, step_id, ..
+        }
+        | ExecutionEvent::ProviderCallFailed {
+            test_id, step_id, ..
+        } = &record.event
+        {
+            let step = plan
+                .tests
+                .iter()
+                .find(|test| test.id == *test_id)
+                .unwrap()
+                .steps()
+                .into_iter()
+                .find(|step| step.id == *step_id)
+                .unwrap();
+            assert_eq!(record.metadata.origin, Some(step.origin));
+            let context = &record.metadata.execution_context;
+            assert!(
+                context.operation_execution_id.is_some(),
+                "{:?}",
+                record.event
+            );
+            let scope = result
+                .journal
+                .iter()
+                .find_map(|candidate| match &candidate.event {
+                    ExecutionEvent::Scope { event, .. }
+                        if event.outcome.is_none()
+                            && event.execution_context.operation_execution_id
+                                == context.operation_execution_id =>
+                    {
+                        Some(event)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(record.metadata, EventMetadata::from(scope));
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn journal_metadata_keeps_interleaved_siblings_and_deferred_failures_in_their_own_scopes() {
+    let source = r#"test "méta" { parallel {
+        browser { evaluate "slow" expect 1 == 2 }
+        browser { evaluate "fast" expect 3 == 3 }
+    } }"#;
+    let plan = compile_source(source);
+    let state = Arc::new(LifecycleState::default());
+    state.page_delays.lock().unwrap().extend([
+        ("slow".into(), Duration::from_millis(10)),
+        ("fast".into(), Duration::from_millis(1)),
+    ]);
+    let result = bounded_runner(1000).run(&plan, &LifecycleHost(state)).await;
+    assert_eq!(result.failed(), 1);
+    assert_source_and_operation_metadata(&plan, &result);
+    let failed = result
+        .journal
+        .iter()
+        .find(|record| matches!(record.event, ExecutionEvent::StepFailed { .. }))
+        .unwrap();
+    let range = failed.metadata.origin.unwrap().range;
+    assert_eq!(
+        &source[u32::from(range.start()) as usize..u32::from(range.end()) as usize],
+        "1 == 2 "
+    );
+    let started: Vec<_> = result
+        .journal
+        .iter()
+        .filter(|r| matches!(r.event, ExecutionEvent::StepStarted { .. }))
+        .collect();
+    assert_ne!(
+        started[0].metadata.execution_context.parent_scope_id,
+        started[1].metadata.execution_context.parent_scope_id
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn journal_metadata_distinguishes_retry_occurrences_and_retains_provider_and_resource_ownership()
+ {
+    let plan = compile_source(
+        r#"test "retry" {
+        server { fs.temp_dir() }
+        retry 2 { server { expect 1 == 2 } }
+    }"#,
+    );
+    let result = bounded_runner(1000)
+        .run(&plan, &LifecycleHost(Arc::default()))
+        .await;
+    assert_eq!(result.failed(), 1);
+    assert_source_and_operation_metadata(&plan, &result);
+    let failures: Vec<_> = result
+        .journal
+        .iter()
+        .filter(|r| matches!(r.event, ExecutionEvent::StepFailed { .. }))
+        .collect();
+    assert_eq!(failures.len(), 2);
+    let first = &failures[0].metadata.execution_context;
+    let second = &failures[1].metadata.execution_context;
+    assert_eq!(first.plan_node_id, second.plan_node_id);
+    assert_eq!(first.task_path, second.task_path);
+    assert!(first.attempt_id.is_some());
+    assert_ne!(first.attempt_id, second.attempt_id);
+    assert_ne!(first.operation_execution_id, second.operation_execution_id);
+    assert!(
+        result
+            .journal
+            .iter()
+            .any(|r| matches!(r.event, ExecutionEvent::ProviderCallFinished { .. }))
+    );
+    assert!(
+        result
+            .journal
+            .iter()
+            .any(|r| matches!(r.event, ExecutionEvent::Resource { .. }))
+    );
+}
+
+#[tokio::test]
+async fn journal_metadata_maps_skipped_tests_without_fabricating_runtime_occurrences() {
+    let mut plan = compile_source(r#"test "skipped" { server { expect 1 == 1 } }"#);
+    plan.required_host_capabilities.clear(); // A rejected plan never creates test roots.
+    let result = bounded_runner(1000)
+        .run(&plan, &LifecycleHost(Arc::default()))
+        .await;
+    assert_eq!(result.skipped(), 1);
+    for record in &result.journal {
+        assert_eq!(record.metadata.source_revision, Some(plan.source_revision));
+        assert!(
+            record
+                .metadata
+                .execution_context
+                .test_execution_id
+                .is_none()
+        );
+        assert!(record.metadata.execution_context.scope_id.is_none());
+        if matches!(record.event, ExecutionEvent::TestSkipped { .. }) {
+            assert_eq!(record.metadata.origin, Some(plan.tests[0].origin));
+            assert_eq!(
+                record.metadata.execution_context.test_id,
+                Some(plan.tests[0].id)
+            );
+        } else {
+            assert!(record.metadata.origin.is_none());
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn journal_timeout_summary_keeps_the_timeout_range_and_test_occurrence() {
+    let source = r#"test "deadline" { timeout 5ms { browser { evaluate "slow" } } }"#;
+    let plan = compile_source(source);
+    let state = Arc::new(LifecycleState::default());
+    state
+        .page_delays
+        .lock()
+        .unwrap()
+        .insert("slow".into(), Duration::from_secs(1));
+    let result = bounded_runner(1000).run(&plan, &LifecycleHost(state)).await;
+    assert_eq!(result.timed_out(), 1);
+    assert_source_and_operation_metadata(&plan, &result);
+    let timeout = result
+        .journal
+        .iter()
+        .find(|r| matches!(r.event, ExecutionEvent::TestTimedOut { .. }))
+        .unwrap();
+    let range = timeout.metadata.origin.unwrap().range;
+    assert_eq!(
+        &source[u32::from(range.start()) as usize..u32::from(range.end()) as usize],
+        "timeout 5ms { browser { evaluate \"slow\" } }"
+    );
+    assert!(
+        timeout
+            .metadata
+            .execution_context
+            .test_execution_id
+            .is_some()
+    );
+    assert!(
+        timeout
+            .metadata
+            .execution_context
+            .operation_execution_id
+            .is_none()
+    );
+}

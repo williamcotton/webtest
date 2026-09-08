@@ -14,12 +14,13 @@ use webtest_provider::ProviderRegistry;
 
 use crate::{
     Artifact, FailureClass, RunError, RunEventSink, RunnerOptions, StepError, StepFailure,
-    artifacts::write_artifacts, evaluation::display_value, events::emit_event,
+    artifacts::write_artifacts, evaluation::display_value, events::emit_event_with_metadata,
 };
 
 use super::browser::step_browser_locator;
 
 pub(super) struct PrepareFailureInput<'a> {
+    pub(super) scope: &'a webtest_observation::ScopeEvent,
     pub(super) step: &'a PlannedStep,
     pub(super) error: StepError,
     pub(super) page: &'a mut Option<Box<dyn Page>>,
@@ -30,6 +31,7 @@ pub(super) struct PrepareFailureInput<'a> {
 
 #[derive(Clone)]
 pub(super) struct PendingFailure {
+    metadata: webtest_observation::EventMetadata,
     step: PlannedStep,
     error: StepError,
     evidence: PageEvidence,
@@ -39,8 +41,14 @@ pub(super) struct PendingFailure {
 }
 
 impl PendingFailure {
-    pub(super) fn primary(step: &PlannedStep, error: StepError, elapsed_ms: u64) -> Self {
+    pub(super) fn primary(
+        step: &PlannedStep,
+        scope: &webtest_observation::ScopeEvent,
+        error: StepError,
+        elapsed_ms: u64,
+    ) -> Self {
         Self {
+            metadata: scope.into(),
             step: step.clone(),
             error,
             evidence: PageEvidence::default(),
@@ -85,6 +93,7 @@ pub(super) struct FailureInput<'a> {
 
 pub(super) async fn prepare_failure(input: PrepareFailureInput<'_>) -> PendingFailure {
     let PrepareFailureInput {
+        scope,
         step,
         error,
         page,
@@ -132,6 +141,7 @@ pub(super) async fn prepare_failure(input: PrepareFailureInput<'_>) -> PendingFa
         (None, Vec::new())
     };
     PendingFailure {
+        metadata: scope.into(),
         step: step.clone(),
         error,
         evidence,
@@ -156,6 +166,7 @@ pub(super) async fn process_failure(input: FailureInput<'_>) -> Result<StepFailu
         event_sink,
     } = input;
     let PendingFailure {
+        metadata,
         step,
         error,
         evidence,
@@ -164,6 +175,7 @@ pub(super) async fn process_failure(input: FailureInput<'_>) -> Result<StepFailu
         elapsed_ms,
     } = pending;
     finish_failure(FinishFailureInput {
+        metadata,
         plan,
         test_id,
         step: &step,
@@ -185,6 +197,7 @@ pub(super) async fn process_failure(input: FailureInput<'_>) -> Result<StepFailu
 }
 
 struct FinishFailureInput<'a> {
+    metadata: webtest_observation::EventMetadata,
     plan: &'a TestPlan,
     test_id: TestId,
     step: &'a PlannedStep,
@@ -205,6 +218,7 @@ struct FinishFailureInput<'a> {
 
 async fn finish_failure(input: FinishFailureInput<'_>) -> Result<StepFailure, RunError> {
     let FinishFailureInput {
+        metadata,
         plan,
         test_id,
         step,
@@ -263,7 +277,8 @@ async fn finish_failure(input: FinishFailureInput<'_>) -> Result<StepFailure, Ru
         Vec::new()
     };
     if let TestOperation::ServerProviderCall(call) = &step.operation {
-        emit_event(
+        emit_event_with_metadata(
+            metadata.clone(),
             events,
             event_sink,
             provider_failure_event(
@@ -291,7 +306,8 @@ async fn finish_failure(input: FinishFailureInput<'_>) -> Result<StepFailure, Ru
             elapsed_ms,
         );
     }
-    emit_event(
+    emit_event_with_metadata(
+        metadata.clone(),
         events,
         event_sink,
         ExecutionEvent::StepFailed {
@@ -547,6 +563,14 @@ mod tests {
             tests: Vec::new(),
         };
         let pending = PendingFailure {
+            metadata: webtest_observation::EventMetadata {
+                execution_context: webtest_observation::EventContext {
+                    test_id: Some(TestId(3)),
+                    ..Default::default()
+                },
+                source_revision: Some(plan.source_revision),
+                origin: Some(step.origin),
+            },
             step,
             error: StepError::Browser(BrowserError::LocatorNotFound {
                 locator: Locator::Id("missing".into()),

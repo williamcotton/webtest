@@ -97,6 +97,15 @@ async fn jobs_bound_live_roots_across_files_and_preserve_source_order() {
         for (ordinal, (event, record)) in result.events.iter().zip(&result.journal).enumerate() {
             assert_eq!(&record.event, event);
             assert_eq!(record.identity.execution_id, result.execution_id);
+            let plan = if result.execution_id == results[0].execution_id {
+                &first
+            } else {
+                &second
+            };
+            assert_eq!(record.metadata.source_revision, Some(plan.source_revision));
+            if let Some(origin) = record.metadata.origin {
+                assert_eq!(origin.file, plan.file);
+            }
             assert_eq!(record.identity.event_sequence.0, ordinal as u64);
             assert_eq!(
                 record.schema_version,

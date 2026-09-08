@@ -490,6 +490,40 @@ Verification: `cargo test --workspace`, warning-free workspace Clippy, Rust form
 and portable WASM compilation pass. The structured-execution example passes all seven
 tests with jobs 2 and its documented journal configuration.
 
+### Native journal source/context continuation — 2026-09-08
+
+Native journal schema 2 now retains `EventMetadata` on each record: source revision,
+optional precise origin, and typed optional execution-context fields. File-run facts
+carry their source revision. Skipped tests carry their static test identity/origin but
+no fabricated runtime occurrence. Started/finished tests carry their root occurrence.
+Scope, wait, and resource facts project the explicit context already owned by their
+payloads; step/provider facts receive their operation scope directly from the executing
+branch. Pending failures retain that immutable metadata before evidence capture and
+teardown, so later reporting keeps the original operation and retry-attempt identity.
+
+The collector's source lookup is an immutable projection of the supplied plan. There is
+no collector-wide current scope or stack inferred from sibling publication order. Retry
+occurrences retain the same structural node/path while carrying distinct attempt, scope,
+and operation IDs. Timeout and cleanup summaries identify the test/child scope reporting
+the outcome, preserving the supplied timeout or active-step origin; their summary context
+does not invent an operation occurrence. Each branch also retains its active operation
+metadata so timeout-derived step/provider failures keep that exact occurrence after
+interruption. Detailed operation/resource terminal facts keep their own contexts. Metadata is retained before publication and participates in immutable
+record equality. Replay rejects contradictory payload/context, incomplete occurrence
+metadata, and conflicts that change source metadata under an existing event identity.
+
+Focused deterministic tests cover interleaved siblings, deferred failures, repeated retry
+steps, provider/resource ownership, Unicode source offsets, multi-file source revisions,
+skipped-test omission, timeout ranges, metadata round-tripping, and replay rejection.
+Existing payload-only CLI projections remain schema 6; this is the native envelope
+foundation, not the complete serialized event vocabulary or a portable trace format.
+Cross-process execution identity, full serialization, traces, IPC, and concurrent DAP
+remain pending.
+
+Verification: full workspace tests (including native Chrome and LSP/DAP), warning-free
+workspace Clippy, Rust formatting, and portable WASM compilation pass. Existing journal
+retention/subscriber tests and CLI payload compatibility checks also pass unchanged.
+
 ## 1. Outcome
 
 Tests can express bounded parallelism, races, retries, and timeouts without leaking child work or losing cleanup. Every attempt and cancellation remains source-mapped in terminal output, traces, editor observations, DAP, and versioned machine output.

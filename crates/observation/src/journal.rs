@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, num::NonZeroUsize, time::Duration};
 
 use crate::{ExecutionEvent, ExecutionId};
 
-pub const EVENT_JOURNAL_SCHEMA_VERSION: u32 = 1;
+pub const EVENT_JOURNAL_SCHEMA_VERSION: u32 = 2;
 
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
@@ -32,6 +32,7 @@ pub struct RecordedEvent {
     pub schema_version: u32,
     pub identity: EventIdentity,
     pub timestamp: EventTime,
+    pub metadata: crate::EventMetadata,
     /// Original typed fact, including scope, source and resource identities.
     pub event: ExecutionEvent,
 }
@@ -47,12 +48,23 @@ pub struct EventJournal {
 
 impl EventJournal {
     pub fn record(&mut self, event: ExecutionEvent, timestamp: EventTime) -> &RecordedEvent {
+        let metadata = event.metadata();
+        self.record_with_metadata(event, timestamp, metadata)
+    }
+
+    pub fn record_with_metadata(
+        &mut self,
+        event: ExecutionEvent,
+        timestamp: EventTime,
+        metadata: crate::EventMetadata,
+    ) -> &RecordedEvent {
         let identity = self.omit(event.execution_id());
         let index = self.records.len();
         self.records.push(RecordedEvent {
             schema_version: EVENT_JOURNAL_SCHEMA_VERSION,
             identity,
             timestamp,
+            metadata,
             event,
         });
         &self.records[index]
@@ -100,6 +112,9 @@ pub enum ReplayError {
     CapacityExceeded {
         capacity: usize,
     },
+    MetadataMismatch {
+        identity: EventIdentity,
+    },
 }
 
 /// Bounded replay index. Out-of-order delivery is legal, including gaps in a
@@ -127,6 +142,11 @@ impl ReplayJournal {
             return Err(ReplayError::ExecutionMismatch {
                 identity: record.identity,
                 payload_execution: record.event.execution_id(),
+            });
+        }
+        if !record.metadata.agrees_with(&record.event) {
+            return Err(ReplayError::MetadataMismatch {
+                identity: record.identity,
             });
         }
         if let Some(existing) = self.records.get(&record.identity) {

@@ -107,7 +107,8 @@ impl Runner {
         let ids = crate::execution::scopes::ExecutionIds::default();
         let resources = crate::ResourceRegistry::default();
         let waits = crate::WaitRegistry::default();
-        let events = EventBuffer::new(self.options.journal_max_events, self.subscribers.clone());
+        let events = EventBuffer::new(self.options.journal_max_events, self.subscribers.clone())
+            .for_plan(plan);
         emit_event(
             &events,
             self.event_sink.as_deref(),
@@ -262,6 +263,7 @@ impl Runner {
                     &events,
                     self.event_sink.as_deref(),
                     execution_id,
+                    None,
                     None,
                     &failure,
                 );
