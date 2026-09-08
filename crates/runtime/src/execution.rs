@@ -137,6 +137,7 @@ pub(crate) async fn execute_test(
     let root = scope_factory.root(&test.body, deadline.at);
     let root_scope = root.event.clone();
     let root_context = root.context.clone();
+    let _journal_root = events.register_root(&root_context);
     let mut branch = branch::BranchState::new(options);
     branch.failure_signals.extend(policy.primary_failure);
     branch.session = session.take();

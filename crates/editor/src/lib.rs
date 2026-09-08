@@ -1083,52 +1083,76 @@ mod tests {
             return;
         };
         let address = listener.local_addr().expect("fixture address");
-        tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Chrome may preconnect without sending a request. Keep each accepted
+        // connection independent so that idle sockets cannot block navigation.
+        let mut connections = tokio::task::JoinSet::new();
+        let serve = async {
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let (mut stream, _) = accepted.expect("accept fixture request");
+                        connections.spawn(async move {
+                            use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-                let mut request = [0u8; 2048];
-                let _ = stream.read(&mut request).await;
-                let body = "<!doctype html><html><body><button id=\"submit\" onclick=\"const result=document.createElement('div');result.textContent='submitted';document.body.append(result)\">Submit</button></body></html>";
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
+                            let mut request = [0u8; 2048];
+                            let _ = stream.read(&mut request).await;
+                            let body = "<!doctype html><html><body><button id=\"submit\" onclick=\"const result=document.createElement('div');result.textContent='submitted';document.body.append(result)\">Submit</button></body></html>";
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = stream.write_all(response.as_bytes()).await;
+                        });
+                    }
+                    Some(result) = connections.join_next(), if !connections.is_empty() => {
+                        result.expect("fixture connection task");
+                    }
+                }
             }
-        });
+        };
+        let exercise = async {
+            // Deterministically exercise the preconnection case, keeping the
+            // idle socket open throughout both browser runs.
+            let _idle = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("idle connection");
+            let editor = EditorService::new();
+            let failing = format!(
+                "test \"missing\" {{ browser {{ open \"http://{address}\" click id(\"missing\") expect text(\"submitted\").visible }} }}"
+            );
+            let file = editor.open_document("file:///vertical.webtest", &failing);
+            let failed = editor
+                .run_file(file, &browser)
+                .await
+                .expect("run failing test");
+            assert_eq!(failed.failed(), 1, "{failed:?}");
+            assert!(
+                editor
+                    .diagnostics(file)
+                    .expect("runtime diagnostics")
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "runtime.locator_not_found")
+            );
 
-        let editor = EditorService::new();
-        let failing = format!(
-            "test \"missing\" {{ browser {{ open \"http://{address}\" click id(\"missing\") expect text(\"submitted\").visible }} }}"
-        );
-        let file = editor.open_document("file:///vertical.webtest", &failing);
-        let failed = editor
-            .run_file(file, &browser)
-            .await
-            .expect("run failing test");
-        assert_eq!(failed.failed(), 1);
-        assert!(
-            editor
-                .diagnostics(file)
-                .expect("runtime diagnostics")
-                .iter()
-                .any(|diagnostic| diagnostic.code == "runtime.locator_not_found")
-        );
-
-        let passing = failing.replace("id(\"missing\")", "id(\"submit\")");
-        editor.update_document(file, passing);
-        let passed = editor
-            .run_file(file, &browser)
-            .await
-            .expect("run passing test");
-        assert_eq!(passed.passed(), 1);
-        assert!(
-            editor
-                .diagnostics(file)
-                .expect("passing diagnostics")
-                .iter()
-                .all(|diagnostic| diagnostic.source != DiagnosticSource::Runtime)
-        );
+            let passing = failing.replace("id(\"missing\")", "id(\"submit\")");
+            editor.update_document(file, passing);
+            let passed = editor
+                .run_file(file, &browser)
+                .await
+                .expect("run passing test");
+            assert_eq!(passed.passed(), 1, "{passed:?}");
+            assert!(
+                editor
+                    .diagnostics(file)
+                    .expect("passing diagnostics")
+                    .iter()
+                    .all(|diagnostic| diagnostic.source != DiagnosticSource::Runtime)
+            );
+        };
+        tokio::select! {
+            () = serve => unreachable!("fixture ended before its test"),
+            () = exercise => {},
+        }
+        connections.shutdown().await;
     }
 }

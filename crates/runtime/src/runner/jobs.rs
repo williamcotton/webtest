@@ -143,7 +143,10 @@ async fn run_scheduled(
                 .runner
                 .observations
                 .begin_execution(input.plan.file, execution_id);
-            let events = EventBuffer::default();
+            let events = EventBuffer::new(
+                input.runner.options.journal_max_events,
+                input.runner.subscribers.clone(),
+            );
             emit_event(
                 &events,
                 input.runner.event_sink.as_deref(),
@@ -213,14 +216,21 @@ async fn run_scheduled(
                     ),
                 };
             }
-            let skip = match &state.outcome {
-                RunOutcome::Completed => services[file]
-                    .failure_notice
-                    .borrow()
-                    .map(|class| (SkipReason::RunAborted, Some(class))),
-                RunOutcome::Cancelled { .. } => Some((SkipReason::RunCancelled, None)),
-                RunOutcome::Aborted { failure, .. } => {
-                    Some((SkipReason::RunAborted, Some(failure.failure_class())))
+            let skip = if services[file].events.overflow().is_some() {
+                Some((
+                    SkipReason::RunAborted,
+                    Some(crate::FailureClass::Infrastructure),
+                ))
+            } else {
+                match &state.outcome {
+                    RunOutcome::Completed => services[file]
+                        .failure_notice
+                        .borrow()
+                        .map(|class| (SkipReason::RunAborted, Some(class))),
+                    RunOutcome::Cancelled { .. } => Some((SkipReason::RunCancelled, None)),
+                    RunOutcome::Aborted { failure, .. } => {
+                        Some((SkipReason::RunAborted, Some(failure.failure_class())))
+                    }
                 }
             };
             if let Some((reason, class)) = skip {

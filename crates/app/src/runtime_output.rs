@@ -122,6 +122,11 @@ fn insert_prior_outcome(report: &mut FailureReport, prior: serde_json::Value) {
 
 fn run_error_semantic_details(error: &RunError) -> serde_json::Value {
     match error {
+        RunError::JournalOverflow(overflow) => serde_json::json!({
+            "code": error.code().short_code(),
+            "failure_class": error.failure_class(),
+            "overflow": overflow,
+        }),
         RunError::Cleanup(failure) => cleanup_failure_details(failure),
         RunError::Multiple { primary, secondary } => serde_json::json!({
             "failure_class": error.failure_class(),
@@ -718,6 +723,31 @@ mod tests {
     use webtest_observation::ExecutionId;
 
     use super::*;
+
+    #[test]
+    fn journal_overflow_output_preserves_the_exact_missing_interval() {
+        let first = webtest_observation::EventIdentity {
+            execution_id: webtest_observation::ExecutionId(42),
+            event_sequence: webtest_observation::EventSequence(9),
+        };
+        let error = webtest_runtime::RunError::JournalOverflow(webtest_runtime::JournalOverflow {
+            capacity: 10,
+            first_rejected: first,
+            last_rejected: webtest_observation::EventIdentity {
+                event_sequence: webtest_observation::EventSequence(12),
+                ..first
+            },
+            rejected_events: 4,
+        });
+        let data = run_error_semantic_details(&error);
+        assert_eq!(data["code"], "journal_capacity_exceeded");
+        assert_eq!(data["failure_class"], "infrastructure");
+        assert_eq!(data["overflow"]["capacity"], 10);
+        assert_eq!(data["overflow"]["first_rejected"]["execution_id"], 42);
+        assert_eq!(data["overflow"]["first_rejected"]["event_sequence"], 9);
+        assert_eq!(data["overflow"]["last_rejected"]["event_sequence"], 12);
+        assert_eq!(data["overflow"]["rejected_events"], 4);
+    }
 
     #[test]
     fn bridge_failures_point_to_targeted_diagnostics() {

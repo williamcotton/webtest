@@ -143,7 +143,9 @@ pub struct RunResult {
     pub execution_id: ExecutionId,
     pub outcome: RunOutcome,
     pub tests: Vec<TestResult>,
-    /// Authoritative native records; `events` is the compatibility projection.
+    /// Retained authoritative native records; `events` is the compatibility projection.
+    /// On journal exhaustion, the run's typed `JournalOverflow` describes the
+    /// omitted interval. The reserved final record still reports the abort.
     pub journal: Vec<webtest_observation::RecordedEvent>,
     pub events: Vec<ExecutionEvent>,
     pub duration: Duration,

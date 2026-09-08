@@ -419,6 +419,48 @@ Journal identity verification: full workspace tests (including Chrome, worker ap
 isolation, and LSP/DAP), warning-free workspace Clippy, Rust formatting, and portable WASM
 compilation pass. Existing report compatibility fixtures remain unchanged and pass.
 
+### Bounded native journal and subscription continuation — 2026-09-08
+
+Each native file run now has a configurable `RunnerOptions.journal_max_events` count
+budget (default 100,000, minimum 1), including one reserved `RunFinished` record.
+Exhaustion latches `JournalOverflow` with the exact first/last rejected identities and
+omitted count, stops further admission in that file, and cancels registered active test
+roots with `RunnerShutdown` without overwriting an earlier cancellation cause. Existing
+branch ownership still awaits all resource teardown. Subsequent omitted events consume
+sequence identities, making the gap explicit; the reserved terminal record reports an
+aborted run. Original test/branch outcomes and independent cleanup failures remain in
+results. CLI and DAP expose the typed infrastructure code `journal_capacity_exceeded`
+and loss details even when an existing test abort would normally suppress a duplicate
+run summary. An exhausted journal is explicitly incomplete, including any omitted
+teardown facts; it must not be presented as a complete trace.
+
+`Runner::subscribe` provides bounded asynchronous native projections. Producers use
+non-awaiting queue publication after authoritative retention. A full subscriber drains
+its accepted prefix, receives one explicit `SubscriberCapacity` marker, and ends; a
+collector failure instead closes healthy projections with `JournalCapacity`. Both markers
+identify the first rejected record and the relevant capacity. Consumers must resynchronize
+from retained results/journals and inspect any authoritative gap. A slow or disconnected
+subscriber cannot cancel tests, lose authoritative records, or hold up teardown. Healthy
+subscriptions preserve per-execution collection order across runs and close when their
+runner and active publishers are dropped. The append service and subscriber queues share
+only narrowly scoped service state; no branch execution state is shared.
+
+Deterministic coverage checks exhaustion at every event boundary, reserved terminal
+retention, cancellation before slow cleanup, prevention of new job admission, preservation
+of earlier failure/cancellation causes, closed and pressured subscribers, repeated runs,
+and exact CLI/DAP loss projections. These are native count budgets, not serialized-byte
+budgets. Trusted legacy `RunEventSink` callbacks remain synchronous fast hooks; adapters
+have not yet migrated to asynchronous subscriptions. Project configuration for journal
+budgets, complete serialized envelopes/context and event vocabulary, durable cross-process
+identity, traces, IPC, and concurrent DAP remain pending. Native envelope version 1 and
+CLI report/event schema 6 are unchanged.
+
+Verification: full workspace tests, warning-free workspace Clippy, Rust formatting,
+and portable WASM compilation pass. The workspace run also exposed a serial HTTP
+fixture in the editor Chrome test that could block behind an idle preconnection.
+The fixture now handles connections independently with owned, awaited tasks, and
+keeps an idle connection open deliberately during both browser runs as a regression.
+
 ## 1. Outcome
 
 Tests can express bounded parallelism, races, retries, and timeouts without leaking child work or losing cleanup. Every attempt and cancellation remains source-mapped in terminal output, traces, editor observations, DAP, and versioned machine output.

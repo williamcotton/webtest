@@ -239,7 +239,7 @@ pub(crate) async fn run_test(
             } => {
                 file_report.outcome = Some(RunReportOutcome::Aborted);
                 file_report.reason = Some(failure.to_string());
-                if result.aborted() == 0 {
+                if result.aborted() == 0 || failure.journal_overflow().is_some() {
                     file_report.execution_error = Some(ExecutionFailureReport {
                         class: failure.failure_class(),
                         failure: aborted_run_failure_report(failure, *prior_outcome),

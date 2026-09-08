@@ -47,15 +47,7 @@ pub struct EventJournal {
 
 impl EventJournal {
     pub fn record(&mut self, event: ExecutionEvent, timestamp: EventTime) -> &RecordedEvent {
-        let execution_id = event.execution_id();
-        let next = self.sequences.entry(execution_id).or_default();
-        let identity = EventIdentity {
-            execution_id,
-            event_sequence: EventSequence(*next),
-        };
-        // The sequence cannot exceed the number of retained records. A Vec on
-        // supported targets cannot hold u64::MAX records.
-        *next += 1;
+        let identity = self.omit(event.execution_id());
         let index = self.records.len();
         self.records.push(RecordedEvent {
             schema_version: EVENT_JOURNAL_SCHEMA_VERSION,
@@ -64,6 +56,18 @@ impl EventJournal {
             event,
         });
         &self.records[index]
+    }
+
+    /// Allocates an identity without retaining a payload. A bounded collector
+    /// must separately expose the resulting gap as an explicit failure.
+    pub fn omit(&mut self, execution_id: ExecutionId) -> EventIdentity {
+        let next = self.sequences.entry(execution_id).or_default();
+        let identity = EventIdentity {
+            execution_id,
+            event_sequence: EventSequence(*next),
+        };
+        *next += 1;
+        identity
     }
 
     pub fn records(&self) -> &[RecordedEvent] {

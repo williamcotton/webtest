@@ -15,6 +15,7 @@ mod resource_scope;
 mod resources;
 mod result;
 mod runner;
+mod subscription;
 mod url;
 mod waits;
 
@@ -24,7 +25,7 @@ pub use control::RunControl;
 pub use error::{
     AssertionFailure, DecodeFailure, EvaluationFailure, EvaluationFailureKind, RunError, StepError,
 };
-pub use events::RunEventSink;
+pub use events::{JournalOverflow, RunEventSink};
 pub use options::{EvidenceOptions, RunnerOptions};
 pub use resource_scope::{
     AcquisitionOwnership, ResourceAdapter, ResourceCleanupFailure, ResourceFailure, ResourceScope,
@@ -37,6 +38,9 @@ pub use result::{
 };
 pub use runner::{
     InvalidJobLimit, JobLimit, Runner, TestRun, TestWorker, run_jobs, run_jobs_on_workers,
+};
+pub use subscription::{
+    EventSubscription, SubscriptionGapReason, SubscriptionItem, SubscriptionOverflow,
 };
 pub use url::resolve_browser_url;
 pub use waits::{

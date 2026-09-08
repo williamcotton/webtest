@@ -51,6 +51,7 @@ pub(crate) fn runner_options(project: &Project) -> RunnerOptions {
             },
         },
         inspection: inspection_options(project),
+        journal_max_events: RunnerOptions::default().journal_max_events,
     }
 }
 

@@ -416,6 +416,8 @@ fn compile_source(source: &str) -> TestPlan {
 
 #[path = "lifecycle/jobs.rs"]
 mod jobs;
+#[path = "lifecycle/journal.rs"]
+mod journal;
 
 #[path = "lifecycle/retry.rs"]
 mod retry;

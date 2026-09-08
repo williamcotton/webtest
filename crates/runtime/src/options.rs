@@ -24,6 +24,8 @@ impl Default for EvidenceOptions {
 
 #[derive(Clone, Debug)]
 pub struct RunnerOptions {
+    /// Maximum retained records per file run, including its reserved terminal record.
+    pub journal_max_events: std::num::NonZeroUsize,
     pub base_url: Option<String>,
     pub action_timeout: Duration,
     pub assertion_timeout: Duration,
@@ -42,6 +44,7 @@ pub struct RunnerOptions {
 impl Default for RunnerOptions {
     fn default() -> Self {
         Self {
+            journal_max_events: const { std::num::NonZeroUsize::new(100_000).unwrap() },
             base_url: None,
             action_timeout: Duration::from_secs(5),
             assertion_timeout: Duration::from_secs(5),

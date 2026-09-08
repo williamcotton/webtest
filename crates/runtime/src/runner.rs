@@ -26,6 +26,7 @@ pub struct Runner {
     options: RunnerOptions,
     providers: ProviderSelection,
     event_sink: Option<Arc<dyn RunEventSink>>,
+    subscribers: Vec<crate::subscription::SubscriptionSender>,
 }
 
 enum ProviderSelection {
@@ -40,6 +41,7 @@ impl Runner {
             options: RunnerOptions::default(),
             providers: ProviderSelection::BuiltInsFromOptions,
             event_sink: None,
+            subscribers: Vec::new(),
         }
     }
 
@@ -66,6 +68,15 @@ impl Runner {
     pub fn with_event_sink(mut self, sink: Arc<dyn RunEventSink>) -> Self {
         self.event_sink = Some(sink);
         self
+    }
+
+    /// Subscribe to future native records without blocking execution on a consumer.
+    /// Overflow ends this projection explicitly; use `RunResult.journal` to replay.
+    pub fn subscribe(&mut self, capacity: std::num::NonZeroUsize) -> crate::EventSubscription {
+        self.subscribers.retain(|sender| !sender.is_closed());
+        let (sender, subscription) = crate::subscription::SubscriptionSender::channel(capacity);
+        self.subscribers.push(sender);
+        subscription
     }
 
     #[instrument(skip_all, fields(file = plan.file.get()))]
@@ -96,7 +107,7 @@ impl Runner {
         let ids = crate::execution::scopes::ExecutionIds::default();
         let resources = crate::ResourceRegistry::default();
         let waits = crate::WaitRegistry::default();
-        let events = EventBuffer::default();
+        let events = EventBuffer::new(self.options.journal_max_events, self.subscribers.clone());
         emit_event(
             &events,
             self.event_sink.as_deref(),
@@ -154,6 +165,18 @@ impl Runner {
             let mut session = None;
 
             for (index, test) in plan.tests.iter().enumerate() {
+                if events.overflow().is_some() {
+                    skip_tests(
+                        &plan.tests[index..],
+                        SkipReason::RunAborted,
+                        Some(FailureClass::Infrastructure),
+                        execution_id,
+                        &mut tests,
+                        &events,
+                        self.event_sink.as_deref(),
+                    );
+                    break;
+                }
                 if control.is_some_and(RunControl::is_cancelled) {
                     outcome = RunOutcome::Cancelled {
                         reason: control.map_or(
@@ -368,6 +391,29 @@ fn finish_run(
     started: Instant,
     event_sink: Option<&dyn RunEventSink>,
 ) -> RunResult {
+    let outcome = match events.overflow() {
+        None => outcome,
+        Some(overflow) => {
+            let error = RunError::JournalOverflow(overflow);
+            match outcome {
+                RunOutcome::Completed => RunOutcome::Aborted {
+                    failure: error,
+                    prior_outcome: None,
+                },
+                RunOutcome::Cancelled { reason } => RunOutcome::Aborted {
+                    failure: error,
+                    prior_outcome: Some(PriorRunOutcome::Cancelled { reason }),
+                },
+                RunOutcome::Aborted {
+                    failure,
+                    prior_outcome,
+                } => RunOutcome::Aborted {
+                    failure: failure.combine_with_error(error),
+                    prior_outcome,
+                },
+            }
+        }
+    };
     let failure_class = outcome.failure_class();
     emit_event(
         &events,

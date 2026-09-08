@@ -664,11 +664,11 @@ impl DebugState {
                 )
                 .await;
         }
-        if result.aborted() == 0
-            && let RunOutcome::Aborted {
-                failure,
-                prior_outcome,
-            } = &result.outcome
+        if let RunOutcome::Aborted {
+            failure,
+            prior_outcome,
+        } = &result.outcome
+            && (result.aborted() == 0 || failure.journal_overflow().is_some())
         {
             let _ = self
                 .writer
@@ -742,6 +742,11 @@ fn failure_output_data(failure: &webtest_runtime::StepFailure) -> Value {
 
 fn run_failure_output_data(failure: &webtest_runtime::RunError) -> Value {
     match failure {
+        webtest_runtime::RunError::JournalOverflow(overflow) => serde_json::json!({
+            "code": failure.code().short_code(),
+            "failure_class": failure.failure_class(),
+            "overflow": overflow,
+        }),
         webtest_runtime::RunError::Cleanup(cleanup) => {
             let cause = match &cleanup.cause {
                 webtest_runtime::CleanupCause::Provider(error) => {
@@ -1684,6 +1689,31 @@ mod tests {
         async fn start(&self) -> Result<Box<dyn BrowserSession>, BrowserError> {
             Err(BrowserError::Launch("unused in this test".into()))
         }
+    }
+
+    #[test]
+    fn journal_overflow_output_preserves_the_exact_missing_interval() {
+        let first = webtest_observation::EventIdentity {
+            execution_id: webtest_observation::ExecutionId(42),
+            event_sequence: webtest_observation::EventSequence(9),
+        };
+        let error = webtest_runtime::RunError::JournalOverflow(webtest_runtime::JournalOverflow {
+            capacity: 10,
+            first_rejected: first,
+            last_rejected: webtest_observation::EventIdentity {
+                event_sequence: webtest_observation::EventSequence(12),
+                ..first
+            },
+            rejected_events: 4,
+        });
+        let data = run_failure_output_data(&error);
+        assert_eq!(data["code"], "journal_capacity_exceeded");
+        assert_eq!(data["failure_class"], "infrastructure");
+        assert_eq!(data["overflow"]["capacity"], 10);
+        assert_eq!(data["overflow"]["first_rejected"]["execution_id"], 42);
+        assert_eq!(data["overflow"]["first_rejected"]["event_sequence"], 9);
+        assert_eq!(data["overflow"]["last_rejected"]["event_sequence"], 12);
+        assert_eq!(data["overflow"]["rejected_events"], 4);
     }
 
     #[test]
