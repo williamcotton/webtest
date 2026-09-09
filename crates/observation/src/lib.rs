@@ -1,5 +1,7 @@
 //! Structured execution events and revision-safe source observations.
 
+mod execution_failure;
+pub use execution_failure::{ExecutionFailure, JournalOverflow, PriorScopeOutcome};
 mod identity;
 pub use identity::{ExecutionId, InvalidExecutionId};
 mod attachment;
@@ -470,7 +472,7 @@ pub enum CleanupResource {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CleanupIoErrorKind {
     NotFound,
@@ -508,7 +510,7 @@ impl From<std::io::ErrorKind> for CleanupIoErrorKind {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CleanupIoFailure {
     pub kind: CleanupIoErrorKind,
     pub raw_os_error: Option<i32>,
@@ -525,7 +527,8 @@ impl From<std::io::Error> for CleanupIoFailure {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", content = "details", rename_all = "snake_case")]
 pub enum CleanupCause {
     Provider(webtest_provider::ProviderError),
     TimedOut { timeout_ms: u64 },
@@ -534,7 +537,7 @@ pub enum CleanupCause {
     Internal { message: String },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CleanupFailure {
     pub resource: CleanupResource,
     pub cause: CleanupCause,
@@ -682,6 +685,13 @@ impl RuntimeFailure {
     deny_unknown_fields
 )]
 pub enum ExecutionEvent {
+    ScopeAborted {
+        execution_id: ExecutionId,
+        scope: ScopeEvent,
+        failure: Box<ExecutionFailure>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prior_outcome: Option<PriorScopeOutcome>,
+    },
     AttachmentCreated {
         execution_id: ExecutionId,
         test_id: TestId,
@@ -794,6 +804,11 @@ pub enum ExecutionEvent {
     },
     RunFinished {
         execution_id: ExecutionId,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        failure: Option<Box<ExecutionFailure>>,
+        /// Current cancellation, or the cancellation superseded by this abort.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cancellation: Option<CancellationReason>,
         outcome: RunOutcomeKind,
         failure_class: Option<FailureClass>,
     },
@@ -802,7 +817,8 @@ pub enum ExecutionEvent {
 impl ExecutionEvent {
     pub const fn execution_id(&self) -> ExecutionId {
         match self {
-            Self::AttachmentCreated { execution_id, .. }
+            Self::ScopeAborted { execution_id, .. }
+            | Self::AttachmentCreated { execution_id, .. }
             | Self::Attempt { execution_id, .. }
             | Self::Wait { execution_id, .. }
             | Self::Resource { execution_id, .. }
@@ -825,6 +841,8 @@ impl ExecutionEvent {
 
     pub fn failure_code(&self) -> Option<RuntimeFailureCode> {
         match self {
+            Self::ScopeAborted { failure, .. } => Some(failure.code()),
+            Self::RunFinished { failure, .. } => failure.as_ref().map(|failure| failure.code()),
             Self::ProviderCallFailed { code, .. } | Self::CleanupFailed { code, .. } => Some(*code),
             Self::StepFailed { failure, .. } => Some(failure.code()),
             Self::TestTimedOut { .. } => Some(RuntimeFailureCode::TestTimeout),
@@ -840,8 +858,7 @@ impl ExecutionEvent {
             | Self::ProviderCallStarted { .. }
             | Self::ProviderCallFinished { .. }
             | Self::TestFinished { .. }
-            | Self::TestSkipped { .. }
-            | Self::RunFinished { .. } => None,
+            | Self::TestSkipped { .. } => None,
         }
     }
 }

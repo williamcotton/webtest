@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, num::NonZeroUsize, time::Duration};
 
 use crate::{ExecutionEvent, ExecutionId};
 
-pub const EVENT_JOURNAL_SCHEMA_VERSION: u32 = 6;
+pub const EVENT_JOURNAL_SCHEMA_VERSION: u32 = 7;
 
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
@@ -258,6 +258,8 @@ mod tests {
                 execution_id: ExecutionId::from_u128(9),
                 outcome: crate::RunOutcomeKind::Completed,
                 failure_class: None,
+                failure: None,
+                cancellation: None,
             },
             time(80, 2),
         );
@@ -310,6 +312,8 @@ mod tests {
             execution_id: ExecutionId::from_u128(1),
             outcome: crate::RunOutcomeKind::Completed,
             failure_class: None,
+            failure: None,
+            cancellation: None,
         };
         assert!(matches!(
             replay.insert(changed),
@@ -402,7 +406,7 @@ mod wire_tests {
             replay.insert_json(&serde_json::to_vec(&unknown).unwrap(), limit),
             Err(ReplayDecodeError::Json(_))
         ));
-        for version in [5, 7] {
+        for version in [6, 8] {
             unknown["schema_version"] = version.into();
             assert!(
                 matches!(replay.insert_json(&serde_json::to_vec(&unknown).unwrap(), limit), Err(ReplayDecodeError::Replay(ReplayError::UnsupportedSchema { found })) if found == version)
@@ -483,7 +487,7 @@ mod wire_tests {
         assert_eq!(
             json,
             serde_json::json!({
-                "schema_version": 6, "execution_id": "00000000000000000000000000000009", "event_sequence": 0,
+                "schema_version": 7, "execution_id": "00000000000000000000000000000009", "event_sequence": 0,
                 "timestamp": {"since_unix_epoch": {"secs":123,"nanos":0}, "elapsed":{"secs":0,"nanos":5}},
                 "execution_context": {}, "kind": "run_started", "payload": {"execution_id":"00000000000000000000000000000009"}
             })

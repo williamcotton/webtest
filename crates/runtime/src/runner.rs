@@ -179,6 +179,7 @@ impl Runner {
                 events,
                 run_started,
                 self.event_sink.as_deref(),
+                &self.options.inspection.redacted_query_parameters,
             )
         } else if control.is_some_and(RunControl::is_cancelled) {
             outcome = RunOutcome::Cancelled {
@@ -203,6 +204,7 @@ impl Runner {
                 events,
                 run_started,
                 self.event_sink.as_deref(),
+                &self.options.inspection.redacted_query_parameters,
             )
         } else {
             let mut session = None;
@@ -262,10 +264,22 @@ impl Runner {
                         SkipReason::RunCancelled,
                         None,
                     )),
-                    TestOutcome::Aborted { failure, .. } => Some((
+                    TestOutcome::Aborted {
+                        failure,
+                        prior_outcome,
+                    } => Some((
                         RunOutcome::Aborted {
                             failure: failure.clone(),
-                            prior_outcome: None,
+                            prior_outcome: match prior_outcome.as_deref() {
+                                Some(crate::PriorTestOutcome::Cancelled { reason }) => {
+                                    Some(PriorRunOutcome::Cancelled { reason: *reason })
+                                }
+                                _ => control.filter(|control| control.is_cancelled()).map(
+                                    |control| PriorRunOutcome::Cancelled {
+                                        reason: control.cancellation_reason(),
+                                    },
+                                ),
+                            },
                         },
                         SkipReason::RunAborted,
                         Some(failure.failure_class()),
@@ -318,6 +332,7 @@ impl Runner {
                 events,
                 run_started,
                 self.event_sink.as_deref(),
+                &self.options.inspection.redacted_query_parameters,
             )
         };
         self.observations.complete_execution(
@@ -434,6 +449,7 @@ fn finish_run(
     events: EventBuffer,
     started: Instant,
     event_sink: Option<&dyn RunEventSink>,
+    query_parameters: &[String],
 ) -> RunResult {
     let outcome = match events.overflow() {
         None => outcome,
@@ -458,6 +474,16 @@ fn finish_run(
             }
         }
     };
+    let outcome = match outcome {
+        RunOutcome::Aborted {
+            failure,
+            prior_outcome,
+        } => RunOutcome::Aborted {
+            failure: crate::redaction::redact_run_error(failure, &[], query_parameters),
+            prior_outcome,
+        },
+        outcome => outcome,
+    };
     let failure_class = outcome.failure_class();
     emit_event(
         &events,
@@ -466,6 +492,20 @@ fn finish_run(
             execution_id,
             outcome: outcome.kind(),
             failure_class,
+            failure: match &outcome {
+                RunOutcome::Aborted { failure, .. } => {
+                    Some(Box::new(failure.to_execution_failure()))
+                }
+                _ => None,
+            },
+            cancellation: match &outcome {
+                RunOutcome::Cancelled { reason } => Some(*reason),
+                RunOutcome::Aborted {
+                    prior_outcome: Some(PriorRunOutcome::Cancelled { reason }),
+                    ..
+                } => Some(*reason),
+                _ => None,
+            },
         },
     );
     let journal = events.into_records();

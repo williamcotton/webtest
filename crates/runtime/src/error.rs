@@ -141,6 +141,28 @@ pub enum RunError {
 }
 
 impl RunError {
+    /// Lossless portable projection. Apply redaction before publication.
+    pub fn to_execution_failure(&self) -> webtest_observation::ExecutionFailure {
+        use webtest_observation::ExecutionFailure as F;
+        match self {
+            Self::ExecutionIdentity(error) => F::IdentityAllocation {
+                raw_os_error: error.source.raw_os_error(),
+                message: error.to_string(),
+            },
+            Self::JournalOverflow(error) => F::JournalOverflow(*error),
+            Self::Browser(error) => F::Browser(error.clone()),
+            Self::Provider(error) => F::Provider(error.clone()),
+            Self::Cleanup(error) => F::Cleanup(error.clone()),
+            Self::Multiple { primary, secondary } => F::Multiple {
+                primary: Box::new(primary.to_execution_failure()),
+                secondary: secondary.iter().map(Self::to_execution_failure).collect(),
+            },
+            Self::Internal(message) => F::Internal {
+                message: message.clone(),
+            },
+        }
+    }
+
     pub fn code(&self) -> RuntimeFailureCode {
         match self {
             Self::Browser(error) => error.into(),
@@ -421,6 +443,14 @@ mod tests {
         for (error, expected_class, expected_code) in cases {
             assert_eq!(error.failure_class(), expected_class, "{error:?}");
             assert_eq!(error.code(), expected_code, "{error:?}");
+            let fact = error.to_execution_failure();
+            assert_eq!(fact.code(), expected_code);
+            assert_eq!(fact.failure_class(), expected_class);
+            let bytes = serde_json::to_vec(&fact).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<webtest_observation::ExecutionFailure>(&bytes).unwrap(),
+                fact
+            );
         }
     }
 

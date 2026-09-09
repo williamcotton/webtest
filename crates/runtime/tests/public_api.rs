@@ -198,6 +198,8 @@ fn defaults_and_result_counts_are_exact() {
                 execution_id,
                 outcome: RunOutcomeKind::Completed,
                 failure_class: None,
+                failure: None,
+                cancellation: None,
             },
         ],
         duration: Duration::ZERO,

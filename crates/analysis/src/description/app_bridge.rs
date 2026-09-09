@@ -623,6 +623,7 @@ fn runtime_configuration_reference() -> ConstructDescription {
         "per-test deadline provider call timeout cleanup budget".into(),
         "journal max_events retention event budget journal_capacity_exceeded attachment_created evidence digest".into(),
         "execution identity execution_identity_unavailable entropy replay".into(),
+        "scope_aborted execution_failure primary secondary cleanup".into(),
         "configuration debugging".into(),
         "inspect project startup owned health".into(),
     ];
@@ -648,6 +649,10 @@ fn runtime_configuration_reference() -> ConstructDescription {
         guidance(
             "runtime_configuration_journal",
             "`[journal].max_events` is a positive integer (default 100000) shared by all tests in one file run, including nested branches and attempts. It includes a reserved final run record. Exceeding the count aborts that file with `journal_capacity_exceeded`, stops admission, cancels active roots, and awaits teardown. The report retains original outcomes and an explicit missing-event interval; the journal is incomplete. Inspect the resolved limit, then increase it and rerun if appropriate. This is an event count, not a byte budget or a trace-export setting.",
+        ),
+        guidance(
+            "runtime_configuration_abort_facts",
+            "scope_aborted records a branch or test-root abort after owned cleanup and before that scope's terminal record. execution_failure preserves typed browser/provider/internal errors, cleanup resource and cause, and ordered primary/secondary errors. prior_outcome retains a superseded timeout or cancellation; a superseded assertion retains its typed failure, step_id, and exact source origin without relying on static step identity to identify a retry occurrence. run_finished carries the run's typed failure, including the exact journal overflow interval in its reserved final record, and any current or superseded typed cancellation reason. These are scoped facts and a run summary; count final test results rather than treating repeated summaries as additional failures. Known branch secrets and configured browser query parameters are redacted before abort publication.",
         ),
         guidance(
             "runtime_configuration_execution_identity",

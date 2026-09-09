@@ -31,6 +31,15 @@ fn assert_overflow(result: &webtest_runtime::RunResult, capacity: usize) {
         overflow.rejected_events
     );
     let terminal = result.journal.last().unwrap();
+    let ExecutionEvent::RunFinished {
+        failure: Some(fact),
+        ..
+    } = &terminal.event
+    else {
+        panic!("reserved terminal must retain the structured abort");
+    };
+    assert_eq!(**fact, failure.to_execution_failure());
+
     assert_eq!(
         terminal.identity.event_sequence.0,
         overflow.last_rejected.event_sequence.0 + 1

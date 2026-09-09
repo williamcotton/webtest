@@ -267,7 +267,8 @@ impl HumanTestProgress {
                     writeln!(state.output, "test {name:?} ... SKIPPED")?;
                 }
                 ExecutionEvent::RunFinished { .. } => {}
-                ExecutionEvent::Wait { .. }
+                ExecutionEvent::ScopeAborted { .. }
+                | ExecutionEvent::Wait { .. }
                 | ExecutionEvent::Resource { .. }
                 | ExecutionEvent::AttachmentCreated { .. }
                 | ExecutionEvent::Attempt { .. }
@@ -356,6 +357,8 @@ mod tests {
             execution_id,
             outcome: webtest_observation::RunOutcomeKind::Completed,
             failure_class: None,
+            failure: None,
+            cancellation: None,
         });
         progress.stopping_browser().expect("browser stopping");
         progress.browser_stopped(true).expect("browser done");

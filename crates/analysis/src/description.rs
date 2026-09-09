@@ -1718,6 +1718,43 @@ mod tests {
     }
 
     #[test]
+    fn abort_fact_guidance_is_searchable_and_explains_aggregation_and_prior_outcomes() {
+        let DescriptionResponse::Construct(topic) =
+            response(DescriptionRequest::Query("runtime.configuration".into()))
+        else {
+            panic!("configuration")
+        };
+        let guidance = topic
+            .guidance
+            .iter()
+            .find(|entry| entry.code == "runtime_configuration_abort_facts")
+            .unwrap();
+        for fact in [
+            "scope_aborted",
+            "execution_failure",
+            "primary/secondary",
+            "prior_outcome",
+            "step_id",
+            "reserved final record",
+            "cancellation reason",
+            "redacted",
+        ] {
+            assert!(guidance.summary.contains(fact), "missing {fact}");
+        }
+        let DescriptionResponse::Search(search) =
+            response(DescriptionRequest::Search("scope_aborted".into()))
+        else {
+            panic!("search")
+        };
+        assert!(
+            search
+                .results
+                .iter()
+                .any(|entry| entry.id == "runtime.configuration")
+        );
+    }
+
+    #[test]
     fn execution_identity_guidance_is_discoverable_and_explains_startup_failure() {
         let DescriptionResponse::Construct(topic) =
             response(DescriptionRequest::Query("runtime.configuration".into()))

@@ -347,6 +347,26 @@ pub(crate) fn event_reports<'a>(
     events
         .into_iter()
         .map(|event| match event {
+            ExecutionEvent::ScopeAborted {
+                execution_id,
+                scope,
+                failure,
+                prior_outcome,
+            } => {
+                let mut event = event_report(
+                    path,
+                    "scope_aborted",
+                    Some(*execution_id),
+                    Some(scope.execution_context.test_id.0),
+                    None,
+                );
+                event.scope = Some(scope.clone());
+                event.code = Some(failure.code().diagnostic_code().into());
+                event.failure_class = Some(failure.failure_class());
+                event.execution_failure = Some(failure.clone());
+                event.prior_outcome = prior_outcome.clone();
+                event
+            }
             ExecutionEvent::AttachmentCreated {
                 execution_id,
                 test_id,
@@ -671,8 +691,15 @@ pub(crate) fn event_reports<'a>(
                 execution_id,
                 outcome,
                 failure_class,
+                failure,
+                cancellation,
             } => {
                 let mut event = event_report(path, "run_finished", Some(*execution_id), None, None);
+                event.execution_failure = failure.clone();
+                event.cancellation = *cancellation;
+                event.code = failure
+                    .as_ref()
+                    .map(|failure| failure.code().diagnostic_code().into());
                 event.outcome = Some(run_outcome_name(*outcome).into());
                 event.failure_class = *failure_class;
                 match outcome {
@@ -716,6 +743,9 @@ fn event_report(
     step_id: Option<u32>,
 ) -> EventReport {
     EventReport {
+        execution_failure: None,
+        prior_outcome: None,
+        cancellation: None,
         attachment: None,
         metadata: None,
         event_sequence: None,
@@ -834,7 +864,7 @@ mod tests {
         );
         let reports = journal_event_reports("tests/a.webtest", journal.records());
         let json = serde_json::to_value(&reports[0]).unwrap();
-        assert_eq!(json["schema_version"], 9);
+        assert_eq!(json["schema_version"], 10);
         assert_eq!(json["type"], "attachment_created");
         assert_eq!(
             json["attachment"],
@@ -1057,6 +1087,8 @@ mod tests {
                 execution_id,
                 outcome: RunOutcomeKind::Aborted,
                 failure_class: Some(FailureClass::Internal),
+                failure: None,
+                cancellation: None,
             },
         ];
         let reports = event_reports("tests/a.webtest", &events);

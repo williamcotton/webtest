@@ -7,20 +7,11 @@ use std::{
     sync::{Arc, Mutex},
 };
 use webtest_model::{ExecutionScopeId, StepId, TestId};
-use webtest_observation::{EventIdentity, EventJournal, EventTime, ExecutionEvent, RecordedEvent};
+use webtest_observation::{EventJournal, EventTime, ExecutionEvent, RecordedEvent};
 use webtest_observation::{EventMetadata, ScopeEvent};
 use webtest_text::{SourceRevision, SyntaxOrigin};
 
-/// An authoritative journal gap. Execution stops admitting work and awaits all
-/// owned teardown. The reserved final record reports an infrastructure outcome.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, thiserror::Error)]
-#[error("event journal capacity {capacity} exceeded; {rejected_events} events omitted (sequences {first} through {last})", first = .first_rejected.event_sequence.0, last = .last_rejected.event_sequence.0)]
-pub struct JournalOverflow {
-    pub capacity: usize,
-    pub first_rejected: EventIdentity,
-    pub last_rejected: EventIdentity,
-    pub rejected_events: u64,
-}
+pub use webtest_observation::JournalOverflow;
 
 /// Trusted synchronous event hook. Implementations must return quickly.
 /// For bounded asynchronous consumers use [`crate::Runner::subscribe`].

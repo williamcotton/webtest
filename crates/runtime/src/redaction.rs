@@ -461,3 +461,124 @@ fn collect_sensitive_values(
 
 #[cfg(test)]
 mod tests;
+
+/// Redact typed aborts after host teardown; ownership paths are never changed
+/// while cleanup still needs them.
+pub(crate) fn redact_run_error(
+    error: crate::RunError,
+    secrets: &[String],
+    query_parameters: &[String],
+) -> crate::RunError {
+    use crate::RunError as E;
+    match error {
+        E::Browser(error) => E::Browser(redact_browser_error(error, secrets, query_parameters)),
+        E::Provider(error) => E::Provider(error.redacted(secrets)),
+        E::Cleanup(error) => E::Cleanup(redact_cleanup_failure(error, secrets, query_parameters)),
+        E::Multiple { primary, secondary } => E::Multiple {
+            primary: Box::new(redact_run_error(*primary, secrets, query_parameters)),
+            secondary: secondary
+                .into_iter()
+                .map(|e| redact_run_error(e, secrets, query_parameters))
+                .collect(),
+        },
+        E::Internal(message) => E::Internal(redact_text(message, secrets)),
+        error @ (E::ExecutionIdentity(_) | E::JournalOverflow(_)) => error,
+    }
+}
+
+pub(crate) fn redact_cleanup_failure(
+    mut error: webtest_observation::CleanupFailure,
+    secrets: &[String],
+    query_parameters: &[String],
+) -> webtest_observation::CleanupFailure {
+    use webtest_observation::{CleanupCause as C, CleanupResource};
+    if let CleanupResource::TemporaryDirectory { path } = &mut error.resource
+        && let Some(text) = path.to_str()
+    {
+        *path = redact_text(text.to_owned(), secrets).into();
+    }
+    error.cause = match error.cause {
+        C::Provider(error) => C::Provider(error.redacted(secrets)),
+        C::Browser(error) => C::Browser(redact_browser_error(error, secrets, query_parameters)),
+        C::Io(mut error) => {
+            error.message = redact_text(error.message, secrets);
+            C::Io(error)
+        }
+        C::Internal { message } => C::Internal {
+            message: redact_text(message, secrets),
+        },
+        cause @ C::TimedOut { .. } => cause,
+    };
+    error
+}
+
+#[cfg(test)]
+mod abort_tests {
+    use super::*;
+    use webtest_observation::{
+        CleanupCause, CleanupFailure, CleanupIoErrorKind, CleanupIoFailure, CleanupResource,
+        ExecutionFailure,
+    };
+
+    #[test]
+    fn typed_abort_projection_redacts_nested_causes_and_preserves_io_facts() {
+        let secret = "private-token";
+        let causes = vec![
+            CleanupCause::Provider(webtest_provider::ProviderError::BridgeTransport {
+                message: secret.into(),
+            }),
+            CleanupCause::Browser(BrowserError::NavigationFailed {
+                url: "https://example.test/?token=url-secret".into(),
+                reason: secret.into(),
+            }),
+            CleanupCause::Io(CleanupIoFailure {
+                kind: CleanupIoErrorKind::PermissionDenied,
+                raw_os_error: Some(13),
+                message: secret.into(),
+            }),
+            CleanupCause::Internal {
+                message: secret.into(),
+            },
+            CleanupCause::TimedOut { timeout_ms: 123 },
+        ];
+        let error = crate::RunError::Multiple {
+            primary: Box::new(crate::RunError::Internal(secret.into())),
+            secondary: causes
+                .into_iter()
+                .map(|cause| {
+                    crate::RunError::Cleanup(CleanupFailure {
+                        resource: CleanupResource::TemporaryDirectory {
+                            path: format!("/tmp/{secret}").into(),
+                        },
+                        cause,
+                    })
+                })
+                .collect(),
+        };
+        let fact =
+            redact_run_error(error, &[secret.into()], &["token".into()]).to_execution_failure();
+        let bytes = serde_json::to_vec(&fact).unwrap();
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert!(!text.contains(secret));
+        assert!(!text.contains("url-secret"));
+        assert_eq!(
+            serde_json::from_slice::<ExecutionFailure>(&bytes).unwrap(),
+            fact
+        );
+        let ExecutionFailure::Multiple { secondary, .. } = fact else {
+            panic!("aggregate")
+        };
+        assert_eq!(secondary.len(), 5);
+        assert!(matches!(
+            &secondary[2],
+            ExecutionFailure::Cleanup(CleanupFailure {
+                cause: CleanupCause::Io(CleanupIoFailure {
+                    kind: CleanupIoErrorKind::PermissionDenied,
+                    raw_os_error: Some(13),
+                    ..
+                }),
+                ..
+            })
+        ));
+    }
+}

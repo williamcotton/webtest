@@ -207,6 +207,18 @@ pub(super) async fn execute_child(
             },
         });
     }
+    let (_, secrets) = branch.bindings.redaction();
+    branch.cleanup_failures = branch
+        .cleanup_failures
+        .into_iter()
+        .map(|error| {
+            crate::redaction::redact_cleanup_failure(
+                error,
+                secrets,
+                &services.options.inspection.redacted_query_parameters,
+            )
+        })
+        .collect();
     for failure in &branch.cleanup_failures {
         emit_cleanup_failed(
             services.events,
@@ -218,6 +230,18 @@ pub(super) async fn execute_child(
         );
     }
     let outcome = combine_test_outcome(provisional, branch.cleanup_failures);
+    let outcome = redact_aborted_outcome(
+        outcome,
+        secrets,
+        &services.options.inspection.redacted_query_parameters,
+    );
+    emit_scope_aborted(
+        &scope.event,
+        &outcome,
+        services.execution_id,
+        services.events,
+        services.event_sink,
+    );
     branch.scopes.finish_descendants(
         &scope,
         services.execution_id,

@@ -62,7 +62,8 @@ impl ExecutionEvent {
     pub fn scope(&self) -> Option<&ScopeEvent> {
         match self {
             Self::Scope { event, .. } => Some(event),
-            Self::Attempt { scope, .. }
+            Self::ScopeAborted { scope, .. }
+            | Self::Attempt { scope, .. }
             | Self::Wait { scope, .. }
             | Self::Resource { scope, .. } => Some(scope),
             _ => None,
@@ -72,7 +73,8 @@ impl ExecutionEvent {
     pub const fn test_id(&self) -> Option<TestId> {
         match self {
             Self::Scope { event, .. } => Some(event.execution_context.test_id),
-            Self::Attempt { scope, .. }
+            Self::ScopeAborted { scope, .. }
+            | Self::Attempt { scope, .. }
             | Self::Wait { scope, .. }
             | Self::Resource { scope, .. } => Some(scope.execution_context.test_id),
             Self::AttachmentCreated { test_id, .. }

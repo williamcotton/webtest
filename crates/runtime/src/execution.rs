@@ -387,6 +387,18 @@ pub(crate) async fn execute_test(
     let bindings = branch
         .bindings
         .final_transferable_bindings(&options.redacted_json_fields);
+    let (_, secrets) = branch.bindings.redaction();
+    branch.cleanup_failures = branch
+        .cleanup_failures
+        .into_iter()
+        .map(|error| {
+            crate::redaction::redact_cleanup_failure(
+                error,
+                secrets,
+                &options.inspection.redacted_query_parameters,
+            )
+        })
+        .collect();
     for failure in &branch.cleanup_failures {
         emit_cleanup_failed(
             events,
@@ -398,6 +410,12 @@ pub(crate) async fn execute_test(
         );
     }
     let outcome = combine_test_outcome(outcome, branch.cleanup_failures);
+    let outcome = redact_aborted_outcome(
+        outcome,
+        secrets,
+        &options.inspection.redacted_query_parameters,
+    );
+    emit_scope_aborted(&root_scope, &outcome, execution_id, events, event_sink);
     let scope_outcome = scope_outcome(&outcome);
     branch
         .scopes
@@ -1285,6 +1303,65 @@ fn combine_test_outcome(
         failure: cleanup_run_error(cleanup_failures),
         prior_outcome,
     }
+}
+
+fn redact_aborted_outcome(
+    outcome: TestOutcome,
+    secrets: &[String],
+    query_parameters: &[String],
+) -> TestOutcome {
+    match outcome {
+        TestOutcome::Aborted {
+            failure,
+            prior_outcome,
+        } => TestOutcome::Aborted {
+            failure: crate::redaction::redact_run_error(failure, secrets, query_parameters),
+            prior_outcome,
+        },
+        outcome => outcome,
+    }
+}
+
+fn emit_scope_aborted(
+    scope: &webtest_observation::ScopeEvent,
+    outcome: &TestOutcome,
+    execution_id: ExecutionId,
+    events: &EventBuffer,
+    event_sink: Option<&dyn RunEventSink>,
+) {
+    let TestOutcome::Aborted {
+        failure,
+        prior_outcome,
+    } = outcome
+    else {
+        return;
+    };
+    use webtest_observation::PriorScopeOutcome as P;
+    let prior_outcome = prior_outcome.as_deref().map(|prior| match prior {
+        PriorTestOutcome::Failed(failure) => P::Failed {
+            step_id: failure.step.id,
+            origin: failure.step.origin,
+            failure: Box::new(failure::runtime_failure(&failure.error)),
+        },
+        PriorTestOutcome::TimedOut {
+            timeout,
+            active_step,
+        } => P::TimedOut {
+            timeout_ms: duration_millis(*timeout),
+            active_step: *active_step,
+        },
+        PriorTestOutcome::Cancelled { reason } => P::Cancelled { reason: *reason },
+    });
+    emit_event(
+        events,
+        event_sink,
+        ExecutionEvent::ScopeAborted {
+            execution_id,
+            scope: scope.clone(),
+            failure: Box::new(failure.to_execution_failure()),
+            prior_outcome,
+        },
+    );
 }
 
 fn scope_outcome(outcome: &TestOutcome) -> webtest_observation::ScopeOutcome {

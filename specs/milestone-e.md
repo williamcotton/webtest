@@ -31,7 +31,7 @@ Milestone E is **not complete**. The execution-tree, resource/wait foundations, 
   resolved configuration, keeping configuration values out of the artifact. Shared validation
   checks tree structure, identities, revisions, capability requirements, and explicit execution
   inputs for detectable drift. There is still no CLI command to execute an emitted plan.
-- Native journal schema 6 and CLI report/event schema 9 use opaque 128-bit execution IDs,
+- Native journal schema 7 and CLI report/event schema 10 use opaque 128-bit execution IDs,
   serialized as 32 lowercase hexadecimal digits. Native OS randomness allocates independent
   file-run IDs across processes; replay identity is `(ExecutionId, event_sequence)`.
   The bounded journal retains attachments, source/context metadata, clocks, explicit retry
@@ -663,6 +663,45 @@ Verification: `cargo test --workspace` passes, including all 118 runtime lifecyc
 tests, native Chrome/protocol integration, and doc tests. Rust formatting and
 warning-free workspace Clippy pass. Both `webtest-wasm` and `webtest-observation`
 compile for `wasm32-unknown-unknown`.
+
+### Typed abort journal continuation — 2026-09-09
+
+Native journal schema 7 adds `ScopeAborted` for branch and test-root aborts.
+Each carries explicit source/scope metadata, typed browser/provider/internal errors,
+cleanup resources and causes (including IO kind/OS code), and ordered recursive
+primary/secondary aggregates. It is emitted after owned teardown, before the
+corresponding scope terminal. Existing early primary-failure scheduler notifications
+remain independent of this final diagnostic record. Superseded timeouts and
+cancellations remain typed; a superseded assertion retains its typed failure,
+StepId, and exact source origin directly, avoiding ambiguous references to a
+static step that may execute in multiple retry attempts.
+
+The reserved `RunFinished` record now carries the typed run failure, including
+the exact missing-event interval on journal overflow, and current or superseded
+cancellation. This requires no additional journal slot and cannot itself trigger
+overflow. Allocation failure before execution still emits no fabricated identity
+or journal. Runtime re-exports the portable JournalOverflow DTO from observation.
+No provider or native source is serialized through a string-only error fallback.
+
+Branch-known secrets and configured browser query parameters are redacted in
+typed aborts after cleanup has used the original ownership paths. Tests also caught
+and fixed sequential run-summary promotion losing a cancelled test's prior cause
+when cleanup aborted; the typed cancellation now survives that promotion, including
+a request arriving during cleanup of an already failed assertion.
+
+CLI report/event schema 10 projects these shared facts. Scoped aborts and terminal
+run summaries can repeat a cause at different ownership levels; final test-result
+counting is unchanged. Description/search, installed guidance, and versioned
+fixtures document that distinction. Plan format 9 and runtime semantics 6 remain
+unchanged. Explicit cancellation-request/output events, full host/resource
+coverage, traces, observation IPC, and concurrent DAP are still pending.
+
+Verification: `cargo test --workspace` passes, including all 125 runtime lifecycle
+tests, native browser/protocol integration, and doc tests. Warning-free workspace
+Clippy and Rust formatting pass. Both `webtest-wasm` and `webtest-observation`
+compile for `wasm32-unknown-unknown`. Focused tests cover typed launch/internal
+aborts, independent siblings, prior outcomes and late cancellation, redaction,
+immutable replay, reserved overflow payloads, and CLI event projection.
 
 ## 1. Outcome
 

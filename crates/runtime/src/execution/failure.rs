@@ -464,7 +464,7 @@ fn record_observation(
     });
 }
 
-fn runtime_failure(error: &StepError) -> RuntimeFailure {
+pub(super) fn runtime_failure(error: &StepError) -> RuntimeFailure {
     match error {
         StepError::Browser(error) => RuntimeFailure::Browser(error.clone()),
         StepError::Provider(error) => RuntimeFailure::Provider(error.clone()),

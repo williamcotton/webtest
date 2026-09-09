@@ -38,6 +38,7 @@ struct LifecycleState {
     next_session: AtomicUsize,
     next_context: AtomicUsize,
     context_close_failures: Mutex<BTreeSet<usize>>,
+    context_close_errors: Mutex<BTreeMap<usize, BrowserError>>,
     context_close_delays: Mutex<BTreeMap<usize, Duration>>,
     session_close_failures: Mutex<BTreeSet<usize>>,
     page_creation_failures: Mutex<BTreeSet<usize>>,
@@ -170,6 +171,16 @@ impl BrowserContext for LifecycleContext {
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
             self.state.push(format!("context_close_done:{}", self.id));
+        }
+        if let Some(error) = self
+            .state
+            .context_close_errors
+            .lock()
+            .unwrap()
+            .get(&self.id)
+            .cloned()
+        {
+            return Err(error);
         }
         if self
             .state
@@ -414,6 +425,8 @@ fn compile_source(source: &str) -> TestPlan {
     database.test_plan(file).unwrap().as_ref().clone()
 }
 
+#[path = "lifecycle/abort_journal.rs"]
+mod abort_journal;
 #[path = "lifecycle/identity.rs"]
 mod identity;
 #[path = "lifecycle/jobs.rs"]
@@ -816,7 +829,8 @@ fn event_names(events: &[ExecutionEvent]) -> Vec<&'static str> {
         .filter(|event| {
             !matches!(
                 event,
-                ExecutionEvent::AttachmentCreated { .. }
+                ExecutionEvent::ScopeAborted { .. }
+                    | ExecutionEvent::AttachmentCreated { .. }
                     | ExecutionEvent::Attempt { .. }
                     | ExecutionEvent::Scope { .. }
                     | ExecutionEvent::Resource { .. }
@@ -824,7 +838,8 @@ fn event_names(events: &[ExecutionEvent]) -> Vec<&'static str> {
             )
         })
         .map(|event| match event {
-            ExecutionEvent::AttachmentCreated { .. }
+            ExecutionEvent::ScopeAborted { .. }
+            | ExecutionEvent::AttachmentCreated { .. }
             | ExecutionEvent::Attempt { .. }
             | ExecutionEvent::Scope { .. }
             | ExecutionEvent::Resource { .. }
@@ -1212,7 +1227,10 @@ async fn failure_event_is_published_only_after_referenced_artifacts_exist() {
         result
             .events
             .iter()
-            .filter(|event| matches!(event, ExecutionEvent::AttachmentCreated { .. }))
+            .filter(|event| matches!(
+                event,
+                ExecutionEvent::ScopeAborted { .. } | ExecutionEvent::AttachmentCreated { .. }
+            ))
             .count(),
         3
     );

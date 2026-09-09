@@ -373,6 +373,7 @@ async fn run_allocated(
                 service.events,
                 service.started,
                 input.runner.event_sink.as_deref(),
+                &input.runner.options.inspection.redacted_query_parameters,
             )
         })
         .collect()
