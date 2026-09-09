@@ -75,7 +75,8 @@ impl ExecutionEvent {
             Self::Attempt { scope, .. }
             | Self::Wait { scope, .. }
             | Self::Resource { scope, .. } => Some(scope.execution_context.test_id),
-            Self::TestStarted { test_id, .. }
+            Self::AttachmentCreated { test_id, .. }
+            | Self::TestStarted { test_id, .. }
             | Self::StepStarted { test_id, .. }
             | Self::StepPassed { test_id, .. }
             | Self::ProviderCallStarted { test_id, .. }
@@ -92,7 +93,8 @@ impl ExecutionEvent {
 
     pub const fn step_id(&self) -> Option<webtest_model::StepId> {
         match self {
-            Self::StepStarted { step_id, .. }
+            Self::AttachmentCreated { step_id, .. }
+            | Self::StepStarted { step_id, .. }
             | Self::StepPassed { step_id, .. }
             | Self::ProviderCallStarted { step_id, .. }
             | Self::ProviderCallFinished { step_id, .. }

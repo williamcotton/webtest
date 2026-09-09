@@ -1,5 +1,7 @@
 //! Structured execution events and revision-safe source observations.
 
+mod attachment;
+pub use attachment::{Artifact, ArtifactKind, Attachment};
 mod event_metadata;
 mod journal;
 pub use event_metadata::{EventContext, EventMetadata};
@@ -693,6 +695,12 @@ impl RuntimeFailure {
     deny_unknown_fields
 )]
 pub enum ExecutionEvent {
+    AttachmentCreated {
+        execution_id: ExecutionId,
+        test_id: TestId,
+        step_id: StepId,
+        attachment: Attachment,
+    },
     Attempt {
         execution_id: ExecutionId,
         scope: ScopeEvent,
@@ -807,7 +815,8 @@ pub enum ExecutionEvent {
 impl ExecutionEvent {
     pub const fn execution_id(&self) -> ExecutionId {
         match self {
-            Self::Attempt { execution_id, .. }
+            Self::AttachmentCreated { execution_id, .. }
+            | Self::Attempt { execution_id, .. }
             | Self::Wait { execution_id, .. }
             | Self::Resource { execution_id, .. }
             | Self::Scope { execution_id, .. }
@@ -832,7 +841,8 @@ impl ExecutionEvent {
             Self::ProviderCallFailed { code, .. } | Self::CleanupFailed { code, .. } => Some(*code),
             Self::StepFailed { failure, .. } => Some(failure.code()),
             Self::TestTimedOut { .. } => Some(RuntimeFailureCode::TestTimeout),
-            Self::Attempt { .. }
+            Self::AttachmentCreated { .. }
+            | Self::Attempt { .. }
             | Self::Wait { .. }
             | Self::Resource { .. }
             | Self::Scope { .. }

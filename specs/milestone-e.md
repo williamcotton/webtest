@@ -31,7 +31,7 @@ Milestone E is **not complete**. The execution-tree, resource/wait foundations, 
   resolved configuration, keeping configuration values out of the artifact. Shared validation
   checks tree structure, identities, revisions, capability requirements, and explicit execution
   inputs for detectable drift. There is still no CLI command to execute an emitted plan.
-- CLI report/event schema 7 includes explicit retry-attempt lifecycle and typed scope facts, shared typed cancellation reasons, and ordered branch aggregates. This remains the existing event stream,
+- CLI report/event schema 8 includes attachments, recorded journal metadata/clocks/sequence, explicit retry-attempt lifecycle and typed scope facts, shared typed cancellation reasons, and ordered branch aggregates. This remains the existing event stream,
   not yet E's authoritative bounded journal with replay-safe event identity.
 - Runtime observations accumulate privately and commit as a complete batch. Starting another
   run clears prior observations and prevents an older in-flight run from overwriting the newer
@@ -590,6 +590,41 @@ trace artifacts/viewer, observation IPC, and concurrent DAP are still pending.
 Verification: `cargo test --workspace`, warning-free workspace Clippy, Rust
 formatting, and WASM compilation pass. Both `webtest-wasm` and the newly
 serializable `webtest-observation` core compile for `wasm32-unknown-unknown`.
+
+### Attachment journal continuation — 2026-09-08
+
+Native journal schema 5 adds `AttachmentCreated` for each acknowledged browser
+failure evidence write. Shared immutable artifact/attachment DTOs live in observation;
+runtime keeps its existing Artifact/ArtifactKind re-exports and result references.
+Each attachment carries file kind/path, byte length, and a 32-byte BLAKE3 digest of
+the written bytes. The event receives the pending failure's original operation,
+attempt, source revision, and precise origin directly. Publication occurs after
+that individual write succeeds and before awaiting any subsequent write, so later
+storage delays or interruption cannot erase an already acknowledged capture.
+Failed or expired writes retain their existing secondary capture failures and emit
+no false attachment. Capture policy and redaction remain in their existing owners.
+
+CLI report/event schema 8 now projects native journal records, retaining their
+sequence, clocks, and metadata alongside existing phase-specific labels and the new
+attachment payload. Final result ordering remains independent of observed event
+order. This uses the authoritative journal rather than reconstructing context from
+payload order. Attachment records share its count bound and explicit overflow
+policy; prior failure outcomes and awaited teardown survive budget exhaustion.
+
+Focused tests check digest/length against persisted bytes, publication before a
+later write expires, failed-directory/write/deadline omission, separate retry
+artifact paths and owning operation identities, serialized replay, CLI projections,
+and journal exhaustion during capture. Shared descriptions/search, installed agent
+guidance and initializer parity, examples, and archived schema 8 report fixtures
+are updated. Plan format 9 and runtime semantics 6 are unchanged. Artifact paths
+are native references; future trace export must supply safe relative paths and
+verify content. Durable execution identity, remaining event kinds, trace writer/
+viewer, observation IPC, and concurrent DAP remain pending.
+
+Verification: full workspace tests pass, including 115 runtime lifecycle tests.
+Warning-free workspace Clippy, Rust formatting, WASM compilation of both
+`webtest-wasm` and `webtest-observation`, and focused checks for attachment
+publication, shared descriptions/search, and bundled-skill parity also pass.
 
 ## 1. Outcome
 

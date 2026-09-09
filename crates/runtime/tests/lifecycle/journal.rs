@@ -576,3 +576,72 @@ pub(super) fn assert_serialized_journal(result: &webtest_runtime::RunResult) {
         result.journal
     );
 }
+
+#[tokio::test]
+async fn journal_exhaustion_during_evidence_preserves_primary_failure_and_awaits_cleanup() {
+    let directory = tempfile::tempdir().unwrap();
+    let plan = compile_source(
+        r#"test "bounded evidence" { retry 2 { browser { expect text("ready").visible } } }"#,
+    );
+    let state = || {
+        let state = Arc::new(LifecycleState::default());
+        state.record_waits.store(true, Ordering::SeqCst);
+        state
+            .locator_outcomes
+            .lock()
+            .unwrap()
+            .extend((0..2).map(|_| {
+                Err(BrowserError::AssertionFailed {
+                    locator: Locator::Text("ready".into()),
+                    expected: LocatorState::Visible,
+                    actual: "missing".into(),
+                })
+            }));
+        state.page_evidence.lock().unwrap().dom_snapshot = Some("<p>evidence</p>".into());
+        state
+            .context_close_delays
+            .lock()
+            .unwrap()
+            .insert(0, Duration::from_millis(5));
+        state
+    };
+    let runner = |capacity| {
+        Runner::new(Arc::default()).with_options(RunnerOptions {
+            journal_max_events: NonZeroUsize::new(capacity).unwrap(),
+            evidence: webtest_runtime::EvidenceOptions {
+                dom_snapshot_on_failure: true,
+                artifact_directory: directory.path().to_owned(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    };
+    let baseline = runner(1000).run(&plan, &LifecycleHost(state())).await;
+    let cutoff = baseline
+        .journal
+        .iter()
+        .position(|record| matches!(record.event, ExecutionEvent::AttachmentCreated { .. }))
+        .unwrap();
+    let state = state();
+    let result = runner(cutoff + 1)
+        .run(&plan, &LifecycleHost(state.clone()))
+        .await;
+    assert_overflow(&result, cutoff + 1);
+    assert_eq!(result.tests[0].branches.len(), 1);
+    let TestOutcome::Failed(failure) = &result.tests[0].branches[0].outcome else {
+        panic!("lost primary outcome: {:?}", result.tests[0].outcome)
+    };
+    assert!(!failure.artifacts.is_empty());
+    assert!(
+        failure
+            .artifacts
+            .iter()
+            .all(|artifact| artifact.path.is_file())
+    );
+    assert!(
+        state
+            .log()
+            .iter()
+            .any(|entry| entry == "context_close_done:0")
+    );
+}

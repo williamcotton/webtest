@@ -754,6 +754,36 @@ async fn retry_preserves_separate_artifact_files_for_every_failed_attempt() {
         .run(&plan, &LifecycleHost(state))
         .await;
     assert_eq!(result.failed(), 1);
+    assert_attempt_events(&result);
+    let attachments: Vec<_> = result
+        .journal
+        .iter()
+        .enumerate()
+        .filter_map(|(index, record)| match &record.event {
+            ExecutionEvent::AttachmentCreated {
+                step_id,
+                attachment,
+                ..
+            } => Some((index, record, *step_id, attachment)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(attachments.len(), 4);
+    for (index, record, step_id, attachment) in attachments {
+        let bytes = tokio::fs::read(&attachment.artifact.path).await.unwrap();
+        assert_eq!(attachment.byte_length, bytes.len() as u64);
+        assert_eq!(attachment.blake3, *blake3::hash(&bytes).as_bytes());
+        let (failure_index, failure) = result.journal.iter().enumerate().find(|(_, candidate)| matches!(candidate.event, ExecutionEvent::StepFailed { step_id: actual, .. } if actual == step_id) && candidate.metadata.execution_context.attempt_id == record.metadata.execution_context.attempt_id).unwrap();
+        assert!(index < failure_index);
+        assert_eq!(record.metadata, failure.metadata);
+        assert!(
+            record
+                .metadata
+                .execution_context
+                .operation_execution_id
+                .is_some()
+        );
+    }
     let attempts = &result.tests[0].branches;
     assert_eq!(attempts.len(), 2);
     let mut paths = BTreeSet::new();

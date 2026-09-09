@@ -200,3 +200,10 @@ remain available, but the journal is incomplete. Increase the budget and rerun w
 This setting controls native event retention; it does not enable trace export.
 Traces and concurrent debugger stepping remain unfinished; discover those
 features with the installed binary before using them.
+
+Configured browser failure evidence produces `attachment_created` events after each
+successful write, with file kind/path, `byte_length`, and a 32-byte BLAKE3 digest.
+Event reports preserve the journal's `event_sequence`, clocks, and `metadata`, including
+source and operation/attempt identity. Failed or expired writes do not claim attachments;
+capture failures remain secondary evidence. Use `webtest describe runtime.configuration`
+to discover these facts and the shared journal budget. Readers must verify referenced files.

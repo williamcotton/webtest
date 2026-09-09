@@ -324,10 +324,42 @@ fn locator_description(locator: &Locator) -> String {
     locator.to_string()
 }
 
-pub(crate) fn event_reports(path: &str, events: &[ExecutionEvent]) -> Vec<EventReport> {
+pub(crate) fn journal_event_reports(
+    path: &str,
+    records: &[webtest_observation::RecordedEvent],
+) -> Vec<EventReport> {
+    let mut reports = event_reports(path, records.iter().map(|record| &record.event));
+    for (report, record) in reports.iter_mut().zip(records) {
+        report.event_sequence = Some(record.identity.event_sequence.0);
+        report.timestamp = Some(record.timestamp);
+        report.metadata = Some(record.metadata.clone());
+    }
+    reports
+}
+
+pub(crate) fn event_reports<'a>(
+    path: &str,
+    events: impl IntoIterator<Item = &'a ExecutionEvent>,
+) -> Vec<EventReport> {
     events
-        .iter()
+        .into_iter()
         .map(|event| match event {
+            ExecutionEvent::AttachmentCreated {
+                execution_id,
+                test_id,
+                step_id,
+                attachment,
+            } => {
+                let mut event = event_report(
+                    path,
+                    "attachment_created",
+                    Some(execution_id.0),
+                    Some(test_id.0),
+                    Some(step_id.0),
+                );
+                event.attachment = Some(attachment.clone());
+                event
+            }
             ExecutionEvent::Attempt {
                 execution_id,
                 scope,
@@ -682,6 +714,10 @@ fn event_report(
     step_id: Option<u32>,
 ) -> EventReport {
     EventReport {
+        attachment: None,
+        metadata: None,
+        event_sequence: None,
+        timestamp: None,
         attempt: None,
         resource_lifecycle: None,
         wait: None,
@@ -745,6 +781,71 @@ mod tests {
     use webtest_observation::ExecutionId;
 
     use super::*;
+
+    #[test]
+    fn attachment_projection_preserves_acknowledged_content_and_recorded_context() {
+        use webtest_model::{
+            AttemptId, ExecutionScopeId, OperationExecutionId, PlanNodeId, TestExecutionId,
+        };
+        use webtest_observation::{
+            Artifact, ArtifactKind, Attachment, EventContext, EventJournal, EventMetadata,
+            EventTime,
+        };
+        let attachment = Attachment {
+            artifact: Artifact {
+                kind: ArtifactKind::DomSnapshot,
+                path: "artifacts/attempt-2.dom.html".into(),
+            },
+            byte_length: 23,
+            blake3: [5; 32],
+        };
+        let metadata = EventMetadata {
+            execution_context: EventContext {
+                test_id: Some(TestId(2)),
+                test_execution_id: Some(TestExecutionId(1)),
+                task_path: Some(vec![0, 1]),
+                scope_id: Some(ExecutionScopeId(3)),
+                parent_scope_id: Some(ExecutionScopeId(2)),
+                plan_node_id: Some(PlanNodeId([7; 32])),
+                attempt_id: Some(AttemptId(4)),
+                operation_execution_id: Some(OperationExecutionId(5)),
+            },
+            source_revision: Some(webtest_text::SourceRevision::of("évidence")),
+            origin: Some(webtest_text::SyntaxOrigin::new(
+                webtest_text::FileId::new(1),
+                webtest_text::TextRange::new(2.into(), 9.into()),
+            )),
+        };
+        let mut journal = EventJournal::default();
+        journal.record_with_metadata(
+            ExecutionEvent::AttachmentCreated {
+                execution_id: ExecutionId(1),
+                test_id: TestId(2),
+                step_id: StepId(3),
+                attachment: attachment.clone(),
+            },
+            EventTime {
+                since_unix_epoch: std::time::Duration::from_secs(7),
+                elapsed: std::time::Duration::from_millis(8),
+            },
+            metadata.clone(),
+        );
+        let reports = journal_event_reports("tests/a.webtest", journal.records());
+        let json = serde_json::to_value(&reports[0]).unwrap();
+        assert_eq!(json["schema_version"], 8);
+        assert_eq!(json["type"], "attachment_created");
+        assert_eq!(
+            json["attachment"],
+            serde_json::to_value(attachment).unwrap()
+        );
+        assert_eq!(json["metadata"], serde_json::to_value(metadata).unwrap());
+        assert_eq!(json["event_sequence"], 0);
+        assert_eq!(
+            json["timestamp"],
+            serde_json::to_value(journal.records()[0].timestamp).unwrap()
+        );
+        assert_eq!(json["step_id"], 3);
+    }
 
     #[test]
     fn journal_overflow_output_preserves_the_exact_missing_interval() {

@@ -1071,6 +1071,7 @@ mod tests {
             ("backoff", "control.retry"),
             ("attempt_started", "control.retry"),
             ("attempt_finished", "control.retry"),
+            ("attachment_created", "runtime.configuration"),
             ("provide", "statement.provide"),
             ("integer overflow", "type.Int"),
             ("optional member", "type.Record"),
@@ -1686,6 +1687,31 @@ mod tests {
             "one file run",
             "journal_capacity_exceeded",
             "awaits teardown",
+        ] {
+            assert!(guidance.summary.contains(fact), "missing {fact}");
+        }
+    }
+
+    #[test]
+    fn attachment_guidance_describes_acknowledgement_identity_and_digest() {
+        let DescriptionResponse::Construct(topic) =
+            response(DescriptionRequest::Query("runtime.configuration".into()))
+        else {
+            panic!("configuration topic")
+        };
+        let guidance = topic
+            .guidance
+            .iter()
+            .find(|entry| entry.code == "runtime_configuration_attachments")
+            .unwrap();
+        for fact in [
+            "attachment_created",
+            "successful file write",
+            "byte_length",
+            "32-byte BLAKE3",
+            "operation/attempt identity",
+            "event_sequence",
+            "Failed or expired writes",
         ] {
             assert!(guidance.summary.contains(fact), "missing {fact}");
         }

@@ -269,6 +269,7 @@ impl HumanTestProgress {
                 ExecutionEvent::RunFinished { .. } => {}
                 ExecutionEvent::Wait { .. }
                 | ExecutionEvent::Resource { .. }
+                | ExecutionEvent::AttachmentCreated { .. }
                 | ExecutionEvent::Attempt { .. }
                 | ExecutionEvent::Scope { .. }
                 | ExecutionEvent::RunStarted { .. }

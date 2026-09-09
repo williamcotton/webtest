@@ -7,24 +7,12 @@ use async_trait::async_trait;
 use tokio::time::Instant;
 use webtest_browser::PageEvidence;
 use webtest_model::{StepId, TestId};
-use webtest_observation::ExecutionId;
+pub use webtest_observation::{Artifact, ArtifactKind};
+use webtest_observation::{Attachment, ExecutionId};
 
 const MAX_CAPTURE_FAILURE_CHARS: usize = 1_024;
 const PERSISTENCE_DEADLINE_FAILURE: &str =
     "artifact persistence exceeded the remaining test budget";
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ArtifactKind {
-    Screenshot,
-    DomSnapshot,
-    Evidence,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Artifact {
-    pub kind: ArtifactKind,
-    pub path: PathBuf,
-}
 
 #[async_trait]
 trait ArtifactFilesystem: Sync {
@@ -45,6 +33,7 @@ impl ArtifactFilesystem for TokioArtifactFilesystem {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn write_artifacts(
     directory: &Path,
     execution_id: ExecutionId,
@@ -52,6 +41,7 @@ pub(crate) async fn write_artifacts(
     step_id: StepId,
     deadline: Instant,
     evidence: &mut PageEvidence,
+    mut on_created: impl FnMut(&Attachment) + Send,
 ) -> Vec<Artifact> {
     write_artifacts_with(
         &TokioArtifactFilesystem,
@@ -61,6 +51,7 @@ pub(crate) async fn write_artifacts(
         step_id,
         deadline,
         evidence,
+        &mut on_created,
     )
     .await
 }
@@ -74,6 +65,7 @@ async fn write_artifacts_with(
     step_id: StepId,
     deadline: Instant,
     evidence: &mut PageEvidence,
+    mut on_created: impl FnMut(&Attachment) + Send,
 ) -> Vec<Artifact> {
     if evidence.screenshot_png.is_none()
         && evidence.dom_snapshot.is_none()
@@ -107,6 +99,7 @@ async fn write_artifacts_with(
             deadline,
             evidence,
             &mut artifacts,
+            &mut on_created,
         )
         .await
     {
@@ -121,6 +114,7 @@ async fn write_artifacts_with(
             deadline,
             evidence,
             &mut artifacts,
+            &mut on_created,
         )
         .await
     {
@@ -143,6 +137,7 @@ async fn write_artifacts_with(
         deadline,
         evidence,
         &mut artifacts,
+        &mut on_created,
     )
     .await;
     artifacts
@@ -177,10 +172,17 @@ async fn write_artifact(
     deadline: Instant,
     evidence: &mut PageEvidence,
     artifacts: &mut Vec<Artifact>,
+    on_created: &mut (dyn FnMut(&Attachment) + Send),
 ) -> bool {
     match await_io(deadline, filesystem.write(&path, contents)).await {
         IoAttempt::Completed(Ok(())) => {
-            artifacts.push(Artifact { kind, path });
+            let attachment = Attachment {
+                artifact: Artifact { kind, path },
+                byte_length: contents.len() as u64,
+                blake3: *blake3::hash(contents).as_bytes(),
+            };
+            on_created(&attachment);
+            artifacts.push(attachment.artifact);
             true
         }
         IoAttempt::Completed(Err(error)) => {
@@ -235,6 +237,7 @@ mod tests {
             StepId(2),
             generous_deadline(),
             &mut PageEvidence::default(),
+            |_| {},
         )
         .await;
         assert!(artifacts.is_empty());
@@ -252,6 +255,7 @@ mod tests {
             dom_snapshot: Some("<main>Example</main>".into()),
             ..PageEvidence::default()
         };
+        let mut published = Vec::new();
         let artifacts = write_artifacts(
             root.path(),
             execution_id,
@@ -259,8 +263,17 @@ mod tests {
             StepId(7),
             generous_deadline(),
             &mut evidence,
+            |attachment| published.push(attachment.clone()),
         )
         .await;
+        assert_eq!(
+            published
+                .iter()
+                .map(|attachment| attachment.artifact.clone())
+                .collect::<Vec<_>>(),
+            artifacts
+        );
+
         let stem = format!("test-4-step-7-execution-{}", execution_id.0);
         assert_eq!(
             artifacts
@@ -300,6 +313,11 @@ mod tests {
                 .expect("summary"),
             "url: https://example.test/\ntitle: Example\nelapsed evidence candidates: 0\nactionability: []\nconsole errors: []\ncapture failures: []\n"
         );
+        for attachment in published {
+            let bytes = tokio::fs::read(&attachment.artifact.path).await.unwrap();
+            assert_eq!(attachment.byte_length, bytes.len() as u64);
+            assert_eq!(attachment.blake3, *blake3::hash(&bytes).as_bytes());
+        }
     }
 
     #[tokio::test]
@@ -311,6 +329,7 @@ mod tests {
             current_url: Some("https://example.test/".into()),
             ..PageEvidence::default()
         };
+        let mut published = Vec::new();
         let artifacts = write_artifacts(
             &file,
             ExecutionId::next(),
@@ -318,8 +337,17 @@ mod tests {
             StepId(2),
             generous_deadline(),
             &mut evidence,
+            |attachment| published.push(attachment.clone()),
         )
         .await;
+        assert_eq!(
+            published
+                .iter()
+                .map(|attachment| attachment.artifact.clone())
+                .collect::<Vec<_>>(),
+            artifacts
+        );
+
         assert!(artifacts.is_empty());
         assert_eq!(evidence.capture_failures.len(), 1);
         assert!(evidence.capture_failures[0].starts_with("artifact directory:"));
@@ -338,6 +366,7 @@ mod tests {
             ..PageEvidence::default()
         };
 
+        let mut published = Vec::new();
         let artifacts = write_artifacts(
             root.path(),
             execution_id,
@@ -345,8 +374,16 @@ mod tests {
             StepId(2),
             generous_deadline(),
             &mut evidence,
+            |attachment| published.push(attachment.clone()),
         )
         .await;
+        assert_eq!(
+            published
+                .iter()
+                .map(|attachment| attachment.artifact.clone())
+                .collect::<Vec<_>>(),
+            artifacts
+        );
 
         assert_eq!(
             artifacts
@@ -406,6 +443,7 @@ mod tests {
             StepId(2),
             generous_deadline(),
             &mut evidence,
+            |_| {},
         );
         let coordinator = {
             let filesystem = Arc::clone(&filesystem);
@@ -451,6 +489,7 @@ mod tests {
             ..PageEvidence::default()
         };
 
+        let mut published = Vec::new();
         let artifacts = write_artifacts_with(
             &filesystem,
             Path::new("unused"),
@@ -459,8 +498,16 @@ mod tests {
             StepId(2),
             Instant::now() + std::time::Duration::from_secs(1),
             &mut evidence,
+            |attachment| published.push(attachment.clone()),
         )
         .await;
+        assert_eq!(
+            published
+                .iter()
+                .map(|attachment| attachment.artifact.clone())
+                .collect::<Vec<_>>(),
+            artifacts
+        );
 
         assert!(artifacts.is_empty());
         assert_eq!(filesystem.writes.lock().expect("writes").len(), 1);
@@ -486,6 +533,7 @@ mod tests {
             StepId(2),
             generous_deadline(),
             &mut evidence,
+            |_| {},
         )
         .await;
         let mut persisted_text = String::new();
@@ -509,6 +557,7 @@ mod tests {
             StepId(2),
             generous_deadline(),
             &mut failing_evidence,
+            |_| {},
         )
         .await;
         assert!(artifacts.is_empty());
@@ -530,5 +579,53 @@ mod tests {
             MAX_CAPTURE_FAILURE_CHARS
         );
         assert!(evidence.capture_failures[0].ends_with('…'));
+    }
+    #[tokio::test(start_paused = true)]
+    async fn acknowledged_attachment_is_published_before_a_later_write_expires() {
+        struct PartialFilesystem {
+            writes: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait]
+        impl ArtifactFilesystem for PartialFilesystem {
+            async fn create_dir_all(&self, _: &Path) -> io::Result<()> {
+                Ok(())
+            }
+            async fn write(&self, _: &Path, _: &[u8]) -> io::Result<()> {
+                if self.writes.fetch_add(1, Ordering::SeqCst) > 0 {
+                    std::future::pending::<()>().await;
+                }
+                Ok(())
+            }
+        }
+        let filesystem = PartialFilesystem { writes: 0.into() };
+        let started = Instant::now();
+        let mut published = Vec::new();
+        let mut evidence = PageEvidence {
+            screenshot_png: Some(vec![1, 2, 3]),
+            dom_snapshot: Some("never acknowledged".into()),
+            ..Default::default()
+        };
+        let artifacts = write_artifacts_with(
+            &filesystem,
+            Path::new("unused"),
+            ExecutionId::next(),
+            TestId(1),
+            StepId(2),
+            started + std::time::Duration::from_millis(5),
+            &mut evidence,
+            |attachment| {
+                published.push((Instant::now() - started, attachment.clone()));
+            },
+        )
+        .await;
+        assert_eq!(started.elapsed(), std::time::Duration::from_millis(5));
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].0, std::time::Duration::ZERO);
+        assert_eq!(published[0].1.artifact.kind, ArtifactKind::Screenshot);
+        assert_eq!(published[0].1.byte_length, 3);
+        assert_eq!(published[0].1.blake3, *blake3::hash(&[1, 2, 3]).as_bytes());
+        assert_eq!(artifacts, [published[0].1.artifact.clone()]);
+        assert_eq!(filesystem.writes.load(Ordering::SeqCst), 2);
+        assert_eq!(evidence.capture_failures, [PERSISTENCE_DEADLINE_FAILURE]);
     }
 }

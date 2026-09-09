@@ -814,14 +814,16 @@ fn event_names(events: &[ExecutionEvent]) -> Vec<&'static str> {
         .filter(|event| {
             !matches!(
                 event,
-                ExecutionEvent::Attempt { .. }
+                ExecutionEvent::AttachmentCreated { .. }
+                    | ExecutionEvent::Attempt { .. }
                     | ExecutionEvent::Scope { .. }
                     | ExecutionEvent::Resource { .. }
                     | ExecutionEvent::Wait { .. }
             )
         })
         .map(|event| match event {
-            ExecutionEvent::Attempt { .. }
+            ExecutionEvent::AttachmentCreated { .. }
+            | ExecutionEvent::Attempt { .. }
             | ExecutionEvent::Scope { .. }
             | ExecutionEvent::Resource { .. }
             | ExecutionEvent::Wait { .. } => {
@@ -865,6 +867,14 @@ struct ArtifactCheckingEventSink {
 
 impl RunEventSink for ArtifactCheckingEventSink {
     fn publish(&self, event: &ExecutionEvent) {
+        if let ExecutionEvent::AttachmentCreated { attachment, .. } = event {
+            let bytes =
+                std::fs::read(&attachment.artifact.path).expect("attachment exists at publication");
+            assert_eq!(attachment.byte_length, bytes.len() as u64);
+            assert_eq!(attachment.blake3, *blake3::hash(&bytes).as_bytes());
+            return;
+        }
+
         let ExecutionEvent::StepFailed {
             execution_id,
             test_id,
@@ -1196,6 +1206,16 @@ async fn failure_event_is_published_only_after_referenced_artifacts_exist() {
         .await;
 
     assert!(sink.artifacts_ready.load(Ordering::SeqCst));
+    assert_eq!(
+        result
+            .events
+            .iter()
+            .filter(|event| matches!(event, ExecutionEvent::AttachmentCreated { .. }))
+            .count(),
+        3
+    );
+    journal::assert_serialized_journal(&result);
+
     let TestOutcome::Failed(failure) = &result.tests[0].outcome else {
         panic!("browser failure")
     };

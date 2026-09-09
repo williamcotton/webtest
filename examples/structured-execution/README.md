@@ -53,3 +53,9 @@ Retry event output includes `attempt_started` and `attempt_finished`, carrying t
 one-based ordinal and `max_attempts` alongside scope/source identity. The terminal
 event records the final outcome and any cancellation cause after owned teardown;
 it precedes backoff and the next attempt. Nested retries number their attempts locally.
+
+Event reports preserve the journal sequence, clocks, and source/operation/attempt
+metadata. When browser failure evidence is configured, each acknowledged file write
+adds `attachment_created` with its kind/path, byte length, and BLAKE3 digest. Failed
+or expired writes remain capture failures and do not produce attachment references.
+Use `webtest describe runtime.configuration` for the shared evidence/journal guidance.

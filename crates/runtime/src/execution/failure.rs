@@ -271,6 +271,19 @@ async fn finish_failure(input: FinishFailureInput<'_>) -> Result<StepFailure, Ru
             step.id,
             artifact_deadline,
             &mut evidence,
+            |attachment| {
+                emit_event_with_metadata(
+                    metadata.clone(),
+                    events,
+                    event_sink,
+                    ExecutionEvent::AttachmentCreated {
+                        execution_id,
+                        test_id,
+                        step_id: step.id,
+                        attachment: attachment.clone(),
+                    },
+                )
+            },
         )
         .await
     } else {

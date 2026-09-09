@@ -20,7 +20,8 @@ use crate::{
     },
     runtime_configuration::runner_options,
     runtime_output::{
-        aborted_run_failure_report, aborted_test_failure_report, event_reports, step_failure_report,
+        aborted_run_failure_report, aborted_test_failure_report, journal_event_reports,
+        step_failure_report,
     },
     test_progress::HumanTestProgress,
 };
@@ -225,7 +226,7 @@ pub(crate) async fn run_test(
     for ((index, source, plan, _, _), result) in runnable.iter().zip(results) {
         let file_report = &mut report.files[*index];
         file_report.duration_nanos = nanos(result.duration);
-        file_report.events = event_reports(&file_report.path, &result.events);
+        file_report.events = journal_event_reports(&file_report.path, &result.journal);
         let run_exit_class = match &result.outcome {
             RunOutcome::Completed => ExitClass::Success,
             RunOutcome::Cancelled { reason } => {

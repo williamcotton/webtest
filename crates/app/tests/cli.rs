@@ -467,7 +467,7 @@ fn check_without_paths_discovers_configured_tests_in_order() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON report");
-    assert_eq!(report["schema_version"], 7);
+    assert_eq!(report["schema_version"], 8);
     let paths = report["files"]
         .as_array()
         .expect("files")
@@ -996,7 +996,7 @@ fn parallel_reports_every_branch_failure_in_deterministic_source_order() {
         if reporter == "json" || reporter == "events" {
             let test = if reporter == "json" {
                 let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-                assert_eq!(value["schema_version"], 7);
+                assert_eq!(value["schema_version"], 8);
                 value["files"][0]["tests"][0].clone()
             } else {
                 let events: Vec<serde_json::Value> = text
@@ -1007,7 +1007,7 @@ fn parallel_reports_every_branch_failure_in_deterministic_source_order() {
                     .iter()
                     .find(|event| event["type"] == "test_result")
                     .unwrap();
-                assert_eq!(aggregate["schema_version"], 7);
+                assert_eq!(aggregate["schema_version"], 8);
                 aggregate["test"].clone()
             };
             assert_eq!(test["outcome"], "failed");
@@ -1070,7 +1070,7 @@ fn public_race_reports_the_winner_and_retains_failed_alternatives() {
         let stdout = String::from_utf8(output.stdout).unwrap();
         if reporter == "json" {
             let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-            assert_eq!(report["schema_version"], 7);
+            assert_eq!(report["schema_version"], 8);
             let test = &report["files"][0]["tests"][0];
             assert_eq!(test["outcome"], "passed");
             assert_eq!(test["branches"][0]["race_winner"], false);
@@ -1121,6 +1121,18 @@ fn public_retry_reports_every_attempt_and_rejects_unsafe_work_before_execution()
                 .lines()
                 .map(|line| serde_json::from_str(line).unwrap())
                 .collect();
+            let recorded: Vec<_> = events
+                .iter()
+                .filter(|event| event.get("execution_id").is_some())
+                .collect();
+            for (sequence, event) in recorded.iter().enumerate() {
+                assert_eq!(event["event_sequence"], sequence as u64);
+                assert!(event["timestamp"]["elapsed"].is_object());
+                assert_eq!(
+                    event["metadata"]["source_revision"],
+                    serde_json::to_value(webtest_text::SourceRevision::of(source)).unwrap()
+                );
+            }
             let attempts: Vec<_> = events
                 .iter()
                 .filter(|event| {
@@ -1132,7 +1144,7 @@ fn public_retry_reports_every_attempt_and_rejects_unsafe_work_before_execution()
                 .collect();
             assert_eq!(attempts.len(), 4);
             for (index, attempt) in attempts.iter().enumerate() {
-                assert_eq!(attempt["schema_version"], 7);
+                assert_eq!(attempt["schema_version"], 8);
                 assert_eq!(
                     attempt["attempt"],
                     serde_json::json!({"ordinal": index / 2 + 1, "max_attempts": 2})
