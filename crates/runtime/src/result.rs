@@ -140,7 +140,8 @@ impl RunOutcome {
 
 #[derive(Clone, Debug)]
 pub struct RunResult {
-    pub execution_id: ExecutionId,
+    /// Absent only when identity allocation failed before execution began.
+    pub execution_id: Option<ExecutionId>,
     pub outcome: RunOutcome,
     pub tests: Vec<TestResult>,
     /// Retained authoritative native records; `events` is the compatibility projection.

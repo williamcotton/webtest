@@ -22,6 +22,7 @@ mod jobs;
 pub use jobs::{InvalidJobLimit, JobLimit, TestRun, TestWorker, run_jobs, run_jobs_on_workers};
 
 pub struct Runner {
+    identity_source: Arc<dyn crate::ExecutionIdentitySource>,
     observations: Arc<ObservationStore>,
     options: RunnerOptions,
     providers: ProviderSelection,
@@ -37,11 +38,49 @@ enum ProviderSelection {
 impl Runner {
     pub fn new(observations: Arc<ObservationStore>) -> Self {
         Self {
+            identity_source: Arc::new(crate::identity::OsExecutionIdentitySource),
             observations,
             options: RunnerOptions::default(),
             providers: ProviderSelection::BuiltInsFromOptions,
             event_sink: None,
             subscribers: Vec::new(),
+        }
+    }
+
+    pub fn with_execution_identity_source(
+        mut self,
+        source: Arc<dyn crate::ExecutionIdentitySource>,
+    ) -> Self {
+        self.identity_source = source;
+        self
+    }
+
+    fn failed_identity(&self, plan: &TestPlan, error: crate::ExecutionIdentityError) -> RunResult {
+        self.observations.clear_for_file(plan.file);
+        RunResult {
+            execution_id: None,
+            outcome: RunOutcome::Aborted {
+                failure: RunError::ExecutionIdentity(error),
+                prior_outcome: None,
+            },
+            tests: plan
+                .tests
+                .iter()
+                .map(|test| TestResult {
+                    test_id: test.id,
+                    name: test.name.clone(),
+                    outcome: TestOutcome::Skipped {
+                        reason: SkipReason::RunAborted,
+                        failure_class: Some(FailureClass::Infrastructure),
+                    },
+                    duration: std::time::Duration::ZERO,
+                    bindings: BTreeMap::new(),
+                    branches: Vec::new(),
+                })
+                .collect(),
+            events: Vec::new(),
+            journal: Vec::new(),
+            duration: std::time::Duration::ZERO,
         }
     }
 
@@ -101,7 +140,10 @@ impl Runner {
             ProviderSelection::Explicit(providers) => providers.clone(),
         };
         let run_started = Instant::now();
-        let execution_id = ExecutionId::next();
+        let execution_id = match self.identity_source.allocate() {
+            Ok(id) => id,
+            Err(error) => return self.failed_identity(plan, error),
+        };
         self.observations.begin_execution(plan.file, execution_id);
         let pending_observations = ObservationStore::default();
         let ids = crate::execution::scopes::ExecutionIds::default();
@@ -428,7 +470,7 @@ fn finish_run(
     );
     let journal = events.into_records();
     RunResult {
-        execution_id,
+        execution_id: Some(execution_id),
         outcome,
         tests,
         events: journal.iter().map(|record| record.event.clone()).collect(),

@@ -122,6 +122,8 @@ impl std::fmt::Display for EvaluationFailure {
 #[derive(Clone, Debug, Error)]
 pub enum RunError {
     #[error(transparent)]
+    ExecutionIdentity(crate::ExecutionIdentityError),
+    #[error(transparent)]
     JournalOverflow(crate::JournalOverflow),
     #[error(transparent)]
     Browser(#[from] BrowserError),
@@ -144,6 +146,7 @@ impl RunError {
             Self::Browser(error) => error.into(),
             Self::Provider(error) => error.into(),
             Self::Cleanup(failure) => failure.code(),
+            Self::ExecutionIdentity(_) => RuntimeFailureCode::ExecutionIdentityUnavailable,
             Self::JournalOverflow(_) => RuntimeFailureCode::JournalCapacityExceeded,
             Self::Multiple { primary, .. } => primary.code(),
             Self::Internal(_) => RuntimeFailureCode::InternalError,
@@ -152,9 +155,10 @@ impl RunError {
 
     pub const fn failure_class(&self) -> FailureClass {
         match self {
-            Self::Browser(_) | Self::Provider(_) | Self::JournalOverflow(_) => {
-                FailureClass::Infrastructure
-            }
+            Self::ExecutionIdentity(_)
+            | Self::Browser(_)
+            | Self::Provider(_)
+            | Self::JournalOverflow(_) => FailureClass::Infrastructure,
             Self::Cleanup(failure) => failure.failure_class(),
             Self::Multiple { primary, .. } => primary.failure_class(),
             Self::Internal(_) => FailureClass::Internal,
@@ -356,10 +360,17 @@ mod tests {
             },
         };
         let identity = webtest_observation::EventIdentity {
-            execution_id: webtest_observation::ExecutionId(1),
+            execution_id: webtest_observation::ExecutionId::from_u128(1),
             event_sequence: webtest_observation::EventSequence(9),
         };
         let cases = [
+            (
+                RunError::ExecutionIdentity(crate::ExecutionIdentityError {
+                    source: getrandom::Error::UNSUPPORTED,
+                }),
+                FailureClass::Infrastructure,
+                RuntimeFailureCode::ExecutionIdentityUnavailable,
+            ),
             (
                 RunError::JournalOverflow(crate::JournalOverflow {
                     capacity: 10,

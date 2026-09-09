@@ -185,7 +185,7 @@ mod tests {
         );
         assert_eq!(json["execution_context"]["operation_execution_id"], 6);
         let run = ExecutionEvent::RunStarted {
-            execution_id: ExecutionId(1),
+            execution_id: ExecutionId::from_u128(1),
         }
         .metadata();
         assert_eq!(
@@ -193,7 +193,7 @@ mod tests {
             serde_json::json!({"execution_context": {}})
         );
         let skipped = ExecutionEvent::TestSkipped {
-            execution_id: ExecutionId(1),
+            execution_id: ExecutionId::from_u128(1),
             test_id: TestId(7),
             name: "skipped".into(),
             reason: crate::SkipReason::RunAborted,
@@ -212,7 +212,7 @@ mod tests {
         let record = source
             .record(
                 ExecutionEvent::Scope {
-                    execution_id: ExecutionId(1),
+                    execution_id: ExecutionId::from_u128(1),
                     event: scope(),
                 },
                 EventTime {
@@ -231,7 +231,7 @@ mod tests {
         ));
         let mut operation = record.clone();
         operation.event = ExecutionEvent::StepPassed {
-            execution_id: ExecutionId(1),
+            execution_id: ExecutionId::from_u128(1),
             test_id: TestId(1),
             step_id: webtest_model::StepId(3),
         };
@@ -253,6 +253,6 @@ mod tests {
             Err(ReplayError::MetadataMismatch { .. })
         ));
         assert_eq!(replay.insert(operation), Ok(ReplayOutcome::Duplicate));
-        assert_eq!(replay.records_for(ExecutionId(1)).count(), 2);
+        assert_eq!(replay.records_for(ExecutionId::from_u128(1)).count(), 2);
     }
 }

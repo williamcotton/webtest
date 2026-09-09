@@ -467,7 +467,7 @@ fn check_without_paths_discovers_configured_tests_in_order() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON report");
-    assert_eq!(report["schema_version"], 8);
+    assert_eq!(report["schema_version"], 9);
     let paths = report["files"]
         .as_array()
         .expect("files")
@@ -996,7 +996,7 @@ fn parallel_reports_every_branch_failure_in_deterministic_source_order() {
         if reporter == "json" || reporter == "events" {
             let test = if reporter == "json" {
                 let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-                assert_eq!(value["schema_version"], 8);
+                assert_eq!(value["schema_version"], 9);
                 value["files"][0]["tests"][0].clone()
             } else {
                 let events: Vec<serde_json::Value> = text
@@ -1007,7 +1007,7 @@ fn parallel_reports_every_branch_failure_in_deterministic_source_order() {
                     .iter()
                     .find(|event| event["type"] == "test_result")
                     .unwrap();
-                assert_eq!(aggregate["schema_version"], 8);
+                assert_eq!(aggregate["schema_version"], 9);
                 aggregate["test"].clone()
             };
             assert_eq!(test["outcome"], "failed");
@@ -1070,7 +1070,7 @@ fn public_race_reports_the_winner_and_retains_failed_alternatives() {
         let stdout = String::from_utf8(output.stdout).unwrap();
         if reporter == "json" {
             let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-            assert_eq!(report["schema_version"], 8);
+            assert_eq!(report["schema_version"], 9);
             let test = &report["files"][0]["tests"][0];
             assert_eq!(test["outcome"], "passed");
             assert_eq!(test["branches"][0]["race_winner"], false);
@@ -1144,7 +1144,7 @@ fn public_retry_reports_every_attempt_and_rejects_unsafe_work_before_execution()
                 .collect();
             assert_eq!(attempts.len(), 4);
             for (index, attempt) in attempts.iter().enumerate() {
-                assert_eq!(attempt["schema_version"], 8);
+                assert_eq!(attempt["schema_version"], 9);
                 assert_eq!(
                     attempt["attempt"],
                     serde_json::json!({"ordinal": index / 2 + 1, "max_attempts": 2})
@@ -1340,4 +1340,67 @@ fn journal_configuration_changes_the_build_fingerprint_without_changing_test_pla
     );
     assert_eq!(plans[0]["tests"], plans[1]["tests"]);
     assert_eq!(plans[0]["source_files"], plans[1]["source_files"]);
+}
+
+#[test]
+fn execution_identities_are_canonical_and_disjoint_across_cli_processes() {
+    use std::collections::BTreeSet;
+    let directory = tempfile::tempdir().unwrap();
+    for file in ["first", "second"] {
+        write(
+            &directory.path().join(format!("{file}.webtest")),
+            r#"test "nested" { parallel { server { expect 1 == 1 } server { expect true } } }"#,
+        );
+    }
+    let mut all_ids = BTreeSet::new();
+    for jobs in ["1", "2", "2"] {
+        let output = webtest(directory.path())
+            .args([
+                "test",
+                "first.webtest",
+                "second.webtest",
+                "--jobs",
+                jobs,
+                "--reporter",
+                "events",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let records: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let starts: Vec<_> = records
+            .iter()
+            .filter(|r| r["type"] == "run_started")
+            .collect();
+        assert_eq!(starts.len(), 2);
+        for start in starts {
+            let id = start["execution_id"].as_str().unwrap();
+            assert_eq!(id.len(), 32);
+            assert!(
+                id.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            );
+            assert!(
+                all_ids.insert(id.to_owned()),
+                "reused ID across files/processes"
+            );
+            let events: Vec<_> = records.iter().filter(|r| r["execution_id"] == id).collect();
+            assert!(events.len() > 10);
+            for (sequence, record) in events.iter().enumerate() {
+                assert_eq!(record["schema_version"], 9);
+                assert_eq!(record["event_sequence"], sequence);
+                assert_eq!(record["file"], start["file"]);
+            }
+            assert_eq!(events.last().unwrap()["type"], "run_finished");
+        }
+    }
+    assert_eq!(all_ids.len(), 6);
 }

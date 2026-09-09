@@ -134,10 +134,41 @@ async fn run_scheduled(
     jobs: JobLimit,
     workers: Option<&[TestWorker]>,
 ) -> Vec<RunResult> {
+    let mut ready = Vec::new();
+    let mut identities = Vec::new();
+    let mut indices = Vec::new();
+    let mut results = Vec::new();
+    for (index, input) in inputs.iter().enumerate() {
+        match input.runner.identity_source.allocate() {
+            Ok(id) => {
+                ready.push(TestRun {
+                    runner: input.runner,
+                    plan: input.plan,
+                    browser: input.browser,
+                    control: input.control,
+                });
+                identities.push(id);
+                indices.push(index);
+            }
+            Err(error) => results.push((index, input.runner.failed_identity(input.plan, error))),
+        }
+    }
+    let completed = run_allocated(&ready, jobs, workers, &identities).await;
+    results.extend(indices.into_iter().zip(completed));
+    results.sort_by_key(|(index, _)| *index);
+    results.into_iter().map(|(_, result)| result).collect()
+}
+
+async fn run_allocated(
+    inputs: &[TestRun<'_>],
+    jobs: JobLimit,
+    workers: Option<&[TestWorker]>,
+    identities: &[ExecutionId],
+) -> Vec<RunResult> {
     let services: Vec<_> = inputs
         .iter()
-        .map(|input| {
-            let execution_id = ExecutionId::next();
+        .zip(identities.iter().copied())
+        .map(|(input, execution_id)| {
             let (primary_failure, failure_notice) = crate::execution::FailureSignal::channel();
             input
                 .runner

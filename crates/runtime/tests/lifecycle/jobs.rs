@@ -96,8 +96,13 @@ async fn jobs_bound_live_roots_across_files_and_preserve_source_order() {
         assert_eq!(result.events.len(), result.journal.len());
         for (ordinal, (event, record)) in result.events.iter().zip(&result.journal).enumerate() {
             assert_eq!(&record.event, event);
-            assert_eq!(record.identity.execution_id, result.execution_id);
-            let plan = if result.execution_id == results[0].execution_id {
+            assert_eq!(
+                record.identity.execution_id,
+                result.execution_id.expect("run started")
+            );
+            let plan = if result.execution_id.expect("run started")
+                == results[0].execution_id.expect("run started")
+            {
                 &first
             } else {
                 &second
@@ -128,9 +133,18 @@ async fn jobs_bound_live_roots_across_files_and_preserve_source_order() {
     assert_eq!(
         finished,
         [
-            (results[0].execution_id, first.tests[1].id),
-            (results[1].execution_id, second.tests[0].id),
-            (results[0].execution_id, first.tests[0].id),
+            (
+                results[0].execution_id.expect("run started"),
+                first.tests[1].id
+            ),
+            (
+                results[1].execution_id.expect("run started"),
+                second.tests[0].id
+            ),
+            (
+                results[0].execution_id.expect("run started"),
+                first.tests[0].id
+            ),
         ]
     );
 }
@@ -186,9 +200,9 @@ async fn jobs_keep_bindings_and_failure_observations_isolated_and_publish_atomic
         [plan.tests[0].id, plan.tests[1].id]
     );
     assert!(
-        batch
-            .iter()
-            .all(|observation| observation.execution_id == result.execution_id)
+        batch.iter().all(
+            |observation| observation.execution_id == result.execution_id.expect("run started")
+        )
     );
 }
 

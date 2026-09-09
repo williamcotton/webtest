@@ -12,7 +12,7 @@ use webtest_project::Project;
 
 use crate::{error::AppError, project_context::normalized_path};
 
-pub(crate) const REPORT_SCHEMA_VERSION: u32 = 8;
+pub(crate) const REPORT_SCHEMA_VERSION: u32 = 9;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -300,7 +300,7 @@ pub struct EventReport {
     pub kind: String,
     pub file: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub execution_id: Option<u64>,
+    pub execution_id: Option<webtest_observation::ExecutionId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub test_id: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -960,7 +960,7 @@ mod tests {
     }
 
     fn cancelled_sample() -> CommandReport {
-        let execution_id = ExecutionId(7);
+        let execution_id = ExecutionId::from_u128(7);
         let events = crate::runtime_output::event_reports(
             "tests/cancel.webtest",
             &[
@@ -1032,7 +1032,7 @@ mod tests {
     }
 
     fn internal_error_sample() -> CommandReport {
-        let execution_id = ExecutionId(9);
+        let execution_id = ExecutionId::from_u128(9);
         let events = crate::runtime_output::event_reports(
             "tests/internal.webtest",
             &[ExecutionEvent::RunFinished {
@@ -1078,7 +1078,7 @@ mod tests {
     }
 
     fn timeout_sample() -> CommandReport {
-        let execution_id = ExecutionId(11);
+        let execution_id = ExecutionId::from_u128(11);
         let test_id = TestId(3);
         let step_id = StepId(7);
         let events = crate::runtime_output::event_reports(
@@ -1224,7 +1224,7 @@ mod tests {
         assert_eq!(value["exit_class"], "test_failure");
         assert_eq!(
             String::from_utf8(json).expect("UTF-8 JSON"),
-            include_str!("../tests/fixtures/report-v8.json")
+            include_str!("../tests/fixtures/report-v9.json")
         );
 
         let mut events = Vec::new();
@@ -1236,7 +1236,7 @@ mod tests {
             let value: serde_json::Value = serde_json::from_str(line).expect("json line");
             assert_eq!(value["schema_version"], REPORT_SCHEMA_VERSION);
         }
-        assert_eq!(events, include_str!("../tests/fixtures/report-v8.jsonl"));
+        assert_eq!(events, include_str!("../tests/fixtures/report-v9.jsonl"));
     }
 
     #[test]
@@ -1263,11 +1263,11 @@ mod tests {
             ),
             (
                 Reporter::Json,
-                include_str!("../tests/fixtures/cancellation-v8.json"),
+                include_str!("../tests/fixtures/cancellation-v9.json"),
             ),
             (
                 Reporter::Events,
-                include_str!("../tests/fixtures/cancellation-v8.jsonl"),
+                include_str!("../tests/fixtures/cancellation-v9.jsonl"),
             ),
             (
                 Reporter::Junit,

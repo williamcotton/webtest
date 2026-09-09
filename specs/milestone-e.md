@@ -31,8 +31,12 @@ Milestone E is **not complete**. The execution-tree, resource/wait foundations, 
   resolved configuration, keeping configuration values out of the artifact. Shared validation
   checks tree structure, identities, revisions, capability requirements, and explicit execution
   inputs for detectable drift. There is still no CLI command to execute an emitted plan.
-- CLI report/event schema 8 includes attachments, recorded journal metadata/clocks/sequence, explicit retry-attempt lifecycle and typed scope facts, shared typed cancellation reasons, and ordered branch aggregates. This remains the existing event stream,
-  not yet E's authoritative bounded journal with replay-safe event identity.
+- Native journal schema 6 and CLI report/event schema 9 use opaque 128-bit execution IDs,
+  serialized as 32 lowercase hexadecimal digits. Native OS randomness allocates independent
+  file-run IDs across processes; replay identity is `(ExecutionId, event_sequence)`.
+  The bounded journal retains attachments, source/context metadata, clocks, explicit retry
+  attempts, typed scope/cancellation facts, and ordered branch aggregates. Remaining event
+  kinds and complete host/resource coverage are still pending.
 - Runtime observations accumulate privately and commit as a complete batch. Starting another
   run clears prior observations and prevents an older in-flight run from overwriting the newer
   batch. Cross-process publication remains unimplemented.
@@ -625,6 +629,40 @@ Verification: full workspace tests pass, including 115 runtime lifecycle tests.
 Warning-free workspace Clippy, Rust formatting, WASM compilation of both
 `webtest-wasm` and `webtest-observation`, and focused checks for attachment
 publication, shared descriptions/search, and bundled-skill parity also pass.
+
+### Durable execution identity continuation — 2026-09-09
+
+Native runtime now allocates each file run's opaque 128-bit execution identity from
+OS randomness through an injectable identity service. The portable observation core
+owns canonical parsing/serialization, without native entropy or a process-local counter.
+The ID stays constant across tests, siblings, attempts, observations, attachments, and
+terminal records. Static plan identity and per-run occurrence/sequence allocation are
+unchanged. ID ordering is useful for indexing, never chronology.
+
+Allocation failure returns typed infrastructure code
+`runtime.execution_identity_unavailable` before test admission. It clears stale
+observations, marks tests skipped in source order, and returns an aborted run with
+no execution ID or fabricated journal records. Scheduled healthy files still execute,
+and final results retain input order. Native `RunResult.execution_id` is consequently
+optional only for this pre-execution failure.
+
+Native journal schema 6 and CLI report/event schema 9 serialize IDs as exactly 32
+lowercase hexadecimal digits. Old numeric IDs are rejected rather than coerced;
+replay rejects unsupported schema versions before decoding event payloads. Evidence
+filenames include the full opaque ID, preventing process-local counter reuse from
+overwriting previous runs' captures. Plan format 9 and runtime semantics 6 are unchanged.
+
+Focused coverage includes canonical and malformed IDs, immutable replay, injected
+allocation failure and stale-observation clearing, sequential/concurrent/worker
+schedulers, branch/attempt identity reuse, separate CLI processes, and report fixtures.
+Shared description/search and installed guidance explain the ID and startup failure.
+Remaining event kinds, complete resource/host coverage, trace writer/viewer,
+observation IPC, and concurrent DAP are still pending.
+
+Verification: `cargo test --workspace` passes, including all 118 runtime lifecycle
+tests, native Chrome/protocol integration, and doc tests. Rust formatting and
+warning-free workspace Clippy pass. Both `webtest-wasm` and `webtest-observation`
+compile for `wasm32-unknown-unknown`.
 
 ## 1. Outcome
 

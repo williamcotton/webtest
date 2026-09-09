@@ -207,3 +207,10 @@ Event reports preserve the journal's `event_sequence`, clocks, and `metadata`, i
 source and operation/attempt identity. Failed or expired writes do not claim attachments;
 capture failures remain secondary evidence. Use `webtest describe runtime.configuration`
 to discover these facts and the shared journal budget. Readers must verify referenced files.
+
+Each file run has an opaque 128-bit `execution_id`, serialized as 32 lowercase hexadecimal
+digits and allocated independently across processes. Replay identity is
+`(execution_id, event_sequence)`; ID sorting does not indicate chronology.
+`execution_identity_unavailable` is an infrastructure failure before tests start:
+stale observations are cleared, and no run ID or journal records are fabricated.
+Inspect the native randomness failure before rerunning.

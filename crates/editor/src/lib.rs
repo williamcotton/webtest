@@ -568,7 +568,7 @@ mod tests {
         .enumerate()
         {
             editor.observations().record(RuntimeObservation {
-                execution_id: ExecutionId(index as u64 + 1),
+                execution_id: ExecutionId::from_u128((index as u64 + 1) as u128),
                 file,
                 source_revision: revision,
                 test_id: webtest_model::TestId(0),
@@ -813,7 +813,7 @@ mod tests {
         editor
             .observations()
             .record(webtest_observation::RuntimeObservation {
-                execution_id: webtest_observation::ExecutionId::next(),
+                execution_id: webtest_observation::ExecutionId::from_u128(1),
                 file,
                 source_revision: webtest_text::SourceRevision::of(source),
                 test_id: webtest_model::TestId(0),

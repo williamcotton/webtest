@@ -168,9 +168,9 @@ fn defaults_and_result_counts_are_exact() {
         ]
     );
 
-    let execution_id = ExecutionId::next();
+    let execution_id = ExecutionId::from_u128(1);
     let result = RunResult {
-        execution_id,
+        execution_id: Some(execution_id),
         journal: Vec::new(),
         outcome: RunOutcome::Completed,
         tests: vec![

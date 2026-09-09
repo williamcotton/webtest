@@ -87,7 +87,7 @@ async fn write_artifacts_with(
     }
     let stem = format!(
         "test-{}-step-{}-execution-{}",
-        test_id.0, step_id.0, execution_id.0
+        test_id.0, step_id.0, execution_id
     );
     let mut artifacts = Vec::new();
     if let Some(png) = evidence.screenshot_png.clone()
@@ -232,7 +232,7 @@ mod tests {
         let directory = root.path().join("artifacts");
         let artifacts = write_artifacts(
             &directory,
-            ExecutionId::next(),
+            ExecutionId::from_u128(1),
             TestId(1),
             StepId(2),
             generous_deadline(),
@@ -245,9 +245,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn artifact_names_preserve_all_execution_id_bits_without_overwriting_prior_runs() {
+        let root = tempfile::tempdir().unwrap();
+        let mut saved = Vec::new();
+        for (id, bytes) in [(1, vec![1, 2]), ((1u128 << 127) + 1, vec![3, 4])] {
+            let mut evidence = PageEvidence {
+                screenshot_png: Some(bytes.clone()),
+                ..Default::default()
+            };
+            let artifacts = write_artifacts(
+                root.path(),
+                ExecutionId::from_u128(id),
+                TestId(0),
+                StepId(0),
+                generous_deadline(),
+                &mut evidence,
+                |_| {},
+            )
+            .await;
+            let screenshot = artifacts
+                .iter()
+                .find(|a| a.kind == ArtifactKind::Screenshot)
+                .unwrap();
+            saved.push((screenshot.path.clone(), bytes));
+        }
+        assert_ne!(saved[0].0, saved[1].0);
+        for (path, bytes) in saved {
+            assert_eq!(tokio::fs::read(path).await.unwrap(), bytes);
+        }
+    }
+
+    #[tokio::test]
     async fn artifacts_use_deterministic_names_kinds_contents_and_order() {
         let root = tempfile::tempdir().expect("temporary root");
-        let execution_id = ExecutionId::next();
+        let execution_id = ExecutionId::from_u128(1);
         let mut evidence = PageEvidence {
             screenshot_png: Some(vec![1, 2, 3]),
             current_url: Some("https://example.test/".into()),
@@ -274,7 +305,7 @@ mod tests {
             artifacts
         );
 
-        let stem = format!("test-4-step-7-execution-{}", execution_id.0);
+        let stem = format!("test-4-step-7-execution-{}", execution_id);
         assert_eq!(
             artifacts
                 .iter()
@@ -332,7 +363,7 @@ mod tests {
         let mut published = Vec::new();
         let artifacts = write_artifacts(
             &file,
-            ExecutionId::next(),
+            ExecutionId::from_u128(1),
             TestId(1),
             StepId(2),
             generous_deadline(),
@@ -356,8 +387,8 @@ mod tests {
     #[tokio::test]
     async fn one_write_failure_does_not_publish_a_false_path_or_stop_later_writes() {
         let root = tempfile::tempdir().expect("temporary root");
-        let execution_id = ExecutionId::next();
-        let stem = format!("test-1-step-2-execution-{}", execution_id.0);
+        let execution_id = ExecutionId::from_u128(1);
+        let stem = format!("test-1-step-2-execution-{}", execution_id);
         std::fs::create_dir(root.path().join(format!("{stem}.png")))
             .expect("screenshot collision directory");
         let mut evidence = PageEvidence {
@@ -438,7 +469,7 @@ mod tests {
         let persistence = write_artifacts_with(
             filesystem.as_ref(),
             Path::new("unused"),
-            ExecutionId::next(),
+            ExecutionId::from_u128(1),
             TestId(1),
             StepId(2),
             generous_deadline(),
@@ -493,7 +524,7 @@ mod tests {
         let artifacts = write_artifacts_with(
             &filesystem,
             Path::new("unused"),
-            ExecutionId::next(),
+            ExecutionId::from_u128(1),
             TestId(1),
             StepId(2),
             Instant::now() + std::time::Duration::from_secs(1),
@@ -518,7 +549,7 @@ mod tests {
     async fn persisted_redactions_and_io_errors_never_expose_evidence_contents() {
         const SECRET: &str = "private-secret";
         let root = tempfile::tempdir().expect("temporary root");
-        let execution_id = ExecutionId::next();
+        let execution_id = ExecutionId::from_u128(1);
         let mut evidence = PageEvidence {
             current_url: Some("https://example.test/?token=%5Bredacted%5D".into()),
             title: Some("[redacted]".into()),
@@ -552,7 +583,7 @@ mod tests {
         };
         let artifacts = write_artifacts(
             &collision,
-            ExecutionId::next(),
+            ExecutionId::from_u128(1),
             TestId(1),
             StepId(2),
             generous_deadline(),
@@ -608,7 +639,7 @@ mod tests {
         let artifacts = write_artifacts_with(
             &filesystem,
             Path::new("unused"),
-            ExecutionId::next(),
+            ExecutionId::from_u128(1),
             TestId(1),
             StepId(2),
             started + std::time::Duration::from_millis(5),

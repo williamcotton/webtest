@@ -9,6 +9,8 @@ mod error;
 mod evaluation;
 mod events;
 mod execution;
+mod identity;
+pub use identity::{ExecutionIdentityError, ExecutionIdentitySource};
 mod options;
 mod redaction;
 mod resource_scope;

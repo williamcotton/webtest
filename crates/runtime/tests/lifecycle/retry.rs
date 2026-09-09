@@ -800,7 +800,7 @@ async fn retry_preserves_separate_artifact_files_for_every_failed_attempt() {
             assert!(artifact.path.is_file());
             let owner = format!(
                 "execution-{}-attempt-{}",
-                result.execution_id.0,
+                result.execution_id.expect("run started"),
                 attempt.scope.execution_context.attempt_id.unwrap().0
             );
             assert!(artifact.path.parent().unwrap().ends_with(owner));

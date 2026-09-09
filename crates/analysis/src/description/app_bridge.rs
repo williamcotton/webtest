@@ -622,6 +622,7 @@ fn runtime_configuration_reference() -> ConstructDescription {
         "browser base URL server base URL".into(),
         "per-test deadline provider call timeout cleanup budget".into(),
         "journal max_events retention event budget journal_capacity_exceeded attachment_created evidence digest".into(),
+        "execution identity execution_identity_unavailable entropy replay".into(),
         "configuration debugging".into(),
         "inspect project startup owned health".into(),
     ];
@@ -647,6 +648,10 @@ fn runtime_configuration_reference() -> ConstructDescription {
         guidance(
             "runtime_configuration_journal",
             "`[journal].max_events` is a positive integer (default 100000) shared by all tests in one file run, including nested branches and attempts. It includes a reserved final run record. Exceeding the count aborts that file with `journal_capacity_exceeded`, stops admission, cancels active roots, and awaits teardown. The report retains original outcomes and an explicit missing-event interval; the journal is incomplete. Inspect the resolved limit, then increase it and rerun if appropriate. This is an event count, not a byte budget or a trace-export setting.",
+        ),
+        guidance(
+            "runtime_configuration_execution_identity",
+            "Each file run receives an opaque 128-bit execution_id from native OS randomness, serialized as 32 lowercase hexadecimal digits. It remains constant across that run's tests, branches, attempts, observations, and evidence filenames. Separate processes allocate independent IDs; lexical ID ordering does not imply chronology. Replay identity is (execution_id, event_sequence). If allocation fails, execution_identity_unavailable aborts the file as infrastructure before tests start, clears stale observations, and emits no fabricated run identity or journal records. Inspect the native randomness failure before rerunning.",
         ),
         guidance(
             "runtime_configuration_attachments",

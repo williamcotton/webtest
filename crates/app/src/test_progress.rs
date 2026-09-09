@@ -327,7 +327,7 @@ mod tests {
     fn progress_renders_observable_lifecycle_stages_in_order() {
         let output = SharedOutput::default();
         let progress = HumanTestProgress::new(Box::new(output.clone()));
-        let execution_id = ExecutionId(7);
+        let execution_id = ExecutionId::from_u128(7);
 
         progress.checking(2).expect("checking");
         progress.checked(0).expect("checked");
@@ -406,9 +406,9 @@ mod tests {
         let output = SharedOutput::default();
         let progress = HumanTestProgress::new(Box::new(output.clone()));
         for (execution_id, test_id, name) in [
-            (ExecutionId(1), TestId(0), "first"),
-            (ExecutionId(1), TestId(1), "second"),
-            (ExecutionId(2), TestId(0), "other file"),
+            (ExecutionId::from_u128(1), TestId(0), "first"),
+            (ExecutionId::from_u128(1), TestId(1), "second"),
+            (ExecutionId::from_u128(2), TestId(0), "other file"),
         ] {
             progress.publish(&ExecutionEvent::TestStarted {
                 execution_id,
@@ -417,9 +417,21 @@ mod tests {
             });
         }
         for (execution_id, test_id, outcome) in [
-            (ExecutionId(2), TestId(0), TestOutcomeKind::Passed),
-            (ExecutionId(1), TestId(1), TestOutcomeKind::Failed),
-            (ExecutionId(1), TestId(0), TestOutcomeKind::Passed),
+            (
+                ExecutionId::from_u128(2),
+                TestId(0),
+                TestOutcomeKind::Passed,
+            ),
+            (
+                ExecutionId::from_u128(1),
+                TestId(1),
+                TestOutcomeKind::Failed,
+            ),
+            (
+                ExecutionId::from_u128(1),
+                TestId(0),
+                TestOutcomeKind::Passed,
+            ),
         ] {
             progress.publish(&ExecutionEvent::TestFinished {
                 execution_id,

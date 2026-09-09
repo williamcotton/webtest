@@ -258,10 +258,10 @@ async fn finish_failure(input: FinishFailureInput<'_>) -> Result<StepFailure, Ru
         let directory = attempt_id.map_or_else(
             || options.evidence.artifact_directory.clone(),
             |attempt| {
-                options.evidence.artifact_directory.join(format!(
-                    "execution-{}-attempt-{}",
-                    execution_id.0, attempt.0
-                ))
+                options
+                    .evidence
+                    .artifact_directory
+                    .join(format!("execution-{}-attempt-{}", execution_id, attempt.0))
             },
         );
         write_artifacts(
@@ -608,7 +608,7 @@ mod tests {
         };
         let providers = ProviderRegistry::default();
         let observations = Arc::new(ObservationStore::default());
-        let execution_id = ExecutionId::next();
+        let execution_id = ExecutionId::from_u128(1);
         let events = EventBuffer::default();
 
         let failure = process_failure(FailureInput {

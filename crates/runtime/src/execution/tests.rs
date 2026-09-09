@@ -72,7 +72,7 @@ async fn sibling_futures_have_independent_bindings_active_operations_and_explici
         plan: &plan,
         observations: &observations,
         test,
-        execution_id: ExecutionId(1),
+        execution_id: ExecutionId::from_u128(1),
         events: &events,
         event_sink: None,
         control: Some(&control),

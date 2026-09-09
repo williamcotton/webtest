@@ -1,5 +1,7 @@
 //! Structured execution events and revision-safe source observations.
 
+mod identity;
+pub use identity::{ExecutionId, InvalidExecutionId};
 mod attachment;
 pub use attachment::{Artifact, ArtifactKind, Attachment};
 mod event_metadata;
@@ -19,15 +21,7 @@ pub use resource::{
 pub use scope::{AttemptEvent, ExecutionContext, ScopeCancellation, ScopeEvent, ScopeOutcome};
 pub use wait::{WaitEvent, WaitEventKind};
 
-use std::{
-    collections::BTreeMap,
-    collections::HashMap,
-    path::PathBuf,
-    sync::{
-        Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
-};
+use std::{collections::BTreeMap, collections::HashMap, path::PathBuf, sync::Mutex};
 
 use webtest_browser::{CandidateEvidence, Locator, PageSummary};
 use webtest_feedback::{FailureClass, RepairHint};
@@ -93,6 +87,7 @@ pub enum RuntimeFailureCode {
     DivisionByZero,
     IntegerOverflow,
     InternalError,
+    ExecutionIdentityUnavailable,
     JournalCapacityExceeded,
     CleanupScopeFailed,
     CleanupBrowserContextFailed,
@@ -156,6 +151,7 @@ impl RuntimeFailureCode {
             Self::DivisionByZero => "division_by_zero",
             Self::IntegerOverflow => "integer_overflow",
             Self::InternalError => "internal_error",
+            Self::ExecutionIdentityUnavailable => "execution_identity_unavailable",
             Self::JournalCapacityExceeded => "journal_capacity_exceeded",
             Self::CleanupScopeFailed => "cleanup_scope_failed",
             Self::CleanupBrowserContextFailed => "cleanup_browser_context_failed",
@@ -219,6 +215,7 @@ impl RuntimeFailureCode {
             Self::DivisionByZero => "runtime.division_by_zero",
             Self::IntegerOverflow => "runtime.integer_overflow",
             Self::InternalError => "runtime.internal_error",
+            Self::ExecutionIdentityUnavailable => "runtime.execution_identity_unavailable",
             Self::JournalCapacityExceeded => "runtime.journal_capacity_exceeded",
             Self::CleanupScopeFailed => "runtime.cleanup_scope_failed",
             Self::CleanupBrowserContextFailed => "runtime.cleanup_browser_context_failed",
@@ -282,6 +279,7 @@ impl RuntimeFailureCode {
             "division_by_zero" => Some(Self::DivisionByZero),
             "integer_overflow" => Some(Self::IntegerOverflow),
             "internal_error" => Some(Self::InternalError),
+            "execution_identity_unavailable" => Some(Self::ExecutionIdentityUnavailable),
             "journal_capacity_exceeded" => Some(Self::JournalCapacityExceeded),
             "cleanup_scope_failed" => Some(Self::CleanupScopeFailed),
             "cleanup_browser_context_failed" => Some(Self::CleanupBrowserContextFailed),
@@ -293,7 +291,9 @@ impl RuntimeFailureCode {
 
     pub const fn default_reference_queries(self) -> &'static [&'static str] {
         match self {
-            Self::JournalCapacityExceeded => &["runtime.configuration"],
+            Self::ExecutionIdentityUnavailable | Self::JournalCapacityExceeded => {
+                &["runtime.configuration"]
+            }
             Self::AppBridgeHandshake
             | Self::AppBridgeProtocol
             | Self::AppBridgeTransport
@@ -428,19 +428,6 @@ pub enum ValueDiff {
         expected_item: String,
         actual: String,
     },
-}
-
-static NEXT_EXECUTION_ID: AtomicU64 = AtomicU64::new(1);
-
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-)]
-pub struct ExecutionId(pub u64);
-
-impl ExecutionId {
-    pub fn next() -> Self {
-        Self(NEXT_EXECUTION_ID.fetch_add(1, Ordering::Relaxed))
-    }
 }
 
 pub use webtest_host::CancellationReason;
@@ -1051,8 +1038,9 @@ mod tests {
         let store = ObservationStore::default();
         let file = FileId::new(1);
         let revision = SourceRevision::of("same source");
-        let old = ExecutionId::next();
-        let new = ExecutionId::next();
+        // Start order, not numeric/lexical ID order, decides publication.
+        let old = ExecutionId::from_u128(u128::MAX);
+        let new = ExecutionId::from_u128(1);
         let observation = |execution_id| RuntimeObservation {
             execution_id,
             file,
@@ -1084,7 +1072,7 @@ mod tests {
         let file = FileId::new(1);
         let revision = SourceRevision::of("a");
         store.record(RuntimeObservation {
-            execution_id: ExecutionId::next(),
+            execution_id: ExecutionId::from_u128(1),
             file,
             source_revision: revision,
             test_id: TestId(0),
@@ -1114,7 +1102,7 @@ mod tests {
         assert_eq!(failure.code(), RuntimeFailureCode::IntegerOverflow);
 
         let event = ExecutionEvent::StepFailed {
-            execution_id: ExecutionId(1),
+            execution_id: ExecutionId::from_u128(1),
             test_id: TestId(2),
             step_id: StepId(3),
             failure_class: FailureClass::Test,
@@ -1379,6 +1367,11 @@ mod failure_code_tests {
                 "runtime.integer_overflow",
             ),
             (C::InternalError, "internal_error", "runtime.internal_error"),
+            (
+                C::ExecutionIdentityUnavailable,
+                "execution_identity_unavailable",
+                "runtime.execution_identity_unavailable",
+            ),
             (
                 C::JournalCapacityExceeded,
                 "journal_capacity_exceeded",

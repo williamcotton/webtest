@@ -133,7 +133,10 @@ fn run_error_semantic_details(error: &RunError) -> serde_json::Value {
             "primary": run_error_semantic_details(primary),
             "secondary": secondary.iter().map(run_error_semantic_details).collect::<Vec<_>>(),
         }),
-        RunError::Browser(_) | RunError::Provider(_) | RunError::Internal(_) => {
+        RunError::ExecutionIdentity(_)
+        | RunError::Browser(_)
+        | RunError::Provider(_)
+        | RunError::Internal(_) => {
             serde_json::json!({
                 "code": run_error_code(error),
                 "failure_class": error.failure_class(),
@@ -353,7 +356,7 @@ pub(crate) fn event_reports<'a>(
                 let mut event = event_report(
                     path,
                     "attachment_created",
-                    Some(execution_id.0),
+                    Some(*execution_id),
                     Some(test_id.0),
                     Some(step_id.0),
                 );
@@ -373,7 +376,7 @@ pub(crate) fn event_reports<'a>(
                 let mut event = event_report(
                     path,
                     kind,
-                    Some(execution_id.0),
+                    Some(*execution_id),
                     Some(scope.execution_context.test_id.0),
                     None,
                 );
@@ -394,7 +397,7 @@ pub(crate) fn event_reports<'a>(
                 let mut event = event_report(
                     path,
                     kind,
-                    Some(execution_id.0),
+                    Some(*execution_id),
                     Some(scope.execution_context.test_id.0),
                     None,
                 );
@@ -410,7 +413,7 @@ pub(crate) fn event_reports<'a>(
                 let mut event = event_report(
                     path,
                     resource.kind.name(),
-                    Some(execution_id.0),
+                    Some(*execution_id),
                     Some(scope.execution_context.test_id.0),
                     None,
                 );
@@ -425,7 +428,7 @@ pub(crate) fn event_reports<'a>(
                 let mut event = event_report(
                     path,
                     scope.kind(),
-                    Some(execution_id.0),
+                    Some(*execution_id),
                     Some(scope.execution_context.test_id.0),
                     None,
                 );
@@ -433,7 +436,7 @@ pub(crate) fn event_reports<'a>(
                 event
             }
             ExecutionEvent::RunStarted { execution_id } => {
-                event_report(path, "run_started", Some(execution_id.0), None, None)
+                event_report(path, "run_started", Some(*execution_id), None, None)
             }
             ExecutionEvent::TestStarted {
                 execution_id,
@@ -443,7 +446,7 @@ pub(crate) fn event_reports<'a>(
                 let mut event = event_report(
                     path,
                     "test_started",
-                    Some(execution_id.0),
+                    Some(*execution_id),
                     Some(test_id.0),
                     None,
                 );
@@ -457,7 +460,7 @@ pub(crate) fn event_reports<'a>(
             } => event_report(
                 path,
                 "step_started",
-                Some(execution_id.0),
+                Some(*execution_id),
                 Some(test_id.0),
                 Some(step_id.0),
             ),
@@ -468,7 +471,7 @@ pub(crate) fn event_reports<'a>(
             } => event_report(
                 path,
                 "step_passed",
-                Some(execution_id.0),
+                Some(*execution_id),
                 Some(test_id.0),
                 Some(step_id.0),
             ),
@@ -484,7 +487,7 @@ pub(crate) fn event_reports<'a>(
                 let mut event = event_report(
                     path,
                     "provider_call_started",
-                    Some(execution_id.0),
+                    Some(*execution_id),
                     Some(test_id.0),
                     Some(step_id.0),
                 );
@@ -506,7 +509,7 @@ pub(crate) fn event_reports<'a>(
                 let mut event = event_report(
                     path,
                     "provider_call_finished",
-                    Some(execution_id.0),
+                    Some(*execution_id),
                     Some(test_id.0),
                     Some(step_id.0),
                 );
@@ -531,7 +534,7 @@ pub(crate) fn event_reports<'a>(
                 let mut event = event_report(
                     path,
                     "provider_call_failed",
-                    Some(execution_id.0),
+                    Some(*execution_id),
                     Some(test_id.0),
                     Some(step_id.0),
                 );
@@ -555,7 +558,7 @@ pub(crate) fn event_reports<'a>(
                 let mut event = event_report(
                     path,
                     "step_failed",
-                    Some(execution_id.0),
+                    Some(*execution_id),
                     Some(test_id.0),
                     Some(step_id.0),
                 );
@@ -583,7 +586,7 @@ pub(crate) fn event_reports<'a>(
                 let mut event = event_report(
                     path,
                     "test_timed_out",
-                    Some(execution_id.0),
+                    Some(*execution_id),
                     Some(test_id.0),
                     active_step.map(|step| step.0),
                 );
@@ -605,7 +608,7 @@ pub(crate) fn event_reports<'a>(
                 let mut event = event_report(
                     path,
                     "cleanup_failed",
-                    Some(execution_id.0),
+                    Some(*execution_id),
                     test_id.map(|test_id| test_id.0),
                     None,
                 );
@@ -625,7 +628,7 @@ pub(crate) fn event_reports<'a>(
                 let mut event = event_report(
                     path,
                     "test_finished",
-                    Some(execution_id.0),
+                    Some(*execution_id),
                     Some(test_id.0),
                     None,
                 );
@@ -651,7 +654,7 @@ pub(crate) fn event_reports<'a>(
                 let mut event = event_report(
                     path,
                     "test_skipped",
-                    Some(execution_id.0),
+                    Some(*execution_id),
                     Some(test_id.0),
                     None,
                 );
@@ -669,8 +672,7 @@ pub(crate) fn event_reports<'a>(
                 outcome,
                 failure_class,
             } => {
-                let mut event =
-                    event_report(path, "run_finished", Some(execution_id.0), None, None);
+                let mut event = event_report(path, "run_finished", Some(*execution_id), None, None);
                 event.outcome = Some(run_outcome_name(*outcome).into());
                 event.failure_class = *failure_class;
                 match outcome {
@@ -709,7 +711,7 @@ fn runtime_failure_report(failure: &RuntimeFailure) -> (String, String) {
 fn event_report(
     path: &str,
     kind: &str,
-    execution_id: Option<u64>,
+    execution_id: Option<webtest_observation::ExecutionId>,
     test_id: Option<u32>,
     step_id: Option<u32>,
 ) -> EventReport {
@@ -819,7 +821,7 @@ mod tests {
         let mut journal = EventJournal::default();
         journal.record_with_metadata(
             ExecutionEvent::AttachmentCreated {
-                execution_id: ExecutionId(1),
+                execution_id: ExecutionId::from_u128(1),
                 test_id: TestId(2),
                 step_id: StepId(3),
                 attachment: attachment.clone(),
@@ -832,7 +834,7 @@ mod tests {
         );
         let reports = journal_event_reports("tests/a.webtest", journal.records());
         let json = serde_json::to_value(&reports[0]).unwrap();
-        assert_eq!(json["schema_version"], 8);
+        assert_eq!(json["schema_version"], 9);
         assert_eq!(json["type"], "attachment_created");
         assert_eq!(
             json["attachment"],
@@ -850,7 +852,7 @@ mod tests {
     #[test]
     fn journal_overflow_output_preserves_the_exact_missing_interval() {
         let first = webtest_observation::EventIdentity {
-            execution_id: webtest_observation::ExecutionId(42),
+            execution_id: webtest_observation::ExecutionId::from_u128(42),
             event_sequence: webtest_observation::EventSequence(9),
         };
         let error = webtest_runtime::RunError::JournalOverflow(webtest_runtime::JournalOverflow {
@@ -866,7 +868,10 @@ mod tests {
         assert_eq!(data["code"], "journal_capacity_exceeded");
         assert_eq!(data["failure_class"], "infrastructure");
         assert_eq!(data["overflow"]["capacity"], 10);
-        assert_eq!(data["overflow"]["first_rejected"]["execution_id"], 42);
+        assert_eq!(
+            data["overflow"]["first_rejected"]["execution_id"],
+            "0000000000000000000000000000002a"
+        );
         assert_eq!(data["overflow"]["first_rejected"]["event_sequence"], 9);
         assert_eq!(data["overflow"]["last_rejected"]["event_sequence"], 12);
         assert_eq!(data["overflow"]["rejected_events"], 4);
@@ -959,7 +964,7 @@ mod tests {
 
     #[test]
     fn every_execution_event_variant_has_a_stable_report_kind() {
-        let execution_id = ExecutionId(7);
+        let execution_id = ExecutionId::from_u128(7);
         let test_id = TestId(3);
         let step_id = StepId(5);
         let events = vec![

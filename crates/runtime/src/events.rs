@@ -262,7 +262,7 @@ mod tests {
             &events,
             None,
             ExecutionEvent::RunStarted {
-                execution_id: ExecutionId(1),
+                execution_id: ExecutionId::from_u128(1),
             },
         );
         let third_guard = events.register_root(&third);
@@ -312,7 +312,7 @@ mod tests {
                             events,
                             Some(sink),
                             ExecutionEvent::RunStarted {
-                                execution_id: ExecutionId(producer % 2),
+                                execution_id: ExecutionId::from_u128((producer % 2) as u128),
                             },
                         );
                     }
@@ -335,7 +335,7 @@ mod tests {
         for record in records.iter().rev() {
             assert_eq!(replay.insert(record.clone()), Ok(ReplayOutcome::Inserted));
         }
-        for execution in [ExecutionId(0), ExecutionId(1)] {
+        for execution in [ExecutionId::from_u128(0), ExecutionId::from_u128(1)] {
             let sequence: Vec<_> = replay
                 .records_for(execution)
                 .map(|record| record.identity.event_sequence.0)

@@ -414,6 +414,8 @@ fn compile_source(source: &str) -> TestPlan {
     database.test_plan(file).unwrap().as_ref().clone()
 }
 
+#[path = "lifecycle/identity.rs"]
+mod identity;
 #[path = "lifecycle/jobs.rs"]
 mod jobs;
 #[path = "lifecycle/journal.rs"]
@@ -670,7 +672,7 @@ async fn execution_scope_occurrences_are_parented_unique_and_closed_after_childr
         else {
             continue;
         };
-        assert_eq!(*execution_id, result.execution_id);
+        assert_eq!(*execution_id, result.execution_id.expect("run started"));
         assert_eq!(event.source_revision, plan.source_revision);
         let context = &event.execution_context;
         if event.outcome.is_none() {
@@ -886,7 +888,7 @@ impl RunEventSink for ArtifactCheckingEventSink {
         };
         let stem = format!(
             "test-{}-step-{}-execution-{}",
-            test_id.0, step_id.0, execution_id.0
+            test_id.0, step_id.0, execution_id
         );
         self.artifacts_ready.store(
             [
@@ -1550,7 +1552,7 @@ async fn observations_are_cleared_before_lazy_browser_start_can_fail() {
         ],
     );
     store.record(RuntimeObservation {
-        execution_id: ExecutionId::next(),
+        execution_id: ExecutionId::from_u128(1),
         file: plan.file,
         source_revision: plan.source_revision,
         test_id: TestId(0),
@@ -1686,7 +1688,7 @@ async fn internal_step_failure_aborts_with_typed_events_and_no_user_observation(
         vec![vec![missing_binding()], vec![pure(Value::Null)]],
     );
     store.record(RuntimeObservation {
-        execution_id: ExecutionId::next(),
+        execution_id: ExecutionId::from_u128(1),
         file: plan.file,
         source_revision: plan.source_revision,
         test_id: TestId(0),
@@ -1761,7 +1763,7 @@ async fn internal_step_failure_aborts_with_typed_events_and_no_user_observation(
     ));
 
     store.record(RuntimeObservation {
-        execution_id: result.execution_id,
+        execution_id: result.execution_id.expect("run started"),
         file: plan.file,
         source_revision: plan.source_revision,
         test_id: TestId(0),

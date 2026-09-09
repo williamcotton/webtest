@@ -1718,6 +1718,43 @@ mod tests {
     }
 
     #[test]
+    fn execution_identity_guidance_is_discoverable_and_explains_startup_failure() {
+        let DescriptionResponse::Construct(topic) =
+            response(DescriptionRequest::Query("runtime.configuration".into()))
+        else {
+            panic!("configuration topic")
+        };
+        let guidance = topic
+            .guidance
+            .iter()
+            .find(|entry| entry.code == "runtime_configuration_execution_identity")
+            .unwrap();
+        for fact in [
+            "128-bit",
+            "32 lowercase hexadecimal",
+            "Separate processes",
+            "(execution_id, event_sequence)",
+            "execution_identity_unavailable",
+            "before tests start",
+            "clears stale observations",
+            "no fabricated",
+        ] {
+            assert!(guidance.summary.contains(fact), "missing {fact}");
+        }
+        let DescriptionResponse::Search(search) = response(DescriptionRequest::Search(
+            "execution_identity_unavailable".into(),
+        )) else {
+            panic!("search")
+        };
+        assert!(
+            search
+                .results
+                .iter()
+                .any(|entry| entry.id == "runtime.configuration")
+        );
+    }
+
+    #[test]
     fn runtime_configuration_attaches_only_to_its_project_query() {
         let resolved = ResolvedRuntimeConfiguration {
             selected_adapter: Some("bridge".into()),

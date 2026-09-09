@@ -18,7 +18,10 @@ fn assert_overflow(result: &webtest_runtime::RunResult, capacity: usize) {
     let overflow = failure.journal_overflow().expect("typed gap");
     assert_eq!(overflow.capacity, capacity);
     assert_eq!(result.journal.len(), capacity);
-    assert_eq!(overflow.first_rejected.execution_id, result.execution_id);
+    assert_eq!(
+        overflow.first_rejected.execution_id,
+        result.execution_id.expect("run started")
+    );
     assert_eq!(
         overflow.first_rejected.event_sequence,
         EventSequence((capacity - 1) as u64)
@@ -570,7 +573,7 @@ pub(super) fn assert_serialized_journal(result: &webtest_runtime::RunResult) {
     }
     assert_eq!(
         replay
-            .records_for(result.execution_id)
+            .records_for(result.execution_id.expect("run started"))
             .cloned()
             .collect::<Vec<_>>(),
         result.journal

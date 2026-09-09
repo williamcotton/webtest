@@ -784,7 +784,8 @@ fn run_failure_output_data(failure: &webtest_runtime::RunError) -> Value {
             "primary": run_failure_output_data(primary),
             "secondary": secondary.iter().map(run_failure_output_data).collect::<Vec<_>>(),
         }),
-        webtest_runtime::RunError::Browser(_)
+        webtest_runtime::RunError::ExecutionIdentity(_)
+        | webtest_runtime::RunError::Browser(_)
         | webtest_runtime::RunError::Provider(_)
         | webtest_runtime::RunError::Internal(_) => json!({
             "code": failure.code().short_code(),
@@ -1694,7 +1695,7 @@ mod tests {
     #[test]
     fn journal_overflow_output_preserves_the_exact_missing_interval() {
         let first = webtest_observation::EventIdentity {
-            execution_id: webtest_observation::ExecutionId(42),
+            execution_id: webtest_observation::ExecutionId::from_u128(42),
             event_sequence: webtest_observation::EventSequence(9),
         };
         let error = webtest_runtime::RunError::JournalOverflow(webtest_runtime::JournalOverflow {
@@ -1710,7 +1711,10 @@ mod tests {
         assert_eq!(data["code"], "journal_capacity_exceeded");
         assert_eq!(data["failure_class"], "infrastructure");
         assert_eq!(data["overflow"]["capacity"], 10);
-        assert_eq!(data["overflow"]["first_rejected"]["execution_id"], 42);
+        assert_eq!(
+            data["overflow"]["first_rejected"]["execution_id"],
+            "0000000000000000000000000000002a"
+        );
         assert_eq!(data["overflow"]["first_rejected"]["event_sequence"], 9);
         assert_eq!(data["overflow"]["last_rejected"]["event_sequence"], 12);
         assert_eq!(data["overflow"]["rejected_events"], 4);

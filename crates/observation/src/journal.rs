@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, num::NonZeroUsize, time::Duration};
 
 use crate::{ExecutionEvent, ExecutionId};
 
-pub const EVENT_JOURNAL_SCHEMA_VERSION: u32 = 5;
+pub const EVENT_JOURNAL_SCHEMA_VERSION: u32 = 6;
 
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
@@ -243,19 +243,19 @@ mod tests {
         let mut source = EventJournal::default();
         source.record(
             ExecutionEvent::RunStarted {
-                execution_id: ExecutionId(9),
+                execution_id: ExecutionId::from_u128(9),
             },
             time(100, 0),
         );
         source.record(
             ExecutionEvent::RunStarted {
-                execution_id: ExecutionId(3),
+                execution_id: ExecutionId::from_u128(3),
             },
             time(90, 1),
         );
         source.record(
             ExecutionEvent::RunFinished {
-                execution_id: ExecutionId(9),
+                execution_id: ExecutionId::from_u128(9),
                 outcome: crate::RunOutcomeKind::Completed,
                 failure_class: None,
             },
@@ -275,12 +275,12 @@ mod tests {
         }
         assert_eq!(
             replay
-                .records_for(ExecutionId(9))
+                .records_for(ExecutionId::from_u128(9))
                 .cloned()
                 .collect::<Vec<_>>(),
             [records[0].clone(), records[2].clone()]
         );
-        assert_eq!(replay.records_for(ExecutionId(3)).count(), 1);
+        assert_eq!(replay.records_for(ExecutionId::from_u128(3)).count(), 1);
         for record in &records {
             assert_eq!(replay.insert(record.clone()), Ok(ReplayOutcome::Duplicate));
         }
@@ -292,7 +292,7 @@ mod tests {
         let record = source
             .record(
                 ExecutionEvent::RunStarted {
-                    execution_id: ExecutionId(1),
+                    execution_id: ExecutionId::from_u128(1),
                 },
                 time(10, 0),
             )
@@ -307,7 +307,7 @@ mod tests {
         ));
         let mut changed = record.clone();
         changed.event = ExecutionEvent::RunFinished {
-            execution_id: ExecutionId(1),
+            execution_id: ExecutionId::from_u128(1),
             outcome: crate::RunOutcomeKind::Completed,
             failure_class: None,
         };
@@ -316,7 +316,7 @@ mod tests {
             Err(ReplayError::ConflictingIdentity { .. })
         ));
         let mut changed = record.clone();
-        changed.identity.execution_id = ExecutionId(2);
+        changed.identity.execution_id = ExecutionId::from_u128(2);
         assert!(matches!(
             replay.insert(changed),
             Err(ReplayError::ExecutionMismatch { .. })
@@ -330,7 +330,7 @@ mod tests {
         let next = source
             .record(
                 ExecutionEvent::RunStarted {
-                    execution_id: ExecutionId(2),
+                    execution_id: ExecutionId::from_u128(2),
                 },
                 time(12, 2),
             )
@@ -341,12 +341,12 @@ mod tests {
         );
         assert_eq!(
             replay
-                .records_for(ExecutionId(1))
+                .records_for(ExecutionId::from_u128(1))
                 .cloned()
                 .collect::<Vec<_>>(),
             [record]
         );
-        assert_eq!(replay.records_for(ExecutionId(2)).count(), 0);
+        assert_eq!(replay.records_for(ExecutionId::from_u128(2)).count(), 0);
     }
 }
 
@@ -358,7 +358,7 @@ mod wire_tests {
         EventJournal::default()
             .record(
                 ExecutionEvent::RunStarted {
-                    execution_id: ExecutionId(9),
+                    execution_id: ExecutionId::from_u128(9),
                 },
                 EventTime {
                     since_unix_epoch: Duration::from_secs(123),
@@ -402,7 +402,7 @@ mod wire_tests {
             replay.insert_json(&serde_json::to_vec(&unknown).unwrap(), limit),
             Err(ReplayDecodeError::Json(_))
         ));
-        for version in [4, 6] {
+        for version in [5, 7] {
             unknown["schema_version"] = version.into();
             assert!(
                 matches!(replay.insert_json(&serde_json::to_vec(&unknown).unwrap(), limit), Err(ReplayDecodeError::Replay(ReplayError::UnsupportedSchema { found })) if found == version)
@@ -415,7 +415,8 @@ mod wire_tests {
             Err(ReplayDecodeError::Json(_))
         ));
         let mut wrong = value.clone();
-        wrong["payload"]["execution_id"] = 10.into();
+        wrong["payload"]["execution_id"] =
+            serde_json::to_value(ExecutionId::from_u128(10)).unwrap();
         assert!(matches!(
             replay.insert_json(&serde_json::to_vec(&wrong).unwrap(), limit),
             Err(ReplayDecodeError::Replay(
@@ -447,8 +448,8 @@ mod wire_tests {
             }))
         ));
         let duplicate_field = String::from_utf8(bytes.clone()).unwrap().replacen(
-            "\"execution_id\":9",
-            "\"execution_id\":9,\"execution_id\":9",
+            "\"execution_id\":\"00000000000000000000000000000009\"",
+            "\"execution_id\":\"00000000000000000000000000000009\",\"execution_id\":\"00000000000000000000000000000009\"",
             1,
         );
         for invalid in [
@@ -464,7 +465,9 @@ mod wire_tests {
             ));
         }
         assert_eq!(
-            replay.records_for(ExecutionId(9)).collect::<Vec<_>>(),
+            replay
+                .records_for(ExecutionId::from_u128(9))
+                .collect::<Vec<_>>(),
             [&record]
         );
         assert_eq!(
@@ -480,9 +483,9 @@ mod wire_tests {
         assert_eq!(
             json,
             serde_json::json!({
-                "schema_version": 5, "execution_id": 9, "event_sequence": 0,
+                "schema_version": 6, "execution_id": "00000000000000000000000000000009", "event_sequence": 0,
                 "timestamp": {"since_unix_epoch": {"secs":123,"nanos":0}, "elapsed":{"secs":0,"nanos":5}},
-                "execution_context": {}, "kind": "run_started", "payload": {"execution_id":9}
+                "execution_context": {}, "kind": "run_started", "payload": {"execution_id":"00000000000000000000000000000009"}
             })
         );
         let bytes = serde_json::to_vec(&record).unwrap();
@@ -501,7 +504,9 @@ mod wire_tests {
             ReplayOutcome::Duplicate
         );
         assert_eq!(
-            replay.records_for(ExecutionId(9)).collect::<Vec<_>>(),
+            replay
+                .records_for(ExecutionId::from_u128(9))
+                .collect::<Vec<_>>(),
             [&record]
         );
     }
