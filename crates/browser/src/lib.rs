@@ -294,7 +294,8 @@ pub struct PageEvidence {
     pub capture_failures: Vec<String>,
 }
 
-#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[derive(Clone, Debug, Error, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "details", rename_all = "snake_case")]
 pub enum BrowserError {
     #[error("no element matching {locator} was found")]
     LocatorNotFound { locator: Locator },

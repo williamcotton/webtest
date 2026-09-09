@@ -2437,6 +2437,9 @@ async fn provider_failure_is_redacted_before_control_events_and_observation() {
         store.observations_for(plan.file, plan.source_revision)
     );
     assert!(!reachable.contains("private"), "secret leaked: {reachable}");
+    let wire = serde_json::to_string(&result.journal).unwrap();
+    assert!(!wire.contains("private"), "wire secret leaked: {wire}");
+    journal::assert_serialized_journal(&result);
     assert!(hook_log.contains("argument.token"));
     assert!(hook_log.contains("[redacted]"));
     assert_eq!(

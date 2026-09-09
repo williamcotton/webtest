@@ -555,6 +555,42 @@ Verification: `cargo test --workspace` passes, including all 114 runtime lifecyc
 tests and CLI/LSP/DAP integration tests. Warning-free workspace Clippy, Rust
 formatting, portable WASM compilation, and focused retry checks also pass.
 
+### Native journal wire-envelope continuation — 2026-09-08
+
+Native journal schema 4 serializes complete `RecordedEvent` values through the
+existing observation/browser/provider DTOs. The flat JSON envelope carries
+schema version, execution ID, event sequence, both clocks, optional source/origin
+and execution context, and a tagged typed payload. Native tags mirror the current `ExecutionEvent`
+variants; scope/attempt payloads retain their explicit entry or terminal state,
+while CLI projections keep their existing phase-specific labels. Browser/runtime failures,
+value diffs, provider errors, repair hints, scope/attempt facts, waits, resources,
+and existing terminal summaries round-trip without being converted through CLI
+report strings. Payload-owned identity/context remain explicit and must agree
+with envelope metadata during replay; absent occurrence fields stay absent.
+
+`ReplayJournal::insert_json` checks a caller-supplied positive per-record byte
+limit before parsing, checks schema version before interpreting the event payload,
+then applies the existing immutable replay validation and retained-record bound.
+Malformed JSON, unknown envelope fields/kinds, duplicate fields, mismatched context
+or execution identity, conflicting deliveries, and capacity failures leave accepted
+records unchanged. Errors retain typed byte-limit/replay variants or the original
+JSON decoding error. JSON whitespace does not affect duplicate identity. The byte
+limit bounds individual incoming records; transport framing and total stream or
+trace retention budgets remain the future reader's responsibility.
+
+Deterministic tests round-trip real interleaved sibling, retry, cancellation,
+timeout, provider, resource, cleanup, and skipped-test journals, replay them in
+reverse order, and verify duplicates at capacity. Browser/provider failure matrices
+retain their structured variants, and provider secrets remain redacted in serialized
+records. Existing CLI report/event schema 7, plan format 9, and runtime semantics 6
+are unchanged. This native API adds no trace writer or CLI export option. Execution
+IDs remain process-local; durable cross-process identity, remaining event kinds,
+trace artifacts/viewer, observation IPC, and concurrent DAP are still pending.
+
+Verification: `cargo test --workspace`, warning-free workspace Clippy, Rust
+formatting, and WASM compilation pass. Both `webtest-wasm` and the newly
+serializable `webtest-observation` core compile for `wasm32-unknown-unknown`.
+
 ## 1. Outcome
 
 Tests can express bounded parallelism, races, retries, and timeouts without leaking child work or losing cleanup. Every attempt and cancellation remains source-mapped in terminal output, traces, editor observations, DAP, and versioned machine output.

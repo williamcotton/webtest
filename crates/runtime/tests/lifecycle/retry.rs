@@ -781,6 +781,7 @@ async fn retry_preserves_separate_artifact_files_for_every_failed_attempt() {
 /// Attempt facts surround the same explicit owned scope, including cancellation
 /// and teardown failures. Descendants must not masquerade as extra attempts.
 fn assert_attempt_events(result: &webtest_runtime::RunResult) {
+    super::journal::assert_serialized_journal(result);
     use webtest_observation::{AttemptEvent, EventMetadata, ReplayJournal, ScopeEvent};
     let mut replay = ReplayJournal::new(std::num::NonZeroUsize::new(result.journal.len()).unwrap());
     for record in result.journal.iter().rev() {

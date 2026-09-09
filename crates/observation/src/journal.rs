@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, num::NonZeroUsize, time::Duration};
 
 use crate::{ExecutionEvent, ExecutionId};
 
-pub const EVENT_JOURNAL_SCHEMA_VERSION: u32 = 3;
+pub const EVENT_JOURNAL_SCHEMA_VERSION: u32 = 4;
 
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
@@ -27,13 +27,20 @@ pub struct EventTime {
     pub elapsed: Duration,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Complete native wire envelope. Serde checks its shape; replay ingestion also
+/// validates version, identity, source/context agreement, and immutable delivery.
+/// Optional source/occurrence fields remain absent when they do not apply.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecordedEvent {
     pub schema_version: u32,
+    #[serde(flatten)]
     pub identity: EventIdentity,
     pub timestamp: EventTime,
+    #[serde(flatten)]
     pub metadata: crate::EventMetadata,
     /// Original typed fact, including scope, source and resource identities.
+    #[serde(flatten)]
     pub event: ExecutionEvent,
 }
 
@@ -117,6 +124,15 @@ pub enum ReplayError {
     },
 }
 
+/// Bounded wire ingestion errors preserve syntax/data locations and typed replay
+/// failures. Rejected input never mutates the replay index.
+#[derive(Debug)]
+pub enum ReplayDecodeError {
+    RecordTooLarge { limit: usize, actual: usize },
+    Json(serde_json::Error),
+    Replay(ReplayError),
+}
+
 /// Bounded replay index. Out-of-order delivery is legal, including gaps in a
 /// subscriber projection. Exact duplicates never consume additional capacity.
 pub struct ReplayJournal {
@@ -130,6 +146,35 @@ impl ReplayJournal {
             capacity,
             records: BTreeMap::new(),
         }
+    }
+
+    /// Decode one complete JSON record within a caller-selected byte budget.
+    /// This is independent of retained event count; framing/total stream budgets
+    /// remain the caller's responsibility. Check version before typed payloads so
+    /// future event kinds are rejected as an unsupported contract, not guessed.
+    pub fn insert_json(
+        &mut self,
+        input: &[u8],
+        max_bytes: NonZeroUsize,
+    ) -> Result<ReplayOutcome, ReplayDecodeError> {
+        if input.len() > max_bytes.get() {
+            return Err(ReplayDecodeError::RecordTooLarge {
+                limit: max_bytes.get(),
+                actual: input.len(),
+            });
+        }
+        #[derive(serde::Deserialize)]
+        struct Header {
+            schema_version: u32,
+        }
+        let header: Header = serde_json::from_slice(input).map_err(ReplayDecodeError::Json)?;
+        if header.schema_version != EVENT_JOURNAL_SCHEMA_VERSION {
+            return Err(ReplayDecodeError::Replay(ReplayError::UnsupportedSchema {
+                found: header.schema_version,
+            }));
+        }
+        let record = serde_json::from_slice(input).map_err(ReplayDecodeError::Json)?;
+        self.insert(record).map_err(ReplayDecodeError::Replay)
     }
 
     pub fn insert(&mut self, record: RecordedEvent) -> Result<ReplayOutcome, ReplayError> {
@@ -302,5 +347,162 @@ mod tests {
             [record]
         );
         assert_eq!(replay.records_for(ExecutionId(2)).count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+
+    fn record() -> RecordedEvent {
+        EventJournal::default()
+            .record(
+                ExecutionEvent::RunStarted {
+                    execution_id: ExecutionId(9),
+                },
+                EventTime {
+                    since_unix_epoch: Duration::from_secs(123),
+                    elapsed: Duration::from_nanos(5),
+                },
+            )
+            .clone()
+    }
+
+    #[test]
+    fn bounded_wire_replay_rejects_corruption_without_mutating_accepted_records() {
+        let record = record();
+        let value = serde_json::to_value(&record).unwrap();
+        let bytes = serde_json::to_vec(&record).unwrap();
+        let limit = NonZeroUsize::new(16_384).unwrap();
+        let mut replay = ReplayJournal::new(NonZeroUsize::new(1).unwrap());
+        replay.insert_json(&bytes, limit).unwrap();
+        assert!(
+            matches!(replay.insert_json(&bytes, NonZeroUsize::new(bytes.len() - 1).unwrap()), Err(ReplayDecodeError::RecordTooLarge { actual, .. }) if actual == bytes.len())
+        );
+        for field in [
+            "kind",
+            "execution_id",
+            "payload",
+            "timestamp",
+            "execution_context",
+        ] {
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                matches!(
+                    replay.insert_json(&serde_json::to_vec(&missing).unwrap(), limit),
+                    Err(ReplayDecodeError::Json(_))
+                ),
+                "missing {field}"
+            );
+        }
+        let mut unknown = value.clone();
+        unknown["kind"] = "future_kind".into();
+        assert!(matches!(
+            replay.insert_json(&serde_json::to_vec(&unknown).unwrap(), limit),
+            Err(ReplayDecodeError::Json(_))
+        ));
+        for version in [3, 5] {
+            unknown["schema_version"] = version.into();
+            assert!(
+                matches!(replay.insert_json(&serde_json::to_vec(&unknown).unwrap(), limit), Err(ReplayDecodeError::Replay(ReplayError::UnsupportedSchema { found })) if found == version)
+            );
+        }
+        let mut extra = value.clone();
+        extra["unrecognized"] = true.into();
+        assert!(matches!(
+            replay.insert_json(&serde_json::to_vec(&extra).unwrap(), limit),
+            Err(ReplayDecodeError::Json(_))
+        ));
+        let mut wrong = value.clone();
+        wrong["payload"]["execution_id"] = 10.into();
+        assert!(matches!(
+            replay.insert_json(&serde_json::to_vec(&wrong).unwrap(), limit),
+            Err(ReplayDecodeError::Replay(
+                ReplayError::ExecutionMismatch { .. }
+            ))
+        ));
+        wrong = value.clone();
+        wrong["execution_context"]["test_id"] = 2.into();
+        assert!(matches!(
+            replay.insert_json(&serde_json::to_vec(&wrong).unwrap(), limit),
+            Err(ReplayDecodeError::Replay(
+                ReplayError::MetadataMismatch { .. }
+            ))
+        ));
+        wrong = value.clone();
+        wrong["timestamp"]["elapsed"]["nanos"] = 7.into();
+        assert!(matches!(
+            replay.insert_json(&serde_json::to_vec(&wrong).unwrap(), limit),
+            Err(ReplayDecodeError::Replay(
+                ReplayError::ConflictingIdentity { .. }
+            ))
+        ));
+        wrong = value.clone();
+        wrong["event_sequence"] = 1.into();
+        assert!(matches!(
+            replay.insert_json(&serde_json::to_vec(&wrong).unwrap(), limit),
+            Err(ReplayDecodeError::Replay(ReplayError::CapacityExceeded {
+                capacity: 1
+            }))
+        ));
+        let duplicate_field = String::from_utf8(bytes.clone()).unwrap().replacen(
+            "\"execution_id\":9",
+            "\"execution_id\":9,\"execution_id\":9",
+            1,
+        );
+        for invalid in [
+            b"".to_vec(),
+            b"{".to_vec(),
+            vec![0xff],
+            [bytes.as_slice(), b" {}"].concat(),
+            duplicate_field.into_bytes(),
+        ] {
+            assert!(matches!(
+                replay.insert_json(&invalid, limit),
+                Err(ReplayDecodeError::Json(_))
+            ));
+        }
+        assert_eq!(
+            replay.records_for(ExecutionId(9)).collect::<Vec<_>>(),
+            [&record]
+        );
+        assert_eq!(
+            replay.insert_json(&bytes, limit).unwrap(),
+            ReplayOutcome::Duplicate
+        );
+    }
+
+    #[test]
+    fn wire_envelope_is_flat_typed_and_replays_idempotently() {
+        let record = record();
+        let json = serde_json::to_value(&record).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "schema_version": 4, "execution_id": 9, "event_sequence": 0,
+                "timestamp": {"since_unix_epoch": {"secs":123,"nanos":0}, "elapsed":{"secs":0,"nanos":5}},
+                "execution_context": {}, "kind": "run_started", "payload": {"execution_id":9}
+            })
+        );
+        let bytes = serde_json::to_vec(&record).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<RecordedEvent>(&bytes).unwrap(),
+            record
+        );
+        let mut replay = ReplayJournal::new(NonZeroUsize::new(1).unwrap());
+        let limit = NonZeroUsize::new(bytes.len()).unwrap();
+        assert_eq!(
+            replay.insert_json(&bytes, limit).unwrap(),
+            ReplayOutcome::Inserted
+        );
+        assert_eq!(
+            replay.insert_json(&bytes, limit).unwrap(),
+            ReplayOutcome::Duplicate
+        );
+        assert_eq!(
+            replay.records_for(ExecutionId(9)).collect::<Vec<_>>(),
+            [&record]
+        );
     }
 }

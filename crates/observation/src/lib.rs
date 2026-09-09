@@ -8,7 +8,7 @@ mod scope;
 mod wait;
 pub use journal::{
     EVENT_JOURNAL_SCHEMA_VERSION, EventIdentity, EventJournal, EventSequence, EventTime,
-    RecordedEvent, ReplayError, ReplayJournal, ReplayOutcome,
+    RecordedEvent, ReplayDecodeError, ReplayError, ReplayJournal, ReplayOutcome,
 };
 pub use resource::{
     AcquisitionState, ResourceAccess, ResourceEvent, ResourceEventKind, ResourceKey, ResourceKind,
@@ -400,7 +400,7 @@ impl<'de> serde::Deserialize<'de> for RuntimeFailureCode {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ValueDiff {
     Scalar {
@@ -443,14 +443,14 @@ impl ExecutionId {
 
 pub use webtest_host::CancellationReason;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkipReason {
     RunCancelled,
     RunAborted,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TestOutcomeKind {
     Passed,
@@ -460,7 +460,7 @@ pub enum TestOutcomeKind {
     Aborted,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunOutcomeKind {
     Completed,
@@ -468,7 +468,7 @@ pub enum RunOutcomeKind {
     Aborted,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CleanupResource {
     ExecutionScope {
@@ -646,7 +646,8 @@ mod cleanup_tests {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", content = "details", rename_all = "snake_case")]
 pub enum RuntimeFailure {
     TestTimeout {
         timeout_ms: u64,
@@ -684,7 +685,13 @@ impl RuntimeFailure {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "payload",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum ExecutionEvent {
     Attempt {
         execution_id: ExecutionId,
@@ -1577,6 +1584,14 @@ mod failure_code_tests {
             ),
         ];
         for (error, code, class) in cases {
+            let failure = super::RuntimeFailure::Browser(error.clone());
+            assert_eq!(
+                serde_json::from_value::<super::RuntimeFailure>(
+                    serde_json::to_value(&failure).unwrap()
+                )
+                .unwrap(),
+                failure
+            );
             assert_eq!(RuntimeFailureCode::from(&error), code);
             assert_eq!(code.short_code(), error.code());
             assert_eq!(
@@ -1741,6 +1756,14 @@ mod failure_code_tests {
             ),
         ];
         for (error, code, class) in cases {
+            let failure = super::RuntimeFailure::Provider(error.clone());
+            assert_eq!(
+                serde_json::from_value::<super::RuntimeFailure>(
+                    serde_json::to_value(&failure).unwrap()
+                )
+                .unwrap(),
+                failure
+            );
             assert_eq!(RuntimeFailureCode::from(&error), code);
             assert_eq!(code.short_code(), error.code());
             assert_eq!(

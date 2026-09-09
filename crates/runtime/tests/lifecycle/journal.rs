@@ -11,6 +11,7 @@ fn bounded_runner(capacity: usize) -> Runner {
 }
 
 fn assert_overflow(result: &webtest_runtime::RunResult, capacity: usize) {
+    assert_serialized_journal(result);
     let RunOutcome::Aborted { failure, .. } = &result.outcome else {
         panic!("collector exhaustion did not abort: {:?}", result.outcome);
     };
@@ -290,6 +291,7 @@ async fn collector_failure_closes_even_a_fast_projection_with_a_typed_journal_ga
 }
 
 fn assert_source_and_operation_metadata(plan: &TestPlan, result: &webtest_runtime::RunResult) {
+    assert_serialized_journal(result);
     use webtest_observation::{EventMetadata, ReplayJournal, ReplayOutcome};
     let mut replay = ReplayJournal::new(NonZeroUsize::new(result.journal.len()).unwrap());
     for record in result.journal.iter().rev() {
@@ -452,6 +454,7 @@ async fn journal_metadata_maps_skipped_tests_without_fabricating_runtime_occurre
         .run(&plan, &LifecycleHost(Arc::default()))
         .await;
     assert_eq!(result.skipped(), 1);
+    assert_serialized_journal(&result);
     for record in &result.journal {
         assert_eq!(record.metadata.source_revision, Some(plan.source_revision));
         assert!(
@@ -541,4 +544,35 @@ async fn journal_exhaustion_on_attempt_events_preserves_explicit_gaps_and_stops_
             Duration::ZERO
         );
     }
+}
+
+/// Exercise the portable wire representation against real execution, including
+/// out-of-order delivery and semantically identical re-delivery at capacity.
+pub(super) fn assert_serialized_journal(result: &webtest_runtime::RunResult) {
+    use webtest_observation::{RecordedEvent, ReplayJournal, ReplayOutcome};
+    let mut replay = ReplayJournal::new(NonZeroUsize::new(result.journal.len()).unwrap());
+    for record in result.journal.iter().rev() {
+        let bytes = serde_json::to_vec(record).unwrap();
+        let decoded: RecordedEvent = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(&decoded, record);
+        let limit = NonZeroUsize::new(bytes.len()).unwrap();
+        assert_eq!(
+            replay.insert_json(&bytes, limit).unwrap(),
+            ReplayOutcome::Inserted
+        );
+        let pretty = serde_json::to_vec_pretty(record).unwrap();
+        assert_eq!(
+            replay
+                .insert_json(&pretty, NonZeroUsize::new(pretty.len()).unwrap())
+                .unwrap(),
+            ReplayOutcome::Duplicate
+        );
+    }
+    assert_eq!(
+        replay
+            .records_for(result.execution_id)
+            .cloned()
+            .collect::<Vec<_>>(),
+        result.journal
+    );
 }
