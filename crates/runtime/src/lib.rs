@@ -46,8 +46,8 @@ pub use subscription::{
 };
 pub use url::resolve_browser_url;
 pub use waits::{
-    TimerWait, WaitCleanupFailure, WaitCleanupPhase, WaitCompletion, WaitInvariant, WaitOutcome,
-    WaitRegistry, WaitSource,
+    TimerWait, WaitCleanupFailure, WaitCleanupPhase, WaitCompletion, WaitInvariant,
+    WaitNotification, WaitOutcome, WaitRegistry, WaitSource,
 };
 pub use webtest_feedback::FailureClass;
 pub use webtest_observation::{

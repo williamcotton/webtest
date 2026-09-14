@@ -66,15 +66,13 @@ pub(super) async fn execute_child(
         let mut source = wait::TestBodyWait::new(execution.body(node, &scope));
         let mut result = services
             .waits
-            .wait(&scope.context, &mut source, cleanup_timeout, |event| {
-                emit_event(
+            .wait_observed(&scope.context, &mut source, cleanup_timeout, |event| {
+                crate::events::emit_wait_notification(
+                    &scope.event,
                     services.events,
                     services.event_sink,
-                    ExecutionEvent::Wait {
-                        execution_id: services.execution_id,
-                        scope: scope.event.clone(),
-                        event,
-                    },
+                    services.execution_id,
+                    event,
                 );
             })
             .await;

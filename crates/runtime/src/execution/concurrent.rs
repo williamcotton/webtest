@@ -17,10 +17,12 @@ impl TreeExecution<'_, '_> {
         };
         self.branch.active_step = None;
         self.branch.active_operation = None;
+        let mut child_scopes = Vec::with_capacity(children.len());
         let children = children
             .iter()
             .map(|node| {
                 let scope = services.scopes.branch(parent, node);
+                child_scopes.push(scope.event.clone());
                 let mut state = self.branch.fork();
                 let (signal, receiver) = scheduler::FailureSignal::channel();
                 state.failure_signals.push(signal);
@@ -52,6 +54,15 @@ impl TreeExecution<'_, '_> {
                 // Persist completed children in the parent's own state as they
                 // finish. An enclosing interrupted wait cannot discard them.
                 self.branch.completed_branches.push(result);
+            },
+            |ordinal, cause| {
+                crate::events::emit_cancellation_request(
+                    &child_scopes[ordinal],
+                    services.events,
+                    services.event_sink,
+                    services.execution_id,
+                    cause,
+                )
             },
         )
         .await;

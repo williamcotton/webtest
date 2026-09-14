@@ -31,10 +31,10 @@ Milestone E is **not complete**. The execution-tree, resource/wait foundations, 
   resolved configuration, keeping configuration values out of the artifact. Shared validation
   checks tree structure, identities, revisions, capability requirements, and explicit execution
   inputs for detectable drift. There is still no CLI command to execute an emitted plan.
-- Native journal schema 7 and CLI report/event schema 10 use opaque 128-bit execution IDs,
+- Native journal schema 8 and CLI report/event schema 11 use opaque 128-bit execution IDs,
   serialized as 32 lowercase hexadecimal digits. Native OS randomness allocates independent
   file-run IDs across processes; replay identity is `(ExecutionId, event_sequence)`.
-  The bounded journal retains attachments, source/context metadata, clocks, explicit retry
+  The bounded journal retains attachments, completed process-output snapshots, source/context metadata, clocks, explicit retry
   attempts, typed scope/cancellation facts, and ordered branch aggregates. Remaining event
   kinds and complete host/resource coverage are still pending.
 - Runtime observations accumulate privately and commit as a complete batch. Starting another
@@ -702,6 +702,89 @@ Clippy and Rust formatting pass. Both `webtest-wasm` and `webtest-observation`
 compile for `wasm32-unknown-unknown`. Focused tests cover typed launch/internal
 aborts, independent siblings, prior outcomes and late cancellation, redaction,
 immutable replay, reserved overflow payloads, and CLI event projection.
+
+### Cancellation-request journal continuation — 2026-09-14
+
+Native journal schema 8 adds `CancellationRequested` with immutable target scope,
+source, operation/attempt metadata, typed reason, and causing scope identity.
+Requests publish synchronously at the existing request sites after the first cause
+is accepted and before notifying waits and propagating to descendants. Repeated
+requests and inherited propagation produce no duplicate originating requests;
+wait and scope terminal facts continue to describe the resulting cancellation.
+
+The token exposes a borrowed synchronous observer, with no persistent collector
+callback or shared branch state. Generic wait/resource drivers forward deadline
+requests; sibling scheduling forwards `ParentFailed`/`RaceLost`, RunControl forwards
+its typed reason, and journal exhaustion forwards `RunnerShutdown`. Execution-tree
+parentage, branch-local ownership, early fatal-failure signaling, and structurally
+awaited teardown are unchanged. A run cancelled before test admission has no scope
+request and retains its reason in its run terminal.
+
+Overflow now copies root cancellation registrations under the journal lock and
+cancels them after unlocking. Request publication can therefore reenter an exhausted
+collector without deadlocking. Rejected request records extend the same explicit
+missing-event interval, and the reserved run terminal retains the complete overflow.
+
+The sibling scheduler now marks a returned child complete before processing
+primary-failure notices published during that same poll. The failure still prevents
+race success, while an already-finished sibling receives no late cancellation
+request. Slow failing-child teardown remains structurally awaited.
+
+CLI report/event schema 11 projects `cancellation_requested` and typed
+`cancellation_cause`; canonical describe/search, installed guidance, and examples
+explain requests versus completion and first-cause retention. Plan format 9 and
+runtime semantics 6 are unchanged. Output events, complete host/resource coverage,
+traces, observation IPC, and concurrent DAP remain pending.
+
+Focused coverage verifies synchronous first-request publication, idempotence and
+reentrant token access, early fatal sibling cancellation, race-loss retention
+through ancestor timeout, every RunControl reason, retry backoff and attempt
+identity (including unpolled owned losers), completion-before-notice handling,
+overflow accounting, immutable replay, and CLI projection. Bootstrap guidance was
+brought back into agreement with the existing initializer assertions. The HTTP
+CLI fixture now drains the declared POST body before responding/closing, avoiding
+an intermittent connection reset caused by assuming one read received the request.
+
+Verification: `cargo test --workspace` passes, including all 131 runtime lifecycle
+tests, native browser/protocol integration, and doc tests. Warning-free workspace
+Clippy and Rust formatting pass. Both `webtest-wasm` and `webtest-observation`
+compile for `wasm32-unknown-unknown`.
+
+### Completed process-output journal continuation — 2026-09-14
+
+The pending native journal schema 8 and CLI report/event schema 11 now also include
+`OutputCaptured`. A completed top-level typed `ProcessResult` yields stdout/stderr
+snapshots, including unbound/discarded results and nonzero process exits. Publication
+uses the existing operation's immutable metadata before its provider terminal;
+recovered retry attempts retain distinct output facts. The native capture driver
+still owns pipes, byte limits, interruption, and process reaping. This adds no
+second capture engine, shared branch state, or detached subscription tasks.
+
+Runtime redacts complete decoded streams before truncating each to 65536 UTF-8
+bytes. Known branch/argument secrets are replaced longest-first, and configured
+stdout/stderr field suppression is honored. Typed capture DTOs preserve original
+captured byte length, redacted length before truncation, and lossy/redacted/truncated
+flags; raw stream bytes are not persisted in these records. Each call publishes
+stdout then stderr as snapshots, without claiming interleaved pipe chronology.
+
+These records share the existing authoritative event budget and explicit overflow
+interval. Failed startup, cancellation, timeout, and provider capture-limit failure
+do not yield a completed ProcessResult, so this path claims no completed snapshots.
+Live/partial process output, application protocol output, browser console/network
+journaling, complete host/resource coverage, traces, observation IPC, and concurrent
+DAP remain pending. Plan format 9 and runtime semantics 6 remain unchanged.
+
+The existing blocked-stdin cancellation test now waits for a complete PID line
+before cancelling; file creation alone could interrupt the child before it wrote
+its PID, making the cleanup assertion race with shell redirection.
+
+Verification: `cargo test --workspace` passes, including all 136 runtime lifecycle
+tests, native browser/protocol integration, and doc tests. Focused tests cover
+discarded and nonzero process results, retry/sibling identity, UTF-8 bounds,
+redaction, binary lengths, journal overflow, startup failure, interrupted and
+over-limit captures, and CLI projection. Warning-free workspace Clippy and Rust
+formatting pass. Both `webtest-wasm` and `webtest-observation` compile for
+`wasm32-unknown-unknown`.
 
 ## 1. Outcome
 

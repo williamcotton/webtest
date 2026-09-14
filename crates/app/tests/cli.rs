@@ -467,7 +467,7 @@ fn check_without_paths_discovers_configured_tests_in_order() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON report");
-    assert_eq!(report["schema_version"], 10);
+    assert_eq!(report["schema_version"], 11);
     let paths = report["files"]
         .as_array()
         .expect("files")
@@ -678,8 +678,37 @@ fn server_only_http_decode_and_assertion_runs_without_chrome() {
     let address = listener.local_addr().expect("fixture address");
     let fixture = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("fixture request");
-        let mut request = [0u8; 4096];
-        let _ = stream.read(&mut request);
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0; 1024];
+        let header_end = loop {
+            let count = stream.read(&mut buffer).expect("request headers");
+            assert!(count > 0, "request ended before headers");
+            request.extend_from_slice(&buffer[..count]);
+            assert!(request.len() <= 16 * 1024, "oversized request");
+            if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                break end + 4;
+            }
+        };
+        let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+        let body_length: usize = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse().unwrap())
+            })
+            .expect("POST body length");
+        assert!(body_length <= 4096);
+        let received = request.len() - header_end;
+        assert!(received <= body_length);
+        // A single read may contain only headers. Closing with unread POST bytes
+        // can reset the connection before the client receives the response.
+        stream
+            .read_exact(&mut vec![0; body_length - received])
+            .expect("request body");
         let body = r#"{"id":7,"email":"alice@example.test"}"#;
         write!(
             stream,
@@ -996,7 +1025,7 @@ fn parallel_reports_every_branch_failure_in_deterministic_source_order() {
         if reporter == "json" || reporter == "events" {
             let test = if reporter == "json" {
                 let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-                assert_eq!(value["schema_version"], 10);
+                assert_eq!(value["schema_version"], 11);
                 value["files"][0]["tests"][0].clone()
             } else {
                 let events: Vec<serde_json::Value> = text
@@ -1007,7 +1036,7 @@ fn parallel_reports_every_branch_failure_in_deterministic_source_order() {
                     .iter()
                     .find(|event| event["type"] == "test_result")
                     .unwrap();
-                assert_eq!(aggregate["schema_version"], 10);
+                assert_eq!(aggregate["schema_version"], 11);
                 aggregate["test"].clone()
             };
             assert_eq!(test["outcome"], "failed");
@@ -1070,7 +1099,7 @@ fn public_race_reports_the_winner_and_retains_failed_alternatives() {
         let stdout = String::from_utf8(output.stdout).unwrap();
         if reporter == "json" {
             let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-            assert_eq!(report["schema_version"], 10);
+            assert_eq!(report["schema_version"], 11);
             let test = &report["files"][0]["tests"][0];
             assert_eq!(test["outcome"], "passed");
             assert_eq!(test["branches"][0]["race_winner"], false);
@@ -1144,7 +1173,7 @@ fn public_retry_reports_every_attempt_and_rejects_unsafe_work_before_execution()
                 .collect();
             assert_eq!(attempts.len(), 4);
             for (index, attempt) in attempts.iter().enumerate() {
-                assert_eq!(attempt["schema_version"], 10);
+                assert_eq!(attempt["schema_version"], 11);
                 assert_eq!(
                     attempt["attempt"],
                     serde_json::json!({"ordinal": index / 2 + 1, "max_attempts": 2})
@@ -1395,7 +1424,7 @@ fn execution_identities_are_canonical_and_disjoint_across_cli_processes() {
             let events: Vec<_> = records.iter().filter(|r| r["execution_id"] == id).collect();
             assert!(events.len() > 10);
             for (sequence, record) in events.iter().enumerate() {
-                assert_eq!(record["schema_version"], 10);
+                assert_eq!(record["schema_version"], 11);
                 assert_eq!(record["event_sequence"], sequence);
                 assert_eq!(record["file"], start["file"]);
             }
@@ -1443,7 +1472,7 @@ fn event_report_retains_typed_browser_startup_failure_and_terminal_abort() {
         .iter()
         .find(|r| r["type"] == "scope_aborted")
         .unwrap();
-    assert_eq!(abort["schema_version"], 10);
+    assert_eq!(abort["schema_version"], 11);
     assert_eq!(abort["code"], "runtime.browser_crashed");
     assert_eq!(abort["failure_class"], "infrastructure");
     assert_eq!(abort["execution_failure"]["kind"], "browser");

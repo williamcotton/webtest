@@ -1497,7 +1497,11 @@ mod tests {
             }
             async fn cancelled(&self) -> webtest_host::Cancellation {
                 tokio::time::timeout(Duration::from_secs(5), async {
-                    while !self.0.exists() {
+                    // Redirection creates the file before echo writes the PID.
+                    // Wait for the whole line before cancellation can kill the writer.
+                    while !std::fs::read_to_string(&self.0).is_ok_and(|text| {
+                        text.ends_with('\n') && text.trim().parse::<i32>().is_ok_and(|pid| pid > 0)
+                    }) {
                         tokio::time::sleep(Duration::from_millis(5)).await;
                     }
                 })

@@ -35,6 +35,47 @@ pub(crate) fn emit_event(
     emit_event_with_metadata(metadata, events, sink, event);
 }
 
+pub(crate) fn emit_cancellation_request(
+    scope: &ScopeEvent,
+    events: &EventBuffer,
+    sink: Option<&dyn RunEventSink>,
+    execution_id: webtest_observation::ExecutionId,
+    cause: webtest_host::Cancellation,
+) {
+    emit_event(
+        events,
+        sink,
+        ExecutionEvent::CancellationRequested {
+            execution_id,
+            scope: scope.clone(),
+            cause,
+        },
+    );
+}
+
+pub(crate) fn emit_wait_notification(
+    scope: &ScopeEvent,
+    events: &EventBuffer,
+    sink: Option<&dyn RunEventSink>,
+    execution_id: webtest_observation::ExecutionId,
+    notification: crate::WaitNotification,
+) {
+    match notification {
+        crate::WaitNotification::Wait(event) => emit_event(
+            events,
+            sink,
+            ExecutionEvent::Wait {
+                execution_id,
+                scope: scope.clone(),
+                event,
+            },
+        ),
+        crate::WaitNotification::CancellationRequested(cause) => {
+            emit_cancellation_request(scope, events, sink, execution_id, cause)
+        }
+    }
+}
+
 pub(crate) fn emit_event_in_scope(
     scope: &ScopeEvent,
     events: &EventBuffer,
@@ -50,6 +91,7 @@ pub(crate) fn emit_event_with_metadata(
     sink: Option<&dyn RunEventSink>,
     event: ExecutionEvent,
 ) {
+    let mut cancelled_roots = Vec::new();
     let publication = {
         let mut state = events.journal.lock().unwrap_or_else(|e| e.into_inner());
         let terminal = matches!(event, ExecutionEvent::RunFinished { .. });
@@ -71,11 +113,9 @@ pub(crate) fn emit_event_with_metadata(
                 for subscriber in &events.subscribers {
                     subscriber.journal_failed(identity, events.capacity.get());
                 }
-                // Cancellation tokens are a shared service, not branch state.
-                // Their propagation never calls back into the event collector.
-                for (&scope_id, token) in &state.roots {
-                    cancel_root(scope_id, token);
-                }
+                // Publish and propagate cancellation after releasing the journal lock:
+                // request publication itself can encounter the exhausted collector.
+                cancelled_roots.extend(state.roots.values().cloned());
             }
             None
         } else {
@@ -98,6 +138,9 @@ pub(crate) fn emit_event_with_metadata(
             sink.map(|sink| (sink, record.clone()))
         }
     };
+    for root in cancelled_roots {
+        cancel_root(&root, events, sink);
+    }
     if let Some((sink, record)) = publication {
         sink.publish_record(&record);
     }
@@ -107,7 +150,7 @@ pub(crate) fn emit_event_with_metadata(
 struct JournalState {
     journal: EventJournal,
     overflow: Option<JournalOverflow>,
-    roots: BTreeMap<ExecutionScopeId, CancellationToken>,
+    roots: BTreeMap<ExecutionScopeId, RootCancellation>,
 }
 
 /// Only journal retention and cancellation registration are shared. Branches
@@ -175,15 +218,29 @@ impl EventBuffer {
             .unwrap_or_else(|e| e.into_inner())
             .overflow
     }
-    pub(crate) fn register_root(&self, root: &ScopeContext) -> JournalRoot<'_> {
-        let mut state = self.journal.lock().unwrap_or_else(|e| e.into_inner());
-        if state.overflow.is_some() {
-            cancel_root(root.scope_id, &root.cancellation);
+    pub(crate) fn register_root(
+        &self,
+        context: &ScopeContext,
+        scope: &ScopeEvent,
+        execution_id: webtest_observation::ExecutionId,
+        sink: Option<&dyn RunEventSink>,
+    ) -> JournalRoot<'_> {
+        let root = RootCancellation {
+            token: context.cancellation.clone(),
+            scope: scope.clone(),
+            execution_id,
+        };
+        let overflow = {
+            let mut state = self.journal.lock().unwrap_or_else(|e| e.into_inner());
+            state.roots.insert(context.scope_id, root.clone());
+            state.overflow.is_some()
+        };
+        if overflow {
+            cancel_root(&root, self, sink);
         }
-        state.roots.insert(root.scope_id, root.cancellation.clone());
         JournalRoot {
             events: self,
-            scope_id: root.scope_id,
+            scope_id: context.scope_id,
         }
     }
     pub(crate) fn into_records(self) -> Vec<RecordedEvent> {
@@ -202,11 +259,21 @@ impl EventBuffer {
     }
 }
 
-fn cancel_root(scope_id: ExecutionScopeId, token: &CancellationToken) {
-    token.cancel(webtest_host::Cancellation {
-        reason: CancellationReason::RunnerShutdown,
-        causing_scope_id: scope_id,
-    });
+#[derive(Clone)]
+struct RootCancellation {
+    token: CancellationToken,
+    scope: ScopeEvent,
+    execution_id: webtest_observation::ExecutionId,
+}
+
+fn cancel_root(root: &RootCancellation, events: &EventBuffer, sink: Option<&dyn RunEventSink>) {
+    root.token.cancel_observed(
+        webtest_host::Cancellation {
+            reason: CancellationReason::RunnerShutdown,
+            causing_scope_id: root.scope.execution_context.scope_id,
+        },
+        |cause| emit_cancellation_request(&root.scope, events, sink, root.execution_id, cause),
+    );
 }
 
 pub(crate) struct JournalRoot<'a> {
@@ -239,6 +306,25 @@ mod tests {
             deadline: None,
             deadline_scope_id: None,
         };
+        let scope = |context: &ScopeContext| ScopeEvent {
+            execution_context: webtest_observation::ExecutionContext {
+                test_execution_id: webtest_model::TestExecutionId(0),
+                test_id: TestId(0),
+                task_path: vec![],
+                scope_id: context.scope_id,
+                parent_scope_id: None,
+                plan_node_id: webtest_model::PlanNodeId([0; 32]),
+                attempt_id: None,
+                operation_execution_id: None,
+            },
+            source_revision: SourceRevision::of("test"),
+            origin: SyntaxOrigin::new(
+                webtest_text::FileId::new(0),
+                webtest_text::TextRange::empty(0.into()),
+            ),
+            outcome: None,
+            cancellation: None,
+        };
         let first = root(1);
         let second = root(2);
         let third = root(3);
@@ -247,8 +333,10 @@ mod tests {
             causing_scope_id: second.scope_id,
         };
         second.cancellation.cancel(prior);
-        let first_guard = events.register_root(&first);
-        let second_guard = events.register_root(&second);
+        let first_guard =
+            events.register_root(&first, &scope(&first), ExecutionId::from_u128(1), None);
+        let second_guard =
+            events.register_root(&second, &scope(&second), ExecutionId::from_u128(1), None);
         emit_event(
             &events,
             None,
@@ -256,7 +344,8 @@ mod tests {
                 execution_id: ExecutionId::from_u128(1),
             },
         );
-        let third_guard = events.register_root(&third);
+        let third_guard =
+            events.register_root(&third, &scope(&third), ExecutionId::from_u128(1), None);
         assert_eq!(
             first.cancellation.cause().unwrap().reason,
             CancellationReason::RunnerShutdown
@@ -265,6 +354,13 @@ mod tests {
         assert_eq!(
             third.cancellation.cause().unwrap().reason,
             CancellationReason::RunnerShutdown
+        );
+        let overflow = events.overflow().unwrap();
+        assert_eq!(overflow.first_rejected.event_sequence.0, 0);
+        assert_eq!(overflow.last_rejected.event_sequence.0, 2);
+        assert_eq!(
+            overflow.rejected_events, 3,
+            "original event plus first and late root requests; the already cancelled root emits no new request"
         );
         drop((first_guard, second_guard, third_guard));
         assert!(events.journal.lock().unwrap().roots.is_empty());

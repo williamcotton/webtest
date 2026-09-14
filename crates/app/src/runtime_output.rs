@@ -347,6 +347,42 @@ pub(crate) fn event_reports<'a>(
     events
         .into_iter()
         .map(|event| match event {
+            ExecutionEvent::OutputCaptured {
+                execution_id,
+                test_id,
+                step_id,
+                provider,
+                operation,
+                output,
+            } => {
+                let mut event = event_report(
+                    path,
+                    "output_captured",
+                    Some(*execution_id),
+                    Some(test_id.0),
+                    Some(step_id.0),
+                );
+                event.name = Some(format!("{provider}.{operation}"));
+                event.output = Some(output.clone());
+                event
+            }
+            ExecutionEvent::CancellationRequested {
+                execution_id,
+                scope,
+                cause,
+            } => {
+                let mut event = event_report(
+                    path,
+                    "cancellation_requested",
+                    Some(*execution_id),
+                    Some(scope.execution_context.test_id.0),
+                    None,
+                );
+                event.scope = Some(scope.clone());
+                event.cancellation = Some(cause.reason);
+                event.cancellation_cause = Some(*cause);
+                event
+            }
             ExecutionEvent::ScopeAborted {
                 execution_id,
                 scope,
@@ -746,6 +782,8 @@ fn event_report(
         execution_failure: None,
         prior_outcome: None,
         cancellation: None,
+        cancellation_cause: None,
+        output: None,
         attachment: None,
         metadata: None,
         event_sequence: None,
@@ -815,6 +853,131 @@ mod tests {
     use super::*;
 
     #[test]
+    fn output_projection_preserves_lengths_flags_and_recorded_operation_identity() {
+        use webtest_model::{
+            AttemptId, ExecutionScopeId, OperationExecutionId, PlanNodeId, TestExecutionId,
+        };
+        use webtest_observation::{
+            CapturedOutput, EventContext, EventJournal, EventMetadata, EventTime, OutputStream,
+        };
+        let output = CapturedOutput {
+            stream: OutputStream::Stderr,
+            text: "é".repeat(32_768),
+            captured_byte_length: 70_100,
+            redacted_byte_length: 70_000,
+            lossy: true,
+            redacted: true,
+            truncated: true,
+        };
+        let metadata = EventMetadata {
+            execution_context: EventContext {
+                test_id: Some(TestId(2)),
+                test_execution_id: Some(TestExecutionId(1)),
+                task_path: Some(vec![0, 1]),
+                scope_id: Some(ExecutionScopeId(3)),
+                parent_scope_id: Some(ExecutionScopeId(2)),
+                plan_node_id: Some(PlanNodeId([7; 32])),
+                attempt_id: Some(AttemptId(4)),
+                operation_execution_id: Some(OperationExecutionId(5)),
+            },
+            source_revision: Some(webtest_text::SourceRevision::of("é output")),
+            origin: Some(webtest_text::SyntaxOrigin::new(
+                webtest_text::FileId::new(1),
+                webtest_text::TextRange::new(3.into(), 9.into()),
+            )),
+        };
+        let mut journal = EventJournal::default();
+        journal.record_with_metadata(
+            ExecutionEvent::OutputCaptured {
+                execution_id: ExecutionId::from_u128(1),
+                test_id: TestId(2),
+                step_id: StepId(3),
+                provider: "process".into(),
+                operation: "run".into(),
+                output: output.clone(),
+            },
+            EventTime {
+                since_unix_epoch: std::time::Duration::from_secs(7),
+                elapsed: std::time::Duration::from_millis(8),
+            },
+            metadata.clone(),
+        );
+        let reports = journal_event_reports("tests/output.webtest", journal.records());
+        let json = serde_json::to_value(&reports[0]).unwrap();
+        assert_eq!(json["schema_version"], 11);
+        assert_eq!(json["type"], "output_captured");
+        assert_eq!(json["name"], "process.run");
+        assert_eq!(json["step_id"], 3);
+        assert_eq!(json["output"], serde_json::to_value(output).unwrap());
+        assert_eq!(json["metadata"], serde_json::to_value(metadata).unwrap());
+        assert_eq!(json["event_sequence"], 0);
+    }
+
+    #[test]
+    fn cancellation_request_projection_preserves_full_cause_and_occurrence_metadata() {
+        use webtest_model::{
+            AttemptId, ExecutionScopeId, OperationExecutionId, PlanNodeId, TestExecutionId,
+        };
+        use webtest_observation::{
+            EventJournal, EventTime, ExecutionContext, ScopeCancellation, ScopeEvent,
+        };
+        let scope = ScopeEvent {
+            execution_context: ExecutionContext {
+                test_id: TestId(2),
+                test_execution_id: TestExecutionId(1),
+                task_path: vec![0, 1],
+                scope_id: ExecutionScopeId(3),
+                parent_scope_id: Some(ExecutionScopeId(2)),
+                plan_node_id: PlanNodeId([7; 32]),
+                attempt_id: Some(AttemptId(4)),
+                operation_execution_id: Some(OperationExecutionId(5)),
+            },
+            source_revision: webtest_text::SourceRevision::of("é cancellation"),
+            origin: webtest_text::SyntaxOrigin::new(
+                webtest_text::FileId::new(1),
+                webtest_text::TextRange::new(3.into(), 15.into()),
+            ),
+            outcome: None,
+            cancellation: None,
+        };
+        let cause = ScopeCancellation {
+            reason: webtest_observation::CancellationReason::RaceLost,
+            causing_scope_id: ExecutionScopeId(2),
+        };
+        let mut journal = EventJournal::default();
+        journal.record(
+            ExecutionEvent::CancellationRequested {
+                execution_id: ExecutionId::from_u128(1),
+                scope: scope.clone(),
+                cause,
+            },
+            EventTime {
+                since_unix_epoch: std::time::Duration::from_secs(7),
+                elapsed: std::time::Duration::from_millis(8),
+            },
+        );
+        let reports = journal_event_reports("tests/a.webtest", journal.records());
+        let json = serde_json::to_value(&reports[0]).unwrap();
+        assert_eq!(json["schema_version"], 11);
+        assert_eq!(json["type"], "cancellation_requested");
+        assert_eq!(json["cancellation"], "race_lost");
+        assert_eq!(
+            json["cancellation_cause"],
+            serde_json::to_value(cause).unwrap()
+        );
+        assert_eq!(json["scope"], serde_json::to_value(scope).unwrap());
+        assert_eq!(
+            json["metadata"],
+            serde_json::to_value(&journal.records()[0].metadata).unwrap()
+        );
+        assert_eq!(json["event_sequence"], 0);
+        assert!(
+            json.get("outcome").is_none(),
+            "a request is not a terminal outcome"
+        );
+    }
+
+    #[test]
     fn attachment_projection_preserves_acknowledged_content_and_recorded_context() {
         use webtest_model::{
             AttemptId, ExecutionScopeId, OperationExecutionId, PlanNodeId, TestExecutionId,
@@ -864,7 +1027,7 @@ mod tests {
         );
         let reports = journal_event_reports("tests/a.webtest", journal.records());
         let json = serde_json::to_value(&reports[0]).unwrap();
-        assert_eq!(json["schema_version"], 10);
+        assert_eq!(json["schema_version"], 11);
         assert_eq!(json["type"], "attachment_created");
         assert_eq!(
             json["attachment"],

@@ -7,6 +7,13 @@ use webtest_host::{Cancellation, CancellationReason};
 use webtest_model::{ExecutionScopeId, WaitRegistrationId};
 use webtest_observation::{WaitEvent, WaitEventKind};
 
+/// Generic driver facts, including the originating deadline cancellation request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WaitNotification {
+    Wait(WaitEvent),
+    CancellationRequested(Cancellation),
+}
+
 #[async_trait]
 pub trait WaitSource: Send {
     type Output: Send;
@@ -89,6 +96,21 @@ impl WaitRegistry {
         cleanup_timeout: Duration,
         mut emit: impl FnMut(WaitEvent) + Send,
     ) -> WaitOutcome<S::Output, S::Error> {
+        self.wait_observed(context, source, cleanup_timeout, |notification| {
+            if let WaitNotification::Wait(event) = notification {
+                emit(event);
+            }
+        })
+        .await
+    }
+
+    pub async fn wait_observed<S: WaitSource>(
+        &self,
+        context: &ScopeContext,
+        source: &mut S,
+        cleanup_timeout: Duration,
+        mut emit: impl FnMut(WaitNotification) + Send,
+    ) -> WaitOutcome<S::Output, S::Error> {
         let registration_id = {
             let mut state = self.lock();
             if state.active.len() >= self.max_active {
@@ -117,12 +139,12 @@ impl WaitRegistry {
                 cleanup_deadline: cleanup.instant(),
             };
         };
-        emit(WaitEvent {
+        emit(WaitNotification::Wait(WaitEvent {
             registration_id,
             owner_scope_id: context.scope_id,
             kind: WaitEventKind::Registered,
             cancellation: None,
-        });
+        }));
         let deadline = async {
             match context.deadline {
                 Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -136,14 +158,18 @@ impl WaitRegistry {
         let primary = tokio::select! {
             biased;
             cause = context.cancellation.cancelled() => WaitCompletion::Cancelled(cause),
-            cause = deadline => { context.cancellation.cancel(cause); WaitCompletion::Cancelled(cause) },
+            cause = deadline => {
+                context.cancellation.cancel_observed(cause, |cause| emit(WaitNotification::CancellationRequested(cause)));
+                // Another requester may have won between select and this request.
+                WaitCompletion::Cancelled(context.cancellation.cause().unwrap_or(cause))
+            },
             result = source.ready() => match result { Ok(value) => WaitCompletion::Ready(value), Err(error) => WaitCompletion::Failed(error) },
         };
         let cancellation = match &primary {
             WaitCompletion::Cancelled(cause) => Some(*cause),
             _ => None,
         };
-        emit(WaitEvent {
+        emit(WaitNotification::Wait(WaitEvent {
             registration_id,
             owner_scope_id: context.scope_id,
             kind: if cancellation.is_some() {
@@ -152,7 +178,7 @@ impl WaitRegistry {
                 WaitEventKind::Ready
             },
             cancellation,
-        });
+        }));
         let cleanup = CleanupDeadline::at(
             context.cancellation.cleanup_deadline(cleanup_timeout),
             cleanup_timeout,

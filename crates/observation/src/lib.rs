@@ -5,7 +5,9 @@ pub use execution_failure::{ExecutionFailure, JournalOverflow, PriorScopeOutcome
 mod identity;
 pub use identity::{ExecutionId, InvalidExecutionId};
 mod attachment;
+mod output;
 pub use attachment::{Artifact, ArtifactKind, Attachment};
+pub use output::{CapturedOutput, OutputStream};
 mod event_metadata;
 mod journal;
 pub use event_metadata::{EventContext, EventMetadata};
@@ -685,6 +687,21 @@ impl RuntimeFailure {
     deny_unknown_fields
 )]
 pub enum ExecutionEvent {
+    OutputCaptured {
+        execution_id: ExecutionId,
+        test_id: TestId,
+        step_id: StepId,
+        provider: String,
+        operation: String,
+        output: CapturedOutput,
+    },
+    /// A first accepted request targeting this scope. Descendant propagation is
+    /// recorded in wait and scope outcomes, not as additional originating requests.
+    CancellationRequested {
+        execution_id: ExecutionId,
+        scope: ScopeEvent,
+        cause: webtest_host::Cancellation,
+    },
     ScopeAborted {
         execution_id: ExecutionId,
         scope: ScopeEvent,
@@ -817,7 +834,9 @@ pub enum ExecutionEvent {
 impl ExecutionEvent {
     pub const fn execution_id(&self) -> ExecutionId {
         match self {
-            Self::ScopeAborted { execution_id, .. }
+            Self::OutputCaptured { execution_id, .. }
+            | Self::CancellationRequested { execution_id, .. }
+            | Self::ScopeAborted { execution_id, .. }
             | Self::AttachmentCreated { execution_id, .. }
             | Self::Attempt { execution_id, .. }
             | Self::Wait { execution_id, .. }
@@ -846,7 +865,9 @@ impl ExecutionEvent {
             Self::ProviderCallFailed { code, .. } | Self::CleanupFailed { code, .. } => Some(*code),
             Self::StepFailed { failure, .. } => Some(failure.code()),
             Self::TestTimedOut { .. } => Some(RuntimeFailureCode::TestTimeout),
-            Self::AttachmentCreated { .. }
+            Self::OutputCaptured { .. }
+            | Self::CancellationRequested { .. }
+            | Self::AttachmentCreated { .. }
             | Self::Attempt { .. }
             | Self::Wait { .. }
             | Self::Resource { .. }

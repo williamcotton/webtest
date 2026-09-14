@@ -67,15 +67,13 @@ impl TreeExecution<'_, '_> {
             let cleanup_timeout = parent.cleanup_timeout(services.options.cleanup_timeout);
             let result = services
                 .waits
-                .wait(&parent.context, &mut timer, cleanup_timeout, |event| {
-                    emit_event(
+                .wait_observed(&parent.context, &mut timer, cleanup_timeout, |event| {
+                    crate::events::emit_wait_notification(
+                        &parent.event,
                         services.events,
                         services.event_sink,
-                        ExecutionEvent::Wait {
-                            execution_id: services.execution_id,
-                            scope: parent.event.clone(),
-                            event,
-                        },
+                        services.execution_id,
+                        event,
                     )
                 })
                 .await;

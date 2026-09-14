@@ -65,6 +65,7 @@ where
 pub(super) async fn with_control<F: Future>(
     control: Option<&dyn RunControl>,
     context: &ScopeContext,
+    accepted: impl FnOnce(Cancellation),
     future: F,
 ) -> F::Output {
     let Some(control) = control else {
@@ -75,7 +76,7 @@ pub(super) async fn with_control<F: Future>(
         biased;
         result = &mut future => result,
         _ = control.cancelled() => {
-            context.cancellation.cancel(Cancellation { reason: control.cancellation_reason(), causing_scope_id: context.scope_id });
+            context.cancellation.cancel_observed(Cancellation { reason: control.cancellation_reason(), causing_scope_id: context.scope_id }, accepted);
             future.await
         }
     }

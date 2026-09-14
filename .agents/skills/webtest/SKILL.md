@@ -134,6 +134,31 @@ For HTTP responses, query `type.Response` for the `status`, `headers`, `body`, `
 
 Use `webtest <command> --help` for CLI flags and reporters. `describe` documents the language and project-visible provider surface; it is not a duplicate CLI manual.
 
+## Discover structured execution and its journal
+
+Query the installed contracts before composing control flow:
+
+```sh
+webtest describe control.timeout
+webtest describe control.parallel
+webtest describe control.race
+webtest describe statement.provide
+webtest describe control.retry
+webtest describe runtime.configuration
+```
+
+Parallel and race branches have independent bindings and lexical browser contexts; browser context isolation does not isolate a shared application's database. Retry only accepts operations the analyzer proves repeatable. Reports retain each branch/attempt outcome and source identity, including `attempt_started` / `attempt_finished`; the terminal attempt fact follows owned attempt teardown.
+
+For concurrent test roots, use `webtest test <path> --jobs 2 --reporter json` after configuring worker isolation. Runner-owned applications receive `WEBTEST_APP_URL`, `WEBTEST_APP_PORT`, and `WEBTEST_WORKER_ID`; the application must honor its assigned address, and external shared databases still require application-level isolation.
+
+Each file run has an opaque execution ID serialized as 32 lowercase hexadecimal digits. Native identity allocation failure reports `execution_identity_unavailable` before test admission, without a fabricated ID or journal. `[journal].max_events` bounds the file's event count, including its reserved final record. Exhaustion reports `journal_capacity_exceeded`, aborts execution, cancels active roots, awaits cleanup, and retains an explicit missing-event interval.
+
+`cancellation_requested` records the first accepted request at its originating site with the target scope's source/operation/attempt identity. `cancellation_cause` retains the typed reason and `causing_scope_id`. Publication precedes notification and descendant propagation; teardown remains pending until terminal facts. Repeated requests and inherited propagation do not create new originating requests. A race loser keeps its original cause if an ancestor later times out. Rejected request records count in the journal's loss interval.
+
+`output_captured` records completed top-level `ProcessResult` stdout/stderr snapshots, including discarded results and nonzero exits. Each stream is capped at 65536 UTF-8 bytes after redaction, with captured/redacted byte lengths and explicit lossy-decoding, redaction, and truncation flags. The records retain operation and attempt identity and share the journal event budget. Snapshot order is stdout then stderr per completed call, not pipe-read chronology. Interrupted or failed capture produces no completed snapshot; live/partial process output and browser console journaling remain pending.
+
+`scope_aborted` retains typed primary/secondary failures and superseded outcomes after owned cleanup. Run terminals retain typed failures and cancellation; count final test results, since scope and run summaries may repeat a cause. `attachment_created` follows an acknowledged evidence write and includes byte length and BLAKE3 digest. Read the shared configuration guidance for these facts; trace export and viewing remain pending.
+
 ## Inspect the project application
 
 Run `webtest inspect [<url>] --reporter json` to obtain bounded semantic elements and validated locator candidates. Do not start the configured application separately: an omitted or relative URL uses project mode, so WebTest starts `[app]`, waits for its health check, resolves against `browser.base_url`, inspects, and tears the application down. An absolute HTTP(S) URL is standalone and does not launch `[app]`. Inspection describes the current page state; candidates are evidence, not a guarantee against later page changes.

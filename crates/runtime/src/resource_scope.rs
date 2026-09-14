@@ -66,6 +66,7 @@ pub struct ResourceScopeOutcome<T, E> {
 pub enum ResourceScopeEvent {
     Resource(ResourceEvent),
     Wait(WaitEvent),
+    CancellationRequested(Cancellation),
 }
 
 pub struct ResourceScope<'a> {
@@ -119,7 +120,7 @@ impl ResourceScope<'_> {
         };
         let acquired = self
             .waits
-            .wait(
+            .wait_observed(
                 self.context,
                 &mut AcquireWait {
                     adapter: &mut adapter,
@@ -127,7 +128,14 @@ impl ResourceScope<'_> {
                     ownership: &ownership,
                 },
                 self.cleanup_timeout,
-                |event| emit(ResourceScopeEvent::Wait(event)),
+                |event| {
+                    emit(match event {
+                        crate::WaitNotification::Wait(event) => ResourceScopeEvent::Wait(event),
+                        crate::WaitNotification::CancellationRequested(cause) => {
+                            ResourceScopeEvent::CancellationRequested(cause)
+                        }
+                    })
+                },
             )
             .await;
         let mut secondary = acquired
@@ -150,14 +158,23 @@ impl ResourceScope<'_> {
                             lease = Some(acquired_lease);
                             let outcome = self
                                 .waits
-                                .wait(
+                                .wait_observed(
                                     self.context,
                                     &mut BodyWait {
                                         adapter: &mut adapter,
                                         body: Some(Box::pin(body(handle))),
                                     },
                                     self.cleanup_timeout,
-                                    |event| emit(ResourceScopeEvent::Wait(event)),
+                                    |event| {
+                                        emit(match event {
+                                            crate::WaitNotification::Wait(event) => {
+                                                ResourceScopeEvent::Wait(event)
+                                            }
+                                            crate::WaitNotification::CancellationRequested(
+                                                cause,
+                                            ) => ResourceScopeEvent::CancellationRequested(cause),
+                                        })
+                                    },
                                 )
                                 .await;
                             cleanup_deadline = outcome.cleanup_deadline;

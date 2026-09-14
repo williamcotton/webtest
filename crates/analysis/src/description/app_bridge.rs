@@ -624,6 +624,8 @@ fn runtime_configuration_reference() -> ConstructDescription {
         "journal max_events retention event budget journal_capacity_exceeded attachment_created evidence digest".into(),
         "execution identity execution_identity_unavailable entropy replay".into(),
         "scope_aborted execution_failure primary secondary cleanup".into(),
+        "output_captured stdout stderr captured_byte_length redacted_byte_length truncation".into(),
+        "cancellation_requested cancellation_cause causing_scope_id race_lost fail_fast".into(),
         "configuration debugging".into(),
         "inspect project startup owned health".into(),
     ];
@@ -649,6 +651,14 @@ fn runtime_configuration_reference() -> ConstructDescription {
         guidance(
             "runtime_configuration_journal",
             "`[journal].max_events` is a positive integer (default 100000) shared by all tests in one file run, including nested branches and attempts. It includes a reserved final run record. Exceeding the count aborts that file with `journal_capacity_exceeded`, stops admission, cancels active roots, and awaits teardown. The report retains original outcomes and an explicit missing-event interval; the journal is incomplete. Inspect the resolved limit, then increase it and rerun if appropriate. This is an event count, not a byte budget or a trace-export setting.",
+        ),
+        guidance(
+            "runtime_configuration_output",
+            "output_captured records stdout and stderr snapshots from a completed top-level ProcessResult provider value, including discarded results and nonzero exit codes. The existing capture driver has already completed process reaping. Each stream's redacted UTF-8 text is capped at 65536 bytes, with captured_byte_length before decoding/redaction, redacted_byte_length before truncation, and explicit lossy, redacted, and truncated flags. Known branch/argument secrets and configured stdout/stderr field suppression apply before truncation. Snapshots appear in stdout-then-stderr order per call; this does not describe interleaved pipe chronology. Journal metadata retains the operation and retry-attempt identity, and records consume the same event budget. Missing output from a spawn failure, cancellation, timeout, or provider capture-limit failure is not represented as a completed stream. Live/partial process capture, application protocol output, and browser console capture are not yet journaled by this path.",
+        ),
+        guidance(
+            "runtime_configuration_cancellation_requests",
+            "cancellation_requested records the first accepted request targeting an execution scope, with explicit source/operation/attempt metadata and cancellation_cause containing the typed reason and causing_scope_id. It is published synchronously at the request site before notifying waits and propagating to descendants; it does not mean teardown has finished. Repeated requests and inherited propagation do not create additional originating requests. Wait and scope terminals retain the inherited cause after owned cleanup; race_lost remains race_lost if an ancestor later times out. Requests consume the journal event budget. Exhaustion cancels roots outside the collector lock; rejected request records are included in the explicit missing-event interval. A run cancelled before test admission has no target scope and reports its typed reason in the run terminal.",
         ),
         guidance(
             "runtime_configuration_abort_facts",

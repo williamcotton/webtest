@@ -1927,6 +1927,13 @@ fn type_constructs() -> Vec<ConstructDescription> {
             if let Some(usage) = type_usage_example(name) {
                 value.examples.push(usage);
             }
+            if name == "ProcessResult" {
+                value.guidance.push(GuidanceDescription {
+                    code: "process_result_output_snapshots".into(),
+                    summary: "Completed top-level provider results emit bounded, redacted output_captured snapshots for stdout and stderr, including discarded values and nonzero exits. Operation and attempt identity, capture lengths, and truncation remain explicit; see runtime.configuration. This does not make ProcessResult transferable or permit unsafe process.run retries.".into(),
+                });
+                value.related.push("runtime.configuration".into());
+            }
             if name == "Record" {
                 value.guidance = vec![
                     GuidanceDescription {

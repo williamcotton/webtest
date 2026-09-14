@@ -427,12 +427,16 @@ fn compile_source(source: &str) -> TestPlan {
 
 #[path = "lifecycle/abort_journal.rs"]
 mod abort_journal;
+#[path = "lifecycle/cancellation_journal.rs"]
+mod cancellation_journal;
 #[path = "lifecycle/identity.rs"]
 mod identity;
 #[path = "lifecycle/jobs.rs"]
 mod jobs;
 #[path = "lifecycle/journal.rs"]
 mod journal;
+#[path = "lifecycle/output_journal.rs"]
+mod output_journal;
 
 #[path = "lifecycle/retry.rs"]
 mod retry;
@@ -829,7 +833,9 @@ fn event_names(events: &[ExecutionEvent]) -> Vec<&'static str> {
         .filter(|event| {
             !matches!(
                 event,
-                ExecutionEvent::ScopeAborted { .. }
+                ExecutionEvent::OutputCaptured { .. }
+                    | ExecutionEvent::CancellationRequested { .. }
+                    | ExecutionEvent::ScopeAborted { .. }
                     | ExecutionEvent::AttachmentCreated { .. }
                     | ExecutionEvent::Attempt { .. }
                     | ExecutionEvent::Scope { .. }
@@ -838,7 +844,9 @@ fn event_names(events: &[ExecutionEvent]) -> Vec<&'static str> {
             )
         })
         .map(|event| match event {
-            ExecutionEvent::ScopeAborted { .. }
+            ExecutionEvent::OutputCaptured { .. }
+            | ExecutionEvent::CancellationRequested { .. }
+            | ExecutionEvent::ScopeAborted { .. }
             | ExecutionEvent::AttachmentCreated { .. }
             | ExecutionEvent::Attempt { .. }
             | ExecutionEvent::Scope { .. }

@@ -62,7 +62,8 @@ impl ExecutionEvent {
     pub fn scope(&self) -> Option<&ScopeEvent> {
         match self {
             Self::Scope { event, .. } => Some(event),
-            Self::ScopeAborted { scope, .. }
+            Self::CancellationRequested { scope, .. }
+            | Self::ScopeAborted { scope, .. }
             | Self::Attempt { scope, .. }
             | Self::Wait { scope, .. }
             | Self::Resource { scope, .. } => Some(scope),
@@ -73,11 +74,13 @@ impl ExecutionEvent {
     pub const fn test_id(&self) -> Option<TestId> {
         match self {
             Self::Scope { event, .. } => Some(event.execution_context.test_id),
-            Self::ScopeAborted { scope, .. }
+            Self::CancellationRequested { scope, .. }
+            | Self::ScopeAborted { scope, .. }
             | Self::Attempt { scope, .. }
             | Self::Wait { scope, .. }
             | Self::Resource { scope, .. } => Some(scope.execution_context.test_id),
-            Self::AttachmentCreated { test_id, .. }
+            Self::OutputCaptured { test_id, .. }
+            | Self::AttachmentCreated { test_id, .. }
             | Self::TestStarted { test_id, .. }
             | Self::StepStarted { test_id, .. }
             | Self::StepPassed { test_id, .. }
@@ -95,7 +98,8 @@ impl ExecutionEvent {
 
     pub const fn step_id(&self) -> Option<webtest_model::StepId> {
         match self {
-            Self::AttachmentCreated { step_id, .. }
+            Self::OutputCaptured { step_id, .. }
+            | Self::AttachmentCreated { step_id, .. }
             | Self::StepStarted { step_id, .. }
             | Self::StepPassed { step_id, .. }
             | Self::ProviderCallStarted { step_id, .. }

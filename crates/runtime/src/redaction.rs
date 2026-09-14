@@ -177,7 +177,7 @@ fn redact_locator(locator: BrowserLocator, secrets: &[String]) -> BrowserLocator
     }
 }
 
-fn redact_text(mut value: String, secrets: &[String]) -> String {
+pub(crate) fn redact_text(mut value: String, secrets: &[String]) -> String {
     for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
         value = value.replace(secret, "[redacted]");
     }

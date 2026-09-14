@@ -655,6 +655,9 @@ mod tests {
         assert!(WEBTEST_SKILL.contains("`attachment_created`"));
         assert!(WEBTEST_SKILL.contains("`execution_identity_unavailable`"));
         assert!(WEBTEST_SKILL.contains("`scope_aborted`"));
+        assert!(WEBTEST_SKILL.contains("`cancellation_requested`"));
+        assert!(WEBTEST_SKILL.contains("`output_captured`"));
+        assert!(WEBTEST_SKILL.contains("`causing_scope_id`"));
         assert!(WEBTEST_SKILL.contains("webtest test <path> --jobs 2 --reporter json"));
         assert!(WEBTEST_SKILL.contains("WEBTEST_APP_URL"));
         assert!(WEBTEST_SKILL.contains("webtest describe app.bridge"));

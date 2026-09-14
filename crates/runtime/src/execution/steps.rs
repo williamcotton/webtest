@@ -9,6 +9,7 @@ use super::{browser::execute_browser, provider::execute_provider, state::TestExe
 
 pub(super) enum StepCompletion {
     Completed,
+    ProviderOutput(Vec<webtest_observation::CapturedOutput>),
     Provided(webtest_model::Value),
     Cancelled,
 }
@@ -57,11 +58,18 @@ pub(super) async fn execute_step(
                 context,
             )
             .await?;
+            let (fields, secrets) = state.redaction();
+            let fields = fields
+                .iter()
+                .chain(&call.redacted_result_fields)
+                .cloned()
+                .collect::<Vec<_>>();
+            let output = super::output::provider_output(&value, &fields, secrets);
             state.accept_provider_resources(&value);
             if let Some(binding) = call.result_binding {
                 state.bind(binding, call.result_name.as_deref(), value);
             }
-            Ok(StepCompletion::Completed)
+            Ok(StepCompletion::ProviderOutput(output))
         }
         TestOperation::Browser(operation) => {
             let page = page.as_deref_mut().ok_or_else(|| {

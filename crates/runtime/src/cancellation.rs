@@ -41,10 +41,26 @@ impl CancellationToken {
 
     /// First cause wins. Cancelling a child never changes an ancestor or sibling.
     pub fn cancel(&self, cause: Cancellation) {
-        self.cancel_at(cause, Instant::now());
+        self.cancel_observed(cause, |_| {});
+    }
+
+    /// Publishes the first accepted request synchronously, outside the token lock,
+    /// before notifying waits and propagating to descendants. Inherited cancellation
+    /// and repeated requests do not publish another request.
+    pub fn cancel_observed(&self, cause: Cancellation, accepted: impl FnOnce(Cancellation)) {
+        self.cancel_at_observed(cause, Instant::now(), accepted);
     }
 
     fn cancel_at(&self, cause: Cancellation, at: Instant) {
+        self.cancel_at_observed(cause, at, |_| {});
+    }
+
+    fn cancel_at_observed(
+        &self,
+        cause: Cancellation,
+        at: Instant,
+        accepted: impl FnOnce(Cancellation),
+    ) {
         let children = {
             let mut state = self
                 .0
@@ -58,6 +74,7 @@ impl CancellationToken {
             state.cancelled_at = Some(at);
             std::mem::take(&mut state.children)
         };
+        accepted(cause);
         self.0.wake.notify_waiters();
         for child in children.into_iter().filter_map(|child| child.upgrade()) {
             Self(child).cancel_at(cause, at);
@@ -143,6 +160,38 @@ impl OperationContext for ScopeContext {
 mod tests {
     use super::*;
     use webtest_host::CancellationReason;
+
+    #[tokio::test(start_paused = true)]
+    async fn accepted_request_is_published_once_without_a_lock_before_descendant_propagation() {
+        let root = CancellationToken::default();
+        let child = root.child();
+        let cause = Cancellation {
+            reason: CancellationReason::FailFast,
+            causing_scope_id: ExecutionScopeId(1),
+        };
+        let mut publications = 0;
+        root.cancel_observed(cause, |actual| {
+            publications += 1;
+            assert_eq!(actual, cause);
+            assert_eq!(
+                root.cause(),
+                Some(cause),
+                "observer may read the token without deadlock"
+            );
+            assert!(child.cause().is_none(), "publish before propagation");
+            root.cancel_observed(
+                Cancellation {
+                    reason: CancellationReason::Timeout,
+                    ..cause
+                },
+                |_| panic!("reentrant duplicate request"),
+            );
+        });
+        root.cancel_observed(cause, |_| panic!("duplicate request"));
+        assert_eq!(publications, 1);
+        assert_eq!(child.cancelled().await, cause);
+        assert_eq!(root.child().cancelled().await, cause);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn parent_cancellation_wakes_existing_and_late_children_and_retains_first_cause() {

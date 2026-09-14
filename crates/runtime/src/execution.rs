@@ -33,6 +33,7 @@ mod browser;
 mod child;
 mod concurrent;
 mod failure;
+mod output;
 mod provider;
 mod resource;
 mod retry;
@@ -138,7 +139,7 @@ pub(crate) async fn execute_test(
     );
     let root_scope = root.event.clone();
     let root_context = root.context.clone();
-    let _journal_root = events.register_root(&root_context);
+    let _journal_root = events.register_root(&root_context, &root_scope, execution_id, event_sink);
     let mut branch = branch::BranchState::new(options);
     branch.failure_signals.extend(policy.primary_failure);
     branch.session = session.take();
@@ -164,63 +165,77 @@ pub(crate) async fn execute_test(
         .contains(&Capability::Browser);
 
     let mut resource_cleanup_deadline = None;
-    let body_outcome = wait::with_control(control, &root_context, async {
-        let mut source = wait::TestBodyWait::new(execute_test_body(&services, &mut branch, &root));
-        let mut result = waits
-            .wait(
-                &root_context,
-                &mut source,
-                options.cleanup_timeout,
-                |event| {
-                    emit_event(
-                        events,
-                        event_sink,
-                        ExecutionEvent::Wait {
+    let body_outcome = wait::with_control(
+        control,
+        &root_context,
+        |cause| {
+            crate::events::emit_cancellation_request(
+                &root_scope,
+                events,
+                event_sink,
+                execution_id,
+                cause,
+            );
+        },
+        async {
+            let mut source =
+                wait::TestBodyWait::new(execute_test_body(&services, &mut branch, &root));
+            let mut result = waits
+                .wait_observed(
+                    &root_context,
+                    &mut source,
+                    options.cleanup_timeout,
+                    |event| {
+                        crate::events::emit_wait_notification(
+                            &root_scope,
+                            events,
+                            event_sink,
                             execution_id,
-                            scope: root_scope.clone(),
                             event,
-                        },
-                    )
-                },
-            )
-            .await;
-        if let Some(primary) = source.interrupted_failure.take() {
-            result.primary = crate::WaitCompletion::Ready(primary);
-        }
-        drop(source);
-        resource_cleanup_deadline = Some(result.cleanup_deadline);
-        branch
-            .cleanup_failures
-            .extend(result.secondary.into_iter().map(|failure| CleanupFailure {
-                resource: CleanupResource::ExecutionScope {
-                    scope_id: root_context.scope_id,
-                },
-                cause: match failure {
-                    crate::WaitCleanupFailure::Failed { error, .. } => error,
-                    crate::WaitCleanupFailure::TimedOut { .. } => CleanupCause::TimedOut {
-                        timeout_ms: duration_millis(options.cleanup_timeout),
+                        )
                     },
-                },
-            }));
-        match result.primary {
-            crate::WaitCompletion::Ready(body) => Some(body),
-            crate::WaitCompletion::Cancelled(_) => None,
-            crate::WaitCompletion::Failed(error) => {
-                branch.cleanup_failures.push(CleanupFailure {
+                )
+                .await;
+            if let Some(primary) = source.interrupted_failure.take() {
+                result.primary = crate::WaitCompletion::Ready(primary);
+            }
+            drop(source);
+            resource_cleanup_deadline = Some(result.cleanup_deadline);
+            branch
+                .cleanup_failures
+                .extend(result.secondary.into_iter().map(|failure| CleanupFailure {
                     resource: CleanupResource::ExecutionScope {
                         scope_id: root_context.scope_id,
                     },
-                    cause: error,
-                });
-                None
+                    cause: match failure {
+                        crate::WaitCleanupFailure::Failed { error, .. } => error,
+                        crate::WaitCleanupFailure::TimedOut { .. } => CleanupCause::TimedOut {
+                            timeout_ms: duration_millis(options.cleanup_timeout),
+                        },
+                    },
+                }));
+            match result.primary {
+                crate::WaitCompletion::Ready(body) => Some(body),
+                crate::WaitCompletion::Cancelled(_) => None,
+                crate::WaitCompletion::Failed(error) => {
+                    branch.cleanup_failures.push(CleanupFailure {
+                        resource: CleanupResource::ExecutionScope {
+                            scope_id: root_context.scope_id,
+                        },
+                        cause: error,
+                    });
+                    None
+                }
+                crate::WaitCompletion::Rejected(error) => Some(TestBodyOutcome::Provisional(
+                    ProvisionalTestOutcome::Aborted {
+                        failure: RunError::Internal(format!(
+                            "wait registration invariant: {error:?}"
+                        )),
+                    },
+                )),
             }
-            crate::WaitCompletion::Rejected(error) => Some(TestBodyOutcome::Provisional(
-                ProvisionalTestOutcome::Aborted {
-                    failure: RunError::Internal(format!("wait registration invariant: {error:?}")),
-                },
-            )),
-        }
-    })
+        },
+    )
     .await;
     let body_outcome = branch.primary_failure.take().or(body_outcome);
     let outcome = match body_outcome {
@@ -285,12 +300,21 @@ pub(crate) async fn execute_test(
             }
         }
         None => {
-            root_context
-                .cancellation
-                .cancel(webtest_host::Cancellation {
+            root_context.cancellation.cancel_observed(
+                webtest_host::Cancellation {
                     reason: webtest_host::CancellationReason::Timeout,
                     causing_scope_id: root_context.scope_id,
-                });
+                },
+                |cause| {
+                    crate::events::emit_cancellation_request(
+                        &root_scope,
+                        events,
+                        event_sink,
+                        execution_id,
+                        cause,
+                    )
+                },
+            );
             let active = branch
                 .active_step
                 .and_then(|id| test.steps().into_iter().find(|step| step.id == id));
@@ -320,15 +344,24 @@ pub(crate) async fn execute_test(
     };
 
     if matches!(outcome, ProvisionalTestOutcome::Cancelled { .. }) {
-        root_context
-            .cancellation
-            .cancel(webtest_host::Cancellation {
+        root_context.cancellation.cancel_observed(
+            webtest_host::Cancellation {
                 reason: control.map_or(
                     webtest_host::CancellationReason::UserCancelled,
                     RunControl::cancellation_reason,
                 ),
                 causing_scope_id: root_context.scope_id,
-            });
+            },
+            |cause| {
+                crate::events::emit_cancellation_request(
+                    &root_scope,
+                    events,
+                    event_sink,
+                    execution_id,
+                    cause,
+                )
+            },
+        );
     }
     drop(branch.page.take());
     let cleanup_deadline = resource_cleanup_deadline.map_or_else(
@@ -698,6 +731,15 @@ impl TreeExecution<'_, '_> {
                     &scope,
                     event,
                 ),
+                crate::ResourceScopeEvent::CancellationRequested(cause) => {
+                    crate::events::emit_cancellation_request(
+                        &scope,
+                        services.events,
+                        services.event_sink,
+                        services.execution_id,
+                        cause,
+                    )
+                }
                 crate::ResourceScopeEvent::Wait(event) => emit_event(
                     services.events,
                     services.event_sink,
@@ -817,16 +859,8 @@ impl TreeExecution<'_, '_> {
         let result = {
             let mut source = wait::TestBodyWait::new(self.node(child, owner));
             let mut result = waits
-                .wait(&context, &mut source, cleanup_timeout, |event| {
-                    emit_event(
-                        events,
-                        sink,
-                        ExecutionEvent::Wait {
-                            execution_id,
-                            scope: scope.clone(),
-                            event,
-                        },
-                    )
+                .wait_observed(&context, &mut source, cleanup_timeout, |event| {
+                    crate::events::emit_wait_notification(&scope, events, sink, execution_id, event)
                 })
                 .await;
             if let Some(primary) = source.interrupted_failure.take() {
@@ -1016,6 +1050,26 @@ impl TreeExecution<'_, '_> {
         )
         .await;
         let completion = match completion {
+            Ok(steps::StepCompletion::ProviderOutput(outputs)) => {
+                if let TestOperation::ServerProviderCall(call) = &step.operation {
+                    for output in outputs {
+                        emit_event_in_scope(
+                            &scope.event,
+                            events,
+                            event_sink,
+                            ExecutionEvent::OutputCaptured {
+                                execution_id,
+                                test_id: test.id,
+                                step_id: step.id,
+                                provider: call.provider.clone(),
+                                operation: call.operation.clone(),
+                                output,
+                            },
+                        );
+                    }
+                }
+                Ok(steps::StepCompletion::Completed)
+            }
             Ok(steps::StepCompletion::Provided(value)) => {
                 self.branch.provided = Some(value);
                 Ok(steps::StepCompletion::Completed)
@@ -1038,6 +1092,11 @@ impl TreeExecution<'_, '_> {
             });
         }
         match completion {
+            Ok(steps::StepCompletion::ProviderOutput(_)) => {
+                return TestBodyOutcome::Provisional(ProvisionalTestOutcome::Aborted {
+                    failure: RunError::Internal("provider output was not published".into()),
+                });
+            }
             Ok(steps::StepCompletion::Cancelled) => {
                 return TestBodyOutcome::Provisional(ProvisionalTestOutcome::Cancelled {
                     reason: host_context.cancellation.cause().map_or_else(

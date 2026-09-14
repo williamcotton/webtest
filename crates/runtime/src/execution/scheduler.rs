@@ -54,6 +54,7 @@ pub(super) async fn schedule<F, T>(
     )>,
     classify: impl Fn(&T) -> Completion,
     mut on_completion: impl FnMut(usize, T),
+    mut on_cancellation: impl FnMut(usize, Cancellation),
 ) -> Option<usize>
 where
     F: Future<Output = T>,
@@ -89,10 +90,13 @@ where
                 if class.is_some() {
                     unhealthy = true;
                     winner = None;
-                    cancel_siblings(parent, &contexts, &completed, ordinal, CancellationReason::ParentFailed);
+                    cancel_siblings(parent, &contexts, &completed, ordinal, CancellationReason::ParentFailed, &mut on_cancellation);
                 }
             }
             Some((ordinal, outcome)) = pending.next() => {
+                // This future includes teardown and terminal publication. Do not
+                // target it with a request while processing same-poll notices.
+                completed[ordinal] = true;
                 // Polling child futures can publish a failure after select has
                 // polled notices but before it returns a completed sibling.
                 // Observe those reports before awarding a race winner.
@@ -100,7 +104,7 @@ where
                     if receiver.borrow().is_some() {
                         unhealthy = true;
                         winner = None;
-                        cancel_siblings(parent, &contexts, &completed, failed, CancellationReason::ParentFailed);
+                        cancel_siblings(parent, &contexts, &completed, failed, CancellationReason::ParentFailed, &mut on_cancellation);
                     }
                 }
                 // Also catches infrastructure failures discovered during cleanup.
@@ -108,7 +112,7 @@ where
                 if matches!(completion, Completion::Failed(FailureClass::Infrastructure | FailureClass::Internal)) {
                     unhealthy = true;
                     winner = None;
-                    cancel_siblings(parent, &contexts, &completed, ordinal, CancellationReason::ParentFailed);
+                    cancel_siblings(parent, &contexts, &completed, ordinal, CancellationReason::ParentFailed, &mut on_cancellation);
                 } else if policy == SiblingPolicy::FirstSuccess
                     && completion == Completion::Passed
                     && winner.is_none()
@@ -116,9 +120,8 @@ where
                     && parent.cancellation.cause().is_none()
                 {
                     winner = Some(ordinal);
-                    cancel_siblings(parent, &contexts, &completed, ordinal, CancellationReason::RaceLost);
+                    cancel_siblings(parent, &contexts, &completed, ordinal, CancellationReason::RaceLost, &mut on_cancellation);
                 }
-                completed[ordinal] = true;
                 on_completion(ordinal, outcome);
             }
         }
@@ -132,13 +135,17 @@ fn cancel_siblings(
     completed: &[bool],
     failed: usize,
     reason: CancellationReason,
+    on_cancellation: &mut impl FnMut(usize, Cancellation),
 ) {
     for (ordinal, context) in contexts.iter().enumerate() {
         if ordinal != failed && !completed[ordinal] {
-            context.cancellation.cancel(Cancellation {
-                reason,
-                causing_scope_id: parent.scope_id,
-            });
+            context.cancellation.cancel_observed(
+                Cancellation {
+                    reason,
+                    causing_scope_id: parent.scope_id,
+                },
+                |cause| on_cancellation(ordinal, cause),
+            );
         }
     }
 }
@@ -188,16 +195,11 @@ mod tests {
             ],
             |outcome| *outcome,
             |ordinal, outcome| completed.push((ordinal, outcome)),
+            |_, _| panic!("the other sibling has already finished"),
         )
         .await;
         assert_eq!(winner, None);
-        assert_eq!(
-            successful.cancellation.cause(),
-            Some(Cancellation {
-                reason: CancellationReason::ParentFailed,
-                causing_scope_id: parent.scope_id,
-            })
-        );
+        assert!(successful.cancellation.cause().is_none());
         assert_eq!(completed.len(), 2);
         assert_eq!(started.elapsed(), Duration::from_millis(100));
     }
@@ -219,6 +221,7 @@ mod tests {
             children,
             |outcome| *outcome,
             |ordinal, outcome| results.push((ordinal, outcome)),
+            |_, _| {},
         )
         .await;
         assert_eq!(winner, Some(results[0].0));
@@ -250,6 +253,7 @@ mod tests {
                 vec![(child.clone(), receiver, async { Completion::Passed })],
                 |outcome| *outcome,
                 |_, _| completed += 1,
+                |_, _| {},
             )
             .await;
             assert_eq!(winner, None);
@@ -329,6 +333,7 @@ mod tests {
                         .map_or(Completion::Passed, Completion::Failed)
                 },
                 |_, outcome| outcomes.push(outcome),
+                |_, _| {},
             )
             .await;
             outcomes.sort_by_key(|outcome| outcome.ordinal);

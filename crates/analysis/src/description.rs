@@ -1718,6 +1718,115 @@ mod tests {
     }
 
     #[test]
+    fn output_guidance_is_searchable_and_distinguishes_completed_capture_from_live_output() {
+        let DescriptionResponse::Construct(process) =
+            response(DescriptionRequest::Query("type.ProcessResult".into()))
+        else {
+            panic!("process type")
+        };
+        assert_eq!(process.return_type, Some(Type::ProcessResult));
+        assert!(
+            process
+                .related
+                .iter()
+                .any(|topic| topic == "runtime.configuration")
+        );
+        assert!(
+            process
+                .guidance
+                .iter()
+                .any(|entry| entry.code == "process_result_output_snapshots")
+        );
+        let DescriptionResponse::Construct(topic) =
+            response(DescriptionRequest::Query("runtime.configuration".into()))
+        else {
+            panic!("configuration")
+        };
+        let guidance = topic
+            .guidance
+            .iter()
+            .find(|entry| entry.code == "runtime_configuration_output")
+            .unwrap();
+        for fact in [
+            "output_captured",
+            "ProcessResult",
+            "discarded",
+            "nonzero",
+            "65536",
+            "before truncation",
+            "captured_byte_length",
+            "redacted_byte_length",
+            "lossy",
+            "stdout-then-stderr",
+            "retry-attempt",
+            "Live/partial",
+        ] {
+            assert!(guidance.summary.contains(fact), "missing {fact}");
+        }
+        for query in [
+            "output_captured",
+            "captured_byte_length",
+            "redacted_byte_length",
+        ] {
+            let DescriptionResponse::Search(search) =
+                response(DescriptionRequest::Search(query.into()))
+            else {
+                panic!("search")
+            };
+            assert!(
+                search
+                    .results
+                    .iter()
+                    .any(|entry| entry.id == "runtime.configuration")
+            );
+        }
+    }
+
+    #[test]
+    fn cancellation_request_guidance_preserves_causality_and_is_searchable() {
+        let DescriptionResponse::Construct(topic) =
+            response(DescriptionRequest::Query("runtime.configuration".into()))
+        else {
+            panic!("configuration")
+        };
+        let guidance = topic
+            .guidance
+            .iter()
+            .find(|entry| entry.code == "runtime_configuration_cancellation_requests")
+            .unwrap();
+        for fact in [
+            "first accepted request",
+            "cancellation_cause",
+            "causing_scope_id",
+            "before notifying waits",
+            "teardown",
+            "inherited propagation",
+            "race_lost",
+            "missing-event interval",
+            "before test admission",
+        ] {
+            assert!(guidance.summary.contains(fact), "missing {fact}");
+        }
+        for query in [
+            "cancellation_requested",
+            "cancellation_cause",
+            "causing_scope_id",
+        ] {
+            let DescriptionResponse::Search(search) =
+                response(DescriptionRequest::Search(query.into()))
+            else {
+                panic!("search")
+            };
+            assert!(
+                search
+                    .results
+                    .iter()
+                    .any(|entry| entry.id == "runtime.configuration")
+            );
+        }
+    }
+
+    #[test]
     fn abort_fact_guidance_is_searchable_and_explains_aggregation_and_prior_outcomes() {
         let DescriptionResponse::Construct(topic) =
             response(DescriptionRequest::Query("runtime.configuration".into()))

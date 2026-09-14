@@ -12,7 +12,7 @@ use webtest_project::Project;
 
 use crate::{error::AppError, project_context::normalized_path};
 
-pub(crate) const REPORT_SCHEMA_VERSION: u32 = 10;
+pub(crate) const REPORT_SCHEMA_VERSION: u32 = 11;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -280,11 +280,15 @@ pub struct SummaryReport {
 #[derive(Clone, Debug, Serialize)]
 pub struct EventReport {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<webtest_observation::CapturedOutput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub execution_failure: Option<Box<webtest_observation::ExecutionFailure>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prior_outcome: Option<webtest_observation::PriorScopeOutcome>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cancellation: Option<webtest_observation::CancellationReason>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancellation_cause: Option<webtest_observation::ScopeCancellation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attachment: Option<webtest_observation::Attachment>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1236,7 +1240,7 @@ mod tests {
         assert_eq!(value["exit_class"], "test_failure");
         assert_eq!(
             String::from_utf8(json).expect("UTF-8 JSON"),
-            include_str!("../tests/fixtures/report-v10.json")
+            include_str!("../tests/fixtures/report-v11.json")
         );
 
         let mut events = Vec::new();
@@ -1248,7 +1252,7 @@ mod tests {
             let value: serde_json::Value = serde_json::from_str(line).expect("json line");
             assert_eq!(value["schema_version"], REPORT_SCHEMA_VERSION);
         }
-        assert_eq!(events, include_str!("../tests/fixtures/report-v10.jsonl"));
+        assert_eq!(events, include_str!("../tests/fixtures/report-v11.jsonl"));
     }
 
     #[test]
@@ -1275,11 +1279,11 @@ mod tests {
             ),
             (
                 Reporter::Json,
-                include_str!("../tests/fixtures/cancellation-v10.json"),
+                include_str!("../tests/fixtures/cancellation-v11.json"),
             ),
             (
                 Reporter::Events,
-                include_str!("../tests/fixtures/cancellation-v10.jsonl"),
+                include_str!("../tests/fixtures/cancellation-v11.jsonl"),
             ),
             (
                 Reporter::Junit,

@@ -59,3 +59,17 @@ metadata. When browser failure evidence is configured, each acknowledged file wr
 adds `attachment_created` with its kind/path, byte length, and BLAKE3 digest. Failed
 or expired writes remain capture failures and do not produce attachment references.
 Use `webtest describe runtime.configuration` for the shared evidence/journal guidance.
+
+Cancellation request records identify the first accepted request's target scope and
+typed cause, including the causing scope. They precede wait notification and
+propagation; terminal scope/resource facts follow owned cleanup. Repeated requests
+and inherited propagation do not create extra originating requests. For example,
+a race loser retains `race_lost` when an enclosing timeout expires during cleanup.
+Requests share the journal budget and rejected requests appear in its loss interval.
+
+Completed top-level `ProcessResult` values emit `output_captured` snapshots for stdout
+and stderr, including discarded results and nonzero exits. The text is redacted
+before a 65536-byte UTF-8 limit is applied. Lengths and lossy/redacted/truncated flags
+make the projection explicit; source, operation, and attempt identity remain in
+journal metadata. These completed snapshots do not represent interleaved pipe
+chronology or partial output from interrupted capture.
