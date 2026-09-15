@@ -37,6 +37,10 @@ Milestone E is **not complete**. The execution-tree, resource/wait foundations, 
   The bounded journal retains attachments, completed process-output snapshots, source/context metadata, clocks, explicit retry
   attempts, typed scope/cancellation facts, and ordered branch aggregates. Remaining event
   kinds and complete host/resource coverage are still pending.
+- The trace artifact core writes and validates deterministic bounded archives of
+  the unchanged native journal, opt-in revision-keyed sources, and checksum-verified
+  attachment mappings. CLI capture/retention policy, truncation events, atomic disk
+  publication, and the viewer remain pending.
 - Runtime observations accumulate privately and commit as a complete batch. Starting another
   run clears prior observations and prevents an older in-flight run from overwriting the newer
   batch. Cross-process publication remains unimplemented.
@@ -784,6 +788,59 @@ discarded and nonzero process results, retry/sibling identity, UTF-8 bounds,
 redaction, binary lengths, journal overflow, startup failure, interrupted and
 over-limit captures, and CLI projection. Warning-free workspace Clippy and Rust
 formatting pass. Both `webtest-wasm` and `webtest-observation` compile for
+`wasm32-unknown-unknown`.
+
+### Trace artifact core continuation — 2026-09-14
+
+`webtest-trace` now owns a versioned deterministic archive writer and validating
+reader over the existing observation journal. Its production dependencies point
+only toward shared observations/source identity and general serialization/hash
+utilities; it neither imports runtime/analysis/project/reporters nor executes
+project code. Runtime integration uses a test-only dependency.
+
+Trace format 1 stores `manifest.json`, unchanged `RecordedEvent` JSONL, optional
+`sources/<revision>`, and optional `attachments/<digest>`. Its documented
+uncompressed regular-file container is length-framed, has deterministic entry
+ordering, and represents no symlinks, permissions, executable entries, or ambient
+timestamps. Neither API opens host paths or extracts files. The manifest records
+compiler/browser/provider versions, project identity, the configuration digest,
+capture policy, execution membership, and checksums/lengths for contained files.
+The exact framing contract is in `crates/trace/README.md` and has a byte fixture.
+
+Readers reject unsupported versions, unknown manifest fields, malformed/trailing
+frames, duplicate or unreferenced members, unsafe paths, link/unknown entry kinds,
+checksum/length mismatches, and independent archive/member/manifest/record/count
+budget overruns. Shared replay validation preserves typed events and checks their
+identity/source/context agreement. A trace additionally requires unique ordered
+sequences and a terminal per execution; missing intervals must exactly match the
+reserved terminal's typed authoritative-journal overflow. No total ordering is
+introduced across executions. Runtime integration exercises every collector
+overflow boundary, including loss of the initial run-start fact.
+
+Source mappings use execution-local file IDs and revisions, validate included
+UTF-8 text/ranges, and deduplicate content by revision. Run-level revision facts
+without an executable range are supported. Attachment mappings bind the original
+immutable event identity to a normalized bundled member whose digest/length must
+match the acknowledged capture. Historical host paths remain unchanged in event
+payloads as data; consumers resolve content only through the verified mappings.
+The reader hashes each shared member once while checking every reference.
+
+This is the artifact foundation, not public trace capture. Callers supply
+already-redacted journals/attachments and explicitly opt into exact source text;
+the core does not reread files or reinterpret upstream values. Its inclusive hard
+limits return typed errors and no archive, rather than silently dropping facts.
+CLI `[trace]` policy, retain-on-failure behavior, budget truncation events, atomic
+filesystem publication, and `webtest trace`/viewer integration remain pending.
+No public language/CLI/configuration/description contract changes in this slice.
+Native journal schema 8, CLI report/event schema 11, plan format 9, and runtime
+semantics 6 remain unchanged. Milestone E is still incomplete.
+
+Verification: `cargo test --workspace` passes, including 11 trace-core tests,
+all 139 runtime lifecycle tests, native browser/protocol integration, and doc
+tests. The three new lifecycle tests cover nested parallel/race/retry/resource
+facts, every authoritative overflow boundary, and native process-output redaction.
+Workspace Clippy with `-D warnings`, Rust formatting, and diff whitespace checks
+pass. Both `webtest-wasm` and the new `webtest-trace` compile for
 `wasm32-unknown-unknown`.
 
 ## 1. Outcome

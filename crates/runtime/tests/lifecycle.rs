@@ -437,6 +437,8 @@ mod jobs;
 mod journal;
 #[path = "lifecycle/output_journal.rs"]
 mod output_journal;
+#[path = "lifecycle/trace.rs"]
+mod trace;
 
 #[path = "lifecycle/retry.rs"]
 mod retry;

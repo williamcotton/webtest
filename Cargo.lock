@@ -2065,6 +2065,7 @@ dependencies = [
  "webtest-plan",
  "webtest-provider",
  "webtest-text",
+ "webtest-trace",
 ]
 
 [[package]]
@@ -2083,6 +2084,19 @@ dependencies = [
  "blake3",
  "rowan",
  "serde",
+]
+
+[[package]]
+name = "webtest-trace"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "webtest-model",
+ "webtest-observation",
+ "webtest-text",
 ]
 
 [[package]]

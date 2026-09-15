@@ -25,5 +25,6 @@ webtest-text.workspace = true
 webtest-provider = { workspace = true, features = ["native"] }
 
 [dev-dependencies]
+webtest-trace.workspace = true
 webtest-analysis.workspace = true
 tempfile.workspace = true

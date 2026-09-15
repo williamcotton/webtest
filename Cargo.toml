@@ -14,6 +14,7 @@ members = [
     "crates/format",
     "crates/plan",
     "crates/observation",
+    "crates/trace",
     "crates/browser",
     "crates/browser-manager",
     "crates/browser-cdp",
@@ -44,6 +45,7 @@ webtest-analysis = { path = "crates/analysis" }
 webtest-format = { path = "crates/format" }
 webtest-plan = { path = "crates/plan" }
 webtest-observation = { path = "crates/observation" }
+webtest-trace = { path = "crates/trace" }
 webtest-browser = { path = "crates/browser" }
 webtest-browser-manager = { path = "crates/browser-manager" }
 webtest-browser-cdp = { path = "crates/browser-cdp" }
