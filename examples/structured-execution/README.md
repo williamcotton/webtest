@@ -60,6 +60,13 @@ adds `attachment_created` with its kind/path, byte length, and BLAKE3 digest. Fa
 or expired writes remain capture failures and do not produce attachment references.
 Use `webtest describe runtime.configuration` for the shared evidence/journal guidance.
 
+Existing trace archives can be viewed with `webtest trace <artifact>`, which prints
+a private loopback URL and serves until Ctrl-C. Use `webtest trace <artifact>
+--output viewer.html` for standalone, script-free HTML (the output must not exist).
+The viewer validates the archive and displays only recorded facts and included
+evidence; it never starts this example app. These test commands do not yet export
+trace archives: test-run capture/retention policy remains pending.
+
 Cancellation request records identify the first accepted request's target scope and
 typed cause, including the causing scope. They precede wait notification and
 propagation; terminal scope/resource facts follow owned cleanup. Repeated requests

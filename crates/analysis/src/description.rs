@@ -1693,6 +1693,41 @@ mod tests {
     }
 
     #[test]
+    fn trace_viewer_guidance_distinguishes_viewing_existing_archives_from_pending_capture() {
+        let DescriptionResponse::Construct(topic) =
+            response(DescriptionRequest::Query("runtime.configuration".into()))
+        else {
+            panic!("runtime configuration")
+        };
+        let guidance = topic
+            .guidance
+            .iter()
+            .find(|entry| entry.code == "runtime_configuration_trace_viewer")
+            .unwrap();
+        for fact in [
+            "validated trace archive",
+            "explicit scope parentage",
+            "script-free",
+            "host paths",
+            "remain pending",
+            "webtest trace --help",
+        ] {
+            assert!(guidance.summary.contains(fact), "{fact}");
+        }
+        let DescriptionResponse::Search(results) =
+            response(DescriptionRequest::Search("trace viewer".into()))
+        else {
+            panic!("search")
+        };
+        assert!(
+            results
+                .results
+                .iter()
+                .any(|entry| entry.id == "runtime.configuration")
+        );
+    }
+
+    #[test]
     fn attachment_guidance_describes_acknowledgement_identity_and_digest() {
         let DescriptionResponse::Construct(topic) =
             response(DescriptionRequest::Query("runtime.configuration".into()))

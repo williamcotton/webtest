@@ -627,6 +627,7 @@ fn runtime_configuration_reference() -> ConstructDescription {
         "output_captured stdout stderr captured_byte_length redacted_byte_length truncation".into(),
         "cancellation_requested cancellation_cause causing_scope_id race_lost fail_fast".into(),
         "configuration debugging".into(),
+        "trace viewer validated archive standalone HTML".into(),
         "inspect project startup owned health".into(),
     ];
     value.constraints = vec![
@@ -644,6 +645,10 @@ fn runtime_configuration_reference() -> ConstructDescription {
         ),
     ];
     value.guidance = vec![
+        guidance(
+            "runtime_configuration_trace_viewer",
+            "The trace viewer reads a validated trace archive without loading project configuration or executing tests. It presents recorded timelines, explicit scope parentage, retry attempts, typed failures and cleanup, process-output facts, opt-in sources, and verified evidence. Source and attachment content omitted by capture policy remains absent; host paths inside facts are never opened. The local and standalone HTML views are script-free and make no external network requests. Test-run trace export, capture/retention policy, and browser console/network journaling remain pending. See `webtest trace --help` for viewing commands and output options.",
+        ),
         guidance(
             "runtime_configuration_fields",
             "The machine-readable `resolved_configuration` object reports selected adapter and transport, resolved command and arguments, working directory, schema path, application ownership and whether health is configured, browser and server base URLs, the per-test deadline, the distinct provider-call default, the separate bounded cleanup timeout, and `journal_max_events`, the per-file native event count limit. Absent optional configuration is represented as null or an empty argument list; timeout values are integer milliseconds.",

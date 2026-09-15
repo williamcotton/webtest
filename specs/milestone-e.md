@@ -39,8 +39,9 @@ Milestone E is **not complete**. The execution-tree, resource/wait foundations, 
   kinds and complete host/resource coverage are still pending.
 - The trace artifact core writes and validates deterministic bounded archives of
   the unchanged native journal, opt-in revision-keyed sources, and checksum-verified
-  attachment mappings. CLI capture/retention policy, truncation events, atomic disk
-  publication, and the viewer remain pending.
+  attachment mappings. A shared script-free viewer now presents existing archives
+  through `webtest trace`, locally or as standalone HTML. Test-run capture/retention
+  policy, truncation events, and atomic archive publication remain pending.
 - Runtime observations accumulate privately and commit as a complete batch. Starting another
   run clears prior observations and prevents an older in-flight run from overwriting the newer
   batch. Cross-process publication remains unimplemented.
@@ -842,6 +843,59 @@ facts, every authoritative overflow boundary, and native process-output redactio
 Workspace Clippy with `-D warnings`, Rust formatting, and diff whitespace checks
 pass. Both `webtest-wasm` and the new `webtest-trace` compile for
 `wasm32-unknown-unknown`.
+
+### Read-only trace viewer continuation — 2026-09-15
+
+`webtest trace <artifact>` now validates an existing trace archive and serves a
+read-only HTML viewer on a random `127.0.0.1` port and unpredictable URL. The
+command prints that URL and serves until Ctrl-C. `--output <file>` instead writes
+a complete standalone HTML document through a temporary file and atomic,
+non-overwriting publication. Viewing does not discover/load project configuration,
+start an application/browser, or execute test code.
+
+The portable renderer lives in `webtest-trace` and accepts only `VerifiedTrace`.
+It displays each execution's elapsed-time timeline in journal order, explicit
+scope/parent links and task paths, retry/operation identities, typed failures and
+cleanup, completed process output, included revision-keyed source, and verified
+evidence. Expandable facts retain the complete native record and its clocks;
+source and evidence links come only from verified manifest mappings. Missing
+parent facts and policy-omitted captures remain explicit. PNG evidence is previewed;
+text/DOM evidence is escaped text, and captured bytes have embedded download links.
+No chronology is invented across executions, and scope/run summaries are not
+counted as additional test failures.
+
+The document contains no JavaScript, external assets, frames, or forms. Untrusted
+strings are escaped at HTML boundaries and a restrictive content-security policy
+applies to served and static views. Host paths in recorded facts remain data, never
+filesystem links or reads. HTML rendering has an inclusive 64 MiB app limit and
+fails before publication if escaped/encoded content exceeds it. Archive input
+remains bounded by the core's 100 MiB default; the native adapter opens regular
+files, rejects link inputs, and bounds reads even if the file grows.
+
+The small native HTTP adapter serves only GET/HEAD of its exact viewer URL, checks
+Host/Origin, rejects request bodies, and sends no-cache/nosniff/frame-denial headers.
+It owns at most 16 simultaneous connections with an 8192-byte request-header bound
+and a five-second connection deadline. Connections are directly owned futures;
+shutdown drops their sockets without detached tasks. Static output and HTTP output
+use the same rendered document.
+
+CLI help/characterization, shared runtime-configuration discovery guidance,
+canonical bootstrap skill/parity checks, and structured-execution examples now
+describe viewing existing archives. Test-run trace export, capture/retention
+policy, byte-budget truncation events, atomic archive publication, remaining host
+and event coverage, observation IPC, and concurrent DAP remain pending. Trace
+format 1, journal schema 8, CLI report/event schema 11, plan format 9, and runtime
+semantics 6 are unchanged. Milestone E is still incomplete.
+
+Verification: `cargo test --workspace` passes, including 13 trace tests, all 139
+runtime lifecycle tests, four viewer CLI tests, native Chrome/protocol integration,
+and doc tests. Focused coverage verifies hostile HTML/source/output escaping,
+capture omissions and verified attachment links, exact rendering budgets,
+Host/Origin/method/path checks, non-overwriting publication, corrupt/oversized/link
+input rejection, shutdown with a stalled client, and real Chrome rendering with
+Ctrl-C server reaping. Description search and CLI help characterization pass.
+Workspace Clippy with `-D warnings`, formatting, diff whitespace checks, and WASM
+compilation of `webtest-wasm` and `webtest-trace` pass.
 
 ## 1. Outcome
 

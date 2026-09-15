@@ -57,6 +57,14 @@ pub(crate) enum Command {
         #[arg(long, value_enum, default_value_t = TestReporter::Human)]
         reporter: TestReporter,
     },
+    /// Validate a trace and serve a local read-only viewer.
+    Trace {
+        /// Trace archive to open; project code is never executed.
+        artifact: PathBuf,
+        /// Write standalone HTML instead of serving it; the file must not exist.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
     /// Inspect one page, starting the configured app for project-relative URLs.
     Inspect {
         url: Option<String>,
@@ -178,6 +186,7 @@ mod tests {
             &["webtest", "fmt"],
             &["webtest", "build", "--emit", "plan.json"],
             &["webtest", "test"],
+            &["webtest", "trace", "run.webtest-trace"],
             &["webtest", "inspect", "https://example.test"],
             &["webtest", "describe"],
             &["webtest", "browser", "list"],

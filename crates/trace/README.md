@@ -5,9 +5,11 @@ records. It depends on shared observations and source identity, never the runtim
 compiler, browser backend, project configuration, or reporters. It performs no
 filesystem access, extraction, network requests, or project execution.
 
-This is the artifact foundation for Milestone E. It is not yet exposed by
-`webtest test` or `webtest trace`. CLI capture/retention settings, capture-budget
-truncation events, atomic disk publication, and the viewer remain pending.
+This is the artifact foundation for Milestone E. `webtest trace <artifact>`
+validates an existing archive and serves the shared viewer on a random loopback
+port; `--output <file>` writes standalone HTML without overwriting an existing
+file. Test-run export, CLI capture/retention settings, capture-budget truncation
+events, and atomic archive publication remain pending.
 
 ## Container version 1
 
@@ -75,3 +77,23 @@ inclusive. Exceeding one returns a typed error and no output archive. This initi
 API does not drop semantic events or synthesize a trace truncation event; adapter
 capture-budget policy must be added before public CLI export. `write` returns a
 complete byte buffer so a future adapter can publish it atomically.
+
+## Viewer
+
+`render_html` consumes only a `VerifiedTrace`. Its inclusive output-byte limit
+covers escaped text and base64 evidence; an overrun returns no partial document.
+The script-free HTML contains the per-execution timeline, explicit parent-scope
+links, attempt/operation identity, all typed facts, included source text, and
+verified evidence. It retains complete recorded JSON in expandable details.
+Omitted capture and missing parent facts stay explicit. Wall time is shown in
+the original fact; the timeline uses recorded elapsed time, never wall-clock
+sorting or a fabricated cross-execution order.
+
+Untrusted strings are escaped, DOM/text evidence is rendered as text, and only
+PNG bytes are used for image previews. Captured bytes may be downloaded through
+an embedded data URL; historical host paths never become links. There are no
+scripts, external assets, frames, forms, or network requests from the page. A
+restrictive content-security policy applies to both served and static output.
+The app owns bounded regular-file input, atomic non-overwriting HTML output,
+the random loopback listener and unguessable URL, request validation, connection
+limits/timeouts, and shutdown. It does not invoke project discovery or execution.

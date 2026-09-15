@@ -7,6 +7,7 @@ mod format;
 mod inspect;
 mod lsp;
 mod test;
+mod trace;
 
 use crate::{
     cli::{Cli, Command},
@@ -21,6 +22,7 @@ pub(crate) async fn run(cli: Cli) -> Result<ExitClass, AppError> {
         Command::Check { paths, reporter } => check::run_check(paths, reporter),
         Command::Fmt { paths, check } => format::run_format(paths, check),
         Command::Build { paths, emit } => build::run_build(paths, emit),
+        Command::Trace { artifact, output } => trace::run(artifact, output).await,
         Command::Test {
             paths,
             chrome_path,

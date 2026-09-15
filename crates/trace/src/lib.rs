@@ -6,12 +6,14 @@
 //! belong to adapters. An exceeded limit is an error, never silent data loss.
 mod archive;
 mod validation;
+mod viewer;
 
 use std::collections::BTreeMap;
 use webtest_observation::{EventIdentity, ExecutionId, RecordedEvent};
 use webtest_text::{FileId, SourceRevision};
 
 pub use archive::{read, write};
+pub use viewer::{RenderError, VIEWER_CSP, render_html};
 
 pub const TRACE_FORMAT_VERSION: u32 = 1;
 

@@ -532,3 +532,95 @@ fn source_ids_are_local_to_execution_and_repeated_content_is_deduplicated() {
     sources[1].execution_id = a;
     assert!(matches!(export(&sources), Err(TraceError::Duplicate(_))));
 }
+
+#[test]
+fn viewer_escapes_untrusted_facts_and_preserves_scope_source_and_output_links() {
+    let attack = "</pre><script src=\"https://evil.invalid/x\">bad()</script><img src=x onerror=bad()> & ' \"";
+    let mut records = fixture();
+    records[2].event = ExecutionEvent::OutputCaptured {
+        execution_id: records[2].identity.execution_id,
+        test_id: TestId(0),
+        step_id: StepId(3),
+        provider: attack.into(),
+        operation: "run".into(),
+        output: webtest_observation::CapturedOutput {
+            stream: webtest_observation::OutputStream::Stdout,
+            text: attack.into(),
+            captured_byte_length: attack.len() as u64,
+            redacted_byte_length: attack.len() as u64,
+            lossy: false,
+            redacted: false,
+            truncated: false,
+        },
+    };
+    records[2].metadata.source_revision = Some(SourceRevision::of(attack));
+    let context = &mut records[2].metadata.execution_context;
+    context.test_execution_id = Some(webtest_model::TestExecutionId(5));
+    context.plan_node_id = Some(webtest_model::PlanNodeId([0; 32]));
+    context.task_path = Some(vec![2, 1]);
+    context.scope_id = Some(webtest_model::ExecutionScopeId(11));
+    context.parent_scope_id = Some(webtest_model::ExecutionScopeId(7));
+    context.attempt_id = Some(webtest_model::AttemptId(3));
+    context.operation_execution_id = Some(webtest_model::OperationExecutionId(19));
+    let bytes = write(
+        TraceInput {
+            metadata: TraceMetadata {
+                capture: CapturePolicy {
+                    sources: true,
+                    attachments: false,
+                },
+                compiler_version: attack.into(),
+                ..metadata(false)
+            },
+            records: &records,
+            sources: &[SourceInput {
+                execution_id: records[2].identity.execution_id,
+                file_id: FileId::new(0),
+                revision: SourceRevision::of(attack),
+                project_path: "tests/unsafe<&>.webtest",
+                text: Some(attack),
+            }],
+            attachments: &[],
+        },
+        TraceLimits::default(),
+    )
+    .unwrap();
+    let trace = read(&bytes, TraceLimits::default()).unwrap();
+    let html = render_html(&trace, 1024 * 1024).unwrap();
+    assert!(!html.contains("<script"));
+    assert!(!html.contains("<img src=x"));
+    assert!(!html.contains("src=\"https:"));
+    assert!(html.contains("&lt;script src=&quot;https://evil.invalid/x&quot;&gt;"));
+    assert!(html.contains("default-src &#39;none&#39;"));
+    assert!(html.contains("task [2, 1]"));
+    assert!(html.contains("attempt 3"));
+    assert!(html.contains("operation 19"));
+    assert!(html.contains("7 (not recorded)"));
+    assert!(html.contains("source-00000000000000000000000000000001-0"));
+    assert_eq!(render_html(&trace, html.len()).unwrap(), html);
+    assert!(matches!(
+        render_html(&trace, html.len() - 1),
+        Err(RenderError::TooLarge { .. })
+    ));
+}
+
+#[test]
+fn viewer_resolves_only_verified_attachment_bytes_and_displays_missing_capture() {
+    let records = fixture();
+    for capture in [false, true] {
+        let trace = read(
+            &build(&records, capture, TraceLimits::default()).unwrap(),
+            TraceLimits::default(),
+        )
+        .unwrap();
+        let html = render_html(&trace, 1024 * 1024).unwrap();
+        assert!(!html.contains("href=\"/private/never-open-this-path"));
+        assert!(!html.contains("src=\"/private/never-open-this-path"));
+        if capture {
+            assert!(html.contains("data:application/octet-stream;base64,"));
+        } else {
+            assert!(html.contains("Attachment bytes were not included."));
+            assert!(html.contains("Source content was not included."));
+        }
+    }
+}

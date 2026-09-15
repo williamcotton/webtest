@@ -145,6 +145,13 @@ Durations accept positive `ms`, `s`, or `m` values. `timeouts.test` is a fresh d
 
 `webtest build --emit` writes a versioned plan only after successful static analysis. Emission refuses literal values in configured secret fields or schema-secret provider arguments; it never writes a redacted placeholder that would alter execution semantics.
 
+`webtest trace <artifact>` validates an existing trace archive and prints a local
+viewer URL; stop the viewer with Ctrl-C. `webtest trace <artifact> --output
+viewer.html` writes standalone HTML without overwriting an existing file. Viewing
+uses recorded facts and included evidence, never project execution or external
+network assets. Automatic trace export from test runs and capture/retention policy
+are still pending.
+
 ## Examples
 
 Each directory under `examples` is an independent WebTest project with its own configuration. For the plain HTML browser example, serve the fixture in one terminal:
