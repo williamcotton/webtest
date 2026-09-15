@@ -139,7 +139,7 @@ fn deterministic_roundtrip_preserves_native_facts_and_resolves_only_bundled_cont
     assert_eq!(trace.attachment(records[2].identity), Some(EVIDENCE));
     assert!(trace.attachment(records[0].identity).is_none());
     assert_eq!(trace.manifest().executions.len(), 2);
-    assert_eq!(trace.manifest().format_version, 1);
+    assert_eq!(trace.manifest().format_version, 2);
     assert_eq!(
         trace.manifest().event_schema_version,
         webtest_observation::EVENT_JOURNAL_SCHEMA_VERSION
@@ -175,7 +175,7 @@ fn capture_policy_explicitly_omits_bytes_without_inventing_or_rewriting_events()
 #[test]
 fn version_checks_precede_unknown_future_payload_decoding() {
     let original = members(&build(&fixture(), false, TraceLimits::default()).unwrap());
-    for version in [0, 2] {
+    for version in [0, 3] {
         let mut files = original.clone();
         files.insert(
             "manifest.json".into(),
@@ -623,4 +623,255 @@ fn viewer_resolves_only_verified_attachment_bytes_and_displays_missing_capture()
             assert!(html.contains("Source content was not included."));
         }
     }
+}
+
+fn budget_fixture(source: &str, evidence: &[u8]) -> Vec<RecordedEvent> {
+    let mut records = fixture();
+    records[2].metadata.source_revision = Some(SourceRevision::of(source));
+    if let ExecutionEvent::AttachmentCreated { attachment, .. } = &mut records[2].event {
+        attachment.byte_length = evidence.len() as u64;
+        attachment.blake3 = *blake3::hash(evidence).as_bytes();
+    }
+    records
+}
+
+fn budget_export(
+    records: &[RecordedEvent],
+    source: &str,
+    evidence: &[u8],
+    limits: TraceLimits,
+) -> Result<Vec<u8>, TraceError> {
+    write_budgeted(
+        TraceInput {
+            metadata: metadata(true),
+            records,
+            sources: &[
+                SourceInput {
+                    execution_id: ExecutionId::from_u128(1),
+                    file_id: FileId::new(0),
+                    revision: SourceRevision::of(source),
+                    project_path: "tests/first.webtest",
+                    text: Some(source),
+                },
+                SourceInput {
+                    execution_id: ExecutionId::from_u128(2),
+                    file_id: FileId::new(0),
+                    revision: SourceRevision::of(source),
+                    project_path: "tests/second.webtest",
+                    text: Some(source),
+                },
+            ],
+            attachments: &[AttachmentInput {
+                event: records[2].identity,
+                bytes: evidence,
+            }],
+        },
+        limits,
+    )
+}
+
+#[test]
+fn budgeted_capture_is_deterministic_preserves_journal_and_charges_shared_content_once() {
+    let source = SOURCE.repeat(3000);
+    let evidence = EVIDENCE.repeat(5000);
+    let records = budget_fixture(&source, &evidence);
+    let full = budget_export(&records, &source, &evidence, TraceLimits::default()).unwrap();
+    let full_trace = read(&full, TraceLimits::default()).unwrap();
+    assert!(
+        full_trace
+            .manifest
+            .capture_report
+            .as_ref()
+            .unwrap()
+            .events
+            .is_empty()
+    );
+    let exact = TraceLimits {
+        max_archive_bytes: full.len(),
+        ..TraceLimits::default()
+    };
+    // The budget is itself persisted, so its decimal width contributes to size.
+    let baseline = budget_export(&records, &source, &evidence, exact).unwrap();
+    let limits = TraceLimits {
+        max_archive_bytes: baseline.len() - 1,
+        ..exact
+    };
+    let bytes = budget_export(&records, &source, &evidence, limits).unwrap();
+    assert_eq!(
+        bytes,
+        budget_export(&records, &source, &evidence, limits).unwrap()
+    );
+    assert!(bytes.len() <= limits.max_archive_bytes);
+    let trace = read(&bytes, limits).unwrap();
+    assert_eq!(trace.records(), records);
+    assert_eq!(
+        members(&full)["events.jsonl"],
+        members(&bytes)["events.jsonl"]
+    );
+    assert!(trace.attachment(records[2].identity).is_none());
+    assert_eq!(
+        trace.source(ExecutionId::from_u128(1), FileId::new(0)),
+        Some(source.as_str())
+    );
+    assert_eq!(
+        trace.source(ExecutionId::from_u128(2), FileId::new(0)),
+        Some(source.as_str())
+    );
+    assert_eq!(
+        trace.manifest.capture_report.as_ref().unwrap().events.len(),
+        1
+    );
+    let limits = TraceLimits {
+        max_entries: 2,
+        ..TraceLimits::default()
+    };
+    let trace = read(
+        &budget_export(&records, &source, &evidence, limits).unwrap(),
+        limits,
+    )
+    .unwrap();
+    assert_eq!(trace.files.len(), 2);
+    assert_eq!(
+        trace.manifest.capture_report.as_ref().unwrap().events.len(),
+        2,
+        "shared source has one truncation fact"
+    );
+    assert!(
+        trace
+            .manifest
+            .sources
+            .iter()
+            .all(|source| source.file.is_none())
+    );
+    let html = render_html(&trace, 1_048_576).unwrap();
+    assert!(html.contains("Capture truncated"));
+    assert!(html.contains("Source bytes were omitted because"));
+    assert!(html.contains("Attachment bytes were omitted because"));
+}
+
+#[test]
+fn optional_content_respects_member_and_total_limits_but_mandatory_journal_is_never_dropped() {
+    let source = SOURCE.repeat(3000);
+    let evidence = EVIDENCE.repeat(5000);
+    let records = budget_fixture(&source, &evidence);
+    for limits in [
+        TraceLimits {
+            max_entry_bytes: 10_000,
+            ..TraceLimits::default()
+        },
+        TraceLimits {
+            max_total_bytes: 10_000,
+            ..TraceLimits::default()
+        },
+    ] {
+        let bytes = budget_export(&records, &source, &evidence, limits).unwrap();
+        let trace = read(&bytes, limits).unwrap();
+        assert_eq!(trace.records(), records);
+        assert_eq!(trace.manifest.capture_report.unwrap().events.len(), 2);
+    }
+    assert!(matches!(
+        budget_export(
+            &records,
+            &source,
+            &evidence,
+            TraceLimits {
+                max_entries: 1,
+                ..TraceLimits::default()
+            }
+        ),
+        Err(TraceError::Limit {
+            kind: LimitKind::Entries,
+            ..
+        })
+    ));
+    assert!(
+        budget_export(
+            &records,
+            &source,
+            &evidence,
+            TraceLimits {
+                max_archive_bytes: 20,
+                ..TraceLimits::default()
+            }
+        )
+        .is_err()
+    );
+    assert!(matches!(
+        budget_export(
+            &records,
+            &source,
+            b"corrupt",
+            TraceLimits {
+                max_entries: 2,
+                ..TraceLimits::default()
+            }
+        ),
+        Err(TraceError::Attachment(_))
+    ));
+}
+
+#[test]
+fn reader_requires_exact_unique_truncation_references_and_verifies_declared_budget() {
+    let records = fixture();
+    let limits = TraceLimits {
+        max_entries: 2,
+        ..TraceLimits::default()
+    };
+    let original = members(&budget_export(&records, SOURCE, EVIDENCE, limits).unwrap());
+    let mut files = original.clone();
+    mutate_manifest(&mut files, |m| {
+        m.capture_report.as_mut().unwrap().events.clear()
+    });
+    assert!(matches!(
+        read(&pack(&files), TraceLimits::default()),
+        Err(TraceError::CapturePolicy)
+    ));
+    let mut files = original.clone();
+    mutate_manifest(&mut files, |m| {
+        let report = m.capture_report.as_mut().unwrap();
+        report.events.push(report.events[0].clone());
+    });
+    assert!(matches!(
+        read(&pack(&files), TraceLimits::default()),
+        Err(TraceError::Capture(_))
+    ));
+    let mut files = original.clone();
+    mutate_manifest(&mut files, |m| {
+        m.capture_report.as_mut().unwrap().budget.max_archive_bytes = 1
+    });
+    assert!(matches!(
+        read(&pack(&files), TraceLimits::default()),
+        Err(TraceError::Capture(_))
+    ));
+    let mut files = original.clone();
+    mutate_manifest(&mut files, |m| {
+        let CaptureEvent::Truncated { file } = &mut m.capture_report.as_mut().unwrap().events[0];
+        file.byte_length += 1;
+    });
+    assert!(matches!(
+        read(&pack(&files), TraceLimits::default()),
+        Err(TraceError::Attachment(_))
+    ));
+    let mut files = original.clone();
+    mutate_manifest(&mut files, |m| m.format_version = 1);
+    assert!(matches!(
+        read(&pack(&files), TraceLimits::default()),
+        Err(TraceError::Capture(_))
+    ));
+    let mut files = original;
+    mutate_manifest(&mut files, |m| m.metadata.capture.sources = false);
+    assert!(matches!(
+        read(&pack(&files), TraceLimits::default()),
+        Err(TraceError::Capture(_))
+    ));
+}
+
+#[test]
+fn reader_still_accepts_version_one_archives_without_capture_reports() {
+    let records = fixture();
+    let mut files = members(&build(&records, true, TraceLimits::default()).unwrap());
+    mutate_manifest(&mut files, |m| m.format_version = 1);
+    let trace = read(&pack(&files), TraceLimits::default()).unwrap();
+    assert_eq!(trace.records(), records);
+    assert!(trace.manifest.capture_report.is_none());
 }

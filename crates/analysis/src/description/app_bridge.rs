@@ -647,7 +647,7 @@ fn runtime_configuration_reference() -> ConstructDescription {
     value.guidance = vec![
         guidance(
             "runtime_configuration_trace_viewer",
-            "The trace viewer reads a validated trace archive without loading project configuration or executing tests. It presents recorded timelines, explicit scope parentage, retry attempts, typed failures and cleanup, process-output facts, opt-in sources, and verified evidence. Source and attachment content omitted by capture policy remains absent; host paths inside facts are never opened. The local and standalone HTML views are script-free and make no external network requests. Test-run trace export, capture/retention policy, and browser console/network journaling remain pending. See `webtest trace --help` for viewing commands and output options.",
+            "The trace viewer reads a validated trace archive without loading project configuration or executing tests. It presents recorded timelines, explicit scope parentage, retry attempts, typed failures and cleanup, process-output facts, opt-in sources, and verified evidence. Source and attachment content omitted by capture policy remains absent; host paths inside facts are never opened. Budgeted archives distinguish whole-member truncation in a typed capture_report, keeping the runtime journal unchanged. The viewer shows those export facts separately from runtime events. The local and standalone HTML views are script-free and make no external network requests. Test-run trace export, capture/retention policy, and browser console/network journaling remain pending. See `webtest trace --help` for viewing commands and output options.",
         ),
         guidance(
             "runtime_configuration_fields",

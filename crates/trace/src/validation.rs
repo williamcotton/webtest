@@ -26,13 +26,14 @@ pub(crate) fn safe_path(path: &str) -> Result<(), TraceError> {
 
 fn check_file<'a>(
     file: &TraceFile,
-    files: &'a BTreeMap<String, Vec<u8>>,
+    files: &'a BTreeMap<String, impl AsRef<[u8]>>,
     used: &mut BTreeMap<String, TraceFile>,
 ) -> Result<&'a [u8], TraceError> {
     safe_path(&file.path)?;
     let bytes = files
         .get(&file.path)
-        .ok_or_else(|| TraceError::Missing(file.path.clone()))?;
+        .ok_or_else(|| TraceError::Missing(file.path.clone()))?
+        .as_ref();
     if let Some(verified) = used.get(&file.path) {
         if verified != file {
             return Err(TraceError::Integrity(file.path.clone()));
@@ -47,10 +48,10 @@ fn check_file<'a>(
 
 pub(crate) fn validate(
     manifest: TraceManifest,
-    files: &BTreeMap<String, Vec<u8>>,
+    files: &BTreeMap<String, impl AsRef<[u8]>>,
     limits: TraceLimits,
 ) -> Result<Vec<RecordedEvent>, TraceError> {
-    if manifest.format_version != TRACE_FORMAT_VERSION {
+    if !matches!(manifest.format_version, 1 | TRACE_FORMAT_VERSION) {
         return Err(TraceError::UnsupportedFormat(manifest.format_version));
     }
     if manifest.event_schema_version != EVENT_JOURNAL_SCHEMA_VERSION {
@@ -68,6 +69,8 @@ pub(crate) fn validate(
     if executions.iter().copied().collect::<Vec<_>>() != manifest.executions {
         return Err(TraceError::Executions);
     }
+    let omissions = capture::omissions(&manifest, files)?;
+    let mut used_omissions = BTreeSet::new();
 
     let mut sources = BTreeMap::new();
     let mut source_texts = BTreeMap::new();
@@ -78,7 +81,16 @@ pub(crate) fn validate(
         if !executions.contains(&source.execution_id) {
             return Err(TraceError::Executions);
         }
-        if source.file.is_some() != manifest.metadata.capture.sources {
+        let source_path = content_path("sources", source.revision.as_bytes());
+        if source.file.is_none() && manifest.metadata.capture.sources {
+            let omitted = omissions
+                .get(&source_path)
+                .ok_or(TraceError::CapturePolicy)?;
+            if &omitted.blake3 != source.revision.as_bytes() {
+                return Err(TraceError::Capture(source_path));
+            }
+            used_omissions.insert(source_path);
+        } else if source.file.is_some() != manifest.metadata.capture.sources {
             return Err(TraceError::CapturePolicy);
         }
         source_revisions.insert((source.execution_id, *source.revision.as_bytes()));
@@ -112,7 +124,7 @@ pub(crate) fn validate(
         if attachments.insert(reference.event, reference).is_some() {
             return Err(TraceError::Attachment(reference.event));
         }
-        if reference.file.is_some() != manifest.metadata.capture.attachments {
+        if reference.file.is_some() && !manifest.metadata.capture.attachments {
             return Err(TraceError::CapturePolicy);
         }
     }
@@ -165,11 +177,26 @@ pub(crate) fn validate(
                     return Err(TraceError::Attachment(record.identity));
                 }
                 check_file(file, files, &mut used)?;
+            } else if manifest.metadata.capture.attachments {
+                let path = content_path("attachments", &attachment.blake3);
+                let omitted = omissions.get(&path).ok_or(TraceError::CapturePolicy)?;
+                if omitted.blake3 != attachment.blake3
+                    || omitted.byte_length != attachment.byte_length
+                {
+                    return Err(TraceError::Attachment(record.identity));
+                }
+                used_omissions.insert(path);
             }
         }
     }
     if let Some((identity, _)) = attachments.first_key_value() {
         return Err(TraceError::Attachment(*identity));
+    }
+    if let Some(path) = omissions
+        .keys()
+        .find(|path| !used_omissions.contains(*path))
+    {
+        return Err(TraceError::Capture(path.clone()));
     }
     if let Some(path) = files
         .keys()

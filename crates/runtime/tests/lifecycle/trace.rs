@@ -42,6 +42,46 @@ fn roundtrip(
     bytes
 }
 
+fn budgeted_roundtrip(source: &str, plan: &TestPlan, result: &webtest_runtime::RunResult) {
+    let bytes = webtest_trace::write_budgeted(
+        TraceInput {
+            metadata: TraceMetadata {
+                compiler_version: env!("CARGO_PKG_VERSION").into(),
+                project_identity: [1; 32],
+                configuration_fingerprint: [2; 32],
+                browser_version: None,
+                provider_versions: BTreeMap::new(),
+                capture: CapturePolicy {
+                    sources: true,
+                    attachments: false,
+                },
+            },
+            records: &result.journal,
+            sources: &[SourceInput {
+                execution_id: result.execution_id.unwrap(),
+                file_id: plan.file,
+                revision: plan.source_revision,
+                project_path: "tests/structured.webtest",
+                text: Some(source),
+            }],
+            attachments: &[],
+        },
+        TraceLimits {
+            max_entries: 2,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let trace = webtest_trace::read(&bytes, TraceLimits::default()).unwrap();
+    assert_eq!(trace.records(), result.journal);
+    assert_eq!(trace.source(result.execution_id.unwrap(), plan.file), None);
+    let report = trace.manifest().capture_report.as_ref().unwrap();
+    assert_eq!(report.events.len(), 1);
+    let webtest_trace::CaptureEvent::Truncated { file } = &report.events[0];
+    assert_eq!(&file.blake3, plan.source_revision.as_bytes());
+    assert_eq!(file.byte_length, source.len() as u64);
+}
+
 #[tokio::test(start_paused = true)]
 async fn trace_roundtrip_preserves_parallel_race_retry_resource_and_failure_facts() {
     let source = r#"test "trace" { timeout 1s { parallel {
@@ -75,6 +115,7 @@ async fn trace_roundtrip_preserves_parallel_race_retry_resource_and_failure_fact
             .any(|r| matches!(r.event, ExecutionEvent::StepFailed { .. }))
     );
     roundtrip(source, &plan, &result, true);
+    budgeted_roundtrip(source, &plan, &result);
 }
 
 #[tokio::test(start_paused = true)]
@@ -95,6 +136,7 @@ async fn trace_accepts_every_explicit_authoritative_overflow_boundary() {
             .run(&plan, &LifecycleHost(Arc::default()))
             .await;
         roundtrip(source, &plan, &result, false);
+        budgeted_roundtrip(source, &plan, &result);
     }
 }
 

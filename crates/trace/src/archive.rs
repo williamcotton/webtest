@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, io::Write};
+use std::{borrow::Cow, collections::BTreeMap, io::Write};
 
 use crate::*;
 use webtest_observation::{EVENT_JOURNAL_SCHEMA_VERSION, ExecutionEvent};
@@ -8,6 +8,8 @@ use webtest_observation::{EVENT_JOURNAL_SCHEMA_VERSION, ExecutionEvent};
 // Magic; u32 LE entry count; repeated u8 kind (0), u32 LE name length,
 // u64 LE content length, UTF-8 name, content. No padding or trailing bytes.
 const MAGIC: &[u8] = b"WEBTEST-TRACE\0\x01";
+
+type CapturedFiles<'a> = BTreeMap<String, Cow<'a, [u8]>>;
 
 pub(crate) fn limit(actual: usize, maximum: usize, kind: LimitKind) -> Result<(), TraceError> {
     if actual > maximum {
@@ -32,17 +34,42 @@ pub(crate) fn content_path(directory: &str, hash: &[u8; 32]) -> String {
     format!("{directory}/{}", blake3::Hash::from(*hash).to_hex())
 }
 
-/// Serialize only after validating all supplied references. Returns a complete
-/// archive for the caller to persist atomically; no partial artifact is published.
+/// Strict capture: any exceeded bound returns an error without publishing an archive.
 pub fn write(input: TraceInput<'_>, limits: TraceLimits) -> Result<Vec<u8>, TraceError> {
+    let (manifest, files) = prepare(input, limits)?;
+    finish(manifest, files, limits)
+}
+
+/// Preserve the entire journal and omit optional content with typed export facts
+/// when capture bounds are reached. Mandatory metadata/journal failure is an error.
+pub fn write_budgeted(input: TraceInput<'_>, limits: TraceLimits) -> Result<Vec<u8>, TraceError> {
+    let (mut manifest, mut files) = prepare(input, limits)?;
+    // Validate supplied bytes before selection. A budget must never conceal a
+    // corrupt digest, invalid source, or missing capture promised by policy.
+    validation::validate(manifest.clone(), &files, limits)?;
+    capture::select(&mut manifest, &mut files, limits)?;
+    finish(manifest, files, limits)
+}
+
+fn prepare(
+    input: TraceInput<'_>,
+    limits: TraceLimits,
+) -> Result<(TraceManifest, CapturedFiles<'_>), TraceError> {
     limit(input.records.len(), limits.max_events, LimitKind::Events)?;
-    let mut events = BoundedBytes::new(limits.max_entry_bytes, LimitKind::EntryBytes);
+    let (event_limit, event_limit_kind) = [
+        (limits.max_entry_bytes, LimitKind::EntryBytes),
+        (limits.max_total_bytes, LimitKind::TotalBytes),
+        (limits.max_archive_bytes, LimitKind::ArchiveBytes),
+    ]
+    .into_iter()
+    .min_by_key(|(bytes, _)| *bytes)
+    .ok_or(TraceError::ArchiveFraming)?;
+    let mut events = BoundedBytes::new(event_limit, event_limit_kind);
     for record in input.records {
         let bytes = json(record, limits.max_record_bytes, LimitKind::RecordBytes)?;
         events.append(&bytes)?;
         events.append(b"\n")?;
     }
-    let mut files = BTreeMap::new();
     let mut manifest = TraceManifest {
         format_version: TRACE_FORMAT_VERSION,
         event_schema_version: EVENT_JOURNAL_SCHEMA_VERSION,
@@ -57,12 +84,13 @@ pub fn write(input: TraceInput<'_>, limits: TraceLimits) -> Result<Vec<u8>, Trac
         events: descriptor("events.jsonl".into(), &events.bytes),
         sources: Vec::new(),
         attachments: Vec::new(),
+        capture_report: None,
     };
-    add_file(&mut files, "events.jsonl".into(), &events.bytes, limits)?;
+    let mut files = BTreeMap::from([("events.jsonl".into(), Cow::Owned(events.bytes))]);
     for source in input.sources {
         let file = if let Some(text) = source.text {
             let path = content_path("sources", source.revision.as_bytes());
-            add_file(&mut files, path.clone(), text.as_bytes(), limits)?;
+            insert_capture(&mut files, path.clone(), text.as_bytes())?;
             Some(descriptor(path, text.as_bytes()))
         } else {
             None
@@ -91,7 +119,7 @@ pub fn write(input: TraceInput<'_>, limits: TraceLimits) -> Result<Vec<u8>, Trac
         if let ExecutionEvent::AttachmentCreated { attachment, .. } = &record.event {
             let file = if let Some(bytes) = supplied.remove(&record.identity) {
                 let path = content_path("attachments", &attachment.blake3);
-                add_file(&mut files, path.clone(), bytes, limits)?;
+                insert_capture(&mut files, path.clone(), bytes)?;
                 Some(descriptor(path, bytes))
             } else {
                 None
@@ -106,15 +134,62 @@ pub fn write(input: TraceInput<'_>, limits: TraceLimits) -> Result<Vec<u8>, Trac
         return Err(TraceError::Attachment(*identity));
     }
     manifest.attachments.sort_by_key(|a| a.event);
+    Ok((manifest, files))
+}
+
+fn insert_capture<'a>(
+    files: &mut CapturedFiles<'a>,
+    path: String,
+    bytes: &'a [u8],
+) -> Result<(), TraceError> {
+    if let Some(existing) = files.get(&path) {
+        if existing.as_ref() != bytes {
+            return Err(TraceError::Integrity(path));
+        }
+    } else {
+        files.insert(path, Cow::Borrowed(bytes));
+    }
+    Ok(())
+}
+
+fn finish(
+    mut manifest: TraceManifest,
+    mut files: CapturedFiles<'_>,
+    limits: TraceLimits,
+) -> Result<Vec<u8>, TraceError> {
+    if let Some(report) = &mut manifest.capture_report {
+        report.events.sort_by(|a, b| {
+            capture::event_file(a)
+                .path
+                .cmp(&capture::event_file(b).path)
+        });
+    }
     let bytes = json(
         &manifest,
         limits.max_manifest_bytes,
         LimitKind::ManifestBytes,
     )?;
-    add_file(&mut files, "manifest.json".into(), &bytes, limits)?;
-    // Use the same validator as an untrusted reader, including journal replay.
+    files.insert("manifest.json".into(), Cow::Owned(bytes));
+    check_sizes(&files, limits)?;
     validation::validate(manifest, &files, limits)?;
     encode(&files, limits)
+}
+
+pub(crate) fn check_sizes(
+    files: &BTreeMap<String, impl AsRef<[u8]>>,
+    limits: TraceLimits,
+) -> Result<(), TraceError> {
+    limit(files.len(), limits.max_entries, LimitKind::Entries)?;
+    let mut total = 0usize;
+    for bytes in files.values() {
+        limit(
+            bytes.as_ref().len(),
+            limits.max_entry_bytes,
+            LimitKind::EntryBytes,
+        )?;
+        total = total.saturating_add(bytes.as_ref().len());
+    }
+    limit(total, limits.max_total_bytes, LimitKind::TotalBytes)
 }
 
 /// Validate a bounded archive without filesystem access or extraction. Historical
@@ -140,7 +215,7 @@ pub fn read(bytes: &[u8], limits: TraceLimits) -> Result<VerifiedTrace, TraceErr
         event_schema_version: u32,
     }
     let header: Header = serde_json::from_slice(bytes)?;
-    if header.format_version != TRACE_FORMAT_VERSION {
+    if !matches!(header.format_version, 1 | TRACE_FORMAT_VERSION) {
         return Err(TraceError::UnsupportedFormat(header.format_version));
     }
     if header.event_schema_version != EVENT_JOURNAL_SCHEMA_VERSION {
@@ -157,34 +232,8 @@ pub fn read(bytes: &[u8], limits: TraceLimits) -> Result<VerifiedTrace, TraceErr
     })
 }
 
-fn add_file(
-    files: &mut BTreeMap<String, Vec<u8>>,
-    path: String,
-    bytes: &[u8],
-    limits: TraceLimits,
-) -> Result<(), TraceError> {
-    limit(bytes.len(), limits.max_entry_bytes, LimitKind::EntryBytes)?;
-    if let Some(existing) = files.get(&path) {
-        if existing != bytes {
-            return Err(TraceError::Integrity(path));
-        }
-        return Ok(());
-    }
-    limit(
-        files.len().saturating_add(1),
-        limits.max_entries,
-        LimitKind::Entries,
-    )?;
-    let total = files
-        .values()
-        .fold(bytes.len(), |sum, file| sum.saturating_add(file.len()));
-    limit(total, limits.max_total_bytes, LimitKind::TotalBytes)?;
-    files.insert(path, bytes.to_vec());
-    Ok(())
-}
-
 pub(crate) fn encode(
-    files: &BTreeMap<String, Vec<u8>>,
+    files: &BTreeMap<String, impl AsRef<[u8]>>,
     limits: TraceLimits,
 ) -> Result<Vec<u8>, TraceError> {
     let mut out = BoundedBytes::new(limits.max_archive_bytes, LimitKind::ArchiveBytes);
@@ -192,6 +241,7 @@ pub(crate) fn encode(
     let count = u32::try_from(files.len()).map_err(|_| TraceError::ArchiveFraming)?;
     out.append(&count.to_le_bytes())?;
     for (name, bytes) in files {
+        let bytes = bytes.as_ref();
         let length = u32::try_from(name.len()).map_err(|_| TraceError::ArchiveFraming)?;
         out.append(&[0])?;
         out.append(&length.to_le_bytes())?;
@@ -295,7 +345,7 @@ impl Write for BoundedBytes {
         Ok(())
     }
 }
-fn json(
+pub(crate) fn json(
     value: &impl serde::Serialize,
     maximum: usize,
     kind: LimitKind,

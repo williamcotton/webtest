@@ -658,6 +658,7 @@ mod tests {
         assert!(WEBTEST_SKILL.contains("`cancellation_requested`"));
         assert!(WEBTEST_SKILL.contains("`output_captured`"));
         assert!(WEBTEST_SKILL.contains("webtest trace <artifact>"));
+        assert!(WEBTEST_SKILL.contains("`capture_report`"));
         assert!(WEBTEST_SKILL.contains("`causing_scope_id`"));
         assert!(WEBTEST_SKILL.contains("webtest test <path> --jobs 2 --reporter json"));
         assert!(WEBTEST_SKILL.contains("WEBTEST_APP_URL"));

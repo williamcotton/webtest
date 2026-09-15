@@ -72,6 +72,13 @@ pub fn render_html(trace: &VerifiedTrace, max_bytes: usize) -> Result<String, Re
     };
     out.add(format_args!("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"{}\"><meta name=\"referrer\" content=\"no-referrer\"><title>WebTest trace</title><style>{}</style></head><body><header><p class=\"muted\">WEBTEST / TRACE</p><h1>Execution record</h1><p>{} executions · {} recorded events</p><nav><a href=\"#timeline\">Timeline</a><a href=\"#scopes\">Branches and scopes</a><a href=\"#sources\">Sources</a><a href=\"#attachments\">Evidence</a><a href=\"#manifest\">Manifest</a></nav></header><main>", Escape(VIEWER_CSP), include_str!("viewer.css"), trace.manifest.executions.len(), trace.records.len()))?;
     out.add(format_args!("<section id=\"timeline\"><h2>Timeline</h2><p class=\"muted\">Elapsed time is local to each execution. Expand an event for its complete recorded fact, including wall time and typed failure details.</p>"))?;
+    if let Some(report) = &trace.manifest.capture_report
+        && !report.events.is_empty()
+    {
+        out.add(format_args!("<aside class=\"panel failure\"><h2>Capture truncated</h2><p>{} content members were omitted to meet trace capture limits. The recorded runtime journal is unchanged.</p><details><summary>Capture budget and truncation facts</summary>", report.events.len()))?;
+        out.json(report)?;
+        out.add(format_args!("</details></aside>"))?;
+    }
     let mut executions = BTreeMap::new();
     let mut scopes = BTreeMap::new();
     let mut sources = BTreeMap::new();
@@ -199,6 +206,10 @@ pub fn render_html(trace: &VerifiedTrace, max_bytes: usize) -> Result<String, Re
                 }
                 out.add(format_args!("</pre>"))?;
             }
+        } else if trace.manifest.metadata.capture.sources {
+            out.add(format_args!(
+                "<p>Source bytes were omitted because the trace capture budget was exceeded.</p>"
+            ))?;
         } else {
             out.add(format_args!("<p>Source content was not included.</p>"))?;
         }
@@ -228,6 +239,8 @@ pub fn render_html(trace: &VerifiedTrace, max_bytes: usize) -> Result<String, Re
                 }
                 out.add(format_args!("<p><a download=\"attachment-{execution}-{sequence}.bin\" href=\"data:application/octet-stream;base64,{}\">Download captured bytes</a></p>", Base64Display::new(bytes, &STANDARD)))?;
             }
+        } else if trace.manifest.metadata.capture.attachments {
+            out.add(format_args!("<p>Attachment bytes were omitted because the trace capture budget was exceeded.</p>"))?;
         } else {
             out.add(format_args!("<p>Attachment bytes were not included.</p>"))?;
         }

@@ -3,8 +3,10 @@
 //! This component never executes project code, opens paths from events, or
 //! extracts archive members to disk. Callers supply already-redacted captures
 //! and explicitly opt into source inclusion. Storage/retention policy and UI
-//! belong to adapters. An exceeded limit is an error, never silent data loss.
+//! belong to adapters. Budgeted capture may omit optional members with explicit
+//! export facts; an exceeded mandatory bound is an error, never silent data loss.
 mod archive;
+mod capture;
 mod validation;
 mod viewer;
 
@@ -12,10 +14,10 @@ use std::collections::BTreeMap;
 use webtest_observation::{EventIdentity, ExecutionId, RecordedEvent};
 use webtest_text::{FileId, SourceRevision};
 
-pub use archive::{read, write};
+pub use archive::{read, write, write_budgeted};
 pub use viewer::{RenderError, VIEWER_CSP, render_html};
 
-pub const TRACE_FORMAT_VERSION: u32 = 1;
+pub const TRACE_FORMAT_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug)]
 pub struct TraceLimits {
@@ -87,6 +89,32 @@ pub struct TraceAttachment {
     pub file: Option<TraceFile>,
 }
 
+/// Export facts have artifact-local identity and never borrow a runtime event
+/// sequence or alter the authoritative journal. One omitted content member may
+/// be referenced by several executions or attachment occurrences.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CaptureEvent {
+    Truncated { file: TraceFile },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureBudget {
+    pub max_archive_bytes: u64,
+    pub max_total_bytes: u64,
+    pub max_entry_bytes: u64,
+    pub max_entries: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureReport {
+    pub budget: CaptureBudget,
+    /// Deterministic content-path order. Vector position is local to this artifact.
+    pub events: Vec<CaptureEvent>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TraceManifest {
@@ -97,6 +125,8 @@ pub struct TraceManifest {
     pub events: TraceFile,
     pub sources: Vec<TraceSource>,
     pub attachments: Vec<TraceAttachment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_report: Option<CaptureReport>,
 }
 
 pub struct SourceInput<'a> {
@@ -192,6 +222,8 @@ pub enum TraceError {
     Attachment(EventIdentity),
     #[error("capture content does not agree with its policy")]
     CapturePolicy,
+    #[error("invalid trace capture budget or truncation fact: {0}")]
+    Capture(String),
     #[error("invalid journal record at line {line}: {error:?}")]
     Journal {
         line: usize,

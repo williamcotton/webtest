@@ -1707,6 +1707,8 @@ mod tests {
         for fact in [
             "validated trace archive",
             "explicit scope parentage",
+            "capture_report",
+            "runtime journal unchanged",
             "script-free",
             "host paths",
             "remain pending",

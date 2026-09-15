@@ -41,7 +41,9 @@ Milestone E is **not complete**. The execution-tree, resource/wait foundations, 
   the unchanged native journal, opt-in revision-keyed sources, and checksum-verified
   attachment mappings. A shared script-free viewer now presents existing archives
   through `webtest trace`, locally or as standalone HTML. Test-run capture/retention
-  policy, truncation events, and atomic archive publication remain pending.
+  policy and atomic archive publication remain pending. Budgeted core capture now
+  omits whole optional members with typed trace-local truncation facts while
+  preserving the authoritative journal unchanged.
 - Runtime observations accumulate privately and commit as a complete batch. Starting another
   run clears prior observations and prevents an older in-flight run from overwriting the newer
   batch. Cross-process publication remains unimplemented.
@@ -896,6 +898,46 @@ input rejection, shutdown with a stalled client, and real Chrome rendering with
 Ctrl-C server reaping. Description search and CLI help characterization pass.
 Workspace Clippy with `-D warnings`, formatting, diff whitespace checks, and WASM
 compilation of `webtest-wasm` and `webtest-trace` pass.
+
+### Trace capture budget continuation — 2026-09-15
+
+The trace core now offers `write_budgeted` alongside strict `write`. It validates
+supplied source/evidence first, then drops whole optional content members to meet
+archive-byte, total-byte, per-member-byte, and entry-count limits. Selection is
+deterministic: largest content first, lexical path tie-breaker. Shared content is
+charged once and all references are omitted together. Content stays borrowed
+until selection completes; metadata and container framing count toward the budget.
+
+Manifest format 2 adds an optional `capture_report`: declared capture limits and
+typed `truncated` facts with omitted paths, lengths, and digests, sorted by path.
+These are trace-local export facts, not invented runtime occurrences. Native
+`RecordedEvent` envelopes, sequence identities, cancellation, failures, cleanup,
+and journal-overflow terminals remain unchanged. The mandatory journal and metadata
+must fit; otherwise writing returns a typed error without an archive. Initial
+manifest size is also a hard bound. Strict writing still fails on any exceeded limit.
+
+The reader checks retained bytes against the declared budget and requires exact
+omission references. Duplicate, orphaned, contradictory, or version-1 capture
+reports are rejected. It still accepts manifest-format-1 archives without reports;
+container framing stays version 1. The viewer distinguishes budget truncation from
+policy-disabled capture and displays export facts separately from runtime events.
+Shared configuration guidance and canonical bootstrap skill now describe that
+distinction. Journal schema 8, CLI report/event schema 11, plan format 9, and runtime
+semantics 6 are unchanged.
+
+Test-run trace export, public capture/retention settings, atomic archive publication,
+remaining host/event coverage, observation IPC, and concurrent DAP remain pending.
+Milestone E is still incomplete.
+
+Verification: `cargo test --workspace` passes, including all 17 trace-core tests,
+139 runtime lifecycle tests, four CLI viewer tests, native Chrome/protocol
+integration, and doc tests. Focused coverage includes deterministic capture,
+byte/member/count bounds, shared-member accounting, invalid-content rejection
+before selection, backward compatibility, corrupt capture-report rejection,
+viewer omission labels, and unchanged runtime parallel/race/retry/resource/failure
+journals across every authoritative journal-overflow boundary. Workspace Clippy
+with `-D warnings`, formatting, diff whitespace checks, and WASM compilation of
+`webtest-wasm` and `webtest-trace` pass.
 
 ## 1. Outcome
 

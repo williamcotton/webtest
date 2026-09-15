@@ -8,8 +8,8 @@ filesystem access, extraction, network requests, or project execution.
 This is the artifact foundation for Milestone E. `webtest trace <artifact>`
 validates an existing archive and serves the shared viewer on a random loopback
 port; `--output <file>` writes standalone HTML without overwriting an existing
-file. Test-run export, CLI capture/retention settings, capture-budget truncation
-events, and atomic archive publication remain pending.
+file. Budgeted capture records explicit omissions of optional content. Test-run
+export, CLI capture/retention settings, and atomic archive publication remain pending.
 
 ## Container version 1
 
@@ -37,7 +37,8 @@ turns even a validated name into a host path.
 
 ## Manifest and journal
 
-The manifest versions the trace format separately from the native event schema.
+Manifest format 2 versions the trace separately from the native event schema and
+container framing. Readers also accept format 1 without capture reports.
 It carries compiler/browser/provider versions, project identity, a configuration
 fingerprint (no raw configuration), capture policy, execution membership, source
 mapping, and byte lengths/BLAKE3 checksums for every other member. A checksum
@@ -73,10 +74,28 @@ be complete and checksum-valid.
 
 Independent bounds cover archive bytes, total member bytes, each member,
 manifest bytes, event-record bytes, member count, and event count. All limits are
-inclusive. Exceeding one returns a typed error and no output archive. This initial
-API does not drop semantic events or synthesize a trace truncation event; adapter
-capture-budget policy must be added before public CLI export. `write` returns a
-complete byte buffer so a future adapter can publish it atomically.
+inclusive. `write` is strict: exceeding any bound returns a typed error and no
+output archive. `write_budgeted` can omit whole optional source/attachment members
+to meet archive-byte, total-byte, per-member-byte, and member-count bounds. It
+validates supplied captures before selection, including captures ultimately omitted.
+The journal is never shortened or rewritten. Mandatory journal/metadata limits,
+including the initial manifest size, still fail without producing an archive.
+
+Budgeted manifests include a `capture_report` with the four capture limits and
+typed `truncated` export facts carrying each omitted member's path, length, and
+digest. These facts belong to the artifact, not the runtime journal: their sorted
+vector positions never borrow execution IDs or event sequences. An empty report
+means nothing was truncated; absent content under a disabled capture policy has
+no truncation fact. Readers verify declared retained sizes, require an exact
+omission reference for every budget-dropped capture, and reject duplicate,
+orphaned, contradictory, or version-1 capture reports.
+
+Selection visits largest members first with lexical path tie-breaking, dropping
+members until the capture fits. Shared content is charged once and dropped for
+every reference together with one truncation fact. This deterministic policy does
+not promise optimal packing. Metadata and framing, including the truncation facts,
+count toward their respective limits. Input content stays borrowed until selection
+finishes. Both APIs return a complete byte buffer for atomic adapter publication.
 
 ## Viewer
 
@@ -85,7 +104,9 @@ covers escaped text and base64 evidence; an overrun returns no partial document.
 The script-free HTML contains the per-execution timeline, explicit parent-scope
 links, attempt/operation identity, all typed facts, included source text, and
 verified evidence. It retains complete recorded JSON in expandable details.
-Omitted capture and missing parent facts stay explicit. Wall time is shown in
+Policy-disabled capture, budget-truncated content, and missing parent facts stay
+distinct and explicit. The viewer displays the capture report separately from the
+unchanged runtime timeline. Wall time is shown in
 the original fact; the timeline uses recorded elapsed time, never wall-clock
 sorting or a fabricated cross-execution order.
 
