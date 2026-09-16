@@ -45,6 +45,8 @@ Milestone E is **not complete**. The execution-tree, resource/wait foundations, 
   and atomic non-overwriting publication. Budgeted core capture now
   omits whole optional members with typed trace-local truncation facts while
   preserving the authoritative journal unchanged.
+- DAP now exposes distinct task threads, explicit scope stacks, cooperative pause/continue,
+  selected-task lexical stepping, retry attempts, exception filters, and joined restart/disconnect.
 - Runtime observations accumulate privately and commit as a complete batch. Starting another
   run clears prior observations and prevents an older in-flight run from overwriting the newer
   batch. Authenticated CLI-to-LSP publication now updates matching open documents
@@ -1036,6 +1038,45 @@ and authentication workflow, all 16 protocol tests, and 139 runtime lifecycle te
 `cargo clippy --workspace --all-targets -- -D warnings`,
 `cargo fmt --all -- --check`, and `git diff --check` pass. The stable-toolchain
 `wasm32-unknown-unknown` check passes for `webtest-wasm` and `webtest-trace`.
+
+### Acceptance-focused checkpoint: concurrent DAP — 2026-09-16
+
+This checkpoint targets criterion 11 through the existing Runner/RunControl path.
+Runtime control hooks now receive immutable task identity, explicit scope ancestry,
+and retry attempt ordinals/limits. Root and owned-child guards retain debugger task
+lifetimes through cleanup. No branch bindings, resources, or execution state are
+shared with DAP; the adapter owns only debugger metadata and redacted snapshots.
+
+Each test, sibling, and retry attempt has a distinct stable DAP thread for its runtime
+occurrence. Stack frames mirror execution scopes with exact source ranges. Operation
+frames expose lexical bindings and assertion expected/actual values; ancestor frames
+expose their scope/attempt metadata without presenting descendant locals as their own.
+Variable/frame handles are unique within the debug session and expire on resume.
+
+Breakpoints and explicit pause cooperatively park every task at its next operation
+safe point. Stopped events identify each parked thread and do not falsely claim that
+in-flight host operations have already stopped. Continue broadcasts to all parked
+hooks; single-thread resume is explicitly rejected. Step in follows the selected task
+or descendants, next returns to its lexical depth, and step out waits for an enclosing
+scope, including return from an owned branch. Retry attempts get fresh identities.
+
+Exception filters cover assertions, providers, infrastructure, and internal failures,
+retaining the existing app-specific filters. Source-modified/revision-mismatched
+breakpoints receive deterministic unverified messages. Restart cancels and joins the
+old execution before rerunning the launched source snapshot. Disconnect, EOF, and
+transport errors also await the runtime task; DAP never performs host teardown.
+Cancellation/deadlines drop only the affected parked snapshots and cleanup remains
+owned by Runner. Restart uses RunnerShutdown and disconnect uses DebugDisconnect.
+
+Boundaries: pause time still counts toward deadlines; an in-flight host call reaches
+its next safe point naturally. Newly collected failure evidence follows the exception
+hook and is therefore not yet inspectable at that stop. DAP launches a single file's
+normal Runner; this checkpoint does not add a debug CLI jobs scheduler. Broader
+resource/event conformance and cross-surface acceptance remain Milestone E work.
+
+Verification: focused runtime-backed DAP tests pass for sibling snapshots, broadcast
+continue, lexical stepping, retry exceptions, timeout, restart, and disconnect.
+Real protocol and full workspace/Clippy/portable validation are in progress.
 
 ## 1. Outcome
 

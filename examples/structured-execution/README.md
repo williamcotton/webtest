@@ -97,3 +97,10 @@ On Unix, running these tests from the CLI also updates runtime diagnostics for
 matching open files in a running WebTest LSP. A passing rerun clears prior failures.
 Unsaved editor changes reject stale on-disk results; a missing editor never changes
 test outcomes. Windows transport and unopened-file publication remain pending.
+
+Debug these files with the editor's WebTest debug command. Parallel/race siblings
+and retry attempts appear as separate threads; select the stopped thread to inspect
+its scope stack and redacted locals. Continue resumes all tasks. Step in follows the
+selected task or children, next stops back at its lexical depth, and step out stops
+in an enclosing scope. Pauses count toward deadlines. Restart and disconnect await
+runner-owned cleanup; restart uses the launched source snapshot.

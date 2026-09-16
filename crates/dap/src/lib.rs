@@ -1,5 +1,8 @@
 //! Debug Adapter Protocol transport over the source-mapped WebTest runtime.
 
+mod concurrent;
+use concurrent::{DebugTasks, ResumeCommand};
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     io::BufRead,
@@ -26,7 +29,7 @@ use webtest_provider::ProviderRegistry;
 use webtest_runtime::{RunControl, RunOutcome, Runner, RunnerOptions, StepError, TestOutcome};
 use webtest_text::TextRange;
 
-const THREAD_ID: i64 = 1;
+#[cfg(test)]
 const VARIABLES_REFERENCE: i64 = 1;
 
 #[derive(Debug, Error)]
@@ -201,21 +204,6 @@ impl StepLocation {
     }
 }
 
-struct PausedFrame {
-    test_name: String,
-    operation: String,
-    source_line: String,
-    path: PathBuf,
-    location: StepLocation,
-    variables: DapVariableStore,
-}
-
-#[derive(Clone, Copy)]
-enum ResumeCommand {
-    Continue,
-    Step,
-}
-
 struct DebugState {
     writer: ProtocolWriter,
     browser: Arc<dyn BrowserHost>,
@@ -223,14 +211,16 @@ struct DebugState {
     providers: ProviderRegistry,
     program: Mutex<Option<LoadedProgram>>,
     breakpoints: Mutex<HashMap<PathBuf, HashSet<u32>>>,
+    breakpoint_revisions: Mutex<HashMap<PathBuf, webtest_text::SourceRevision>>,
     exception_breakpoints: Mutex<HashSet<String>>,
-    paused: Mutex<Option<PausedFrame>>,
-    pending_pause: Mutex<Option<&'static str>>,
-    resume_sender: mpsc::UnboundedSender<ResumeCommand>,
-    resume_receiver: AsyncMutex<mpsc::UnboundedReceiver<ResumeCommand>>,
+    tasks: Mutex<DebugTasks>,
+    wake: watch::Sender<u64>,
+    handles: Arc<AtomicI64>,
+    run_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     configured: AtomicBool,
     started: AtomicBool,
     shutting_down: AtomicBool,
+    cancellation_reason: Mutex<webtest_host::CancellationReason>,
     completion: watch::Sender<bool>,
 }
 
@@ -250,7 +240,7 @@ impl DebugState {
         runner_options: RunnerOptions,
         providers: ProviderRegistry,
     ) -> Arc<Self> {
-        let (resume_sender, resume_receiver) = mpsc::unbounded_channel();
+        let (wake, _) = watch::channel(0);
         let (completion, _) = watch::channel(false);
         Arc::new(Self {
             writer,
@@ -259,14 +249,16 @@ impl DebugState {
             providers,
             program: Mutex::new(None),
             breakpoints: Mutex::new(HashMap::new()),
+            breakpoint_revisions: Mutex::new(HashMap::new()),
             exception_breakpoints: Mutex::new(HashSet::new()),
-            paused: Mutex::new(None),
-            pending_pause: Mutex::new(None),
-            resume_sender,
-            resume_receiver: AsyncMutex::new(resume_receiver),
+            tasks: Mutex::new(DebugTasks::default()),
+            wake,
+            handles: Arc::new(AtomicI64::new(1)),
+            run_task: Mutex::new(None),
             configured: AtomicBool::new(false),
             started: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
+            cancellation_reason: Mutex::new(webtest_host::CancellationReason::DebugDisconnect),
             completion,
         })
     }
@@ -283,10 +275,16 @@ impl DebugState {
                         json!({
                             "supportsConfigurationDoneRequest": true,
                             "supportsTerminateRequest": true,
+                            "supportsRestartRequest": true,
+                            "supportsSingleThreadExecutionRequests": false,
                             "supportsPauseRequest": true,
                             "supportsStepInTargetsRequest": false,
                             "supportsEvaluateForHovers": false,
                             "exceptionBreakpointFilters": [
+                                {"filter":"assertion", "label":"Assertion failures", "default":false},
+                                {"filter":"provider", "label":"Provider failures", "default":false},
+                                {"filter":"infrastructure", "label":"Infrastructure failures", "default":false},
+                                {"filter":"internal", "label":"Internal failures", "default":false},
                                 {
                                     "filter": "appProviderFailure",
                                     "label": "Application provider failures",
@@ -324,40 +322,26 @@ impl DebugState {
                 self.start_if_ready();
             }
             "threads" => {
+                let threads = lock(&self.tasks).threads();
                 self.writer
-                    .response(
-                        &request,
-                        json!({ "threads": [{ "id": THREAD_ID, "name": "WebTest" }] }),
-                    )
+                    .response(&request, json!({"threads":threads}))
                     .await?;
             }
             "stackTrace" => self.stack_trace(&request).await?,
-            "scopes" => {
-                self.writer
-                    .response(
-                        &request,
-                        json!({
-                            "scopes": [{
-                                "name": "WebTest",
-                                "presentationHint": "locals",
-                                "variablesReference": VARIABLES_REFERENCE,
-                                "expensive": false,
-                            }]
-                        }),
-                    )
-                    .await?;
-            }
+            "scopes" => self.scopes(&request).await?,
             "variables" => self.variables(&request).await?,
             "continue" => self.resume(&request, ResumeCommand::Continue).await?,
-            "next" | "stepIn" | "stepOut" => self.resume(&request, ResumeCommand::Step).await?,
+            "next" => self.resume(&request, ResumeCommand::Over).await?,
+            "stepIn" => self.resume(&request, ResumeCommand::In).await?,
+            "stepOut" => self.resume(&request, ResumeCommand::Out).await?,
+            "restart" => self.restart(&request).await?,
             "pause" => {
-                *lock(&self.pending_pause) = Some("pause");
+                lock(&self.tasks).pending_pause = Some("pause");
                 self.writer.response(&request, json!({})).await?;
             }
             "disconnect" | "terminate" => {
-                self.shutting_down.store(true, Ordering::Release);
+                self.cancel_execution();
                 self.writer.response(&request, json!({})).await?;
-                let _ = self.resume_sender.send(ResumeCommand::Continue);
                 return Ok(true);
             }
             _ => {
@@ -402,7 +386,7 @@ impl DebugState {
             .unwrap_or(false);
         *lock(&self.program) = Some(loaded);
         if stop_on_entry {
-            *lock(&self.pending_pause) = Some("entry");
+            lock(&self.tasks).pending_pause = Some("entry");
         }
         self.writer.response(request, json!({})).await?;
         self.writer.event("initialized", json!({})).await?;
@@ -449,6 +433,21 @@ impl DebugState {
                 .await?;
             return Ok(());
         };
+        if request.arguments["sourceModified"].as_bool() == Some(true)
+            || request
+                .arguments
+                .pointer("/source/adapterData/sourceRevision")
+                .is_some_and(|revision| {
+                    serde_json::from_value::<webtest_text::SourceRevision>(revision.clone()).ok()
+                        != Some(program.plan.source_revision)
+                })
+        {
+            lock(&self.breakpoints).remove(&path);
+            lock(&self.breakpoint_revisions).remove(&path);
+            return self.writer.response(request, json!({"breakpoints":unverified_breakpoints(
+                &requested, "Source revision differs from the launched execution; restart with the current source.") })).await;
+        }
+        lock(&self.breakpoint_revisions).insert(path.clone(), program.plan.source_revision);
         let locations = program.locations();
         let mut verified_lines = HashSet::new();
         let breakpoints: Vec<_> = requested
@@ -485,82 +484,6 @@ impl DebugState {
             .await
     }
 
-    async fn stack_trace(&self, request: &Request) -> Result<(), DapError> {
-        let frames = lock(&self.paused).as_ref().map_or_else(Vec::new, |frame| {
-            vec![json!({
-                "id": 1,
-                "name": &frame.operation,
-                "source": { "name": source_name(&frame.path), "path": &frame.path },
-                "line": frame.location.line,
-                "column": frame.location.column,
-                "endLine": frame.location.end_line,
-                "endColumn": frame.location.end_column,
-            })]
-        });
-        self.writer
-            .response(
-                request,
-                json!({ "stackFrames": frames, "totalFrames": frames.len() }),
-            )
-            .await
-    }
-
-    async fn variables(&self, request: &Request) -> Result<(), DapError> {
-        let reference = request
-            .arguments
-            .get("variablesReference")
-            .and_then(Value::as_i64);
-        let variables = reference
-            .and_then(|reference| {
-                lock(&self.paused).as_mut().map(|frame| {
-                    let mut variables = if reference == VARIABLES_REFERENCE {
-                        vec![
-                            dap_leaf_variable("test", &format!("{:?}", frame.test_name), "string"),
-                            dap_leaf_variable(
-                                "operation",
-                                &format!("{:?}", frame.operation),
-                                "string",
-                            ),
-                            dap_leaf_variable(
-                                "source",
-                                &format!("{:?}", frame.source_line),
-                                "string",
-                            ),
-                            dap_leaf_variable("line", &frame.location.line.to_string(), "number"),
-                        ]
-                    } else {
-                        Vec::new()
-                    };
-                    variables.extend(frame.variables.variables(reference));
-                    variables
-                })
-            })
-            .unwrap_or_default();
-        self.writer
-            .response(request, json!({ "variables": variables }))
-            .await
-    }
-
-    async fn resume(&self, request: &Request, command: ResumeCommand) -> Result<(), DapError> {
-        *lock(&self.pending_pause) = match command {
-            ResumeCommand::Continue => None,
-            ResumeCommand::Step => Some("step"),
-        };
-        let body = if matches!(command, ResumeCommand::Continue) {
-            json!({ "allThreadsContinued": true })
-        } else {
-            json!({})
-        };
-        self.writer.response(request, body).await?;
-        let _ = self.resume_sender.send(command);
-        self.writer
-            .event(
-                "continued",
-                json!({ "threadId": THREAD_ID, "allThreadsContinued": true }),
-            )
-            .await
-    }
-
     fn start_if_ready(self: &Arc<Self>) {
         if !self.configured.load(Ordering::Acquire) || lock(&self.program).is_none() {
             return;
@@ -573,9 +496,9 @@ impl DebugState {
             return;
         }
         let state = Arc::clone(self);
-        tokio::spawn(async move {
+        *lock(&self.run_task) = Some(tokio::spawn(async move {
             state.run_program().await;
-        });
+        }));
     }
 
     async fn run_program(self: Arc<Self>) {
@@ -583,13 +506,6 @@ impl DebugState {
         let Some(program) = program else {
             return;
         };
-        let _ = self
-            .writer
-            .event(
-                "thread",
-                json!({ "reason": "started", "threadId": THREAD_ID }),
-            )
-            .await;
         let _ = self
             .writer
             .event(
@@ -698,13 +614,7 @@ impl DebugState {
         if self.shutting_down.load(Ordering::Acquire) {
             return;
         }
-        let _ = self
-            .writer
-            .event(
-                "thread",
-                json!({ "reason": "exited", "threadId": THREAD_ID }),
-            )
-            .await;
+        self.flush_thread_events().await;
         let _ = self
             .writer
             .event("exited", json!({ "exitCode": exit_code }))
@@ -860,203 +770,6 @@ const fn failure_class_name(class: webtest_feedback::FailureClass) -> &'static s
     }
 }
 
-impl DebugState {
-    async fn pause_before_step(
-        &self,
-        test: &PlannedTest,
-        step: &PlannedStep,
-        bindings: BTreeMap<String, webtest_model::Value>,
-    ) {
-        if self.shutting_down.load(Ordering::Acquire) {
-            return;
-        }
-        let program = lock(&self.program).clone();
-        let Some(program) = program else {
-            return;
-        };
-        let location = StepLocation::new(&program.source, step.origin.range);
-        let requested_reason = lock(&self.pending_pause).take();
-        let has_breakpoint = lock(&self.breakpoints)
-            .get(&program.path)
-            .is_some_and(|lines| lines.contains(&location.line));
-        let reason = requested_reason.or(has_breakpoint.then_some("breakpoint"));
-        let Some(reason) = reason else {
-            return;
-        };
-        let source_line = program
-            .source
-            .lines()
-            .nth(location.line.saturating_sub(1) as usize)
-            .unwrap_or_default()
-            .trim()
-            .to_owned();
-        let bindings = bindings
-            .into_iter()
-            .map(|(name, value)| {
-                (
-                    name,
-                    value.redacted(&self.runner_options.redacted_json_fields),
-                )
-            })
-            .collect();
-        *lock(&self.paused) = Some(PausedFrame {
-            test_name: test.name.clone(),
-            operation: operation_name(&step.operation),
-            source_line,
-            path: program.path,
-            location,
-            variables: DapVariableStore::new(bindings),
-        });
-        let _ = self
-            .writer
-            .event(
-                "stopped",
-                json!({
-                    "reason": reason,
-                    "description": format!("Paused before {}", operation_name(&step.operation)),
-                    "threadId": THREAD_ID,
-                    "allThreadsStopped": true,
-                }),
-            )
-            .await;
-        let _ = self.resume_receiver.lock().await.recv().await;
-        *lock(&self.paused) = None;
-    }
-
-    async fn pause_after_app_failure(
-        &self,
-        test: &PlannedTest,
-        step: &PlannedStep,
-        error: &StepError,
-        bindings: BTreeMap<String, webtest_model::Value>,
-    ) {
-        if self.shutting_down.load(Ordering::Acquire) {
-            return;
-        }
-        let TestOperation::ServerProviderCall(call) = &step.operation else {
-            return;
-        };
-        if call.provider != "app" {
-            return;
-        }
-        let StepError::Provider(provider_error) = error else {
-            return;
-        };
-        let filter = if provider_error.is_infrastructure() {
-            "appInfrastructure"
-        } else {
-            "appProviderFailure"
-        };
-        if !lock(&self.exception_breakpoints).contains(filter) {
-            return;
-        }
-        let Some(program) = lock(&self.program).clone() else {
-            return;
-        };
-        let location = StepLocation::new(&program.source, step.origin.range);
-        let source_line = program
-            .source
-            .lines()
-            .nth(location.line.saturating_sub(1) as usize)
-            .unwrap_or_default()
-            .trim()
-            .to_owned();
-        *lock(&self.paused) = Some(PausedFrame {
-            test_name: test.name.clone(),
-            operation: format!(
-                "{} failed: {provider_error}",
-                operation_name(&step.operation)
-            ),
-            source_line,
-            path: program.path,
-            location,
-            variables: DapVariableStore::new(
-                bindings
-                    .into_iter()
-                    .map(|(name, value)| {
-                        (
-                            name,
-                            value.redacted(&self.runner_options.redacted_json_fields),
-                        )
-                    })
-                    .collect(),
-            ),
-        });
-        let _ = self
-            .writer
-            .event(
-                "stopped",
-                json!({
-                    "reason": "exception",
-                    "description": provider_error.to_string(),
-                    "text": RuntimeFailureCode::from(provider_error).short_code(),
-                    "threadId": THREAD_ID,
-                    "allThreadsStopped": true,
-                }),
-            )
-            .await;
-        let _ = self.resume_receiver.lock().await.recv().await;
-        *lock(&self.paused) = None;
-    }
-}
-
-#[async_trait]
-impl RunControl for DebugState {
-    fn cancellation_reason(&self) -> webtest_host::CancellationReason {
-        webtest_host::CancellationReason::DebugDisconnect
-    }
-    fn is_cancelled(&self) -> bool {
-        self.shutting_down.load(Ordering::Acquire)
-    }
-
-    async fn before_step(&self, test: &PlannedTest, step: &PlannedStep) {
-        self.pause_before_step(test, step, BTreeMap::new()).await;
-    }
-
-    fn after_test_timeout(&self, _test: &PlannedTest, _active_step: Option<&PlannedStep>) {
-        *lock(&self.paused) = None;
-    }
-
-    fn should_capture_bindings(&self, _test: &PlannedTest, step: &PlannedStep) -> bool {
-        if lock(&self.pending_pause).is_some() {
-            return true;
-        }
-        let (path, line) = {
-            let program = lock(&self.program);
-            let Some(program) = program.as_ref() else {
-                return false;
-            };
-            (
-                program.path.clone(),
-                StepLocation::new(&program.source, step.origin.range).line,
-            )
-        };
-        lock(&self.breakpoints)
-            .get(&path)
-            .is_some_and(|lines| lines.contains(&line))
-    }
-
-    async fn before_step_with_bindings(
-        &self,
-        test: &PlannedTest,
-        step: &PlannedStep,
-        bindings: BTreeMap<String, webtest_model::Value>,
-    ) {
-        self.pause_before_step(test, step, bindings).await;
-    }
-
-    async fn after_step_failure(
-        &self,
-        test: &PlannedTest,
-        step: &PlannedStep,
-        error: &StepError,
-        bindings: &BTreeMap<String, webtest_model::Value>,
-    ) {
-        self.pause_after_app_failure(test, step, error, bindings.clone())
-            .await;
-    }
-}
-
 pub async fn serve(browser: Arc<dyn BrowserHost>) -> Result<(), DapError> {
     serve_with_options(browser, RunnerOptions::default()).await
 }
@@ -1083,25 +796,26 @@ pub async fn serve_with_configuration(
 async fn serve_state(state: Arc<DebugState>) -> Result<(), DapError> {
     let mut requests = request_channel();
     let mut completion = state.completion.subscribe();
-    loop {
-        if *completion.borrow() {
-            return Ok(());
-        }
-        tokio::select! {
-            request = requests.recv() => {
-                let Some(request) = request else {
-                    return Ok(());
-                };
-                if state.handle(request?).await? {
-                    return Ok(());
-                }
-            }
-            changed = completion.changed() => {
-                let _ = changed;
+    let result = async {
+        loop {
+            if *completion.borrow() {
                 return Ok(());
+            }
+            tokio::select! {
+                request = requests.recv() => {
+                    let Some(request) = request else { return Ok(()); };
+                    if state.handle(request?).await? { return Ok(()); }
+                }
+                changed = completion.changed() => {
+                    if changed.is_err() || *completion.borrow() { return Ok(()); }
+                }
             }
         }
     }
+    .await;
+    state.cancel_execution();
+    state.join_execution().await;
+    result
 }
 
 fn request_channel() -> mpsc::UnboundedReceiver<Result<Request, DapError>> {
@@ -1180,11 +894,19 @@ struct DapVariableStore {
     variables: HashMap<i64, Vec<Value>>,
     targets: HashMap<i64, Arc<webtest_model::Value>>,
     root: Vec<(String, Arc<webtest_model::Value>)>,
-    next_reference: i64,
+    root_reference: i64,
+    handles: Arc<AtomicI64>,
 }
 
 impl DapVariableStore {
+    #[cfg(test)]
     fn new(bindings: BTreeMap<String, webtest_model::Value>) -> Self {
+        Self::with_handles(bindings, Arc::new(AtomicI64::new(1)))
+    }
+    fn with_handles(
+        bindings: BTreeMap<String, webtest_model::Value>,
+        handles: Arc<AtomicI64>,
+    ) -> Self {
         Self {
             variables: HashMap::new(),
             targets: HashMap::new(),
@@ -1192,7 +914,8 @@ impl DapVariableStore {
                 .into_iter()
                 .map(|(name, value)| (name, Arc::new(value)))
                 .collect(),
-            next_reference: VARIABLES_REFERENCE + 1,
+            root_reference: handles.fetch_add(1, Ordering::Relaxed),
+            handles,
         }
     }
 
@@ -1200,7 +923,7 @@ impl DapVariableStore {
         if let Some(variables) = self.variables.get(&reference) {
             return variables.clone();
         }
-        let values = if reference == VARIABLES_REFERENCE {
+        let values = if reference == self.root_reference {
             self.root.clone()
         } else {
             let Some(value) = self.targets.get(&reference).cloned() else {
@@ -1219,8 +942,7 @@ impl DapVariableStore {
     fn provider_variable(&mut self, name: &str, value: Arc<webtest_model::Value>) -> Value {
         let child_shape = dap_child_shape(&value);
         let reference = if child_shape.is_some() {
-            let reference = self.next_reference;
-            self.next_reference += 1;
+            let reference = self.handles.fetch_add(1, Ordering::Relaxed);
             self.targets.insert(reference, Arc::clone(&value));
             reference
         } else {
@@ -1258,10 +980,6 @@ fn dap_child_shape(value: &webtest_model::Value) -> Option<DapChildShape> {
         }),
         _ => None,
     }
-}
-
-fn dap_leaf_variable(name: &str, value: &str, kind: &str) -> Value {
-    dap_variable(name, value, kind, 0)
 }
 
 fn dap_variable(name: &str, value: &str, kind: &str, variables_reference: i64) -> Value {
@@ -1677,20 +1395,11 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use webtest_browser::{
-        BrowserError, BrowserSession, InspectionTruncation, Locator, PageEvidence, PageInspection,
-        PageSummary, RepairHint,
+        BrowserError, InspectionTruncation, Locator, PageEvidence, PageInspection, PageSummary,
+        RepairHint,
     };
 
     use super::*;
-
-    struct UnusedBrowserHost;
-
-    #[async_trait]
-    impl BrowserHost for UnusedBrowserHost {
-        async fn start(&self) -> Result<Box<dyn BrowserSession>, BrowserError> {
-            Err(BrowserError::Launch("unused in this test".into()))
-        }
-    }
 
     #[test]
     fn journal_overflow_output_preserves_the_exact_missing_interval() {
@@ -1950,202 +1659,5 @@ mod tests {
         assert!(json_children.iter().any(|child| {
             child["name"] == "email" && child["value"] == "\"alice@example.test\""
         }));
-    }
-
-    #[tokio::test]
-    async fn breakpoint_pauses_before_the_step_until_continue() {
-        let source = "test \"x\" {\n    browser {\n        open \"about:blank\"\n        click id(\"submit\")\n    }\n}\n";
-        let directory = tempfile::tempdir().expect("temp directory");
-        let path = directory.path().join("debug.webtest");
-        let program = LoadedProgram::load(path, Some(source.into())).expect("program");
-        let test = program.plan.tests[0].clone();
-        let step = test.steps()[1].clone();
-        let state = DebugState::new_with_options(
-            ProtocolWriter::new(tokio::io::sink()),
-            Arc::new(UnusedBrowserHost),
-            RunnerOptions::default(),
-        );
-        *lock(&state.program) = Some(program.clone());
-        assert!(
-            !state.should_capture_bindings(&test, &step),
-            "uninterrupted steps must not build debugger variable snapshots"
-        );
-        lock(&state.breakpoints).insert(program.path.clone(), HashSet::from([4]));
-        *lock(&state.program) = Some(program);
-        assert!(state.should_capture_bindings(&test, &step));
-
-        let bindings = BTreeMap::from([(
-            "user".into(),
-            webtest_model::Value::Record(
-                [
-                    (
-                        "email".into(),
-                        webtest_model::Value::String("alice@example.test".into()),
-                    ),
-                    (
-                        "token".into(),
-                        webtest_model::Value::String("private".into()),
-                    ),
-                ]
-                .into_iter()
-                .collect(),
-            ),
-        )]);
-        let paused_state = Arc::clone(&state);
-        let task = tokio::spawn(async move {
-            paused_state
-                .before_step_with_bindings(&test, &step, bindings)
-                .await;
-        });
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while lock(&state.paused).is_none() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("breakpoint pause");
-
-        {
-            let mut paused = lock(&state.paused);
-            let frame = paused.as_mut().expect("paused frame");
-            assert_eq!(frame.location.line, 4);
-            assert_eq!(frame.operation, "click id(\"submit\")");
-            let variables = frame.variables.variables(VARIABLES_REFERENCE);
-            let user = variables
-                .iter()
-                .find(|variable| variable["name"] == "user")
-                .expect("user variable");
-            assert!(user["value"].as_str().is_some_and(|value| {
-                value.contains("[redacted]") && !value.contains("private")
-            }));
-        }
-        *lock(&state.pending_pause) = Some("step");
-        state
-            .resume(
-                &Request {
-                    seq: 1,
-                    message_type: "request".into(),
-                    command: "continue".into(),
-                    arguments: json!({ "threadId": THREAD_ID }),
-                },
-                ResumeCommand::Continue,
-            )
-            .await
-            .expect("continue");
-        task.await.expect("control task");
-        assert!(lock(&state.paused).is_none());
-        assert!(
-            lock(&state.pending_pause).is_none(),
-            "continue must cancel queued step mode"
-        );
-    }
-
-    #[tokio::test]
-    async fn per_test_timeout_releases_the_visible_dap_pause_state() {
-        let source = "test \"x\" {\n    browser {\n        open \"about:blank\"\n    }\n}\n";
-        let directory = tempfile::tempdir().expect("temp directory");
-        let path = directory.path().join("timeout.webtest");
-        let program = LoadedProgram::load(path, Some(source.into())).expect("program");
-        let test = program.plan.tests[0].clone();
-        let step = test.steps()[0].clone();
-        let state = DebugState::new_with_options(
-            ProtocolWriter::new(tokio::io::sink()),
-            Arc::new(UnusedBrowserHost),
-            RunnerOptions::default(),
-        );
-        lock(&state.breakpoints).insert(program.path.clone(), HashSet::from([3]));
-        *lock(&state.program) = Some(program);
-        let paused_state = Arc::clone(&state);
-        let paused_test = test.clone();
-        let paused_step = step.clone();
-        let task = tokio::spawn(async move {
-            paused_state.before_step(&paused_test, &paused_step).await;
-        });
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while lock(&state.paused).is_none() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("breakpoint pause");
-
-        state.after_test_timeout(&test, Some(&step));
-
-        assert!(lock(&state.paused).is_none());
-        task.abort();
-        let _ = task.await;
-    }
-
-    #[tokio::test]
-    async fn disconnect_releases_a_paused_step_as_a_cancelled_runtime_outcome() {
-        let source = "test \"x\" {\n    server {\n        let value = 1\n        expect value == 1\n    }\n}\n";
-        let directory = tempfile::tempdir().expect("temp directory");
-        let path = directory.path().join("cancel.webtest");
-        let program = LoadedProgram::load(path, Some(source.into())).expect("program");
-        let state = DebugState::new_with_options(
-            ProtocolWriter::new(tokio::io::sink()),
-            Arc::new(UnusedBrowserHost),
-            RunnerOptions::default(),
-        );
-        lock(&state.breakpoints).insert(program.path.clone(), HashSet::from([3]));
-        *lock(&state.program) = Some(program.clone());
-
-        let run_state = Arc::clone(&state);
-        let plan = program.plan.clone();
-        let task = tokio::spawn(async move {
-            Runner::new(Arc::new(ObservationStore::default()))
-                .run_with_control(&plan, &UnusedBrowserHost, Some(run_state.as_ref()))
-                .await
-        });
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while lock(&state.paused).is_none() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("breakpoint pause");
-
-        let disconnected = state
-            .handle(Request {
-                seq: 2,
-                message_type: "request".into(),
-                command: "disconnect".into(),
-                arguments: json!({ "terminateDebuggee": true }),
-            })
-            .await
-            .expect("disconnect response");
-        assert!(disconnected);
-
-        let result = task.await.expect("runtime task");
-        assert!(matches!(
-            result.outcome,
-            RunOutcome::Cancelled {
-                reason: webtest_runtime::CancellationReason::DebugDisconnect
-            }
-        ));
-        assert!(matches!(
-            result.tests[0].outcome,
-            TestOutcome::Cancelled {
-                reason: webtest_runtime::CancellationReason::DebugDisconnect
-            }
-        ));
-        assert_eq!(
-            result
-                .events
-                .iter()
-                .filter(|event| matches!(
-                    event,
-                    webtest_observation::ExecutionEvent::TestFinished { .. }
-                ))
-                .count(),
-            1
-        );
-        assert!(matches!(
-            result.events.last(),
-            Some(webtest_observation::ExecutionEvent::RunFinished {
-                outcome: webtest_observation::RunOutcomeKind::Cancelled,
-                ..
-            })
-        ));
     }
 }

@@ -925,6 +925,7 @@ fn dap_stdio_covers_launch_breakpoint_continue_and_disconnect() {
         request(&mut dap, "configurationDone", json!({}))["success"],
         true
     );
+    dap.receive(|message| message["type"] == "event" && message["event"] == "stopped");
     assert_eq!(
         request(&mut dap, "continue", json!({"threadId":1}))["success"],
         true
@@ -1603,4 +1604,96 @@ fn worker_applications_share_bridge_http_browser_state_only_with_their_own_tests
             );
         }
     }
+}
+
+#[test]
+fn dap_concurrent_threads_frames_steps_restart_and_disconnect() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("concurrent.webtest");
+    std::fs::write(&path, "test \"siblings 🦀\" {\n let seed = 7\n parallel {\n server {\n let local = 11\n expect local == 11\n expect seed == 7\n }\n server {\n let right = 22\n expect right == 22\n }\n }\n expect seed == 7\n}\n").unwrap();
+    let mut dap = ProtocolProcess::spawn(&["dap", "--headless"], directory.path());
+    let mut seq = 0;
+    let mut request = |dap: &mut ProtocolProcess, command: &str, arguments: Value| {
+        seq += 1;
+        dap.send(json!({"seq":seq,"type":"request","command":command,"arguments":arguments}));
+        dap.receive(|message| message["type"] == "response" && message["request_seq"] == seq)
+    };
+    let init = request(&mut dap, "initialize", json!({}));
+    assert_eq!(init["body"]["supportsRestartRequest"], true);
+    assert_eq!(
+        request(&mut dap, "launch", json!({"program":path}))["success"],
+        true
+    );
+    let stale = request(
+        &mut dap,
+        "setBreakpoints",
+        json!({"source":{"path":path},"sourceModified":true,"breakpoints":[{"line":6}]}),
+    );
+    assert_eq!(stale["body"]["breakpoints"][0]["verified"], false);
+    assert!(
+        stale["body"]["breakpoints"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("revision")
+    );
+    let points = request(
+        &mut dap,
+        "setBreakpoints",
+        json!({"source":{"path":path},"breakpoints":[{"line":6},{"line":3}]}),
+    );
+    assert_eq!(points["body"]["breakpoints"][0]["verified"], true);
+    assert_eq!(points["body"]["breakpoints"][1]["verified"], false);
+    request(&mut dap, "configurationDone", json!({}));
+    let stopped = dap.receive(|m| m["event"] == "stopped" && m["body"]["reason"] == "breakpoint");
+    let selected = stopped["body"]["threadId"].as_i64().unwrap();
+    let sibling =
+        dap.receive(|m| m["event"] == "stopped" && m["body"]["preserveFocusHint"] == true);
+    assert_ne!(sibling["body"]["threadId"], selected);
+    let threads = request(&mut dap, "threads", json!({}));
+    assert_eq!(threads["body"]["threads"].as_array().unwrap().len(), 3);
+    let stack = request(&mut dap, "stackTrace", json!({"threadId":selected}));
+    let frames = stack["body"]["stackFrames"].as_array().unwrap();
+    assert_eq!(frames[0]["line"], 6);
+    assert!(frames.iter().any(|frame| frame["name"] == "parallel"));
+    let scopes = request(&mut dap, "scopes", json!({"frameId":frames[0]["id"]}));
+    let reference = scopes["body"]["scopes"][0]["variablesReference"].clone();
+    let vars = request(
+        &mut dap,
+        "variables",
+        json!({"variablesReference":reference}),
+    );
+    assert!(
+        vars["body"]["variables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["name"] == "local" && v["value"] == "11")
+    );
+    assert_eq!(
+        request(
+            &mut dap,
+            "continue",
+            json!({"threadId":selected,"singleThread":true})
+        )["success"],
+        false
+    );
+    assert_eq!(
+        request(&mut dap, "next", json!({"threadId":selected}))["success"],
+        true
+    );
+    let stepped = dap.receive(|m| m["event"] == "stopped" && m["body"]["reason"] == "step");
+    assert_eq!(stepped["body"]["threadId"], selected);
+    let next = request(&mut dap, "stackTrace", json!({"threadId":selected}));
+    assert_eq!(next["body"]["stackFrames"][0]["line"], 7);
+    let stale = request(
+        &mut dap,
+        "variables",
+        json!({"variablesReference":reference}),
+    );
+    assert_eq!(stale["body"]["variables"], json!([]));
+    assert_eq!(request(&mut dap, "restart", json!({}))["success"], true);
+    let entry = dap.receive(|m| m["event"] == "stopped" && m["body"]["reason"] == "entry");
+    assert!(entry["body"]["threadId"].as_i64().unwrap() > selected);
+    assert_eq!(request(&mut dap, "disconnect", json!({}))["success"], true);
+    dap.wait_for_exit();
 }

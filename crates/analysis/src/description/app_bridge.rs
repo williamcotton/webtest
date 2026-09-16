@@ -617,6 +617,7 @@ fn runtime_configuration_reference() -> ConstructDescription {
         "Inspect the project configuration that WebTest resolved for application lifecycle, application-provider, and browser/server startup without exposing environment values or unredacted secret-like arguments.",
     );
     value.search_terms = vec![
+        "DAP debugger threads frames pause step retry restart disconnect".into(),
         "resolved adapter transport command arguments".into(),
         "working directory schema path".into(),
         "browser base URL server base URL".into(),
@@ -646,6 +647,10 @@ fn runtime_configuration_reference() -> ConstructDescription {
         ),
     ];
     value.guidance = vec![
+        guidance(
+            "runtime_configuration_debugger",
+            "DAP projects each runtime test, sibling branch, and retry attempt as a distinct task thread. Stacks follow explicit execution scopes; operation frames expose redacted lexical bindings and failure values, while ancestor frames expose scope/attempt metadata. Breakpoints and pause requests stop managed tasks at their next operation safe point; in-flight host calls are not frozen. Continue resumes all tasks. Step in follows the selected task or descendants; next waits for its lexical depth; step out waits for an enclosing scope. Single-thread resume is rejected. Restart cancels and joins the current execution before starting the same validated source snapshot again. Disconnect and transport exit await runner-owned cleanup. Debug pauses count toward runtime deadlines. Assertion, provider, infrastructure, and internal exception filters are available, along with the existing app-specific filters. Modified/revision-mismatched source breakpoints are unverified. Evidence is collected by the runtime after failure hooks, so newly captured evidence is not available at the exception pause.",
+        ),
         guidance(
             "runtime_configuration_editor_publication",
             "On Unix, CLI test runs automatically publish completed runtime diagnostics to open documents in a running WebTest LSP for the same workspace. Starting a publication clears prior runtime observations; a successful completion commits an empty batch. The editor rejects stale source revisions, changed provider schemas, invalid UTF-8 ranges, and superseded runs. A user-private endpoint descriptor, random token, loopback-only transport, path confinement, 8 MiB frame bound, and two-second request deadline protect the optional publication channel. A missing editor or rejected publication never changes test results. Evidence references remain workspace-relative. This protocol is independent of App Bridge Protocol. Windows transport and publication for unopened documents remain pending.",

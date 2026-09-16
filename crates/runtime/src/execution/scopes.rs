@@ -34,6 +34,9 @@ pub(super) struct ResourceOwner {
 #[derive(Clone)]
 pub(super) struct ExecutionScope {
     attempt: Option<AttemptEvent>,
+    task_id: ExecutionScopeId,
+    parent_task_id: Option<ExecutionScopeId>,
+    debug_frames: Vec<crate::DebugScope>,
     pub event: ScopeEvent,
     pub context: ScopeContext,
     pub resource_owner: ResourceOwner,
@@ -42,6 +45,14 @@ pub(super) struct ExecutionScope {
 }
 
 impl ExecutionScope {
+    pub fn debug_context(&self, execution_id: ExecutionId) -> crate::DebugContext {
+        crate::DebugContext {
+            execution_id,
+            task_id: self.task_id,
+            parent_task_id: self.parent_task_id,
+            frames: self.debug_frames.clone(),
+        }
+    }
     pub fn cleanup_timeout(&self, default: std::time::Duration) -> std::time::Duration {
         self.cleanup_timeout
             .map_or(default, |timeout| timeout.min(default))
@@ -96,7 +107,10 @@ impl ScopeFactory {
             PlanNodeKind::Timeout { duration, .. } => Some(tokio::time::Instant::now() + *duration),
             _ => None,
         };
-        self.create(node, Some(parent), deadline, true)
+        let mut scope = self.create(node, Some(parent), deadline, true);
+        scope.task_id = scope.id();
+        scope.parent_task_id = Some(parent.task_id);
+        scope
     }
 
     pub fn attempt(
@@ -113,6 +127,10 @@ impl ScopeFactory {
         });
         scope.event.execution_context.attempt_id = Some(AttemptId(self.ids.next()));
         scope.resource_owner.event = scope.event.clone();
+        if let Some(frame) = scope.debug_frames.last_mut() {
+            frame.scope = scope.event.clone();
+            frame.attempt = scope.attempt;
+        }
         scope
     }
 
@@ -173,8 +191,25 @@ impl ScopeFactory {
             (Some(inherited), Some(local)) => Some(inherited.min(local)),
             (inherited, local) => inherited.or(local),
         };
+        let mut debug_frames = parent.map_or_else(Vec::new, |parent| parent.debug_frames.clone());
+        debug_frames.push(crate::DebugScope {
+            scope: event.clone(),
+            kind: match node.kind {
+                PlanNodeKind::Sequence { .. } => crate::DebugScopeKind::Sequence,
+                PlanNodeKind::Parallel { .. } => crate::DebugScopeKind::Parallel,
+                PlanNodeKind::Race { .. } => crate::DebugScopeKind::Race,
+                PlanNodeKind::Retry { .. } => crate::DebugScopeKind::Retry,
+                PlanNodeKind::Timeout { .. } => crate::DebugScopeKind::Timeout,
+                PlanNodeKind::ResourceScope { .. } => crate::DebugScopeKind::BrowserContext,
+                PlanNodeKind::Operation { .. } => crate::DebugScopeKind::Operation,
+            },
+            attempt: None,
+        });
         ExecutionScope {
             attempt: None,
+            task_id: parent.map_or(scope_id, |parent| parent.task_id),
+            parent_task_id: parent.and_then(|parent| parent.parent_task_id),
+            debug_frames,
             cleanup_timeout,
             event,
             context,

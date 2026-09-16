@@ -137,6 +137,8 @@ pub(crate) async fn execute_test(
             name: test.name.clone(),
         },
     );
+    let _debug_task =
+        crate::control::DebugTaskGuard::new(control, test, root.debug_context(execution_id));
     let root_scope = root.event.clone();
     let root_context = root.context.clone();
     let _journal_root = events.register_root(&root_context, &root_scope, execution_id, event_sink);
@@ -986,15 +988,13 @@ impl TreeExecution<'_, '_> {
             state.prepare_provider_arguments(call);
         }
         if let Some(control) = control {
-            let before_step = async {
-                if control.should_capture_bindings(test, step) {
-                    control
-                        .before_step_with_bindings(test, step, state.visible_step_bindings(step))
-                        .await;
-                } else {
-                    control.before_step(test, step).await;
-                }
+            let debug_context = scope.debug_context(execution_id);
+            let bindings = if control.should_capture_bindings(test, step) {
+                Some(state.visible_step_bindings(step))
+            } else {
+                None
             };
+            let before_step = control.before_step_in_context(test, step, &debug_context, bindings);
             tokio::select! {
                 biased;
                 _ = host_context.cancellation.cancelled() => {},
@@ -1188,14 +1188,14 @@ impl TreeExecution<'_, '_> {
                     )));
                 }
                 if host_context.cancellation.cause().is_none()
-                    && error.failure_class() != FailureClass::Internal
                     && let Some(control) = control
                 {
                     let bindings = state.visible_step_bindings(step);
+                    let debug_context = scope.debug_context(execution_id);
                     tokio::select! {
                         biased;
                         _ = host_context.cancellation.cancelled() => {},
-                        _ = control.after_step_failure(test, step, &error, &bindings) => {},
+                        _ = control.after_step_failure_in_context(test, step, &debug_context, &error, &bindings) => {},
                     }
                 }
                 let pending = prepare_failure(PrepareFailureInput {

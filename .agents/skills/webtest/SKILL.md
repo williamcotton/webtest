@@ -182,3 +182,16 @@ source changes, changed provider schemas, and superseded runs reject stale resul
 No editor connection is required to run tests, and publication failure does not
 change the CLI outcome. Windows transport and unopened-file publication remain
 pending. Use `webtest describe runtime.configuration` for publication guidance.
+
+### Debug concurrent flows
+
+DAP exposes separate threads for tests, parallel/race branches, and retry attempts.
+Use the stopped event's thread ID and request its stack/scopes before inspecting
+variables; frame and variable references expire on resume. Pause and breakpoints
+park managed tasks at their next operation safe point. Continue resumes all tasks;
+single-thread resume is unsupported. Step in follows the selected task or children,
+next returns to its lexical depth, and step out returns to an enclosing scope.
+Restart joins cleanup before rerunning the same source snapshot. Disconnect also
+awaits cleanup. Debug pause time counts toward deadlines. Exception filters include
+assertion, provider, infrastructure, and internal failures. Inspect
+`webtest describe runtime.configuration` for the current debugger contract.

@@ -49,6 +49,11 @@ pub(super) async fn execute_child(
     scope: scopes::ExecutionScope,
     mut branch: branch::BranchState,
 ) -> ChildCompletion {
+    let _debug_task = crate::control::DebugTaskGuard::new(
+        services.control,
+        services.test,
+        scope.debug_context(services.execution_id),
+    );
     let inherited_page = branch.page.is_some();
     let started = StdInstant::now();
     let cleanup_timeout = scope.cleanup_timeout(services.options.cleanup_timeout);

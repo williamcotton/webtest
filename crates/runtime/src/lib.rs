@@ -23,7 +23,7 @@ mod waits;
 
 pub use artifacts::{Artifact, ArtifactKind};
 pub use cancellation::{CancellationToken, ScopeContext};
-pub use control::RunControl;
+pub use control::{DebugContext, DebugScope, DebugScopeKind, RunControl};
 pub use error::{
     AssertionFailure, DecodeFailure, EvaluationFailure, EvaluationFailureKind, RunError, StepError,
 };

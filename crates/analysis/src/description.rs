@@ -1679,6 +1679,21 @@ mod tests {
             panic!("configuration alias")
         };
         assert_eq!(topic.id, "runtime.configuration");
+        let debugger = topic
+            .guidance
+            .iter()
+            .find(|guidance| guidance.code == "runtime_configuration_debugger")
+            .unwrap();
+        for fact in [
+            "retry attempt",
+            "redacted lexical bindings",
+            "next operation safe point",
+            "Single-thread resume is rejected",
+            "await runner-owned cleanup",
+            "count toward runtime deadlines",
+        ] {
+            assert!(debugger.summary.contains(fact), "{fact}");
+        }
         let publication = topic
             .guidance
             .iter()
