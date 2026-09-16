@@ -41,6 +41,7 @@ pub struct ProjectConfig {
     pub browser: BrowserSection,
     pub timeouts: TimeoutSection,
     pub journal: JournalSection,
+    pub trace: TraceSection,
     pub artifacts: ArtifactSection,
     pub evidence: EvidenceSection,
     pub server: ServerSection,
@@ -109,6 +110,34 @@ impl Default for JournalSection {
 #[derive(serde::Serialize, Clone, Debug)]
 pub struct ArtifactSection {
     pub directory: PathBuf,
+}
+
+#[derive(serde::Serialize, Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TraceMode {
+    #[default]
+    Off,
+    On,
+    RetainOnFailure,
+}
+
+#[derive(serde::Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct TraceSection {
+    pub mode: TraceMode,
+    pub sources: bool,
+    pub attachments: bool,
+    pub max_bytes: NonZeroUsize,
+}
+
+impl Default for TraceSection {
+    fn default() -> Self {
+        Self {
+            mode: TraceMode::Off,
+            sources: false,
+            attachments: true,
+            max_bytes: const { NonZeroUsize::new(104_857_600).unwrap() },
+        }
+    }
 }
 
 #[derive(serde::Serialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -256,6 +285,7 @@ impl Default for ProjectConfig {
                 cleanup: Duration::from_secs(5),
             },
             journal: JournalSection::default(),
+            trace: TraceSection::default(),
             artifacts: ArtifactSection {
                 directory: PathBuf::from(".webtest/artifacts"),
             },
@@ -353,6 +383,8 @@ struct RawConfig {
     #[serde(default)]
     journal: RawJournal,
     #[serde(default)]
+    trace: RawTrace,
+    #[serde(default)]
     artifacts: RawArtifacts,
     #[serde(default)]
     evidence: RawEvidence,
@@ -414,6 +446,16 @@ struct RawTimeouts {
 #[derive(Debug, Default, Deserialize)]
 struct RawJournal {
     max_events: Option<usize>,
+    #[serde(flatten)]
+    extra: toml::Table,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawTrace {
+    mode: Option<TraceMode>,
+    sources: Option<bool>,
+    attachments: Option<bool>,
+    max_bytes: Option<usize>,
     #[serde(flatten)]
     extra: toml::Table,
 }
@@ -688,6 +730,7 @@ fn parse_config(
     collect_unknown(&mut warnings, "browser", &raw.browser.extra);
     collect_unknown(&mut warnings, "timeouts", &raw.timeouts.extra);
     collect_unknown(&mut warnings, "journal", &raw.journal.extra);
+    collect_unknown(&mut warnings, "trace", &raw.trace.extra);
     collect_unknown(&mut warnings, "artifacts", &raw.artifacts.extra);
     collect_unknown(&mut warnings, "evidence", &raw.evidence.extra);
     collect_unknown(&mut warnings, "server", &raw.server.extra);
@@ -905,6 +948,16 @@ fn parse_config(
             message: "evidence.max_dom_bytes must be positive".into(),
         });
     }
+    let trace_max_bytes = raw
+        .trace
+        .max_bytes
+        .unwrap_or(defaults.trace.max_bytes.get());
+    let trace_max_bytes = NonZeroUsize::new(trace_max_bytes)
+        .filter(|value| value.get() <= 104_857_600)
+        .ok_or_else(|| ProjectError::InvalidConfig {
+            path: path.to_path_buf(),
+            message: "trace.max_bytes must be between 1 and 104857600".into(),
+        })?;
     for (key, value) in [
         ("inspection.max_elements", raw.inspection.max_elements),
         (
@@ -974,6 +1027,12 @@ fn parse_config(
             timeouts: resolved_timeouts,
             journal: JournalSection {
                 max_events: journal_max_events,
+            },
+            trace: TraceSection {
+                mode: raw.trace.mode.unwrap_or(defaults.trace.mode),
+                sources: raw.trace.sources.unwrap_or(defaults.trace.sources),
+                attachments: raw.trace.attachments.unwrap_or(defaults.trace.attachments),
+                max_bytes: trace_max_bytes,
             },
             artifacts: ArtifactSection {
                 directory: raw
@@ -1457,6 +1516,33 @@ fn normalized(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trace_policy_is_typed_opt_in_and_bounded() {
+        let path = Path::new("webtest.toml");
+        let (config, _) = parse_config(path, "").unwrap();
+        assert_eq!(config.trace, TraceSection::default());
+        assert_eq!(config.trace.mode, TraceMode::Off);
+        assert!(!config.trace.sources);
+        let (config, warnings) = parse_config(path, "[trace]\nmode = 'retain-on-failure'\nsources = true\nattachments = false\nmax_bytes = 2048\nfuture = true\n").unwrap();
+        assert_eq!(config.trace.mode, TraceMode::RetainOnFailure);
+        assert!(config.trace.sources);
+        assert!(!config.trace.attachments);
+        assert_eq!(config.trace.max_bytes.get(), 2048);
+        assert_eq!(warnings[0].key, "trace.future");
+        for invalid in [
+            "mode = 'always'",
+            "sources = 'true'",
+            "max_bytes = 0",
+            "max_bytes = -1",
+            "max_bytes = 104857601",
+        ] {
+            assert!(
+                parse_config(path, &format!("[trace]\n{invalid}\n")).is_err(),
+                "{invalid}"
+            );
+        }
+    }
 
     fn write(path: &Path, contents: &str) {
         fs::create_dir_all(path.parent().expect("parent")).expect("create parent");

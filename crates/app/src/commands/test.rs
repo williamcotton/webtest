@@ -211,7 +211,7 @@ pub(crate) async fn run_test(
             control: None,
         })
         .collect();
-    let results = if let Some(pool) = &worker_applications {
+    let mut results = if let Some(pool) = &worker_applications {
         // Pool size is constructed from a validated jobs limit and nonzero test count.
         match run_jobs_on_workers(&inputs, &pool.workers).await {
             Ok(results) => results,
@@ -223,7 +223,7 @@ pub(crate) async fn run_test(
     } else {
         run_jobs(&inputs, jobs).await
     };
-    for ((index, source, plan, _, _), result) in runnable.iter().zip(results) {
+    for ((index, source, plan, _, _), result) in runnable.iter().zip(&mut results) {
         let file_report = &mut report.files[*index];
         file_report.duration_nanos = nanos(result.duration);
         file_report.events = journal_event_reports(&file_report.path, &result.journal);
@@ -252,8 +252,7 @@ pub(crate) async fn run_test(
         if matches!(result.outcome, RunOutcome::Completed) {
             file_report.outcome = Some(RunReportOutcome::Completed);
         }
-        file_report.tests = result
-            .tests
+        file_report.tests = std::mem::take(&mut result.tests)
             .into_iter()
             .map(|test| test_report(test, source, plan))
             .collect();
@@ -294,6 +293,45 @@ pub(crate) async fn run_test(
                     .map_or("app", |app| app.configuration_key())
                     .into(),
                 message: error.to_string(),
+            });
+        }
+    }
+    if crate::trace_export::retain(
+        project.config.trace.mode,
+        report.exit_class != ExitClass::Success,
+    ) {
+        let metadata = crate::trace_export::metadata(&project, &providers);
+        for ((index, source, plan, _, _), result) in runnable.iter().zip(&results) {
+            let Some(execution_id) = result.execution_id else {
+                continue;
+            };
+            let file = &report.files[*index].path;
+            let exported = match &metadata {
+                Ok(metadata) => crate::trace_export::export(
+                    &project,
+                    metadata.clone(),
+                    source,
+                    plan,
+                    file,
+                    result,
+                ),
+                Err(error) => Err(AppError::infrastructure(error)),
+            };
+            let outcome = match exported {
+                Ok(path) => crate::report::TraceExportOutcome::Published {
+                    path: path.display().to_string(),
+                },
+                Err(error) => {
+                    report.exit_class = report.exit_class.combine(ExitClass::Infrastructure);
+                    crate::report::TraceExportOutcome::Failed {
+                        message: error.to_string(),
+                    }
+                }
+            };
+            report.traces.push(crate::report::TraceExportReport {
+                file: file.clone(),
+                execution_id,
+                outcome,
             });
         }
     }

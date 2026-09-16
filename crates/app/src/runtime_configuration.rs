@@ -130,6 +130,15 @@ pub(crate) fn resolved_runtime_configuration(project: &Project) -> ResolvedRunti
         provider_call_timeout_ms: duration_millis(project.config.timeouts.provider_call),
         cleanup_timeout_ms: duration_millis(project.config.timeouts.cleanup),
         journal_max_events: project.config.journal.max_events.get(),
+        trace_mode: match project.config.trace.mode {
+            webtest_project::TraceMode::Off => "off",
+            webtest_project::TraceMode::On => "on",
+            webtest_project::TraceMode::RetainOnFailure => "retain-on-failure",
+        }
+        .into(),
+        trace_sources: project.config.trace.sources,
+        trace_attachments: project.config.trace.attachments,
+        trace_max_bytes: project.config.trace.max_bytes.get(),
     }
 }
 

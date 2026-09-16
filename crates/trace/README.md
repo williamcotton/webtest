@@ -8,8 +8,9 @@ filesystem access, extraction, network requests, or project execution.
 This is the artifact foundation for Milestone E. `webtest trace <artifact>`
 validates an existing archive and serves the shared viewer on a random loopback
 port; `--output <file>` writes standalone HTML without overwriting an existing
-file. Budgeted capture records explicit omissions of optional content. Test-run
-export, CLI capture/retention settings, and atomic archive publication remain pending.
+file. Budgeted capture records explicit omissions of optional content. The native
+app exports completed file runs under configured capture/retention
+policy with atomic non-overwriting publication; the core remains filesystem-free.
 
 ## Container version 1
 
@@ -118,3 +119,37 @@ restrictive content-security policy applies to both served and static output.
 The app owns bounded regular-file input, atomic non-overwriting HTML output,
 the random loopback listener and unguessable URL, request validation, connection
 limits/timeouts, and shutdown. It does not invoke project discovery or execution.
+
+## Native test-run export
+
+The app accepts `[trace]` in `webtest.toml`:
+
+```toml
+[trace]
+mode = "retain-on-failure" # off (default) | on | retain-on-failure
+sources = false           # exact analyzed source; opt in explicitly
+attachments = true        # acknowledged evidence under existing [evidence] settings
+max_bytes = 104857600      # 1..104857600, per archive including metadata
+```
+
+After application cleanup, the app publishes one archive per executed file to
+`[artifacts].directory/traces/<execution_id>.webtest-trace`. Retain-on-failure
+considers the whole invocation, including static failures and application teardown.
+Static or pre-admission startup/identity failures have no fabricated journal.
+Reports retain all test outcomes and separately identify published paths or
+infrastructure export errors. Passing retention-off runs create no trace directory.
+Native report schema 12 includes `traces` and adapter `trace_export` envelopes;
+these do not consume native journal sequences.
+
+The app uses the compiled source snapshot and only live acknowledged evidence in
+the runtime artifact directory, rejects non-regular/link inputs and escaping
+storage, and verifies digests before capture. Evidence staging has a separate
+100 MiB hard limit per file export; exceeding it fails export without publication.
+Optional content below that staging limit can be dropped by the capture budget.
+Publication uses a same-directory temporary file, sync, and non-overwriting commit.
+Existing traces are never deleted by retention or overwritten by later runs.
+
+Metadata contains the resolved project-configuration digest and provider schema
+identities (`schema:<hash>`). Browser version is currently unknown (`null`).
+Console/network capture controls and separate trace screenshot policy remain
+pending; screenshot/DOM capture still follows `[evidence]`.

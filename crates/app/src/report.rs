@@ -12,7 +12,7 @@ use webtest_project::Project;
 
 use crate::{error::AppError, project_context::normalized_path};
 
-pub(crate) const REPORT_SCHEMA_VERSION: u32 = 11;
+pub(crate) const REPORT_SCHEMA_VERSION: u32 = 12;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -59,9 +59,26 @@ pub struct CommandReport {
     pub command: String,
     pub project_root: String,
     pub warnings: Vec<WarningReport>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub traces: Vec<TraceExportReport>,
     pub files: Vec<FileReport>,
     pub summary: SummaryReport,
     pub exit_class: ExitClass,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TraceExportReport {
+    pub file: String,
+    pub execution_id: webtest_observation::ExecutionId,
+    #[serde(flatten)]
+    pub outcome: TraceExportOutcome,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum TraceExportOutcome {
+    Published { path: String },
+    Failed { message: String },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -365,6 +382,7 @@ impl CommandReport {
             command: command.into(),
             project_root: project_root.into(),
             warnings: Vec::new(),
+            traces: Vec::new(),
             files: Vec::new(),
             summary: SummaryReport::default(),
             exit_class: ExitClass::Success,
@@ -422,6 +440,30 @@ impl CommandReport {
             }
         }
         self.summary.duration_nanos = self.files.iter().map(|file| file.duration_nanos).sum();
+        self.summary.infrastructure_errors += self.trace_errors();
+    }
+
+    fn trace_errors(&self) -> usize {
+        self.traces
+            .iter()
+            .filter(|trace| matches!(trace.outcome, TraceExportOutcome::Failed { .. }))
+            .count()
+    }
+
+    fn write_trace_paths(&self, output: &mut dyn Write) -> io::Result<()> {
+        for trace in &self.traces {
+            match &trace.outcome {
+                TraceExportOutcome::Published { path } => {
+                    writeln!(output, "trace for {}: {path}", trace.file)?
+                }
+                TraceExportOutcome::Failed { message } => writeln!(
+                    output,
+                    "{}: infrastructure error[trace.export]: {message}",
+                    trace.file
+                )?,
+            }
+        }
+        Ok(())
     }
 
     pub fn write(&self, reporter: Reporter, output: &mut dyn Write) -> io::Result<()> {
@@ -450,6 +492,7 @@ impl CommandReport {
         output: &mut dyn Write,
         include_test_status: bool,
     ) -> io::Result<()> {
+        self.write_trace_paths(output)?;
         for warning in &self.warnings {
             writeln!(output, "warning[{}]: {}", warning.code, warning.message)?;
         }
@@ -549,6 +592,7 @@ impl CommandReport {
     }
 
     fn write_concise(&self, output: &mut dyn Write) -> io::Result<()> {
+        self.write_trace_paths(output)?;
         for warning in &self.warnings {
             writeln!(output, "warning[{}] {}", warning.code, warning.message)?;
         }
@@ -614,6 +658,15 @@ impl CommandReport {
                 "project_root": self.project_root,
             }),
         )?;
+        for trace in &self.traces {
+            write_json_line(
+                output,
+                &serde_json::json!({
+                    "schema_version": REPORT_SCHEMA_VERSION,
+                    "type": "trace_export", "trace": trace,
+                }),
+            )?;
+        }
         for warning in &self.warnings {
             write_json_line(
                 output,
@@ -688,9 +741,9 @@ impl CommandReport {
             .iter()
             .filter(|file| file.execution_error.is_some())
             .count();
-        let tests = self.summary.tests + static_cases + file_execution_errors;
+        let tests = self.summary.tests + static_cases + file_execution_errors + self.trace_errors();
         let failures = self.summary.failed + self.summary.timed_out + static_cases;
-        let errors = self.summary.aborted + file_execution_errors;
+        let errors = self.summary.aborted + file_execution_errors + self.trace_errors();
         let skipped = self.summary.cancelled + self.summary.skipped;
         writeln!(output, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>")?;
         writeln!(
@@ -699,6 +752,20 @@ impl CommandReport {
         )?;
         for file in &self.files {
             writeln!(output, "  <testsuite name=\"{}\">", xml(&file.path))?;
+            for trace in self.traces.iter().filter(|trace| trace.file == file.path) {
+                match &trace.outcome {
+                    TraceExportOutcome::Published { path } => writeln!(
+                        output,
+                        "    <properties><property name=\"webtest.trace\" value=\"{}\"/></properties>",
+                        xml(path)
+                    )?,
+                    TraceExportOutcome::Failed { message } => writeln!(
+                        output,
+                        "    <testcase name=\"trace export\"><error type=\"trace.export\" message=\"{}\"/></testcase>",
+                        xml(message)
+                    )?,
+                }
+            }
             if !file.diagnostics.is_empty() && file.tests.is_empty() {
                 let message = file
                     .diagnostics
@@ -1240,7 +1307,7 @@ mod tests {
         assert_eq!(value["exit_class"], "test_failure");
         assert_eq!(
             String::from_utf8(json).expect("UTF-8 JSON"),
-            include_str!("../tests/fixtures/report-v11.json")
+            include_str!("../tests/fixtures/report-v12.json")
         );
 
         let mut events = Vec::new();
@@ -1252,7 +1319,7 @@ mod tests {
             let value: serde_json::Value = serde_json::from_str(line).expect("json line");
             assert_eq!(value["schema_version"], REPORT_SCHEMA_VERSION);
         }
-        assert_eq!(events, include_str!("../tests/fixtures/report-v11.jsonl"));
+        assert_eq!(events, include_str!("../tests/fixtures/report-v12.jsonl"));
     }
 
     #[test]
@@ -1279,11 +1346,11 @@ mod tests {
             ),
             (
                 Reporter::Json,
-                include_str!("../tests/fixtures/cancellation-v11.json"),
+                include_str!("../tests/fixtures/cancellation-v12.json"),
             ),
             (
                 Reporter::Events,
-                include_str!("../tests/fixtures/cancellation-v11.jsonl"),
+                include_str!("../tests/fixtures/cancellation-v12.jsonl"),
             ),
             (
                 Reporter::Junit,

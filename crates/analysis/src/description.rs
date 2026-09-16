@@ -49,6 +49,10 @@ pub struct ResolvedRuntimeConfiguration {
     pub provider_call_timeout_ms: u64,
     pub cleanup_timeout_ms: u64,
     pub journal_max_events: usize,
+    pub trace_mode: String,
+    pub trace_sources: bool,
+    pub trace_attachments: bool,
+    pub trace_max_bytes: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1704,6 +1708,22 @@ mod tests {
             .iter()
             .find(|entry| entry.code == "runtime_configuration_trace_viewer")
             .unwrap();
+        let capture = topic
+            .guidance
+            .iter()
+            .find(|entry| entry.code == "runtime_configuration_trace_capture")
+            .unwrap();
+        for fact in [
+            "retain-on-failure",
+            "sources defaults to false",
+            "attachments defaults to true",
+            "1..104857600",
+            "after owned application cleanup",
+            "journal is never shortened",
+            "non-overwriting",
+        ] {
+            assert!(capture.summary.contains(fact), "{fact}");
+        }
         for fact in [
             "validated trace archive",
             "explicit scope parentage",
@@ -1954,6 +1974,10 @@ mod tests {
             provider_call_timeout_ms: 60_000,
             cleanup_timeout_ms: 5_000,
             journal_max_events: 1234,
+            trace_mode: "off".into(),
+            trace_sources: false,
+            trace_attachments: true,
+            trace_max_bytes: 104_857_600,
         };
         let project = DescriptionProject {
             root: "/project".into(),

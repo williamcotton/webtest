@@ -31,7 +31,7 @@ Milestone E is **not complete**. The execution-tree, resource/wait foundations, 
   resolved configuration, keeping configuration values out of the artifact. Shared validation
   checks tree structure, identities, revisions, capability requirements, and explicit execution
   inputs for detectable drift. There is still no CLI command to execute an emitted plan.
-- Native journal schema 8 and CLI report/event schema 11 use opaque 128-bit execution IDs,
+- Native journal schema 8 and CLI report/event schema 12 use opaque 128-bit execution IDs,
   serialized as 32 lowercase hexadecimal digits. Native OS randomness allocates independent
   file-run IDs across processes; replay identity is `(ExecutionId, event_sequence)`.
   The bounded journal retains attachments, completed process-output snapshots, source/context metadata, clocks, explicit retry
@@ -40,8 +40,9 @@ Milestone E is **not complete**. The execution-tree, resource/wait foundations, 
 - The trace artifact core writes and validates deterministic bounded archives of
   the unchanged native journal, opt-in revision-keyed sources, and checksum-verified
   attachment mappings. A shared script-free viewer now presents existing archives
-  through `webtest trace`, locally or as standalone HTML. Test-run capture/retention
-  policy and atomic archive publication remain pending. Budgeted core capture now
+  through `webtest trace`, locally or as standalone HTML. Configured test runs now
+  export per-file archives after application cleanup with invocation-wide retention
+  and atomic non-overwriting publication. Budgeted core capture now
   omits whole optional members with typed trace-local truncation facts while
   preserving the authoritative journal unchanged.
 - Runtime observations accumulate privately and commit as a complete batch. Starting another
@@ -938,6 +939,52 @@ viewer omission labels, and unchanged runtime parallel/race/retry/resource/failu
 journals across every authoritative journal-overflow boundary. Workspace Clippy
 with `-D warnings`, formatting, diff whitespace checks, and WASM compilation of
 `webtest-wasm` and `webtest-trace` pass.
+
+### Native test-run trace export continuation — 2026-09-15
+
+`webtest test` now reads typed `[trace]` configuration: mode `off` (default), `on`,
+or `retain-on-failure`; exact source capture defaults to false, acknowledged
+attachment capture defaults to true, and `max_bytes` is 1..104857600 per archive.
+The app exports one archive per executed file after owned application cleanup.
+Retain-on-failure considers the whole invocation, including static, infrastructure,
+and application teardown failures. Pure static and pre-admission startup/identity
+failures have no fabricated trace. Prior traces are never deleted by retention.
+
+Export consumes the native journal directly, the source snapshot used for analysis,
+and acknowledged evidence from the runtime artifact directory. It never rebuilds
+events from reports or rereads source after provider mutations. Evidence reads
+reject non-regular/link inputs and escaping paths, bound reads, and verify content
+against acknowledgement before writing. A separate 100 MiB evidence staging bound
+per file export is a hard limit; capture within that bound uses the shared writer's
+optional whole-member truncation. Mandatory journal/metadata failure publishes no
+archive and preserves all test results.
+
+Archives publish to `[artifacts].directory/traces/<execution_id>.webtest-trace`
+through a synced temporary file and non-overwriting commit. Existing symlink storage
+components are rejected. All reporters expose published paths or separate
+infrastructure export errors; JSON/events schema 12 adds `traces` / `trace_export`
+without inventing native occurrences. JUnit exposes archive properties and distinct
+export-error cases. Trace format 2, journal schema 8, plan format 9, and runtime
+semantics 6 remain unchanged.
+
+Shared description/configuration projections, canonical bootstrap skill/parity,
+and structured-execution guidance now explain export, retention, bounds, and
+source opt-in. Metadata records the resolved project-configuration digest and
+provider schema identities; actual browser version remains unknown (`null`).
+Screenshot/DOM production follows existing `[evidence]` settings. Separate trace
+screenshot policy, console/network capture controls, remaining host/event coverage,
+observation IPC, and concurrent DAP remain pending. Milestone E is still incomplete.
+
+Verification: focused CLI integration passes for retention, concurrent identities,
+source snapshots after file mutation, multiple branch failures, optional source
+truncation, mandatory-budget failures in every reporter, authoritative journal
+overflow, safe storage, and real Chrome evidence rendered through the viewer.
+`cargo test --workspace` passes, including all seven new export integration tests,
+four viewer tests, 139 runtime lifecycle tests, native Chrome/protocol integration,
+and doc tests. An existing viewer startup timeout occurred during concurrent build
+activity; the unchanged viewer tests passed in isolation and in the complete
+workspace rerun. Workspace Clippy with `-D warnings`, formatting, diff whitespace
+checks, and WASM compilation of `webtest-wasm` and `webtest-trace` pass.
 
 ## 1. Outcome
 

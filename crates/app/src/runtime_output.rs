@@ -904,7 +904,7 @@ mod tests {
         );
         let reports = journal_event_reports("tests/output.webtest", journal.records());
         let json = serde_json::to_value(&reports[0]).unwrap();
-        assert_eq!(json["schema_version"], 11);
+        assert_eq!(json["schema_version"], 12);
         assert_eq!(json["type"], "output_captured");
         assert_eq!(json["name"], "process.run");
         assert_eq!(json["step_id"], 3);
@@ -958,7 +958,7 @@ mod tests {
         );
         let reports = journal_event_reports("tests/a.webtest", journal.records());
         let json = serde_json::to_value(&reports[0]).unwrap();
-        assert_eq!(json["schema_version"], 11);
+        assert_eq!(json["schema_version"], 12);
         assert_eq!(json["type"], "cancellation_requested");
         assert_eq!(json["cancellation"], "race_lost");
         assert_eq!(
@@ -1027,7 +1027,7 @@ mod tests {
         );
         let reports = journal_event_reports("tests/a.webtest", journal.records());
         let json = serde_json::to_value(&reports[0]).unwrap();
-        assert_eq!(json["schema_version"], 11);
+        assert_eq!(json["schema_version"], 12);
         assert_eq!(json["type"], "attachment_created");
         assert_eq!(
             json["attachment"],

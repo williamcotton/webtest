@@ -627,7 +627,7 @@ fn runtime_configuration_reference() -> ConstructDescription {
         "output_captured stdout stderr captured_byte_length redacted_byte_length truncation".into(),
         "cancellation_requested cancellation_cause causing_scope_id race_lost fail_fast".into(),
         "configuration debugging".into(),
-        "trace viewer validated archive standalone HTML".into(),
+        "trace viewer validated archive standalone HTML retain-on-failure max_bytes capture_report".into(),
         "inspect project startup owned health".into(),
     ];
     value.constraints = vec![
@@ -646,12 +646,16 @@ fn runtime_configuration_reference() -> ConstructDescription {
     ];
     value.guidance = vec![
         guidance(
+            "runtime_configuration_trace_capture",
+            "[trace] mode is off (default), on, or retain-on-failure. Export runs after owned application cleanup and writes one archive per executed file under [artifacts].directory/traces/<execution_id>.webtest-trace. Retention considers the whole invocation, including static errors and application cleanup failures. sources defaults to false and includes exact analyzed text when enabled; attachments defaults to true and includes acknowledged evidence under existing [evidence] settings. max_bytes is 1..104857600 (default 104857600), per archive including metadata. Optional content is omitted whole with capture_report facts; the journal is never shortened. A separate 100 MiB evidence staging limit is a hard export bound. Export failure is infrastructure without erasing test results; no archive is published for static or pre-admission startup/identity failures. Publication is atomic and non-overwriting. Browser version is unknown when not recorded; provider metadata records schema identities. Console/network capture controls remain pending.",
+        ),
+        guidance(
             "runtime_configuration_trace_viewer",
-            "The trace viewer reads a validated trace archive without loading project configuration or executing tests. It presents recorded timelines, explicit scope parentage, retry attempts, typed failures and cleanup, process-output facts, opt-in sources, and verified evidence. Source and attachment content omitted by capture policy remains absent; host paths inside facts are never opened. Budgeted archives distinguish whole-member truncation in a typed capture_report, keeping the runtime journal unchanged. The viewer shows those export facts separately from runtime events. The local and standalone HTML views are script-free and make no external network requests. Test-run trace export, capture/retention policy, and browser console/network journaling remain pending. See `webtest trace --help` for viewing commands and output options.",
+            "The trace viewer reads a validated trace archive without loading project configuration or executing tests. It presents recorded timelines, explicit scope parentage, retry attempts, typed failures and cleanup, process-output facts, opt-in sources, and verified evidence. Source and attachment content omitted by capture policy remains absent; host paths inside facts are never opened. Budgeted archives distinguish whole-member truncation in a typed capture_report, keeping the runtime journal unchanged. The viewer shows those export facts separately from runtime events. The local and standalone HTML views are script-free and make no external network requests. Browser console/network journaling remain pending. Test-run export uses the configured trace policy. See `webtest trace --help` for viewing commands and output options.",
         ),
         guidance(
             "runtime_configuration_fields",
-            "The machine-readable `resolved_configuration` object reports selected adapter and transport, resolved command and arguments, working directory, schema path, application ownership and whether health is configured, browser and server base URLs, the per-test deadline, the distinct provider-call default, the separate bounded cleanup timeout, and `journal_max_events`, the per-file native event count limit. Absent optional configuration is represented as null or an empty argument list; timeout values are integer milliseconds.",
+            "The machine-readable `resolved_configuration` object reports selected adapter and transport, resolved command and arguments, working directory, schema path, application ownership and whether health is configured, browser and server base URLs, the per-test deadline, the distinct provider-call default, the separate bounded cleanup timeout, and `journal_max_events`, the per-file native event count limit. trace_mode, trace_sources, trace_attachments, and trace_max_bytes report the resolved export policy. Absent optional configuration is represented as null or an empty argument list; timeout values are integer milliseconds.",
         ),
         guidance(
             "runtime_configuration_journal",

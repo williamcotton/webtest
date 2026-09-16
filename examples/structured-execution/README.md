@@ -64,8 +64,20 @@ Existing trace archives can be viewed with `webtest trace <artifact>`, which pri
 a private loopback URL and serves until Ctrl-C. Use `webtest trace <artifact>
 --output viewer.html` for standalone, script-free HTML (the output must not exist).
 The viewer validates the archive and displays only recorded facts and included
-evidence; it never starts this example app. These test commands do not yet export
-trace archives: test-run capture/retention policy remains pending.
+evidence; it never starts this example app. To export these test runs, add:
+
+```toml
+[trace]
+mode = "retain-on-failure"
+sources = true
+```
+
+The CLI reports archives under `.webtest/artifacts/traces/` after application
+cleanup. Sources are opt-in exact text; omit `sources = true` to exclude them.
+Existing evidence is included by default. Use `mode = "on"` for passing runs too.
+`max_bytes` controls each archive's capture budget; explicit truncation facts
+record omitted content without shortening the journal. Export errors preserve test
+outcomes and use the infrastructure exit class.
 
 Cancellation request records identify the first accepted request's target scope and
 typed cause, including the causing scope. They precede wait notification and
