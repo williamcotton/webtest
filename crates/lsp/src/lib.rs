@@ -1,5 +1,8 @@
 //! Thin Tower-based LSP adapter over protocol-independent editor services.
 
+#[cfg(unix)]
+pub mod observation_ipc;
+
 use std::{
     collections::HashMap,
     path::Path,
@@ -517,18 +520,63 @@ pub async fn serve_with_document_editors_and_project_changes(
     editor_for_path: Arc<DocumentEditorResolver>,
     project_file_changed: Arc<ProjectFileChangeHandler>,
 ) {
+    serve_with_observations(
+        browser,
+        default_editor,
+        editor_for_path,
+        project_file_changed,
+        None,
+    )
+    .await;
+}
+
+pub async fn serve_with_observations(
+    browser: Arc<dyn BrowserHost>,
+    default_editor: Arc<EditorService>,
+    editor_for_path: Arc<DocumentEditorResolver>,
+    project_file_changed: Arc<ProjectFileChangeHandler>,
+    workspace: Option<std::path::PathBuf>,
+) {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
+    let (target, receive_target) = tokio::sync::oneshot::channel();
     let (service, socket) = LspService::new(|client| {
-        Backend::new(
-            client,
+        let backend = Backend::new(
+            client.clone(),
             browser,
             default_editor,
             editor_for_path,
             project_file_changed,
-        )
+        );
+        let _ = target.send((client, backend.documents.clone()));
+        backend
     });
-    Server::new(stdin, stdout, socket).serve(service).await;
+    let server = Server::new(stdin, stdout, socket).serve(service);
+    #[cfg(unix)]
+    {
+        let endpoint = match workspace {
+            Some(workspace) => match observation_ipc::Endpoint::bind(&workspace).await {
+                Ok(endpoint) => Some(endpoint),
+                Err(error) => {
+                    tracing::warn!(%error, "observation publication unavailable");
+                    None
+                }
+            },
+            None => None,
+        };
+        let publication = async {
+            if let (Some(endpoint), Ok((client, documents))) = (endpoint, receive_target.await) {
+                endpoint.serve(client, documents).await;
+            }
+            std::future::pending::<()>().await;
+        };
+        tokio::select! { _ = server => {}, _ = publication => {} }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (workspace, receive_target);
+        server.await;
+    }
 }
 
 pub fn text_range_to_lsp(text: &str, range: TextRange) -> Range {

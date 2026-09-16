@@ -47,7 +47,8 @@ Milestone E is **not complete**. The execution-tree, resource/wait foundations, 
   preserving the authoritative journal unchanged.
 - Runtime observations accumulate privately and commit as a complete batch. Starting another
   run clears prior observations and prevents an older in-flight run from overwriting the newer
-  batch. Cross-process publication remains unimplemented.
+  batch. Authenticated CLI-to-LSP publication now updates matching open documents
+  on Unix; Windows transport and unopened-file publication remain pending.
 
 - The runtime resource registry enforces acquisition acknowledgement, shared/exclusive leases,
   generation identity, and exactly-once terminal teardown. The generic adapter driver has fake
@@ -985,6 +986,56 @@ and doc tests. An existing viewer startup timeout occurred during concurrent bui
 activity; the unchanged viewer tests passed in isolation and in the complete
 workspace rerun. Workspace Clippy with `-D warnings`, formatting, diff whitespace
 checks, and WASM compilation of `webtest-wasm` and `webtest-trace` pass.
+
+### Acceptance-focused checkpoint: CLI-to-LSP diagnostics — 2026-09-16
+
+This checkpoint targets acceptance criterion 8 directly. On Unix, running
+`webtest test` now publishes completed runtime observations to matching open
+documents in an already-running LSP. A failed CLI run produces source-mapped editor
+diagnostics; a successful rerun of the same source clears them. No editor connection
+is required and publication rejection never changes test outcomes.
+
+The LSP owns a workspace-scoped loopback endpoint advertised in a user-private
+runtime directory. Protocol 1 is independent of App Bridge Protocol. Metadata
+contains PID, canonical-workspace identity, endpoint, random secret, and creation
+time. Discovery checks ownership, permissions, protocol, PID liveness, and workspace;
+requests authenticate before touching editor state. Paths must remain inside the
+canonical workspace, including through symlinks. Frames are bounded at 8 MiB,
+connections at eight, and each exchange at two seconds. Listener/connections are
+directly owned futures; shutdown removes owned metadata. A persistent lock inode
+prevents competing servers from acquiring different locks for the same workspace.
+
+The CLI reserves a publication ticket before execution and sends the completed
+native observation batch after application cleanup. Tickets are distinct from
+runtime execution identities and order external starts against both external and
+editor-native runs. Publication reuses shared observation kinds, exact UTF-8 ranges,
+and execution/test/step identity; it does not reconstruct failures from CLI reports.
+Editor services atomically validate source revision and ranges, reject mismatched
+provider schemas at reservation, and invalidate tickets on edits or reconfiguration.
+Old completions cannot overwrite a newer run or revive diagnostics after edit/undo.
+Acknowledged artifact references are normalized to workspace-relative paths.
+
+The end-to-end protocol test exercises a real CLI and running LSP: failure appears,
+same-source success clears, unsaved changes reject stale disk results, unauthorized
+and wrong-workspace/version/path requests fail, symlink escapes and oversized frames
+are rejected, metadata is private and removed on exit, and absent-editor execution
+retains its outcome. Editor tests cover atomic rejection of invalid Unicode ranges,
+superseded publishers, native-run precedence, and configuration invalidation.
+
+Scope boundary: this closes the user-facing criterion-8 workflow for open documents
+on Unix. Windows transport and unopened-file publication remain outstanding, and
+observation batches do not yet add scope/resource detail absent from today's stored
+diagnostics. The next principal acceptance target is criterion 11: concurrent DAP
+threads, frames, pause/step/continue/disconnect through `RunControl`. Further trace
+refinement is deferred unless an acceptance test demonstrates a blocker. Milestone E
+remains incomplete; full resource/event conformance and final cross-surface gates
+must still be audited against criteria 5, 6, 9, 12, and 13.
+
+Verification: `cargo test --workspace` passes, including the real CLI/LSP publication
+and authentication workflow, all 16 protocol tests, and 139 runtime lifecycle tests.
+`cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo fmt --all -- --check`, and `git diff --check` pass. The stable-toolchain
+`wasm32-unknown-unknown` check passes for `webtest-wasm` and `webtest-trace`.
 
 ## 1. Outcome
 

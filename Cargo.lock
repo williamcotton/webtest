@@ -1973,7 +1973,12 @@ dependencies = [
 name = "webtest-lsp"
 version = "0.1.0"
 dependencies = [
+ "futures",
+ "getrandom 0.3.4",
+ "libc",
+ "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tower",
  "tower-lsp-server",
@@ -1982,6 +1987,7 @@ dependencies = [
  "webtest-browser",
  "webtest-editor",
  "webtest-feedback",
+ "webtest-observation",
  "webtest-text",
 ]
 

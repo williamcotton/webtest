@@ -175,3 +175,10 @@ Run `webtest inspect [<url>] --reporter json` to obtain bounded semantic element
 Diagnostics may contain canonical `reference_queries` and bounded `repair_hints`. Runtime failures may contain locator replacement candidates when WebTest has safe evidence. Treat both as advisory, preserve their source ranges, and rerun `check` or `test` after any edit; WebTest does not apply repairs automatically.
 
 Do not infer unavailable roadmap syntax from prose or model memory. If a query is unknown, search the installed reference or inspect `webtest describe language --reporter json` rather than inventing a construct.
+
+On Unix, CLI runs automatically publish runtime diagnostics to matching open files
+in a running WebTest LSP. Successful reruns clear old runtime diagnostics; unsaved
+source changes, changed provider schemas, and superseded runs reject stale results.
+No editor connection is required to run tests, and publication failure does not
+change the CLI outcome. Windows transport and unopened-file publication remain
+pending. Use `webtest describe runtime.configuration` for publication guidance.

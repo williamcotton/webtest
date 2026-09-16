@@ -92,3 +92,8 @@ before a 65536-byte UTF-8 limit is applied. Lengths and lossy/redacted/truncated
 make the projection explicit; source, operation, and attempt identity remain in
 journal metadata. These completed snapshots do not represent interleaved pipe
 chronology or partial output from interrupted capture.
+
+On Unix, running these tests from the CLI also updates runtime diagnostics for
+matching open files in a running WebTest LSP. A passing rerun clears prior failures.
+Unsaved editor changes reject stale on-disk results; a missing editor never changes
+test outcomes. Windows transport and unopened-file publication remain pending.

@@ -371,6 +371,175 @@ fn lsp_stdio_covers_document_features_and_shutdown() {
     lsp.wait_for_exit();
 }
 
+#[cfg(unix)]
+#[test]
+fn cli_publication_updates_the_running_lsp_and_success_clears_diagnostics() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("external.webtest");
+    let source = r#"test "é" { server { let output = process.run("/bin/sh", args: ["-c", "cat state"]) expect output.stdout == "ok" } }"#;
+    std::fs::write(&path, source).unwrap();
+    std::fs::write(directory.path().join("state"), "bad").unwrap();
+    let uri = format!("file://{}", path.display());
+    let mut lsp = ProtocolProcess::spawn(&["lsp"], directory.path());
+    lsp.send(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}));
+    lsp.receive(|message| message["id"] == 1);
+    lsp.send(json!({"jsonrpc":"2.0","method":"initialized","params":{}}));
+    lsp.send(json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":uri,"languageId":"webtest","version":1,"text":source}}}));
+    lsp.receive(|message| message["method"] == "textDocument/publishDiagnostics");
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_webtest"))
+            .current_dir(directory.path())
+            .args(["test", "--jobs", "2", "--reporter", "json"])
+            .output()
+            .unwrap()
+    };
+    let failed = run();
+    assert_eq!(
+        failed.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&failed.stderr)
+    );
+    let diagnostics = lsp.receive(|message| {
+        message["method"] == "textDocument/publishDiagnostics"
+            && message["params"]["diagnostics"]
+                .as_array()
+                .is_some_and(|values| {
+                    values
+                        .iter()
+                        .any(|diagnostic| diagnostic["source"] == "webtest.runtime")
+                })
+    });
+    let diagnostic = &diagnostics["params"]["diagnostics"][0];
+    assert_eq!(diagnostic["code"], "runtime.assertion_failed");
+    assert_eq!(
+        diagnostic["range"]["start"]["character"],
+        source[..source.find("output.stdout").unwrap()]
+            .encode_utf16()
+            .count()
+    );
+    // Consume the begin notification retained before the failing terminal batch.
+    lsp.receive(|message| {
+        message["method"] == "textDocument/publishDiagnostics"
+            && message["params"]["diagnostics"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+    });
+    std::fs::write(directory.path().join("state"), "ok").unwrap();
+    let passed = run();
+    assert!(passed.status.success());
+    for _ in 0..2 {
+        lsp.receive(|message| {
+            message["method"] == "textDocument/publishDiagnostics"
+                && message["params"]["diagnostics"]
+                    .as_array()
+                    .is_some_and(Vec::is_empty)
+        });
+    }
+    // An unsaved editor change rejects the old on-disk revision at reservation.
+    lsp.send(json!({"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":uri,"version":2},"contentChanges":[{"text":"test \"unsaved\" {}"}]}}));
+    lsp.receive(|message| {
+        message["method"] == "textDocument/publishDiagnostics" && message["params"]["version"] == 2
+    });
+    std::fs::write(directory.path().join("state"), "bad").unwrap();
+    assert_eq!(run().status.code(), Some(1));
+    lsp.send(json!({"jsonrpc":"2.0","id":2,"method":"textDocument/formatting","params":{"textDocument":{"uri":uri},"options":{"tabSize":4,"insertSpaces":true}}}));
+    lsp.receive(|message| message["id"] == 2);
+    assert!(
+        !lsp.pending
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|message| message["method"] == "textDocument/publishDiagnostics")
+    );
+    // Exercise the native authentication and path boundary against the live LSP.
+    let root = directory.path().canonicalize().unwrap();
+    let workspace_id = blake3::hash(root.to_string_lossy().as_bytes())
+        .to_hex()
+        .to_string();
+    let metadata_path = std::env::temp_dir()
+        .join(format!("webtest-observations-{}", unsafe {
+            libc::geteuid()
+        }))
+        .join(format!("{workspace_id}.json"));
+    let metadata: Value = serde_json::from_slice(&std::fs::read(&metadata_path).unwrap()).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(&metadata_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o077,
+        0
+    );
+    let schemas: std::collections::BTreeMap<_, _> =
+        webtest_provider::ProviderRegistry::built_in_schemas()
+            .schemas()
+            .map(|schema| (schema.name.0.clone(), schema.hash()))
+            .collect();
+    let request = json!({"protocol":1,"token":metadata["token"],"workspace_id":workspace_id,"path":"external.webtest","revision":webtest_text::SourceRevision::of("test \"unsaved\" {}"),"operation":{"kind":"begin","provider_schema_hashes":schemas}});
+    let send = |request: &Value| {
+        let mut stream =
+            std::net::TcpStream::connect(metadata["endpoint"].as_str().unwrap()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let bytes = serde_json::to_vec(request).unwrap();
+        stream
+            .write_all(&(bytes.len() as u32).to_be_bytes())
+            .unwrap();
+        stream.write_all(&bytes).unwrap();
+        let mut length = [0; 4];
+        stream.read_exact(&mut length).unwrap();
+        let mut bytes = vec![0; u32::from_be_bytes(length) as usize];
+        stream.read_exact(&mut bytes).unwrap();
+        serde_json::from_slice::<Value>(&bytes).unwrap()
+    };
+    for (key, invalid) in [
+        ("token", json!("wrong")),
+        ("workspace_id", json!("wrong")),
+        ("protocol", json!(2)),
+        ("path", json!("../external.webtest")),
+        ("path", json!("/etc/passwd")),
+    ] {
+        let mut bad = request.clone();
+        bad[key] = invalid;
+        assert_eq!(send(&bad)["status"], "rejected", "{key}");
+    }
+    let outside = tempfile::NamedTempFile::new().unwrap();
+    std::os::unix::fs::symlink(outside.path(), directory.path().join("escape.webtest")).unwrap();
+    let mut escaped = request.clone();
+    escaped["path"] = json!("escape.webtest");
+    assert_eq!(send(&escaped)["status"], "rejected");
+    assert_eq!(send(&request)["status"], "accepted");
+    lsp.receive(|message| {
+        message["method"] == "textDocument/publishDiagnostics" && message["params"]["version"] == 2
+    });
+    let mut oversized =
+        std::net::TcpStream::connect(metadata["endpoint"].as_str().unwrap()).unwrap();
+    oversized
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    oversized
+        .write_all(&(8 * 1024 * 1024 + 1u32).to_be_bytes())
+        .unwrap();
+    assert_eq!(oversized.read(&mut [0]).unwrap(), 0);
+    lsp.send(json!({"jsonrpc":"2.0","id":3,"method":"shutdown","params":null}));
+    lsp.receive(|message| message["id"] == 3);
+    lsp.send(json!({"jsonrpc":"2.0","method":"exit","params":null}));
+    lsp.wait_for_exit();
+    assert!(
+        !metadata_path.exists(),
+        "owned endpoint metadata is removed on exit"
+    );
+    std::fs::remove_file(directory.path().join("escape.webtest")).unwrap();
+    assert_eq!(
+        run().status.code(),
+        Some(1),
+        "missing editor does not alter test outcome"
+    );
+}
+
 #[test]
 fn lsp_resolves_app_provider_from_the_open_documents_nearest_project() {
     let directory = tempfile::tempdir().expect("temp directory");

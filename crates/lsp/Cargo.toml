@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+serde.workspace = true
+getrandom.workspace = true
+futures.workspace = true
+tempfile.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tower.workspace = true
@@ -14,4 +18,8 @@ webtest-analysis.workspace = true
 webtest-browser.workspace = true
 webtest-editor.workspace = true
 webtest-feedback.workspace = true
+webtest-observation.workspace = true
 webtest-text.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

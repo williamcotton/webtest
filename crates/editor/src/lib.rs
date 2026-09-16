@@ -105,12 +105,50 @@ impl EditorService {
         Arc::clone(&self.observations)
     }
 
+    pub fn begin_publication(
+        &self,
+        file: FileId,
+        revision: webtest_text::SourceRevision,
+        provider_schema_hashes: &std::collections::BTreeMap<String, String>,
+    ) -> Option<u64> {
+        let _configuration = self.lock_configuration();
+        let database = self.read_database();
+        if database.source_revision(file).ok()? != revision
+            || database.provider_schema_hashes() != *provider_schema_hashes
+        {
+            return None;
+        }
+        Some(self.observations.begin_publication(file))
+    }
+
+    pub fn complete_publication(
+        &self,
+        file: FileId,
+        ticket: u64,
+        batch: webtest_observation::ObservationPublication,
+    ) -> bool {
+        let _configuration = self.lock_configuration();
+        let database = self.read_database();
+        let Ok(source) = database.source(file) else {
+            return false;
+        };
+        let revision = batch.revision;
+        let execution = batch.execution_id;
+        let Some(values) = batch.into_observations(file, &source) else {
+            return false;
+        };
+        self.observations
+            .complete_publication(file, revision, ticket, execution, values)
+    }
+
     pub fn open_document(&self, path: impl Into<String>, text: impl Into<String>) -> FileId {
         self.write_database().open_file(path, text)
     }
 
     pub fn update_document(&self, file: FileId, text: impl Into<String>) {
-        self.write_database().set_file_text(file, text);
+        let mut database = self.write_database();
+        database.set_file_text(file, text);
+        self.observations.clear_for_file(file);
     }
 
     pub fn close_document(&self, file: FileId) {
@@ -537,6 +575,84 @@ mod tests {
     use webtest_browser_cdp::ChromeHost;
     use webtest_model::{Capability, Type, Value};
     use webtest_observation::{ExecutionId, RuntimeObservation};
+
+    #[test]
+    fn external_publication_is_atomic_revision_safe_and_superseded_by_new_runs() {
+        use webtest_observation::{ObservationPublication, PublishedObservation};
+        let editor = EditorService::new();
+        let source = "test \"é\" { expect 1 == 2 }";
+        let file = editor.open_document("external.webtest", source);
+        let revision = webtest_text::SourceRevision::of(source);
+        let batch = || ObservationPublication {
+            execution_id: ExecutionId::from_u128(42),
+            revision,
+            observations: vec![PublishedObservation {
+                test_id: webtest_model::TestId(0),
+                step_id: None,
+                start: 0,
+                end: source.len() as u32,
+                kind: RuntimeObservationKind::TestTimeout {
+                    timeout_ms: 1,
+                    active_step: None,
+                },
+            }],
+        };
+        let schemas = editor.read_database().provider_schema_hashes();
+        assert!(
+            editor
+                .begin_publication(file, revision, &Default::default())
+                .is_none()
+        );
+        let old = editor.begin_publication(file, revision, &schemas).unwrap();
+        let current = editor.begin_publication(file, revision, &schemas).unwrap();
+        assert!(!editor.complete_publication(file, old, batch()));
+        assert!(editor.complete_publication(file, current, batch()));
+        assert_eq!(
+            editor.observations().observations_for(file, revision).len(),
+            1
+        );
+        let clear = editor.begin_publication(file, revision, &schemas).unwrap();
+        let mut success = batch();
+        success.observations.clear();
+        assert!(editor.complete_publication(file, clear, success));
+        assert!(
+            editor
+                .observations()
+                .observations_for(file, revision)
+                .is_empty()
+        );
+        let edited = editor.begin_publication(file, revision, &schemas).unwrap();
+        editor.update_document(file, "test \"changed\" {}");
+        assert!(!editor.complete_publication(file, edited, batch()));
+        assert!(editor.begin_publication(file, revision, &schemas).is_none());
+        editor.update_document(file, source);
+        assert!(
+            !editor.complete_publication(file, edited, batch()),
+            "editing back must not resurrect a ticket"
+        );
+        let native = editor.begin_publication(file, revision, &schemas).unwrap();
+        editor
+            .observations()
+            .begin_execution(file, ExecutionId::from_u128(99));
+        assert!(!editor.complete_publication(file, native, batch()));
+        let invalid = editor.begin_publication(file, revision, &schemas).unwrap();
+        let mut mixed = batch();
+        let mut bad = mixed.observations[0].clone();
+        bad.start = source.find('é').unwrap() as u32 + 1;
+        mixed.observations.push(bad);
+        assert!(!editor.complete_publication(file, invalid, mixed));
+        assert!(
+            editor
+                .observations()
+                .observations_for(file, revision)
+                .is_empty()
+        );
+        editor.reconfigure(
+            RunnerOptions::default(),
+            ProviderRegistry::built_in_schemas(),
+        );
+        assert!(!editor.complete_publication(file, invalid, batch()));
+    }
     use webtest_provider::{
         CallContext, OperationName, OperationSchema, ProviderCall, ProviderName, ProviderResult,
         ProviderSchema, ServerProvider,

@@ -12,7 +12,7 @@ pub(crate) async fn run_lsp(chrome_path: Option<PathBuf>) -> Result<ExitClass, A
     let editor = project_editors.editor_for_project(&project)?;
     let document_projects = Arc::clone(&project_editors);
     let changed_projects = Arc::clone(&project_editors);
-    webtest_lsp::serve_with_document_editors_and_project_changes(
+    webtest_lsp::serve_with_observations(
         Arc::new(browser),
         editor,
         Arc::new(move |path| {
@@ -25,6 +25,7 @@ pub(crate) async fn run_lsp(chrome_path: Option<PathBuf>) -> Result<ExitClass, A
                 .reload_for_changed_path(path)
                 .map_err(|error| error.to_string())
         }),
+        Some(project.root.clone()),
     )
     .await;
     project_editors.shutdown().await?;

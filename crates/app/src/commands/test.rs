@@ -149,7 +149,7 @@ pub(crate) async fn run_test(
         }
 
         let observations = Arc::new(ObservationStore::default());
-        let mut runner = Runner::new(observations)
+        let mut runner = Runner::new(observations.clone())
             .with_options(options.clone())
             .with_provider_registry(providers.clone());
         if let Some(progress) = &progress {
@@ -199,18 +199,39 @@ pub(crate) async fn run_test(
             analyzed.plan,
             runner,
             file_browser,
+            observations,
         ));
         report.files.push(file_report);
     }
     let inputs: Vec<_> = runnable
         .iter()
-        .map(|(_, _, plan, runner, browser)| TestRun {
+        .map(|(_, _, plan, runner, browser, _)| TestRun {
             runner,
             plan,
             browser,
             control: None,
         })
         .collect();
+    #[cfg(unix)]
+    let publications = {
+        let mut publications = Vec::new();
+        let schemas = providers
+            .schemas()
+            .map(|schema| (schema.name.0.clone(), schema.hash()))
+            .collect();
+        for (index, _, plan, _, _, _) in &runnable {
+            publications.push(
+                webtest_lsp::observation_ipc::begin(
+                    &project.root,
+                    &project.root.join(&report.files[*index].path),
+                    plan.source_revision,
+                    &schemas,
+                )
+                .await,
+            );
+        }
+        publications
+    };
     let mut results = if let Some(pool) = &worker_applications {
         // Pool size is constructed from a validated jobs limit and nonzero test count.
         match run_jobs_on_workers(&inputs, &pool.workers).await {
@@ -223,7 +244,7 @@ pub(crate) async fn run_test(
     } else {
         run_jobs(&inputs, jobs).await
     };
-    for ((index, source, plan, _, _), result) in runnable.iter().zip(&mut results) {
+    for ((index, source, plan, _, _, _), result) in runnable.iter().zip(&mut results) {
         let file_report = &mut report.files[*index];
         file_report.duration_nanos = nanos(result.duration);
         file_report.events = journal_event_reports(&file_report.path, &result.journal);
@@ -296,12 +317,30 @@ pub(crate) async fn run_test(
             });
         }
     }
+    #[cfg(unix)]
+    for (((_, _, plan, _, _, observations), result), publication) in
+        runnable.iter().zip(&results).zip(publications)
+    {
+        if let (Some(publication), Some(execution_id)) = (publication, result.execution_id) {
+            publication
+                .complete(webtest_observation::ObservationPublication {
+                    execution_id,
+                    revision: plan.source_revision,
+                    observations: observations
+                        .observations_for(plan.file, plan.source_revision)
+                        .into_iter()
+                        .map(Into::into)
+                        .collect(),
+                })
+                .await;
+        }
+    }
     if crate::trace_export::retain(
         project.config.trace.mode,
         report.exit_class != ExitClass::Success,
     ) {
         let metadata = crate::trace_export::metadata(&project, &providers);
-        for ((index, source, plan, _, _), result) in runnable.iter().zip(&results) {
+        for ((index, source, plan, _, _, _), result) in runnable.iter().zip(&results) {
             let Some(execution_id) = result.execution_id else {
                 continue;
             };

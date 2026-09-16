@@ -6,8 +6,10 @@ mod identity;
 pub use identity::{ExecutionId, InvalidExecutionId};
 mod attachment;
 mod output;
+mod publication;
 pub use attachment::{Artifact, ArtifactKind, Attachment};
 pub use output::{CapturedOutput, OutputStream};
+pub use publication::{ObservationPublication, PublishedObservation};
 mod event_metadata;
 mod journal;
 pub use event_metadata::{EventContext, EventMetadata};
@@ -895,7 +897,8 @@ pub struct RuntimeObservation {
     pub kind: RuntimeObservationKind,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RuntimeObservationKind {
     TestTimeout {
         timeout_ms: u64,
@@ -950,10 +953,64 @@ impl RuntimeObservationKind {
 #[derive(Default)]
 pub struct ObservationStore {
     observations: Mutex<HashMap<(FileId, SourceRevision), Vec<RuntimeObservation>>>,
-    latest_executions: Mutex<HashMap<FileId, ExecutionId>>,
+    latest_executions: Mutex<HashMap<FileId, ObservationOwner>>,
+    next_publication: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ObservationOwner {
+    Execution(ExecutionId),
+    Publication(u64),
 }
 
 impl ObservationStore {
+    /// A publication ticket orders external starts independently of execution IDs.
+    pub fn begin_publication(&self, file: FileId) -> u64 {
+        let mut latest = self
+            .latest_executions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let ticket = self
+            .next_publication
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        latest.insert(file, ObservationOwner::Publication(ticket));
+        self.observations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(stored, _), _| *stored != file);
+        ticket
+    }
+
+    pub fn complete_publication(
+        &self,
+        file: FileId,
+        revision: SourceRevision,
+        ticket: u64,
+        execution: ExecutionId,
+        values: Vec<RuntimeObservation>,
+    ) -> bool {
+        let mut latest = self
+            .latest_executions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // An editor-native run started after the external reservation supersedes it.
+        if latest.get(&file) != Some(&ObservationOwner::Publication(ticket))
+            || values.iter().any(|value| {
+                value.file != file
+                    || value.source_revision != revision
+                    || value.execution_id != execution
+            })
+        {
+            return false;
+        }
+        latest.insert(file, ObservationOwner::Execution(execution));
+        self.observations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((file, revision), values);
+        true
+    }
     pub fn clear(&self) {
         let mut latest = self
             .latest_executions
@@ -985,7 +1042,7 @@ impl ObservationStore {
             .latest_executions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        latest.insert(file, execution);
+        latest.insert(file, ObservationOwner::Execution(execution));
         self.observations
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1004,7 +1061,7 @@ impl ObservationStore {
             .latest_executions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if latest.get(&file) != Some(&execution)
+        if latest.get(&file) != Some(&ObservationOwner::Execution(execution))
             || values.iter().any(|value| {
                 value.file != file
                     || value.source_revision != revision

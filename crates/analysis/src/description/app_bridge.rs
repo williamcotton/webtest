@@ -628,6 +628,7 @@ fn runtime_configuration_reference() -> ConstructDescription {
         "cancellation_requested cancellation_cause causing_scope_id race_lost fail_fast".into(),
         "configuration debugging".into(),
         "trace viewer validated archive standalone HTML retain-on-failure max_bytes capture_report".into(),
+        "CLI LSP editor diagnostics publication IPC stale revision".into(),
         "inspect project startup owned health".into(),
     ];
     value.constraints = vec![
@@ -645,6 +646,10 @@ fn runtime_configuration_reference() -> ConstructDescription {
         ),
     ];
     value.guidance = vec![
+        guidance(
+            "runtime_configuration_editor_publication",
+            "On Unix, CLI test runs automatically publish completed runtime diagnostics to open documents in a running WebTest LSP for the same workspace. Starting a publication clears prior runtime observations; a successful completion commits an empty batch. The editor rejects stale source revisions, changed provider schemas, invalid UTF-8 ranges, and superseded runs. A user-private endpoint descriptor, random token, loopback-only transport, path confinement, 8 MiB frame bound, and two-second request deadline protect the optional publication channel. A missing editor or rejected publication never changes test results. Evidence references remain workspace-relative. This protocol is independent of App Bridge Protocol. Windows transport and publication for unopened documents remain pending.",
+        ),
         guidance(
             "runtime_configuration_trace_capture",
             "[trace] mode is off (default), on, or retain-on-failure. Export runs after owned application cleanup and writes one archive per executed file under [artifacts].directory/traces/<execution_id>.webtest-trace. Retention considers the whole invocation, including static errors and application cleanup failures. sources defaults to false and includes exact analyzed text when enabled; attachments defaults to true and includes acknowledged evidence under existing [evidence] settings. max_bytes is 1..104857600 (default 104857600), per archive including metadata. Optional content is omitted whole with capture_report facts; the journal is never shortened. A separate 100 MiB evidence staging limit is a hard export bound. Export failure is infrastructure without erasing test results; no archive is published for static or pre-admission startup/identity failures. Publication is atomic and non-overwriting. Browser version is unknown when not recorded; provider metadata records schema identities. Console/network capture controls remain pending.",

@@ -1679,6 +1679,22 @@ mod tests {
             panic!("configuration alias")
         };
         assert_eq!(topic.id, "runtime.configuration");
+        let publication = topic
+            .guidance
+            .iter()
+            .find(|guidance| guidance.code == "runtime_configuration_editor_publication")
+            .unwrap();
+        for fact in [
+            "On Unix",
+            "open documents",
+            "successful completion",
+            "stale source revisions",
+            "superseded runs",
+            "never changes test results",
+            "Windows transport",
+        ] {
+            assert!(publication.summary.contains(fact), "{fact}");
+        }
         let guidance = topic
             .guidance
             .iter()
