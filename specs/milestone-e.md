@@ -1074,9 +1074,22 @@ hook and is therefore not yet inspectable at that stop. DAP launches a single fi
 normal Runner; this checkpoint does not add a debug CLI jobs scheduler. Broader
 resource/event conformance and cross-surface acceptance remain Milestone E work.
 
-Verification: focused runtime-backed DAP tests pass for sibling snapshots, broadcast
-continue, lexical stepping, retry exceptions, timeout, restart, and disconnect.
-Real protocol and full workspace/Clippy/portable validation are in progress.
+Verification completed 2026-10-17: `cargo test --workspace` passes, including all
+17 DAP unit tests, 17 protocol tests, and 140 runtime lifecycle tests. Coverage
+includes sibling snapshots, broadcast continue, lexical stepping, retry exceptions,
+timeout, restart, disconnect, and the real concurrent DAP protocol workflow.
+`cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo fmt --all -- --check`, and `git diff --check` pass. Stable-toolchain
+`wasm32-unknown-unknown` checks pass for `webtest-wasm` and `webtest-trace`, and
+`npm run compile` passes in `editors/vscode`.
+
+Validation follow-up — 2026-10-17: the full workspace run exposed a legacy
+`RunControl` compatibility regression. Context-aware debugger hooks receive internal
+failures so DAP can stop on them, but the default forwarding implementation must
+preserve the legacy failure hook's exclusion of internal failures. The forwarding
+guard now preserves that contract. A runtime regression test proves that an explicit
+context-aware control still receives the internal failure with its real execution,
+test, operation scope, and source origin, without creating a user diagnostic.
 
 ## 1. Outcome
 

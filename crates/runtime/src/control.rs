@@ -78,6 +78,8 @@ pub trait RunControl: Send + Sync {
         }
     }
 
+    /// Context-aware controls can inspect every failure class, including internal
+    /// failures. The default preserves the legacy hook's non-internal contract.
     async fn after_step_failure_in_context(
         &self,
         test: &PlannedTest,
@@ -86,7 +88,9 @@ pub trait RunControl: Send + Sync {
         error: &StepError,
         bindings: &BTreeMap<String, Value>,
     ) {
-        self.after_step_failure(test, step, error, bindings).await;
+        if error.failure_class() != webtest_feedback::FailureClass::Internal {
+            self.after_step_failure(test, step, error, bindings).await;
+        }
     }
 
     fn is_cancelled(&self) -> bool {

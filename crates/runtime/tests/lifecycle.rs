@@ -1709,6 +1709,53 @@ async fn inconsistent_plan_union_is_rejected_without_browser_allocation() {
 }
 
 #[tokio::test]
+async fn context_aware_control_observes_internal_failures_without_user_diagnostics() {
+    struct ContextControl(Mutex<Option<(webtest_runtime::DebugContext, StepError)>>);
+    #[async_trait]
+    impl RunControl for ContextControl {
+        async fn before_step(&self, _: &PlannedTest, _: &PlannedStep) {}
+        async fn after_step_failure_in_context(
+            &self,
+            _: &PlannedTest,
+            _: &PlannedStep,
+            context: &webtest_runtime::DebugContext,
+            error: &StepError,
+            _: &BTreeMap<String, Value>,
+        ) {
+            *self.0.lock().unwrap() = Some((context.clone(), error.clone()));
+        }
+    }
+    let store = Arc::new(ObservationStore::default());
+    let plan = plan_with_tests(vec![Capability::Pure], vec![vec![missing_binding()]]);
+    let control = ContextControl(Mutex::new(None));
+    let result = Runner::new(store.clone())
+        .run_with_control(
+            &plan,
+            &LifecycleHost(Arc::new(LifecycleState::default())),
+            Some(&control),
+        )
+        .await;
+    let (context, error) = control
+        .0
+        .lock()
+        .unwrap()
+        .take()
+        .expect("context-aware failure hook");
+    assert!(matches!(error, StepError::Internal(_)));
+    assert_eq!(Some(context.execution_id), result.execution_id);
+    let frame = context.frames.last().unwrap();
+    assert_eq!(frame.kind, webtest_runtime::DebugScopeKind::Operation);
+    assert_eq!(frame.scope.origin, plan.tests[0].steps()[0].origin);
+    assert_eq!(frame.scope.execution_context.test_id, plan.tests[0].id);
+    assert_eq!(result.aborted(), 1);
+    assert!(
+        store
+            .observations_for(plan.file, plan.source_revision)
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn internal_step_failure_aborts_with_typed_events_and_no_user_observation() {
     let store = Arc::new(ObservationStore::default());
     let plan = plan_with_tests(
