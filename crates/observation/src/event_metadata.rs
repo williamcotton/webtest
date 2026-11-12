@@ -65,8 +65,8 @@ impl ExecutionEvent {
             Self::CancellationRequested { scope, .. }
             | Self::ScopeAborted { scope, .. }
             | Self::Attempt { scope, .. }
-            | Self::Wait { scope, .. }
-            | Self::Resource { scope, .. } => Some(scope),
+            | Self::Wait { scope, .. } => Some(scope),
+            Self::Resource { scope, .. } => scope.as_ref(),
             _ => None,
         }
     }
@@ -77,8 +77,11 @@ impl ExecutionEvent {
             Self::CancellationRequested { scope, .. }
             | Self::ScopeAborted { scope, .. }
             | Self::Attempt { scope, .. }
-            | Self::Wait { scope, .. }
-            | Self::Resource { scope, .. } => Some(scope.execution_context.test_id),
+            | Self::Wait { scope, .. } => Some(scope.execution_context.test_id),
+            Self::Resource { scope, .. } => match scope {
+                Some(scope) => Some(scope.execution_context.test_id),
+                None => None,
+            },
             Self::OutputCaptured { test_id, .. }
             | Self::AttachmentCreated { test_id, .. }
             | Self::TestStarted { test_id, .. }

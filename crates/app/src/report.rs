@@ -12,7 +12,7 @@ use webtest_project::Project;
 
 use crate::{error::AppError, project_context::normalized_path};
 
-pub(crate) const REPORT_SCHEMA_VERSION: u32 = 12;
+pub(crate) const REPORT_SCHEMA_VERSION: u32 = 13;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -61,6 +61,8 @@ pub struct CommandReport {
     pub warnings: Vec<WarningReport>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub traces: Vec<TraceExportReport>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub application_events: Vec<webtest_observation::RecordedEvent>,
     pub files: Vec<FileReport>,
     pub summary: SummaryReport,
     pub exit_class: ExitClass,
@@ -383,6 +385,7 @@ impl CommandReport {
             project_root: project_root.into(),
             warnings: Vec::new(),
             traces: Vec::new(),
+            application_events: Vec::new(),
             files: Vec::new(),
             summary: SummaryReport::default(),
             exit_class: ExitClass::Success,
@@ -504,6 +507,12 @@ impl CommandReport {
                 plural(self.summary.tests),
                 self.summary.files,
                 plural(self.summary.files)
+            )?;
+        }
+        for record in &self.application_events {
+            write_json_line(
+                output,
+                &serde_json::json!({ "schema_version": REPORT_SCHEMA_VERSION, "type": "application_event", "record": record }),
             )?;
         }
         for file in &self.files {
@@ -1307,7 +1316,7 @@ mod tests {
         assert_eq!(value["exit_class"], "test_failure");
         assert_eq!(
             String::from_utf8(json).expect("UTF-8 JSON"),
-            include_str!("../tests/fixtures/report-v12.json")
+            include_str!("../tests/fixtures/report-v13.json")
         );
 
         let mut events = Vec::new();
@@ -1319,7 +1328,7 @@ mod tests {
             let value: serde_json::Value = serde_json::from_str(line).expect("json line");
             assert_eq!(value["schema_version"], REPORT_SCHEMA_VERSION);
         }
-        assert_eq!(events, include_str!("../tests/fixtures/report-v12.jsonl"));
+        assert_eq!(events, include_str!("../tests/fixtures/report-v13.jsonl"));
     }
 
     #[test]
@@ -1346,11 +1355,11 @@ mod tests {
             ),
             (
                 Reporter::Json,
-                include_str!("../tests/fixtures/cancellation-v12.json"),
+                include_str!("../tests/fixtures/cancellation-v13.json"),
             ),
             (
                 Reporter::Events,
-                include_str!("../tests/fixtures/cancellation-v12.jsonl"),
+                include_str!("../tests/fixtures/cancellation-v13.jsonl"),
             ),
             (
                 Reporter::Junit,

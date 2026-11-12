@@ -1,6 +1,6 @@
 use super::{scopes::BranchScopes, state::TestExecutionState, temporary::TemporaryResources};
 use crate::RunnerOptions;
-use webtest_browser::{BrowserSession, Page};
+use webtest_browser::Page;
 use webtest_model::StepId;
 use webtest_observation::CleanupFailure;
 
@@ -9,7 +9,8 @@ use webtest_observation::CleanupFailure;
 pub(super) struct BranchState {
     pub bindings: TestExecutionState,
     pub page: Option<Box<dyn Page>>,
-    pub session: Option<Box<dyn BrowserSession>>,
+    pub session: Option<super::resource::OwnedBrowserSession>,
+    pub session_owner: Option<webtest_observation::ScopeEvent>,
     pub provided: Option<webtest_model::Value>,
     pub active_step: Option<StepId>,
     pub active_operation: Option<webtest_observation::ScopeEvent>,
@@ -30,6 +31,7 @@ impl BranchState {
             ),
             page: None,
             session: None,
+            session_owner: None,
             active_step: None,
             active_operation: None,
             provided: None,
@@ -47,6 +49,7 @@ impl BranchState {
             bindings: self.bindings.transferable_snapshot(),
             page: None,
             session: None,
+            session_owner: None,
             active_step: None,
             active_operation: None,
             provided: None,

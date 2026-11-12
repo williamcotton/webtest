@@ -54,6 +54,7 @@ pub(super) async fn execute_child(
         services.test,
         scope.debug_context(services.execution_id),
     );
+    branch.session_owner = Some(scope.event.clone());
     let inherited_page = branch.page.is_some();
     let started = StdInstant::now();
     let cleanup_timeout = scope.cleanup_timeout(services.options.cleanup_timeout);
@@ -185,11 +186,16 @@ pub(super) async fn execute_child(
             .await,
     );
     if let Some(mut session) = branch.session.take()
-        && let Err(error) = cleanup
-            .run(
-                CleanupResource::BrowserSession,
-                session.close(),
-                CleanupCause::Browser,
+        && let Err(error) = session
+            .close(
+                cleanup,
+                &super::temporary::ResourceEvents {
+                    registry: services.resources,
+                    execution_id: services.execution_id,
+                    events: services.events,
+                    sink: services.event_sink,
+                },
+                scope.context.cancellation.cause(),
             )
             .await
     {

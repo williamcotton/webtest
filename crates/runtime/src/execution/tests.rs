@@ -2,6 +2,7 @@ use super::*;
 use async_trait::async_trait;
 use std::{collections::BTreeMap, sync::Mutex};
 use tokio::sync::Barrier;
+use webtest_browser::BrowserSession;
 use webtest_model::{BindingId, Value};
 use webtest_observation::{ScopeEvent, ScopeOutcome};
 use webtest_plan::PlanNodeKind;

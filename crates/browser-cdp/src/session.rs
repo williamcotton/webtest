@@ -8,15 +8,17 @@ use crate::{connection::CdpConnection, page::CdpPage, process::ChromeProcess, wi
 
 pub(crate) struct CdpBrowserSession {
     process: Option<ChromeProcess>,
-    connection: CdpConnection,
+    connection: Option<CdpConnection>,
+    command_timeout: Duration,
     navigation_timeout: Duration,
 }
 
 #[async_trait]
 impl BrowserSession for CdpBrowserSession {
     async fn new_page(&mut self) -> Result<Box<dyn Page>, BrowserError> {
+        let connection = self.connection().await?;
         let (page, _) = create_page(
-            &self.connection,
+            &connection,
             self.navigation_timeout,
             None,
             &BrowserContextOptions::default(),
@@ -29,13 +31,13 @@ impl BrowserSession for CdpBrowserSession {
         &mut self,
         options: &BrowserContextOptions,
     ) -> Result<Box<dyn BrowserContext>, BrowserError> {
-        let created = self
-            .connection
+        let connection = self.connection().await?;
+        let created = connection
             .command("Target.createBrowserContext", Some(json!({})), None)
             .await?;
         let context_id = string_field(&created, "browserContextId", "Target.createBrowserContext")?;
         Ok(Box::new(CdpBrowserContext {
-            connection: self.connection.clone(),
+            connection,
             context_id: Some(context_id),
             options: options.clone(),
             navigation_timeout: self.navigation_timeout,
@@ -44,7 +46,20 @@ impl BrowserSession for CdpBrowserSession {
     }
 
     async fn close(&mut self) -> Result<(), BrowserError> {
-        let graceful = self.connection.command("Browser.close", None, None).await;
+        if self.process.is_none() {
+            return Ok(());
+        }
+        let graceful = if let Some(connection) = self.connection.take() {
+            let result = connection.command("Browser.close", None, None).await;
+            connection.shutdown().await;
+            result
+        } else {
+            // Startup never reached CDP readiness; terminate without a grace wait.
+            if let Some(process) = self.process.as_mut() {
+                process.interrupt()?;
+            }
+            Ok(Value::Null)
+        };
         let Some(mut process) = self.process.take() else {
             return graceful.map(|_| ());
         };
@@ -183,14 +198,29 @@ async fn create_page(
 impl CdpBrowserSession {
     pub(crate) fn new(
         process: ChromeProcess,
-        connection: CdpConnection,
+        command_timeout: Duration,
         navigation_timeout: Duration,
     ) -> Self {
         Self {
             process: Some(process),
-            connection,
+            connection: None,
+            command_timeout,
             navigation_timeout,
         }
+    }
+
+    async fn connection(&mut self) -> Result<CdpConnection, BrowserError> {
+        if let Some(connection) = &self.connection {
+            return Ok(connection.clone());
+        }
+        let process = self
+            .process
+            .as_mut()
+            .ok_or(BrowserError::BrowserDisconnected)?;
+        let url = process.ready().await?;
+        let connection = CdpConnection::connect(&url, self.command_timeout).await?;
+        self.connection = Some(connection.clone());
+        Ok(connection)
     }
 }
 

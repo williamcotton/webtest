@@ -14,9 +14,12 @@ identity, and the existing revision-safe observations and DAP `RunControl` hook.
 
 Milestone E changes how operations are scheduled, owned, cancelled, and observed. It must preserve the same compiler, plan, runner, provider, browser, editor, and debugger paths used by sequential execution, while establishing generic execution-scope, resource-lifecycle, cancellation, deadline, wait, and event-journal abstractions that later milestones can extend without introducing another runtime architecture. [`milestone-f.md`](./milestone-f.md), [`milestone-h.md`](./milestone-h.md), and [`milestone-i.md`](./milestone-i.md) are forward-compatibility constraints, not dependencies and not authorization to implement their public features early.
 
-### Implementation progress — 2026-09-07
+### Current acceptance status — 2026-11-12
 
-Milestone E is **not complete**. The execution-tree, resource/wait foundations, timeout, public parallel, public race/result paths, public retry, and isolated test-root jobs are implemented:
+The public execution features, bounded journal, trace export/viewer, Unix observation IPC,
+concurrent DAP, and the final application/bridge lifecycle closure are implemented.
+The current closure boundary and verification are listed below. Historical checkpoint notes describe their
+own dates and are not the current backlog.
 
 - Tests and capability blocks lower through explicit `Sequence` nodes. Leaf operations exist only
   in that tree; diagnostic, debugger, and secret-checking traversal is a read-only projection.
@@ -31,12 +34,12 @@ Milestone E is **not complete**. The execution-tree, resource/wait foundations, 
   resolved configuration, keeping configuration values out of the artifact. Shared validation
   checks tree structure, identities, revisions, capability requirements, and explicit execution
   inputs for detectable drift. There is still no CLI command to execute an emitted plan.
-- Native journal schema 8 and CLI report/event schema 12 use opaque 128-bit execution IDs,
+- Native journal schema 9 and CLI report/event schema 13 use opaque 128-bit execution IDs,
   serialized as 32 lowercase hexadecimal digits. Native OS randomness allocates independent
   file-run IDs across processes; replay identity is `(ExecutionId, event_sequence)`.
   The bounded journal retains attachments, completed process-output snapshots, source/context metadata, clocks, explicit retry
-  attempts, typed scope/cancellation facts, and ordered branch aggregates. Remaining event
-  kinds and complete host/resource coverage are still pending.
+  attempts, typed scope/cancellation facts, and ordered branch aggregates. Application processes,
+  bridge endpoints, browser sessions/contexts, and temporary directories carry terminal resource facts.
 - The trace artifact core writes and validates deterministic bounded archives of
   the unchanged native journal, opt-in revision-keyed sources, and checksum-verified
   attachment mappings. A shared script-free viewer now presents existing archives
@@ -84,11 +87,55 @@ Milestone E is **not complete**. The execution-tree, resource/wait foundations, 
   finalized during transport shutdown. Cancellation tests cover a successful sibling call,
   missing acknowledgement, and command-adapter cancellation with blocked stdin.
 
-Remaining work includes complete resource ownership and explicit host interruption across HTTP,
-bridge/application startup and lifecycle, non-Unix process trees, and browser sessions;
-the authoritative event journal;
-trace artifacts/viewer; observation IPC; concurrent DAP behavior; and their conformance/stress
-coverage. The acceptance criteria below remain normative and unsatisfied as a whole.
+Current closure work (criteria 5 and 13): HTTP provider and application HTTP calls now use
+one bounded async transport with typed cancellation, rather than uninterruptible blocking
+workers. Health checks use async header readiness. Chrome transfers process ownership
+before startup waits; cancelled/failed startup is reaped and its profile removed through
+session close. Session close joins the CDP transport even while page handles remain, and
+fallback profile removal no longer spawns detached work. A deterministic 32-seed nested
+execution test checks scope ordering, terminal resource/wait facts, exactly-once teardown,
+and absence of post-completion activity. CI now includes generated bridge projections and
+Python/Node/Ruby conformance alongside the existing Rust, Chrome, WASM, and editor gates.
+
+Application/bridge startup now stores partial process ownership in lifecycle state before any
+health, connection, or handshake wait. Cancelling the startup future leaves those handles
+available to explicit shutdown. Shutdown retains state while awaiting cleanup, joins stderr
+readers (including stdio bridges), interrupts and verifies Unix process groups even after the
+leader exits, and preserves typed primary failures when cleanup also fails. Tests cover
+cancelled health/socket/stdio startup, endpoint-directory removal, reader completion, and
+orphaned descendants holding stderr.
+
+The host resource-observation contract projects physical ownership through the existing runtime
+resource registry. Application processes and bridge endpoints use a separate bounded invocation
+journal because their actual owner spans files and workers. JSON reports expose its unchanged
+native records in `application_events`; event output wraps each record as `application_event`.
+Configured trace retention exports it as a separate source-free `<application>` trace after
+shutdown, including failed startup. Browser sessions retain sequential reuse and branch isolation,
+with acquisition and terminal teardown facts in their file journal. Run-owned resources omit
+`owner_scope_id` and test scope/source origins rather than inventing a declaration. Native journal
+schema 9 and CLI report/event schema 13 version this change; plan format 9, runtime semantics 6,
+and trace manifest format 2 are unchanged. Existing schema-8 archives remain readable
+through explicitly selected bounded replay validation, preserving their original records.
+
+Do not reopen parallel/race/retry, trace-viewer refinements, or concurrent DAP as unfinished
+feature projects. Existing limitations remain Unix CLI-to-LSP publication for open documents;
+Windows publication/process-tree cleanup and unopened-file publication are unsupported. Browser
+event-source journals remain deferred by §7.3; browser-version capture and additional trace
+capture controls remain separate documented limitations. The acceptance criteria below remain
+normative; the closure check is the complete quality suite rather than another feature slice.
+
+Lifecycle closure verification — 2026-11-12: `cargo test --workspace` passes all 624 tests,
+including real Chrome, CLI-to-LSP, concurrent DAP, worker applications, 141 runtime lifecycle
+tests, native replay, and legacy schema-8 archive compatibility. `cargo build`,
+`cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check`, and
+`git diff --check` pass. Portable `webtest-wasm` and `webtest-trace` checks pass for
+`wasm32-unknown-unknown` using the installed rustup stable compiler. Generated bridge
+projections and Python/Node/Ruby conformance pass. Extension compilation, VSIX package
+smoke, and isolated VS Code activation smoke pass. An initial worker/browser test hit a
+CDP context-creation timeout while extension activation was also launching browsers;
+its isolated rerun and the subsequent full workspace runs passed without increasing
+runtime deadlines. The concrete lifecycle closure backlog above is resolved; the stated
+platform and capture limitations remain explicit.
 
 ### Checkpoint 2 handoff — 2026-09-06
 

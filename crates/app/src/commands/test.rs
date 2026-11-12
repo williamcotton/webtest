@@ -12,7 +12,7 @@ use crate::{
     error::AppError,
     project_analysis::analyze_file,
     project_context::{display_path, nanos, project},
-    provider_composition::{runtime_application, runtime_provider_registry},
+    provider_composition::{runtime_application_observed, runtime_provider_registry_observed},
     report::{
         ExecutionFailureReport, ExitClass, FailureReport, FileReport, RunReportOutcome, TestReport,
         TestReportOutcome, WarningReport, base_report, write_human_report_after_progress,
@@ -37,12 +37,25 @@ pub(crate) async fn run_test(
     let mut report = base_report("test", &project);
     let show_browser = headed || !project.config.browser.headless;
     let options = runner_options(&project);
-    let runtime_providers = runtime_provider_registry(&project, &options)?;
+    let application_journal = if project.config.app.is_some() || project.config.server.app.is_some()
+    {
+        Some(
+            webtest_runtime::HostResourceJournal::new(options.journal_max_events)
+                .map_err(AppError::infrastructure)?,
+        )
+    } else {
+        None
+    };
+    let observer = application_journal
+        .as_ref()
+        .map(|journal| journal.observer());
+    let runtime_providers =
+        runtime_provider_registry_observed(&project, &options, observer.clone())?;
     let worker_mode = jobs.get() > 1 && project.config.app.as_ref().is_some_and(|app| app.owned);
     let application = if worker_mode {
         None
     } else {
-        runtime_application(&project, runtime_providers.app.clone())
+        runtime_application_observed(&project, runtime_providers.app.clone(), observer.clone())
     };
     let providers = runtime_providers.registry;
     let progress = (reporter == TestReporter::Human)
@@ -93,6 +106,7 @@ pub(crate) async fn run_test(
         Some(crate::worker_applications::WorkerApplications::prepare(
             &project,
             jobs.get().min(runnable_tests),
+            observer.clone(),
         )?)
     } else {
         None
@@ -123,7 +137,14 @@ pub(crate) async fn run_test(
                 &mut progress_error,
             );
         }
-        result.err()
+        result.err().or_else(|| {
+            application_journal
+                .as_ref()
+                .and_then(|journal| journal.overflow())
+                .map(|_| webtest_provider::ProviderError::BridgeProcess {
+                    message: "application resource journal exhausted its event budget".into(),
+                })
+        })
     } else {
         None
     };
@@ -288,6 +309,7 @@ pub(crate) async fn run_test(
             report.exit_class = report.exit_class.combine(file_report.exit_class);
         }
     }
+    let mut application_cleanup_failures = Vec::new();
     if app_started {
         if let Some(progress) = &progress {
             record_progress_error(progress.stopping_application(), &mut progress_error);
@@ -305,6 +327,7 @@ pub(crate) async fn run_test(
                 &mut progress_error,
             );
         }
+        application_cleanup_failures = failures.clone();
         for error in failures {
             report.exit_class = report.exit_class.combine(ExitClass::Infrastructure);
             report.warnings.push(WarningReport {
@@ -317,6 +340,39 @@ pub(crate) async fn run_test(
             });
         }
     }
+    let application_result = application_journal
+        .as_ref()
+        .filter(|_| app_started)
+        .map(|journal| {
+            let mut failures = startup_failure
+                .clone()
+                .into_iter()
+                .chain(application_cleanup_failures)
+                .map(webtest_runtime::RunError::Provider);
+            let outcome = match failures.next() {
+                Some(primary) => RunOutcome::Aborted {
+                    failure: {
+                        let secondary: Vec<_> = failures.collect();
+                        if secondary.is_empty() {
+                            primary
+                        } else {
+                            webtest_runtime::RunError::Multiple {
+                                primary: Box::new(primary),
+                                secondary,
+                            }
+                        }
+                    },
+                    prior_outcome: None,
+                },
+                None => RunOutcome::Completed,
+            };
+            let result = journal.finish(outcome);
+            if matches!(result.outcome, RunOutcome::Aborted { .. }) {
+                report.exit_class = report.exit_class.combine(ExitClass::Infrastructure);
+            }
+            report.application_events = result.journal.clone();
+            result
+        });
     #[cfg(unix)]
     for (((_, _, plan, _, _, observations), result), publication) in
         runnable.iter().zip(&results).zip(publications)
@@ -340,6 +396,33 @@ pub(crate) async fn run_test(
         report.exit_class != ExitClass::Success,
     ) {
         let metadata = crate::trace_export::metadata(&project, &providers);
+        if let Some(result) = &application_result {
+            let exported = match &metadata {
+                Ok(metadata) => {
+                    crate::trace_export::export_application(&project, metadata.clone(), result)
+                }
+                Err(error) => Err(AppError::infrastructure(error)),
+            };
+            let outcome = match exported {
+                Ok(path) => crate::report::TraceExportOutcome::Published {
+                    path: path.display().to_string(),
+                },
+                Err(error) => {
+                    report.exit_class = report.exit_class.combine(ExitClass::Infrastructure);
+                    crate::report::TraceExportOutcome::Failed {
+                        message: error.to_string(),
+                    }
+                }
+            };
+            if let Some(execution_id) = result.execution_id {
+                report.traces.push(crate::report::TraceExportReport {
+                    file: "<application>".into(),
+                    execution_id,
+                    outcome,
+                });
+            }
+        }
+
         for ((index, source, plan, _, _, _), result) in runnable.iter().zip(&results) {
             let Some(execution_id) = result.execution_id else {
                 continue;

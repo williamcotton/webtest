@@ -73,7 +73,11 @@ sources = true
 ```
 
 The CLI reports archives under `.webtest/artifacts/traces/` after application
-cleanup. Sources are opt-in exact text; omit `sources = true` to exclude them.
+cleanup. Configured applications also produce a separate source-free invocation
+archive containing process/bridge ownership and terminal cleanup facts across files
+and workers. Its native records appear in JSON `application_events` and as
+`application_event` envelopes in event output. Browser-session resource facts remain
+in each file journal. Sources are opt-in exact text; omit `sources = true` to exclude them.
 Existing evidence is included by default. Use `mode = "on"` for passing runs too.
 `max_bytes` controls each archive's capture budget; explicit truncation facts
 record omitted content without shortening the journal. Export errors preserve test

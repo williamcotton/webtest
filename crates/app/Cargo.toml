@@ -32,6 +32,7 @@ webtest-editor.workspace = true
 webtest-format.workspace = true
 webtest-feedback.workspace = true
 webtest-lsp.workspace = true
+webtest-host.workspace = true
 webtest-model.workspace = true
 webtest-observation.workspace = true
 webtest-plan.workspace = true

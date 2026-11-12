@@ -31,7 +31,7 @@ pub(super) struct TemporaryResources {
     owned: BTreeMap<PathBuf, OwnedDirectory>,
 }
 
-pub(super) struct ResourceEvents<'a> {
+pub(crate) struct ResourceEvents<'a> {
     pub registry: &'a ResourceRegistry,
     pub execution_id: ExecutionId,
     pub events: &'a EventBuffer,

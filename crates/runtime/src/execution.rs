@@ -5,7 +5,7 @@ use std::{
 };
 
 use tokio::time::Instant;
-use webtest_browser::{BrowserHost, BrowserSession};
+use webtest_browser::BrowserHost;
 use webtest_host::OperationContext as _;
 use webtest_model::{Capability, StepId, TestId};
 use webtest_observation::{
@@ -35,13 +35,13 @@ mod concurrent;
 mod failure;
 mod output;
 mod provider;
-mod resource;
+pub(crate) mod resource;
 mod retry;
 mod scheduler;
 pub(crate) mod scopes;
 mod state;
 mod steps;
-mod temporary;
+pub(crate) mod temporary;
 mod wait;
 
 #[cfg(test)]
@@ -113,7 +113,7 @@ pub(crate) async fn execute_test(
     events: &EventBuffer,
     event_sink: Option<&dyn RunEventSink>,
     browser: &dyn BrowserHost,
-    session: &mut Option<Box<dyn BrowserSession>>,
+    session: &mut Option<resource::OwnedBrowserSession>,
     control: Option<&dyn RunControl>,
     options: &RunnerOptions,
     providers: &ProviderRegistry,
@@ -145,6 +145,9 @@ pub(crate) async fn execute_test(
     let mut branch = branch::BranchState::new(options);
     branch.failure_signals.extend(policy.primary_failure);
     branch.session = session.take();
+    if policy.close_session {
+        branch.session_owner = Some(root.event.clone());
+    }
     branch.scopes.start(&root, execution_id, events, event_sink);
     let services = ExecutionServices {
         plan,
@@ -403,11 +406,16 @@ pub(crate) async fn execute_test(
         ))
         && uses_browser
         && let Some(mut owned_session) = branch.session.take()
-        && let Err(error) = cleanup_deadline
-            .run(
-                CleanupResource::BrowserSession,
-                owned_session.close(),
-                CleanupCause::Browser,
+        && let Err(error) = owned_session
+            .close(
+                cleanup_deadline,
+                &temporary::ResourceEvents {
+                    registry: resources,
+                    execution_id,
+                    events,
+                    sink: event_sink,
+                },
+                root_context.cancellation.cause(),
             )
             .await
     {
@@ -696,6 +704,8 @@ impl TreeExecution<'_, '_> {
         let context = owner.context.clone();
         let scope = owner.event.clone();
         let mut session = self.branch.session.take();
+        let mut session_acquisition = None;
+        let session_owner = self.branch.session_owner.clone();
         let mut interrupted_body_cleanup = None;
         let signals = self.branch.failure_signals.clone();
         let result = crate::ResourceScope {
@@ -710,6 +720,14 @@ impl TreeExecution<'_, '_> {
             resource::BrowserResource {
                 host: services.browser,
                 session: &mut session,
+                acquisition: &mut session_acquisition,
+                owner: session_owner.as_ref(),
+                events: temporary::ResourceEvents {
+                    registry: services.resources,
+                    execution_id: services.execution_id,
+                    events: services.events,
+                    sink: services.event_sink,
+                },
                 options: &services.options.browser_context,
                 context: None,
             },
@@ -770,6 +788,23 @@ impl TreeExecution<'_, '_> {
             },
         )
         .await;
+        if session.is_none()
+            && let Some(key) = session_acquisition
+            && let Err(error) = resource::finish_session_acquisition(
+                key,
+                session_owner.as_ref(),
+                &temporary::ResourceEvents {
+                    registry: services.resources,
+                    execution_id: services.execution_id,
+                    events: services.events,
+                    sink: services.event_sink,
+                },
+            )
+        {
+            self.branch
+                .cleanup_failures
+                .push(resource_cleanup_invariant(error));
+        }
         self.branch.session = session;
         self.branch.cleanup_failures.extend(
             result
@@ -1516,7 +1551,7 @@ fn emit_resource_event(
         sink,
         ExecutionEvent::Resource {
             execution_id,
-            scope: scope.clone(),
+            scope: Some(scope.clone()),
             event,
         },
     );

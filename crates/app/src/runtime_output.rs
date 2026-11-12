@@ -470,10 +470,12 @@ pub(crate) fn event_reports<'a>(
                     path,
                     resource.kind.name(),
                     Some(*execution_id),
-                    Some(scope.execution_context.test_id.0),
+                    scope
+                        .as_ref()
+                        .map(|scope| scope.execution_context.test_id.0),
                     None,
                 );
-                event.scope = Some(scope.clone());
+                event.scope = scope.clone();
                 event.resource_lifecycle = Some(resource.clone());
                 event
             }
@@ -904,7 +906,7 @@ mod tests {
         );
         let reports = journal_event_reports("tests/output.webtest", journal.records());
         let json = serde_json::to_value(&reports[0]).unwrap();
-        assert_eq!(json["schema_version"], 12);
+        assert_eq!(json["schema_version"], 13);
         assert_eq!(json["type"], "output_captured");
         assert_eq!(json["name"], "process.run");
         assert_eq!(json["step_id"], 3);
@@ -958,7 +960,7 @@ mod tests {
         );
         let reports = journal_event_reports("tests/a.webtest", journal.records());
         let json = serde_json::to_value(&reports[0]).unwrap();
-        assert_eq!(json["schema_version"], 12);
+        assert_eq!(json["schema_version"], 13);
         assert_eq!(json["type"], "cancellation_requested");
         assert_eq!(json["cancellation"], "race_lost");
         assert_eq!(
@@ -1027,7 +1029,7 @@ mod tests {
         );
         let reports = journal_event_reports("tests/a.webtest", journal.records());
         let json = serde_json::to_value(&reports[0]).unwrap();
-        assert_eq!(json["schema_version"], 12);
+        assert_eq!(json["schema_version"], 13);
         assert_eq!(json["type"], "attachment_created");
         assert_eq!(
             json["attachment"],

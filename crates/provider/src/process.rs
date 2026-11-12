@@ -174,13 +174,26 @@ async fn bounded_process_output<R: tokio::io::AsyncRead + Unpin>(
     })
 }
 
-struct ProcessGroupGuard {
+/// Owns a native process group; explicit cleanup verifies terminal disappearance.
+/// Drop is only a synchronous interruption fallback.
+pub struct ProcessGroupGuard {
     process_id: Option<u32>,
 }
 
 impl ProcessGroupGuard {
-    const fn new(process_id: Option<u32>) -> Self {
+    pub const fn new(process_id: Option<u32>) -> Self {
         Self { process_id }
+    }
+
+    pub async fn cleanup(&mut self) -> bool {
+        #[cfg(unix)]
+        let clean = self.process_id.is_none() || cleanup_process_group(self.process_id).await;
+        #[cfg(not(unix))]
+        let clean = true; // The caller reaps the child; Windows tree cleanup is unsupported.
+        if clean {
+            self.disarm();
+        }
+        clean
     }
 
     fn disarm(&mut self) {

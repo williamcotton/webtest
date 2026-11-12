@@ -51,9 +51,21 @@ pub(crate) fn runtime_application(
     project: &Project,
     provider: Option<Arc<AppProvider>>,
 ) -> Option<RuntimeApplication> {
+    runtime_application_observed(project, provider, None)
+}
+
+pub(crate) fn runtime_application_observed(
+    project: &Project,
+    provider: Option<Arc<AppProvider>>,
+    observer: Option<Arc<dyn webtest_host::ResourceObserver>>,
+) -> Option<RuntimeApplication> {
     provider.map(RuntimeApplication::Provider).or_else(|| {
         app_process_config(project)
             .map(ApplicationLifecycle::new)
+            .map(|process| match observer {
+                Some(observer) => process.with_resource_observer(observer),
+                None => process,
+            })
             .map(Arc::new)
             .map(RuntimeApplication::Process)
     })
@@ -73,6 +85,14 @@ pub(crate) fn runtime_provider_registry(
     project: &Project,
     options: &RunnerOptions,
 ) -> Result<RuntimeProviders, AppError> {
+    runtime_provider_registry_observed(project, options, None)
+}
+
+pub(crate) fn runtime_provider_registry_observed(
+    project: &Project,
+    options: &RunnerOptions,
+    observer: Option<Arc<dyn webtest_host::ResourceObserver>>,
+) -> Result<RuntimeProviders, AppError> {
     let mut registry = ProviderRegistry::built_in(options.provider_config.clone());
     let Some(manifest) = app_manifest(project)? else {
         return Ok(RuntimeProviders {
@@ -81,7 +101,12 @@ pub(crate) fn runtime_provider_registry(
         });
     };
     let config = app_provider_config(project)?;
-    let provider = Arc::new(AppProvider::new(manifest, config).map_err(AppError::usage)?);
+    let provider = AppProvider::new(manifest, config).map_err(AppError::usage)?;
+    let provider = match observer {
+        Some(observer) => provider.with_resource_observer(observer),
+        None => provider,
+    };
+    let provider = Arc::new(provider);
     registry.register(provider.clone());
     Ok(RuntimeProviders {
         registry,

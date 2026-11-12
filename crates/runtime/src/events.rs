@@ -243,12 +243,13 @@ impl EventBuffer {
             scope_id: context.scope_id,
         }
     }
+    pub(crate) fn take_records(&self) -> Vec<RecordedEvent> {
+        let mut state = self.journal.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut state.journal).into_records()
+    }
+    #[cfg(test)]
     pub(crate) fn into_records(self) -> Vec<RecordedEvent> {
-        self.journal
-            .into_inner()
-            .unwrap_or_else(|e| e.into_inner())
-            .journal
-            .into_records()
+        self.take_records()
     }
     #[cfg(test)]
     pub(crate) fn into_events(self) -> Vec<ExecutionEvent> {

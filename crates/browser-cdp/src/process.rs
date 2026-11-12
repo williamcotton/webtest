@@ -16,14 +16,11 @@ pub(crate) struct ChromeProcess {
 }
 
 impl ChromeProcess {
-    pub(crate) async fn launch(
-        executable: &Path,
-        headless: bool,
-    ) -> Result<(Self, String), BrowserError> {
+    pub(crate) fn spawn(executable: &Path, headless: bool) -> Result<Self, BrowserError> {
         let profile =
             tempfile::tempdir().map_err(|error| BrowserError::Launch(error.to_string()))?;
         let mut command = ProcessCommand::new(executable);
-        let mut child = command
+        let child = command
             .args(chrome_arguments(profile.path(), headless))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -32,13 +29,25 @@ impl ChromeProcess {
             .spawn()
             .map_err(|error| BrowserError::Launch(error.to_string()))?;
 
+        Ok(Self {
+            child,
+            profile: Some(profile),
+        })
+    }
+
+    pub(crate) async fn ready(&mut self) -> Result<String, BrowserError> {
+        let profile = self
+            .profile
+            .as_ref()
+            .ok_or(BrowserError::BrowserDisconnected)?;
         let port_file = profile.path().join("DevToolsActivePort");
         let contents = timeout(STARTUP_TIMEOUT, async {
             loop {
                 match tokio::fs::read_to_string(&port_file).await {
                     Ok(contents) if contents.lines().take(2).count() == 2 => break Ok(contents),
                     Ok(_) => {
-                        if let Some(status) = child
+                        if let Some(status) = self
+                            .child
                             .try_wait()
                             .map_err(|error| BrowserError::Launch(error.to_string()))?
                         {
@@ -49,7 +58,8 @@ impl ChromeProcess {
                         sleep(Duration::from_millis(25)).await;
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        if let Some(status) = child
+                        if let Some(status) = self
+                            .child
                             .try_wait()
                             .map_err(|error| BrowserError::Launch(error.to_string()))?
                         {
@@ -66,14 +76,28 @@ impl ChromeProcess {
         .await
         .map_err(|_| BrowserError::Launch("timed out waiting for Chrome to start".into()))??;
 
-        let websocket_url = websocket_url(&contents)?;
-        Ok((
-            Self {
-                child,
-                profile: Some(profile),
-            },
-            websocket_url,
-        ))
+        websocket_url(&contents)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn launch(
+        executable: &Path,
+        headless: bool,
+    ) -> Result<(Self, String), BrowserError> {
+        let mut process = Self::spawn(executable, headless)?;
+        match process.ready().await {
+            Ok(url) => Ok((process, url)),
+            Err(error) => {
+                let _ = process.shutdown().await;
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn interrupt(&mut self) -> Result<(), BrowserError> {
+        self.child
+            .start_kill()
+            .map_err(|error| BrowserError::Launch(format!("could not terminate Chrome: {error}")))
     }
 
     pub(crate) async fn shutdown(&mut self) -> Result<(), BrowserError> {
@@ -159,22 +183,9 @@ impl Drop for ChromeProcess {
         let Some(profile) = self.profile.take() else {
             return;
         };
-        let path = profile.keep();
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                let deadline = Instant::now() + SHUTDOWN_GRACE;
-                loop {
-                    match tokio::fs::remove_dir_all(&path).await {
-                        Ok(()) => break,
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
-                        Err(_) if Instant::now() >= deadline => break,
-                        Err(_) => sleep(Duration::from_millis(25)).await,
-                    }
-                }
-            });
-        } else {
-            let _ = fs_err_remove_dir_all(&path);
-        }
+        // Normal and cancelled execution await shutdown. Drop is only the fallback
+        // for callers abandoning ownership; never launch detached cleanup here.
+        let _ = fs_err_remove_dir_all(&profile.keep());
     }
 }
 

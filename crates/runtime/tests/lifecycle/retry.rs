@@ -409,8 +409,13 @@ async fn retry_reacquires_lexical_contexts_only_after_terminal_teardown_and_back
         .events
         .iter()
         .filter_map(|event| match event {
-            ExecutionEvent::Resource { scope, event, .. }
-                if event.kind == webtest_observation::ResourceEventKind::Ready =>
+            ExecutionEvent::Resource {
+                scope: Some(scope),
+                event,
+                ..
+            } if event.kind == webtest_observation::ResourceEventKind::Ready
+                && event.resource.resource_kind
+                    == webtest_observation::ResourceKind::BrowserContext =>
             {
                 Some((
                     scope.execution_context.attempt_id,

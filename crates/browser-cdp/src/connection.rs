@@ -28,6 +28,22 @@ pub(crate) struct CdpConnection {
     in_flight: Arc<AtomicUsize>,
     console_errors: Arc<Mutex<Vec<String>>>,
     events: broadcast::Sender<CdpEvent>,
+    task: Arc<ConnectionTask>,
+}
+
+// Shared transport ownership only; execution state stays in the runtime branches.
+struct ConnectionTask(std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>);
+impl Drop for ConnectionTask {
+    fn drop(&mut self) {
+        if let Some(task) = self
+            .0
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            task.abort();
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -60,8 +76,9 @@ impl CdpConnection {
         url: &str,
         command_timeout: Duration,
     ) -> Result<Self, BrowserError> {
-        let (socket, _) = tokio_tungstenite::connect_async(url)
+        let (socket, _) = timeout(command_timeout, tokio_tungstenite::connect_async(url))
             .await
+            .map_err(|_| BrowserError::Launch("timed out connecting to Chrome".into()))?
             .map_err(|error| {
                 BrowserError::Launch(format!("could not connect to Chrome: {error}"))
             })?;
@@ -74,7 +91,7 @@ impl CdpConnection {
         let (events, _) = broadcast::channel(256);
         let actor_events = events.clone();
 
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut next_id = 1u64;
             let mut pending = HashMap::<u64, PendingCommand>::new();
             let mut sweep = interval(CORRELATION_SWEEP);
@@ -227,7 +244,28 @@ impl CdpConnection {
             in_flight,
             console_errors,
             events,
+            task: Arc::new(ConnectionTask(std::sync::Mutex::new(Some(task)))),
         })
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        let task = self
+            .task
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some(task) = task {
+            task.abort();
+            let _ = task.await;
+            self.in_flight.store(0, Ordering::Relaxed);
+            let _ = self.events.send(CdpEvent {
+                session_id: None,
+                method: String::new(),
+                params: Value::Null,
+                terminal: Some(BrowserError::BrowserDisconnected),
+            });
+        }
     }
 
     #[instrument(skip_all, fields(method))]

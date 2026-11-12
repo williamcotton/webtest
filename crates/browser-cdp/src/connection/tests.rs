@@ -38,6 +38,34 @@ fn command_id(message: Message) -> u64 {
 }
 
 #[tokio::test]
+async fn shutdown_joins_transport_even_with_live_page_connections() {
+    let Some((connection, mut server)) = fake_cdp(Duration::from_secs(30)).await else {
+        return;
+    };
+    let page_connection = connection.clone();
+    let pending = page_connection.command("Never.responds", None, None);
+    let shutdown = async {
+        server.next().await.unwrap().unwrap();
+        assert_eq!(connection.in_flight(), 1);
+        connection.shutdown().await;
+        assert_eq!(connection.in_flight(), 0);
+        assert!(connection.task.0.lock().unwrap().is_none());
+        connection.shutdown().await;
+        assert!(matches!(
+            connection.command("After.close", None, None).await,
+            Err(BrowserError::BrowserDisconnected)
+        ));
+        assert!(server.next().await.is_none_or(|message| message.is_err()));
+    };
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::join!(pending, shutdown)
+    })
+    .await
+    .expect("transport and pending command terminate promptly");
+    assert_eq!(result, Err(BrowserError::BrowserDisconnected));
+}
+
+#[tokio::test]
 async fn command_timeout_removes_correlation_entry() {
     let Some((connection, mut server)) = fake_cdp(Duration::from_millis(30)).await else {
         return;

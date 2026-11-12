@@ -443,6 +443,9 @@ mod trace;
 #[path = "lifecycle/retry.rs"]
 mod retry;
 
+#[path = "lifecycle/conformance.rs"]
+mod conformance;
+
 #[tokio::test(start_paused = true)]
 async fn nested_timeout_uses_the_earliest_deadline_and_preserves_its_causing_scope() {
     for (outer, inner, expected) in [(2, 5, 2), (5, 2, 2)] {
@@ -599,7 +602,7 @@ async fn timeout_owns_discarded_temp_results_and_releases_before_following_steps
         .iter()
         .find(|(_, event)| event.kind == ResourceEventKind::Released)
         .unwrap();
-    let owner = inner.1.resource.owner_scope_id;
+    let owner = inner.1.resource.owner_scope_id.unwrap();
     let terminal = result.events.iter().position(|event| matches!(event,
         ExecutionEvent::Scope { event, .. } if event.execution_context.scope_id == owner && event.outcome.is_some()
     )).unwrap();

@@ -27,6 +27,18 @@ jobs:
         uses: browser-actions/setup-chrome@v1
         id: setup-chrome
 
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+
+      - name: Check bridge projections and conformance
+        run: |
+          python3 protocol/conformance/generate.py --check
+          python3 protocol/conformance/harness.py
+          python3 protocol/conformance/harness.py node sdks/node/conformance.js
+          python3 protocol/conformance/harness.py ruby sdks/ruby/conformance.rb
+
       - name: Allow downloaded Chrome sandbox
         if: runner.os == 'Linux'
         run: |
@@ -44,7 +56,7 @@ jobs:
           WEBTEST_CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
 
       - name: Check WASM target
-        run: cargo check -p webtest-wasm --target wasm32-unknown-unknown
+        run: cargo check -p webtest-wasm -p webtest-trace --target wasm32-unknown-unknown
 
       - name: Build webtest binary
         run: cargo build

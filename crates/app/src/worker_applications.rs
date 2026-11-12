@@ -6,7 +6,9 @@ use webtest_runtime::TestWorker;
 
 use crate::{
     error::AppError,
-    provider_composition::{RuntimeApplication, runtime_application, runtime_provider_registry},
+    provider_composition::{
+        RuntimeApplication, runtime_application_observed, runtime_provider_registry_observed,
+    },
     runtime_configuration::runner_options,
 };
 
@@ -16,7 +18,11 @@ pub(crate) struct WorkerApplications {
 }
 
 impl WorkerApplications {
-    pub fn prepare(project: &Project, count: usize) -> Result<Self, AppError> {
+    pub fn prepare(
+        project: &Project,
+        count: usize,
+        observer: Option<std::sync::Arc<dyn webtest_host::ResourceObserver>>,
+    ) -> Result<Self, AppError> {
         if project.config.server.app.as_ref().is_some_and(|app| {
             app.adapter == webtest_project::ServerAppAdapter::Command
                 || (app.adapter == webtest_project::ServerAppAdapter::Bridge
@@ -38,9 +44,11 @@ impl WorkerApplications {
                 .port();
             let project = worker_project(project, worker, port)?;
             let options = runner_options(&project);
-            let providers = runtime_provider_registry(&project, &options)?;
-            let application = runtime_application(&project, providers.app)
-                .ok_or_else(|| AppError::internal("worker application lifecycle is missing"))?;
+            let providers =
+                runtime_provider_registry_observed(&project, &options, observer.clone())?;
+            let application =
+                runtime_application_observed(&project, providers.app, observer.clone())
+                    .ok_or_else(|| AppError::internal("worker application lifecycle is missing"))?;
             workers.push(TestWorker {
                 options,
                 providers: providers.registry,

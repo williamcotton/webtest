@@ -370,7 +370,7 @@ async fn run_allocated(
                 service.execution_id,
                 state.outcome,
                 state.tests.into_iter().flatten().collect(),
-                service.events,
+                &service.events,
                 service.started,
                 input.runner.event_sink.as_deref(),
                 &input.runner.options.inspection.redacted_query_parameters,

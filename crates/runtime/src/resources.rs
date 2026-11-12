@@ -68,7 +68,7 @@ impl ResourceRegistry {
 
     pub fn begin_acquisition(
         &self,
-        owner: ExecutionScopeId,
+        owner: impl Into<Option<ExecutionScopeId>>,
         kind: ResourceKind,
         access: ResourceAccess,
     ) -> ResourceEvent {
@@ -79,7 +79,7 @@ impl ResourceRegistry {
         };
         let resource = RuntimeResourceEntry {
             key,
-            owner_scope_id: owner,
+            owner_scope_id: owner.into(),
             resource_kind: kind,
             access_policy: access,
             acquisition_state: AcquisitionState::Acquiring,
@@ -256,7 +256,7 @@ impl ResourceRegistry {
         let generation = ResourceGenerationId(state.next());
         let entry = state.entry(key)?;
         entry.key.generation_id = generation;
-        entry.owner_scope_id = owner;
+        entry.owner_scope_id = Some(owner);
         entry.acquisition_state = AcquisitionState::Acquiring;
         entry.teardown_state = TeardownState::Pending;
         entry.ownership_acquired = false;
@@ -267,6 +267,22 @@ impl ResourceRegistry {
         })
     }
 
+    pub(crate) fn validate_finished(&self) -> Result<(), ResourceInvariant> {
+        let state = self.lock();
+        if !state.leases.is_empty()
+            || state.entries.values().any(|entry| {
+                matches!(
+                    entry.teardown_state,
+                    TeardownState::Pending | TeardownState::Releasing
+                )
+            })
+        {
+            Err(ResourceInvariant::LiveResource)
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn validate_owner_finished(
         &self,
         owner: ExecutionScopeId,
@@ -274,7 +290,7 @@ impl ResourceRegistry {
         let state = self.lock();
         if state.leases.values().any(|lease| lease.owner == owner)
             || state.entries.values().any(|entry| {
-                entry.owner_scope_id == owner
+                entry.owner_scope_id == Some(owner)
                     && matches!(
                         entry.teardown_state,
                         TeardownState::Pending | TeardownState::Releasing

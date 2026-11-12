@@ -5,8 +5,7 @@ use tracing::instrument;
 use webtest_browser::BrowserHost;
 use webtest_model::{Capability, Value};
 use webtest_observation::{
-    CleanupCause, CleanupFailure, CleanupResource, ExecutionEvent, ExecutionId, ObservationStore,
-    SkipReason,
+    CleanupFailure, ExecutionEvent, ExecutionId, ObservationStore, SkipReason,
 };
 use webtest_plan::{AssertionOperation, PlannedTest, TestOperation, TestPlan};
 use webtest_provider::ProviderRegistry;
@@ -176,7 +175,7 @@ impl Runner {
                 execution_id,
                 outcome,
                 tests,
-                events,
+                &events,
                 run_started,
                 self.event_sink.as_deref(),
                 &self.options.inspection.redacted_query_parameters,
@@ -201,7 +200,7 @@ impl Runner {
                 execution_id,
                 outcome,
                 tests,
-                events,
+                &events,
                 run_started,
                 self.event_sink.as_deref(),
                 &self.options.inspection.redacted_query_parameters,
@@ -306,14 +305,18 @@ impl Runner {
             }
 
             if let Some(mut session) = session.take()
-                && let Err(failure) =
-                    crate::cleanup::CleanupDeadline::new(self.options.cleanup_timeout)
-                        .run(
-                            CleanupResource::BrowserSession,
-                            session.close(),
-                            CleanupCause::Browser,
-                        )
-                        .await
+                && let Err(failure) = session
+                    .close(
+                        crate::cleanup::CleanupDeadline::new(self.options.cleanup_timeout),
+                        &crate::execution::temporary::ResourceEvents {
+                            registry: &resources,
+                            execution_id,
+                            events: &events,
+                            sink: self.event_sink.as_deref(),
+                        },
+                        None,
+                    )
+                    .await
             {
                 emit_cleanup_failed(
                     &events,
@@ -329,7 +332,7 @@ impl Runner {
                 execution_id,
                 outcome,
                 tests,
-                events,
+                &events,
                 run_started,
                 self.event_sink.as_deref(),
                 &self.options.inspection.redacted_query_parameters,
@@ -442,11 +445,11 @@ fn skip_tests(
     }
 }
 
-fn finish_run(
+pub(crate) fn finish_run(
     execution_id: ExecutionId,
     outcome: RunOutcome,
     tests: Vec<TestResult>,
-    events: EventBuffer,
+    events: &EventBuffer,
     started: Instant,
     event_sink: Option<&dyn RunEventSink>,
     query_parameters: &[String],
@@ -486,7 +489,7 @@ fn finish_run(
     };
     let failure_class = outcome.failure_class();
     emit_event(
-        &events,
+        events,
         event_sink,
         ExecutionEvent::RunFinished {
             execution_id,
@@ -508,7 +511,7 @@ fn finish_run(
             },
         },
     );
-    let journal = events.into_records();
+    let journal = events.take_records();
     RunResult {
         execution_id: Some(execution_id),
         outcome,

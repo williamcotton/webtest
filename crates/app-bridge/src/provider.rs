@@ -1,6 +1,5 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    io::Read,
     path::PathBuf,
     pin::Pin,
     process::Stdio,
@@ -121,6 +120,7 @@ impl Default for AppProviderConfig {
 }
 
 pub struct AppProvider {
+    resource_observer: Option<Arc<dyn webtest_host::ResourceObserver>>,
     manifest: AppManifest,
     schema: ProviderSchema,
     config: AppProviderConfig,
@@ -130,6 +130,7 @@ pub struct AppProvider {
 
 enum AppState {
     Stopped,
+    Starting(ProcessResources),
     Bridge(ActiveBridge),
     Compatibility(ProcessResources),
     Failed(ProviderError),
@@ -143,17 +144,50 @@ struct ActiveBridge {
 
 #[derive(Default)]
 struct ProcessResources {
+    observer: Option<Arc<dyn webtest_host::ResourceObserver>>,
+    endpoint_observation: Option<Box<dyn webtest_host::ResourceObservation>>,
     children: Vec<ManagedProcess>,
     endpoint_directory: Option<tempfile::TempDir>,
 }
 
+impl ProcessResources {
+    fn adopt(&mut self, mut process: ManagedProcess) {
+        process.observation = self
+            .observer
+            .as_ref()
+            .map(|observer| observer.acquired(webtest_host::ResourceKind::ApplicationProcess));
+        self.children.push(process);
+    }
+
+    fn endpoint_acquired(&mut self) {
+        self.endpoint_observation = self
+            .observer
+            .as_ref()
+            .map(|observer| observer.acquired(webtest_host::ResourceKind::BridgeEndpoint));
+    }
+
+    fn ready(&mut self) {
+        for process in &mut self.children {
+            if let Some(observation) = &mut process.observation {
+                observation.ready();
+            }
+        }
+        if let Some(observation) = &mut self.endpoint_observation {
+            observation.ready();
+        }
+    }
+}
+
 struct ManagedProcess {
+    observation: Option<Box<dyn webtest_host::ResourceObservation>>,
+    group: webtest_provider::process::ProcessGroupGuard,
     child: Child,
     stderr: Option<StderrCapture>,
 }
 
 /// Owns one configured application process independently of an application provider.
 pub struct ApplicationLifecycle {
+    resource_observer: Option<Arc<dyn webtest_host::ResourceObserver>>,
     config: AppProcessConfig,
     shutdown_timeout: Duration,
     max_stderr_bytes: usize,
@@ -162,11 +196,13 @@ pub struct ApplicationLifecycle {
 
 enum ApplicationState {
     Stopped,
+    Starting(ProcessResources),
     Started(ProcessResources),
     Failed(ProviderError),
 }
 
 struct StderrCapture {
+    task: Option<tokio::task::JoinHandle<()>>,
     state: Arc<StdMutex<CapturedStderr>>,
     finished: Arc<Notify>,
 }
@@ -179,8 +215,17 @@ struct CapturedStderr {
 }
 
 impl ApplicationLifecycle {
+    pub fn with_resource_observer(
+        mut self,
+        observer: Arc<dyn webtest_host::ResourceObserver>,
+    ) -> Self {
+        self.resource_observer = Some(observer);
+        self
+    }
+
     pub fn new(config: AppProcessConfig) -> Self {
         Self {
+            resource_observer: None,
             config,
             shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
             max_stderr_bytes: DEFAULT_MAX_STDERR_BYTES,
@@ -193,21 +238,30 @@ impl ApplicationLifecycle {
         match &*state {
             ApplicationState::Started(_) => return Ok(()),
             ApplicationState::Failed(error) => return Err(error.clone()),
+            ApplicationState::Starting(_) => return Err(interrupted_startup()),
             ApplicationState::Stopped => {}
         }
-        let started = start_application_process(
-            &self.config,
-            project_root,
-            self.max_stderr_bytes,
-            self.shutdown_timeout,
-        )
-        .await;
+        *state = ApplicationState::Starting(ProcessResources {
+            observer: self.resource_observer.clone(),
+            ..ProcessResources::default()
+        });
+        let ApplicationState::Starting(resources) = &mut *state else {
+            return Err(interrupted_startup());
+        };
+        let started =
+            start_application_process(&self.config, project_root, self.max_stderr_bytes, resources)
+                .await;
         match started {
-            Ok(resources) => {
-                *state = ApplicationState::Started(resources);
+            Ok(()) => {
+                resources.ready();
+                *state = ApplicationState::Started(std::mem::take(resources));
                 Ok(())
             }
             Err(error) => {
+                let error = startup_failure(
+                    error,
+                    terminate_process(resources, self.shutdown_timeout).await,
+                );
                 *state = ApplicationState::Failed(error.clone());
                 Err(error)
             }
@@ -215,15 +269,27 @@ impl ApplicationLifecycle {
     }
 
     pub async fn shutdown(&self) -> Result<(), ProviderError> {
-        let state = std::mem::replace(&mut *self.state.lock().await, ApplicationState::Stopped);
-        if let ApplicationState::Started(mut resources) = state {
-            terminate_process(&mut resources, self.shutdown_timeout).await;
-        }
-        Ok(())
+        let mut state = self.state.lock().await;
+        let result = match &mut *state {
+            ApplicationState::Starting(resources) | ApplicationState::Started(resources) => {
+                terminate_process(resources, self.shutdown_timeout).await
+            }
+            ApplicationState::Stopped | ApplicationState::Failed(_) => Ok(()),
+        };
+        *state = ApplicationState::Stopped;
+        result
     }
 }
 
 impl AppProvider {
+    pub fn with_resource_observer(
+        mut self,
+        observer: Arc<dyn webtest_host::ResourceObserver>,
+    ) -> Self {
+        self.resource_observer = Some(observer);
+        self
+    }
+
     pub fn new(manifest: AppManifest, config: AppProviderConfig) -> Result<Self, AppSchemaError> {
         manifest.validate()?;
         if config.max_message_bytes == 0
@@ -236,6 +302,7 @@ impl AppProvider {
         }
         let schema = manifest.provider_schema();
         Ok(Self {
+            resource_observer: None,
             manifest,
             schema,
             config,
@@ -264,19 +331,20 @@ impl AppProvider {
             .active_transport
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-        let state = std::mem::replace(&mut *self.state.lock().await, AppState::Stopped);
-        let result = match state {
-            AppState::Bridge(mut active) => {
+        let mut state = self.state.lock().await;
+        let result = match &mut *state {
+            AppState::Bridge(active) => {
                 let bridge_result = active.client.shutdown(self.config.shutdown_timeout).await;
-                terminate_process(&mut active.resources, self.config.shutdown_timeout).await;
-                bridge_result
+                let process_result =
+                    terminate_process(&mut active.resources, self.config.shutdown_timeout).await;
+                combine_cleanup(bridge_result, process_result)
             }
-            AppState::Compatibility(mut resources) => {
-                terminate_process(&mut resources, self.config.shutdown_timeout).await;
-                Ok(())
+            AppState::Starting(resources) | AppState::Compatibility(resources) => {
+                terminate_process(resources, self.config.shutdown_timeout).await
             }
             AppState::Stopped | AppState::Failed(_) => Ok(()),
         };
+        *state = AppState::Stopped;
         info!("application bridge resources finalized");
         result
     }
@@ -349,14 +417,35 @@ impl AppProvider {
         match &*state {
             AppState::Bridge(_) | AppState::Compatibility(_) => return Ok(()),
             AppState::Failed(error) => return Err(error.clone()),
+            AppState::Starting(_) => return Err(interrupted_startup()),
             AppState::Stopped => {}
         }
+        *state = AppState::Starting(ProcessResources {
+            observer: self.resource_observer.clone(),
+            ..ProcessResources::default()
+        });
+        let AppState::Starting(resources) = &mut *state else {
+            return Err(interrupted_startup());
+        };
         let started = match self.config.adapter {
-            AppAdapter::Bridge => self.start_bridge(project_root).await.map(AppState::Bridge),
+            AppAdapter::Bridge => {
+                self.start_bridge(project_root, resources)
+                    .await
+                    .map(|(client, transport)| {
+                        AppState::Bridge(ActiveBridge {
+                            client,
+                            transport,
+                            resources: std::mem::take(resources),
+                        })
+                    })
+            }
             AppAdapter::Command | AppAdapter::Http => self
-                .start_compatibility_process(project_root)
+                .start_compatibility_process(project_root, resources)
                 .await
-                .map(AppState::Compatibility),
+                .map(|()| {
+                    resources.ready();
+                    AppState::Compatibility(std::mem::take(resources))
+                }),
         };
         match started {
             Ok(started) => {
@@ -364,6 +453,10 @@ impl AppProvider {
                 Ok(())
             }
             Err(error) => {
+                let error = startup_failure(
+                    error,
+                    terminate_process(resources, self.config.shutdown_timeout).await,
+                );
                 *state = AppState::Failed(error.clone());
                 Err(error)
             }
@@ -373,21 +466,36 @@ impl AppProvider {
     async fn start_bridge(
         &self,
         project_root: &std::path::Path,
-    ) -> Result<ActiveBridge, ProviderError> {
+        resources: &mut ProcessResources,
+    ) -> Result<(Arc<BridgeClient>, &'static str), ProviderError> {
         let token = random_secret()?;
         let run_id = random_secret()?;
-        let (io, mut resources, transport) = match self.config.transport {
-            AppTransport::Stdio => self.start_stdio_bridge(project_root, &token).await?,
-            AppTransport::Auto => self.start_auto_bridge(project_root, &token).await?,
-            AppTransport::Unix => self.start_unix_bridge(project_root, &token).await?,
-            AppTransport::Tcp => self.start_tcp_bridge(project_root, &token).await?,
-            AppTransport::NamedPipe => self.start_named_pipe_bridge(project_root, &token).await?,
+        let (io, transport) = match self.config.transport {
+            AppTransport::Stdio => {
+                self.start_stdio_bridge(project_root, &token, resources)
+                    .await?
+            }
+            AppTransport::Auto => {
+                self.start_auto_bridge(project_root, &token, resources)
+                    .await?
+            }
+            AppTransport::Unix => {
+                self.start_unix_bridge(project_root, &token, resources)
+                    .await?
+            }
+            AppTransport::Tcp => {
+                self.start_tcp_bridge(project_root, &token, resources)
+                    .await?
+            }
+            AppTransport::NamedPipe => {
+                self.start_named_pipe_bridge(project_root, &token, resources)
+                    .await?
+            }
         };
         let client =
             match BridgeClient::handshake(io, token, run_id, &self.manifest, &self.config).await {
                 Ok(client) => client,
                 Err(error) => {
-                    terminate_process(&mut resources, self.config.shutdown_timeout).await;
                     return Err(error);
                 }
             };
@@ -399,18 +507,16 @@ impl AppProvider {
             .active_transport
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(transport.into());
-        Ok(ActiveBridge {
-            client: Arc::new(client),
-            resources,
-            transport,
-        })
+        resources.ready();
+        Ok((Arc::new(client), transport))
     }
 
     async fn start_stdio_bridge(
         &self,
         project_root: &std::path::Path,
         token: &str,
-    ) -> Result<(DynIo, ProcessResources, &'static str), ProviderError> {
+        resources: &mut ProcessResources,
+    ) -> Result<(DynIo, &'static str), ProviderError> {
         let (program, args) = command_parts(&self.config.command)?;
         let mut command = Command::new(program);
         command
@@ -420,6 +526,8 @@ impl AppProvider {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        #[cfg(unix)]
+        command.process_group(0);
         command.env("WEBTEST_TOKEN", token);
         command.env("WEBTEST_PROTOCOL", PROTOCOL_VERSION.to_string());
         let mut child = command
@@ -427,28 +535,36 @@ impl AppProvider {
             .map_err(|error| ProviderError::BridgeTransport {
                 message: format!("could not spawn stdio bridge: {error}"),
             })?;
-        let stdin = child
+        let stderr = child
+            .stderr
+            .take()
+            .map(|stderr| capture_stderr(stderr, self.config.max_stderr_bytes));
+        let group = webtest_provider::process::ProcessGroupGuard::new(child.id());
+        resources.adopt(ManagedProcess {
+            child,
+            stderr,
+            group,
+            observation: None,
+        });
+        let process = resources
+            .children
+            .last_mut()
+            .ok_or_else(interrupted_startup)?;
+        let stdin = process
+            .child
             .stdin
             .take()
             .ok_or_else(|| ProviderError::BridgeTransport {
                 message: "stdio bridge stdin was unavailable".into(),
             })?;
-        let stdout = child
+        let stdout = process
+            .child
             .stdout
             .take()
             .ok_or_else(|| ProviderError::BridgeTransport {
                 message: "stdio bridge stdout was unavailable".into(),
             })?;
-        if let Some(stderr) = child.stderr.take() {
-            drain_stderr(stderr, self.config.max_stderr_bytes);
-        }
-        let mut resources = ProcessResources {
-            children: vec![ManagedProcess {
-                child,
-                stderr: None,
-            }],
-            endpoint_directory: None,
-        };
+        resources.endpoint_acquired();
         if let Some(application) = &self.config.application {
             if application.owned {
                 match spawn_application(
@@ -457,24 +573,19 @@ impl AppProvider {
                     &[],
                     self.config.max_stderr_bytes,
                 ) {
-                    Ok(application) => resources.children.push(application),
+                    Ok(application) => resources.adopt(application),
                     Err(error) => {
-                        terminate_process(&mut resources, self.config.shutdown_timeout).await;
                         return Err(error);
                     }
                 }
             }
-            if let Err(error) = wait_for_health(application.health.as_ref()).await {
-                terminate_process(&mut resources, self.config.shutdown_timeout).await;
-                return Err(error);
-            }
+            wait_for_health(application.health.as_ref()).await?;
         }
         Ok((
             Box::new(StdioIo {
                 reader: stdout,
                 writer: stdin,
             }),
-            resources,
             "stdio",
         ))
     }
@@ -482,15 +593,16 @@ impl AppProvider {
     async fn start_compatibility_process(
         &self,
         project_root: &std::path::Path,
-    ) -> Result<ProcessResources, ProviderError> {
+        resources: &mut ProcessResources,
+    ) -> Result<(), ProviderError> {
         let Some(application) = &self.config.application else {
-            return Ok(ProcessResources::default());
+            return Ok(());
         };
         start_application_process(
             application,
             project_root,
             self.config.max_stderr_bytes,
-            self.config.shutdown_timeout,
+            resources,
         )
         .await
     }
@@ -500,12 +612,13 @@ impl AppProvider {
         &self,
         project_root: &std::path::Path,
         token: &str,
-    ) -> Result<(DynIo, ProcessResources, &'static str), ProviderError> {
-        match self.start_unix_bridge(project_root, token).await {
+        resources: &mut ProcessResources,
+    ) -> Result<(DynIo, &'static str), ProviderError> {
+        match self.start_unix_bridge(project_root, token, resources).await {
             Ok(bridge) => Ok(bridge),
             Err(error) if is_local_ipc_unavailable(&error) => {
                 warn!(%error, "Unix bridge unavailable; falling back to loopback TCP");
-                self.start_tcp_bridge(project_root, token).await
+                self.start_tcp_bridge(project_root, token, resources).await
             }
             Err(error) => Err(error),
         }
@@ -516,12 +629,16 @@ impl AppProvider {
         &self,
         project_root: &std::path::Path,
         token: &str,
-    ) -> Result<(DynIo, ProcessResources, &'static str), ProviderError> {
-        match self.start_named_pipe_bridge(project_root, token).await {
+        resources: &mut ProcessResources,
+    ) -> Result<(DynIo, &'static str), ProviderError> {
+        match self
+            .start_named_pipe_bridge(project_root, token, resources)
+            .await
+        {
             Ok(bridge) => Ok(bridge),
             Err(error) if is_local_ipc_unavailable(&error) => {
                 warn!(%error, "named-pipe bridge unavailable; falling back to loopback TCP");
-                self.start_tcp_bridge(project_root, token).await
+                self.start_tcp_bridge(project_root, token, resources).await
             }
             Err(error) => Err(error),
         }
@@ -532,8 +649,9 @@ impl AppProvider {
         &self,
         project_root: &std::path::Path,
         token: &str,
-    ) -> Result<(DynIo, ProcessResources, &'static str), ProviderError> {
-        self.start_tcp_bridge(project_root, token).await
+        resources: &mut ProcessResources,
+    ) -> Result<(DynIo, &'static str), ProviderError> {
+        self.start_tcp_bridge(project_root, token, resources).await
     }
 
     #[cfg(unix)]
@@ -541,7 +659,8 @@ impl AppProvider {
         &self,
         project_root: &std::path::Path,
         token: &str,
-    ) -> Result<(DynIo, ProcessResources, &'static str), ProviderError> {
+        resources: &mut ProcessResources,
+    ) -> Result<(DynIo, &'static str), ProviderError> {
         use std::os::unix::fs::PermissionsExt;
         use tokio::net::UnixListener;
 
@@ -558,20 +677,17 @@ impl AppProvider {
         std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
             .map_err(local_ipc_error)?;
         let endpoint = format!("unix:{}", socket_path.display());
+        resources.endpoint_acquired();
         info!(endpoint = %endpoint, "application bridge endpoint created");
-        let mut resources = ProcessResources {
-            children: self
-                .spawn_managed_application(project_root, &endpoint, token)?
-                .into_iter()
-                .collect(),
-            endpoint_directory: Some(directory),
-        };
+        resources.endpoint_directory = Some(directory);
+        if let Some(process) = self.spawn_managed_application(project_root, &endpoint, token)? {
+            resources.adopt(process);
+        }
         let accepted = if let Some(process) = resources.children.first_mut() {
             tokio::select! {
                 accepted = tokio::time::timeout(self.config.startup_timeout, listener.accept()) => accepted,
                 status = process.child.wait() => {
                     let error = bridge_process_error(process, status).await;
-                    terminate_process(&mut resources, self.config.shutdown_timeout).await;
                     return Err(error);
                 }
             }
@@ -581,11 +697,9 @@ impl AppProvider {
         let stream = match accepted {
             Ok(Ok((stream, _))) => stream,
             Ok(Err(error)) => {
-                terminate_process(&mut resources, self.config.shutdown_timeout).await;
                 return Err(transport_error(error));
             }
             Err(_) => {
-                terminate_process(&mut resources, self.config.shutdown_timeout).await;
                 return Err(ProviderError::BridgeHandshake {
                     code: "bridge_readiness_timeout".into(),
                     message: format!(
@@ -598,10 +712,9 @@ impl AppProvider {
         if let Some(application) = &self.config.application
             && let Err(error) = wait_for_health(application.health.as_ref()).await
         {
-            terminate_process(&mut resources, self.config.shutdown_timeout).await;
             return Err(error);
         }
-        Ok((Box::new(stream), resources, "unix"))
+        Ok((Box::new(stream), "unix"))
     }
 
     #[cfg(not(unix))]
@@ -609,7 +722,8 @@ impl AppProvider {
         &self,
         _project_root: &std::path::Path,
         _token: &str,
-    ) -> Result<(DynIo, ProcessResources, &'static str), ProviderError> {
+        _resources: &mut ProcessResources,
+    ) -> Result<(DynIo, &'static str), ProviderError> {
         Err(ProviderError::BridgeTransport {
             message: "Unix-domain sockets are unavailable on this host".into(),
         })
@@ -619,7 +733,8 @@ impl AppProvider {
         &self,
         project_root: &std::path::Path,
         token: &str,
-    ) -> Result<(DynIo, ProcessResources, &'static str), ProviderError> {
+        resources: &mut ProcessResources,
+    ) -> Result<(DynIo, &'static str), ProviderError> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .map_err(transport_error)?;
@@ -630,20 +745,17 @@ impl AppProvider {
             });
         }
         let endpoint = format!("tcp://{address}");
+        resources.endpoint_acquired();
         info!(endpoint = %endpoint, "application bridge endpoint created");
-        let mut resources = ProcessResources {
-            children: self
-                .spawn_managed_application(project_root, &endpoint, token)?
-                .into_iter()
-                .collect(),
-            endpoint_directory: None,
-        };
+        resources.endpoint_directory = None;
+        if let Some(process) = self.spawn_managed_application(project_root, &endpoint, token)? {
+            resources.adopt(process);
+        }
         let accepted = if let Some(process) = resources.children.first_mut() {
             tokio::select! {
                 accepted = tokio::time::timeout(self.config.startup_timeout, listener.accept()) => accepted,
                 status = process.child.wait() => {
                     let error = bridge_process_error(process, status).await;
-                    terminate_process(&mut resources, self.config.shutdown_timeout).await;
                     return Err(error);
                 }
             }
@@ -653,18 +765,15 @@ impl AppProvider {
         let stream = match accepted {
             Ok(Ok((stream, peer))) if peer.ip().is_loopback() => stream,
             Ok(Ok((_, peer))) => {
-                terminate_process(&mut resources, self.config.shutdown_timeout).await;
                 return Err(ProviderError::BridgeHandshake {
                     code: "non_loopback_peer".into(),
                     message: format!("rejected bridge peer {peer}"),
                 });
             }
             Ok(Err(error)) => {
-                terminate_process(&mut resources, self.config.shutdown_timeout).await;
                 return Err(transport_error(error));
             }
             Err(_) => {
-                terminate_process(&mut resources, self.config.shutdown_timeout).await;
                 return Err(ProviderError::BridgeHandshake {
                     code: "bridge_readiness_timeout".into(),
                     message: format!(
@@ -677,10 +786,9 @@ impl AppProvider {
         if let Some(application) = &self.config.application
             && let Err(error) = wait_for_health(application.health.as_ref()).await
         {
-            terminate_process(&mut resources, self.config.shutdown_timeout).await;
             return Err(error);
         }
-        Ok((Box::new(stream), resources, "tcp"))
+        Ok((Box::new(stream), "tcp"))
     }
 
     #[cfg(windows)]
@@ -688,7 +796,8 @@ impl AppProvider {
         &self,
         project_root: &std::path::Path,
         token: &str,
-    ) -> Result<(DynIo, ProcessResources, &'static str), ProviderError> {
+        resources: &mut ProcessResources,
+    ) -> Result<(DynIo, &'static str), ProviderError> {
         use tokio::net::windows::named_pipe::ServerOptions;
         let name = format!(r"\\.\pipe\webtest-{}", random_secret()?);
         let server = ServerOptions::new()
@@ -697,20 +806,17 @@ impl AppProvider {
             .create(&name)
             .map_err(local_ipc_error)?;
         let endpoint = format!("pipe:{name}");
+        resources.endpoint_acquired();
         info!("application bridge named-pipe endpoint created");
-        let mut resources = ProcessResources {
-            children: self
-                .spawn_managed_application(project_root, &endpoint, token)?
-                .into_iter()
-                .collect(),
-            endpoint_directory: None,
-        };
+        resources.endpoint_directory = None;
+        if let Some(process) = self.spawn_managed_application(project_root, &endpoint, token)? {
+            resources.adopt(process);
+        }
         let connected = if let Some(process) = resources.children.first_mut() {
             tokio::select! {
                 connected = tokio::time::timeout(self.config.startup_timeout, server.connect()) => connected,
                 status = process.child.wait() => {
                     let error = bridge_process_error(process, status).await;
-                    terminate_process(&mut resources, self.config.shutdown_timeout).await;
                     return Err(error);
                 }
             }
@@ -720,11 +826,9 @@ impl AppProvider {
         match connected {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
-                terminate_process(&mut resources, self.config.shutdown_timeout).await;
                 return Err(transport_error(error));
             }
             Err(_) => {
-                terminate_process(&mut resources, self.config.shutdown_timeout).await;
                 return Err(ProviderError::BridgeHandshake {
                     code: "bridge_readiness_timeout".into(),
                     message: "application did not connect to the named pipe".into(),
@@ -734,10 +838,9 @@ impl AppProvider {
         if let Some(application) = &self.config.application
             && let Err(error) = wait_for_health(application.health.as_ref()).await
         {
-            terminate_process(&mut resources, self.config.shutdown_timeout).await;
             return Err(error);
         }
-        Ok((Box::new(server), resources, "named_pipe"))
+        Ok((Box::new(server), "named_pipe"))
     }
 
     #[cfg(not(windows))]
@@ -745,7 +848,8 @@ impl AppProvider {
         &self,
         _project_root: &std::path::Path,
         _token: &str,
-    ) -> Result<(DynIo, ProcessResources, &'static str), ProviderError> {
+        _resources: &mut ProcessResources,
+    ) -> Result<(DynIo, &'static str), ProviderError> {
         Err(ProviderError::BridgeTransport {
             message: "Windows named pipes are unavailable on this host".into(),
         })
@@ -849,7 +953,7 @@ impl AppProvider {
         &self,
         function: &str,
         arguments: serde_json::Value,
-        timeout: Duration,
+        context: &CallContext,
     ) -> Result<serde_json::Value, ProviderError> {
         let operation = self.config.http.operations.get(function).ok_or_else(|| {
             ProviderError::BridgeTransport {
@@ -878,41 +982,33 @@ impl AppProvider {
         };
         let body =
             serde_json::to_string(&arguments).map_err(|error| protocol_error("encode", error))?;
-        let max = self.config.max_message_bytes;
-        let value_limits = self.config.value_limits;
-        let url = url.to_string();
-        let method = method.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let response = match ureq::request(&method, &url)
-                .timeout(timeout)
-                .set("content-type", "application/json")
-                .send_string(&body)
-            {
-                Ok(response) | Err(ureq::Error::Status(_, response)) => response,
-                Err(error) => {
-                    return Err(ProviderError::BridgeTransport {
-                        message: error.to_string(),
-                    });
-                }
-            };
-            let mut bytes = Vec::new();
-            response
-                .into_reader()
-                .take(max.saturating_add(1) as u64)
-                .read_to_end(&mut bytes)
-                .map_err(transport_error)?;
-            if bytes.len() > max {
-                return Err(ProviderError::BridgeProtocol {
+        let headers = [("content-type".into(), "application/json".into())]
+            .into_iter()
+            .collect();
+        let response = webtest_provider::http::HttpClient::new(true)
+            .execute(
+                webtest_provider::http::HttpRequest {
+                    method,
+                    url: url.as_str(),
+                    headers: &headers,
+                    body: Some(body.into_bytes()),
+                    timeout: context.effective_timeout(),
+                    max_response_bytes: self.config.max_message_bytes,
+                },
+                context.execution.as_deref(),
+            )
+            .await
+            .map_err(|error| match error {
+                ProviderError::ResponseTooLarge { .. } => ProviderError::BridgeProtocol {
                     code: "frame_too_large".into(),
                     message: "HTTP adapter response exceeded the configured limit".into(),
-                });
-            }
-            compatibility_response(&bytes, value_limits)
-        })
-        .await
-        .map_err(|error| ProviderError::BridgeTransport {
-            message: format!("HTTP adapter task failed: {error}"),
-        })?
+                },
+                ProviderError::HttpTransport { message } => {
+                    ProviderError::BridgeTransport { message }
+                }
+                other => other,
+            })?;
+        compatibility_response(&response.body, self.config.value_limits)
     }
 }
 
@@ -976,7 +1072,7 @@ impl ServerProvider for AppProvider {
                     .await?
             }
             AppAdapter::Http => {
-                self.http_call(&call.operation.0, arguments, timeout)
+                self.http_call(&call.operation.0, arguments, &context)
                     .await?
             }
         };
@@ -1923,11 +2019,11 @@ async fn start_application_process(
     application: &AppProcessConfig,
     project_root: &std::path::Path,
     max_stderr_bytes: usize,
-    shutdown_timeout: Duration,
-) -> Result<ProcessResources, ProviderError> {
+    resources: &mut ProcessResources,
+) -> Result<(), ProviderError> {
     if !application.owned {
         wait_for_health(application.health.as_ref()).await?;
-        return Ok(ProcessResources::default());
+        return Ok(());
     }
     if application.command.is_empty() {
         return Err(ProviderError::BridgeProcess {
@@ -1935,15 +2031,8 @@ async fn start_application_process(
         });
     }
     let child = spawn_application(application, project_root, &[], max_stderr_bytes)?;
-    let mut resources = ProcessResources {
-        children: vec![child],
-        endpoint_directory: None,
-    };
-    if let Err(error) = wait_for_health(application.health.as_ref()).await {
-        terminate_process(&mut resources, shutdown_timeout).await;
-        return Err(error);
-    }
-    Ok(resources)
+    resources.adopt(child);
+    wait_for_health(application.health.as_ref()).await
 }
 
 fn spawn_application(
@@ -1966,6 +2055,8 @@ fn spawn_application(
         .stderr(Stdio::piped())
         .kill_on_drop(application.owned)
         .envs(&application.environment);
+    #[cfg(unix)]
+    command.process_group(0);
     for (name, value) in bridge_environment {
         command.env(name, value);
     }
@@ -1986,7 +2077,13 @@ fn spawn_application(
         .stderr
         .take()
         .map(|stderr| capture_stderr(stderr, max_stderr_bytes));
-    Ok(ManagedProcess { child, stderr })
+    let group = webtest_provider::process::ProcessGroupGuard::new(child.id());
+    Ok(ManagedProcess {
+        child,
+        stderr,
+        group,
+        observation: None,
+    })
 }
 
 fn capture_stderr(mut stderr: tokio::process::ChildStderr, limit: usize) -> StderrCapture {
@@ -1994,7 +2091,7 @@ fn capture_stderr(mut stderr: tokio::process::ChildStderr, limit: usize) -> Stde
     let output = Arc::clone(&state);
     let finished = Arc::new(Notify::new());
     let completion = Arc::clone(&finished);
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         use tokio::io::AsyncReadExt;
 
         let mut buffer = [0u8; 8_192];
@@ -2034,7 +2131,19 @@ fn capture_stderr(mut stderr: tokio::process::ChildStderr, limit: usize) -> Stde
             .done = true;
         completion.notify_one();
     });
-    StderrCapture { state, finished }
+    StderrCapture {
+        task: Some(task),
+        state,
+        finished,
+    }
+}
+
+impl Drop for StderrCapture {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
 }
 
 async fn wait_for_health(health: Option<&HealthCheck>) -> Result<(), ProviderError> {
@@ -2042,16 +2151,14 @@ async fn wait_for_health(health: Option<&HealthCheck>) -> Result<(), ProviderErr
         return Ok(());
     };
     let started = Instant::now();
+    let client = webtest_provider::http::HttpClient::new(true);
     while started.elapsed() < health.timeout {
-        let url = health.url.clone();
-        let ready = tokio::task::spawn_blocking(move || {
-            ureq::get(&url)
-                .timeout(Duration::from_millis(250))
-                .call()
-                .is_ok()
-        })
-        .await
-        .unwrap_or(false);
+        let ready = client
+            .healthy(
+                &health.url,
+                Duration::from_millis(250).min(health.timeout.saturating_sub(started.elapsed())),
+            )
+            .await;
         if ready {
             info!(url = %health.url, "application health check ready");
             return Ok(());
@@ -2068,55 +2175,90 @@ async fn wait_for_health(health: Option<&HealthCheck>) -> Result<(), ProviderErr
     })
 }
 
-async fn terminate_process(resources: &mut ProcessResources, timeout: Duration) {
+fn interrupted_startup() -> ProviderError {
+    ProviderError::BridgeProcess {
+        message: "application startup was interrupted; shutdown is required before restarting"
+            .into(),
+    }
+}
+
+fn startup_failure(primary: ProviderError, cleanup: Result<(), ProviderError>) -> ProviderError {
+    match cleanup {
+        Ok(()) => primary,
+        Err(_) => ProviderError::ProcessCleanup {
+            primary: Some(Box::new(primary)),
+        },
+    }
+}
+
+fn combine_cleanup<T>(
+    primary: Result<T, ProviderError>,
+    cleanup: Result<(), ProviderError>,
+) -> Result<T, ProviderError> {
+    match (primary, cleanup) {
+        (result, Ok(())) => result,
+        (Err(primary), Err(_)) => Err(ProviderError::ProcessCleanup {
+            primary: Some(Box::new(primary)),
+        }),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+async fn terminate_process(
+    resources: &mut ProcessResources,
+    timeout: Duration,
+) -> Result<(), ProviderError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut failed = false;
+    // Interrupt every process before awaiting any one of them.
+    if let Some(observation) = &mut resources.endpoint_observation {
+        observation.releasing();
+    }
     for process in &mut resources.children {
-        if let Ok(Some(_)) = process.child.try_wait() {
-            continue;
+        if let Some(observation) = &mut process.observation {
+            observation.releasing();
         }
         let _ = process.child.start_kill();
-        info!("terminating runner-owned application process");
-        if tokio::time::timeout(timeout, process.child.wait())
-            .await
-            .is_err()
+    }
+    for process in &mut resources.children {
+        let reaped = tokio::time::timeout_at(deadline, async {
+            let (group_clean, status) = tokio::join!(process.group.cleanup(), process.child.wait());
+            group_clean && status.is_ok()
+        })
+        .await;
+        let mut process_clean = matches!(reaped, Ok(true));
+        if let Some(stderr) = &mut process.stderr
+            && let Some(task) = &mut stderr.task
         {
-            warn!("application process did not exit before the teardown deadline");
+            match tokio::time::timeout_at(deadline, &mut *task).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => process_clean = false,
+                Err(_) => {
+                    task.abort();
+                    let _ = task.await;
+                }
+            }
+            // Completed JoinHandles must never be polled again if shutdown
+            // is interrupted while cleaning a later process.
+            stderr.task = None;
+        }
+        failed |= !process_clean;
+        if let Some(observation) = &mut process.observation {
+            observation.released(process_clean);
         }
     }
     resources.children.clear();
-    resources.endpoint_directory = None;
-}
-
-fn drain_stderr(stderr: tokio::process::ChildStderr, limit: usize) {
-    tokio::spawn(async move {
-        if let Ok((_, total, truncated)) = read_bounded_stream(stderr, limit).await
-            && total > 0
-        {
-            warn!(
-                bytes = total,
-                truncated, "application bridge wrote to stderr"
-            );
-        }
-    });
-}
-
-async fn read_bounded_stream(
-    mut reader: impl AsyncRead + Unpin,
-    limit: usize,
-) -> std::io::Result<(Vec<u8>, usize, bool)> {
-    use tokio::io::AsyncReadExt;
-    let mut captured = Vec::with_capacity(limit.min(8_192));
-    let mut total = 0usize;
-    let mut buffer = [0u8; 8_192];
-    loop {
-        let read = reader.read(&mut buffer).await?;
-        if read == 0 {
-            break;
-        }
-        total = total.saturating_add(read);
-        let remaining = limit.saturating_sub(captured.len());
-        captured.extend_from_slice(&buffer[..read.min(remaining)]);
+    if let Some(directory) = resources.endpoint_directory.take() {
+        failed |= directory.close().is_err();
     }
-    Ok((captured, total, total > limit))
+    if let Some(mut observation) = resources.endpoint_observation.take() {
+        observation.released(!failed);
+    }
+    if failed {
+        Err(ProviderError::ProcessCleanup { primary: None })
+    } else {
+        Ok(())
+    }
 }
 
 fn compatibility_response(
@@ -2280,6 +2422,7 @@ fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
     use std::io::Write as _;
 
     use super::*;
@@ -2362,6 +2505,163 @@ mod tests {
             .status()
             .expect("probe process");
         assert!(!status.success(), "application process still exists");
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_pid(project: &std::path::Path) -> u32 {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(value) = std::fs::read_to_string(project.join("pid"))
+                    && let Ok(pid) = value.trim().parse()
+                {
+                    return pid;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("child reached startup barrier")
+    }
+
+    #[cfg(unix)]
+    fn assert_reaped(pid: u32) {
+        let status = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .expect("probe child");
+        assert!(!status.success(), "child {pid} survived shutdown");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_application_health_startup_retains_ownership_until_joined_shutdown() {
+        let project = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = application_config("sh", true);
+        config.args = vec!["-c".into(), "echo $$ > pid; exec sleep 60".into()];
+        config.health = Some(HealthCheck {
+            url: format!("http://{}/health", listener.local_addr().unwrap()),
+            timeout: Duration::from_secs(60),
+        });
+        let lifecycle = Arc::new(ApplicationLifecycle::new(config));
+        let owner = lifecycle.clone();
+        let root = project.path().to_owned();
+        let startup = tokio::spawn(async move { owner.start(&root).await });
+        let pid = wait_for_pid(project.path()).await;
+        startup.abort();
+        assert!(startup.await.unwrap_err().is_cancelled());
+        let reader = {
+            let state = lifecycle.state.lock().await;
+            let ApplicationState::Starting(resources) = &*state else {
+                panic!("partial startup must remain owned")
+            };
+            resources.children[0]
+                .stderr
+                .as_ref()
+                .unwrap()
+                .task
+                .as_ref()
+                .unwrap()
+                .abort_handle()
+        };
+        assert!(lifecycle.start(project.path()).await.is_err());
+        lifecycle.shutdown().await.unwrap();
+        assert!(reader.is_finished(), "stderr reader was not joined");
+        assert_reaped(pid);
+        lifecycle.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_bridge_startup_joins_children_readers_and_removes_endpoints() {
+        for transport in [AppTransport::Tcp, AppTransport::Unix, AppTransport::Stdio] {
+            let project = tempfile::tempdir().unwrap();
+            let mut application = application_config("sh", true);
+            application.args = vec!["-c".into(), "echo $$ > pid; exec sleep 60".into()];
+            let provider = Arc::new(
+                AppProvider::new(
+                    manifest(),
+                    AppProviderConfig {
+                        transport,
+                        command: vec![
+                            "sh".into(),
+                            "-c".into(),
+                            "echo $$ > pid; exec sleep 60".into(),
+                        ],
+                        application: (transport != AppTransport::Stdio).then_some(application),
+                        startup_timeout: Duration::from_secs(60),
+                        ..AppProviderConfig::default()
+                    },
+                )
+                .unwrap(),
+            );
+            let owner = provider.clone();
+            let root = project.path().to_owned();
+            let startup = tokio::spawn(async move { owner.start(&root).await });
+            let pid = wait_for_pid(project.path()).await;
+            startup.abort();
+            assert!(startup.await.unwrap_err().is_cancelled());
+            let (reader, endpoint) = {
+                let state = provider.state.lock().await;
+                let AppState::Starting(resources) = &*state else {
+                    panic!("partial bridge startup must remain owned")
+                };
+                (
+                    resources.children[0]
+                        .stderr
+                        .as_ref()
+                        .unwrap()
+                        .task
+                        .as_ref()
+                        .unwrap()
+                        .abort_handle(),
+                    resources
+                        .endpoint_directory
+                        .as_ref()
+                        .map(|directory| directory.path().to_owned()),
+                )
+            };
+            provider.shutdown().await.unwrap();
+            assert!(
+                reader.is_finished(),
+                "{transport:?} stderr reader was not joined"
+            );
+            assert_reaped(pid);
+            if let Some(endpoint) = endpoint {
+                assert!(!endpoint.exists());
+            }
+            provider.shutdown().await.unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_kills_descendants_holding_stderr_even_after_leader_exit() {
+        let project = tempfile::tempdir().unwrap();
+        let mut config = application_config("sh", true);
+        config.args = vec!["-c".into(), "sleep 60 & echo $! > pid".into()];
+        let lifecycle = ApplicationLifecycle::new(config);
+        lifecycle.start(project.path()).await.unwrap();
+        let descendant = wait_for_pid(project.path()).await;
+        let reader = {
+            let mut state = lifecycle.state.lock().await;
+            let ApplicationState::Started(resources) = &mut *state else {
+                panic!("started")
+            };
+            resources.children[0].child.wait().await.unwrap();
+            resources.children[0]
+                .stderr
+                .as_ref()
+                .unwrap()
+                .task
+                .as_ref()
+                .unwrap()
+                .abort_handle()
+        };
+        lifecycle.shutdown().await.unwrap();
+        assert!(reader.is_finished());
+        assert_reaped(descendant);
     }
 
     fn manifest() -> AppManifest {

@@ -1182,16 +1182,23 @@ conformance coverage. Direct processes and command adapters share cancellation-a
 active bridge calls await terminal cancellation acknowledgement. Public `race` and `provide` use a distinct Race plan node and the shared sibling scheduler.
 Bound races require compatible transferable results, transfer only the winner with its redaction
 metadata, and cancel and join losers. Recovered failures remain in branch results/events but do
-not become current diagnostics. CLI schema 6 marks the final winning branch. Public `retry`
+not become current diagnostics. CLI schema 13 marks the final winning branch. Public `retry`
 now lowers to shared owned-child execution, with fresh attempt identity, repeatability validation, capped
 cancellation-aware backoff, awaited teardown, and separate attempt evidence. Compiler diagnostics
 reject unsafe operations and native captures; descriptions, formatting, and portable plans use the
 same contracts. `--jobs N` now schedules isolated test roots across files (1–64, default 1),
 with root-owned browser sessions, bounded cleanup before slot reuse, atomic observation batches,
 and source-ordered final reports. Owned applications run per worker with an injected endpoint
-and matching bridge/HTTP/browser routing; each worker reuses its app sequentially. Complete host/resource ownership,
-authoritative journal retention/live subscribers/serialization, traces, observation IPC, and concurrent DAP remain
-pending; native journal identity and bounded replay validation are implemented. See the milestone's implementation-progress section for the exact boundary.
+and matching bridge/HTTP/browser routing; each worker reuses its app sequentially. The bounded
+authoritative journal, live subscribers, replay validation, trace archives/export/viewer, Unix
+CLI-to-LSP publication for open documents, and concurrent DAP are implemented. HTTP calls are
+cancellable async operations; Chrome startup and CDP transport cleanup are explicitly owned.
+Application/bridge startup retains partial ownership; shutdown joins stderr readers and
+verifies Unix process groups. Application processes, bridge endpoints, browser sessions/contexts,
+and temporary directories now have generic terminal resource facts. Application invocation
+journals and traces remain separate from file journals, with no invented source/test scope. Windows publication/process-tree cleanup and unopened
+file publication remain unsupported. See the milestone's current acceptance status for the
+exact boundary; historical checkpoint notes are not an additional feature backlog.
 
 - sequence/parallel/race/retry/timeout plan nodes;
 - cancellation-safe resource lifecycles;

@@ -54,7 +54,10 @@ pub(crate) fn validate(
     if !matches!(manifest.format_version, 1 | TRACE_FORMAT_VERSION) {
         return Err(TraceError::UnsupportedFormat(manifest.format_version));
     }
-    if manifest.event_schema_version != EVENT_JOURNAL_SCHEMA_VERSION {
+    if !matches!(
+        manifest.event_schema_version,
+        8 | EVENT_JOURNAL_SCHEMA_VERSION
+    ) {
         return Err(TraceError::UnsupportedEventSchema(
             manifest.event_schema_version,
         ));
@@ -64,7 +67,7 @@ pub(crate) fn validate(
     }
     let mut used = BTreeMap::new();
     let events = check_file(&manifest.events, files, &mut used)?;
-    let records = decode_records(events, limits)?;
+    let records = decode_records(events, limits, manifest.event_schema_version)?;
     let executions: BTreeSet<_> = records.iter().map(|r| r.identity.execution_id).collect();
     if executions.iter().copied().collect::<Vec<_>>() != manifest.executions {
         return Err(TraceError::Executions);
@@ -207,7 +210,11 @@ pub(crate) fn validate(
     Ok(records)
 }
 
-fn decode_records(bytes: &[u8], limits: TraceLimits) -> Result<Vec<RecordedEvent>, TraceError> {
+fn decode_records(
+    bytes: &[u8],
+    limits: TraceLimits,
+    schema_version: u32,
+) -> Result<Vec<RecordedEvent>, TraceError> {
     if bytes.is_empty() || !bytes.ends_with(b"\n") {
         return Err(TraceError::Framing);
     }
@@ -219,7 +226,8 @@ fn decode_records(bytes: &[u8], limits: TraceLimits) -> Result<Vec<RecordedEvent
         kind: LimitKind::RecordBytes,
         limit: 0,
     })?;
-    let mut replay = ReplayJournal::new(capacity);
+    let mut replay = ReplayJournal::for_schema(capacity, schema_version)
+        .map_err(|_| TraceError::UnsupportedEventSchema(schema_version))?;
     let mut records = Vec::new();
     let mut streams = BTreeMap::<ExecutionId, (u64, bool)>::new();
     for (index, line) in bytes[..bytes.len() - 1].split(|b| *b == b'\n').enumerate() {

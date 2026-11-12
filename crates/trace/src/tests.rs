@@ -875,3 +875,24 @@ fn reader_still_accepts_version_one_archives_without_capture_reports() {
     assert_eq!(trace.records(), records);
     assert!(trace.manifest.capture_report.is_none());
 }
+
+#[test]
+fn legacy_schema_eight_archives_preserve_original_journal_records() {
+    let mut records = fixture();
+    let mut files = members(&build(&records, true, TraceLimits::default()).unwrap());
+    let mut events = Vec::new();
+    for record in &mut records {
+        record.schema_version = 8;
+        serde_json::to_writer(&mut events, record).unwrap();
+        events.push(b'\n');
+    }
+    replace_events(&mut files, events);
+    mutate_manifest(&mut files, |manifest| manifest.event_schema_version = 8);
+    let trace = read(&pack(&files), TraceLimits::default()).unwrap();
+    assert_eq!(trace.records(), records);
+    assert_eq!(
+        trace.source(ExecutionId::from_u128(1), FileId::new(0)),
+        Some(SOURCE)
+    );
+    assert_eq!(trace.attachment(records[2].identity), Some(EVIDENCE));
+}

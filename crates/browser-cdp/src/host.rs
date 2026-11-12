@@ -4,10 +4,7 @@ use async_trait::async_trait;
 use tracing::instrument;
 use webtest_browser::{BrowserError, BrowserHost, BrowserSession};
 
-use crate::{
-    connection::CdpConnection, discovery::find_system_chrome, process::ChromeProcess,
-    session::CdpBrowserSession,
-};
+use crate::{discovery::find_system_chrome, process::ChromeProcess, session::CdpBrowserSession};
 
 const LOAD_TIMEOUT: Duration = Duration::from_secs(15);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
@@ -58,11 +55,12 @@ impl BrowserHost for ChromeHost {
                 "Chrome was not found; set WEBTEST_CHROME_PATH or pass --chrome-path".into(),
             )
         })?;
-        let (process, websocket_url) = ChromeProcess::launch(&executable, self.headless).await?;
-        let connection = CdpConnection::connect(&websocket_url, self.command_timeout).await?;
+        // Return the owned process before any readiness wait. The runner stores
+        // this session before new_context/new_page may be cancelled.
+        let process = ChromeProcess::spawn(&executable, self.headless)?;
         Ok(Box::new(CdpBrowserSession::new(
             process,
-            connection,
+            self.command_timeout,
             self.navigation_timeout,
         )))
     }
@@ -86,6 +84,66 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interrupted_startup_is_reaped_and_its_profile_removed_before_close_returns() {
+        use std::os::unix::fs::PermissionsExt;
+        use webtest_browser::BrowserContextOptions;
+        for fail_startup in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let executable = root.path().join("chrome");
+            let marker = root.path().join("started");
+            std::fs::write(&executable, format!(
+                "#!/bin/sh\nfor arg in \"$@\"; do case \"$arg\" in --user-data-dir=*) profile=${{arg#*=}};; esac; done\nprintf '%s\\n%s\\n' \"$$\" \"$profile\" > '{}'\n{}\n",
+                marker.display(), if fail_startup { "exit 7" } else { "exec /bin/sleep 30" }
+            )).unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let host = ChromeHost::new(Some(executable));
+            let mut session = host.start().await.unwrap();
+            let started = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if let Ok(text) = tokio::fs::read_to_string(&marker).await
+                        && text.lines().count() == 2
+                    {
+                        break text;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let profile = PathBuf::from(started.lines().nth(1).unwrap());
+            assert!(profile.exists());
+            let acquisition = tokio::time::timeout(
+                Duration::from_millis(100),
+                session.new_context(&BrowserContextOptions::default()),
+            )
+            .await;
+            if fail_startup {
+                assert!(matches!(acquisition, Ok(Err(_))));
+            } else {
+                assert!(acquisition.is_err());
+            }
+            session.close().await.unwrap();
+            assert!(
+                !profile.exists(),
+                "startup profile survived session cleanup"
+            );
+            // A second close must neither contact Chrome nor repeat teardown.
+            session.close().await.unwrap();
+            let pid = started.lines().next().unwrap();
+            let status = std::process::Command::new("/bin/kill")
+                .args(["-0", pid])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(
+                !status.success(),
+                "startup process survived session cleanup"
+            );
+        }
+    }
 
     fn assert_host_traits<T: Clone + std::fmt::Debug + Send + Sync>() {}
 

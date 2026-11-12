@@ -729,7 +729,8 @@ pub enum ExecutionEvent {
     },
     Resource {
         execution_id: ExecutionId,
-        scope: ScopeEvent,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        scope: Option<ScopeEvent>,
         event: ResourceEvent,
     },
     Scope {

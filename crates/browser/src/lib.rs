@@ -406,6 +406,8 @@ impl BrowserError {
 
 #[async_trait]
 pub trait BrowserHost: Send + Sync {
+    /// Return ownership before cancellable readiness waits. Sessions may finish
+    /// startup in new_context/new_page; close must also handle incomplete startup.
     async fn start(&self) -> Result<Box<dyn BrowserSession>, BrowserError>;
 }
 

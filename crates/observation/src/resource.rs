@@ -1,16 +1,7 @@
 use serde::{Deserialize, Serialize};
 use webtest_model::{ExecutionScopeId, ResourceGenerationId, RuntimeResourceId};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ResourceKind {
-    ApplicationProcess,
-    BridgeEndpoint,
-    BrowserSession,
-    BrowserContext,
-    TemporaryDirectory,
-    Conformance,
-}
+pub use webtest_host::ResourceKind;
 
 pub use webtest_model::ResourceAccess;
 
@@ -40,7 +31,9 @@ pub struct ResourceKey {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeResourceEntry {
     pub key: ResourceKey,
-    pub owner_scope_id: ExecutionScopeId,
+    /// Absent for resources owned by the file run or application invocation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_scope_id: Option<ExecutionScopeId>,
     pub resource_kind: ResourceKind,
     pub access_policy: ResourceAccess,
     pub acquisition_state: AcquisitionState,

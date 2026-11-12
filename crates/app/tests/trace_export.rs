@@ -86,7 +86,7 @@ fn concurrent_file_traces_preserve_sources_failures_and_unique_nonoverwriting_pa
     let first = run(directory.path(), "json", "5");
     assert_eq!(first.status.code(), Some(1));
     let first = report(&first);
-    assert_eq!(first["schema_version"], 12);
+    assert_eq!(first["schema_version"], 13);
     assert_eq!(first["traces"].as_array().unwrap().len(), 2);
     let captured = trace(&first, 0);
     let mapping = &captured.manifest().sources[0];
@@ -283,5 +283,134 @@ fn chrome_failure_exports_acknowledged_evidence_and_static_viewer_opens_it() {
         fs::read_to_string(directory.path().join("viewer.html"))
             .unwrap()
             .contains("Download captured bytes")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn application_resources_are_joined_before_the_invocation_trace_terminal() {
+    let directory = fixture(
+        "[app]\ncommand = 'sh'\nargs = ['-c', 'exec sleep 60']\n[trace]\nmode = 'on'\n",
+        "test \"pass\" { expect 1 == 1 }",
+    );
+    let output = run(directory.path(), "json", "1");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = report(&output);
+    assert_eq!(report["traces"].as_array().unwrap().len(), 2, "{report}");
+    let application = trace(&report, 0);
+    assert!(application.manifest().sources.is_empty());
+    let records = application.records();
+    assert_eq!(
+        serde_json::to_value(records).unwrap(),
+        report["application_events"]
+    );
+    let history: Vec<_> = records
+        .iter()
+        .filter_map(|record| match &record.event {
+            ExecutionEvent::Resource { scope, event, .. } => {
+                assert!(scope.is_none());
+                assert!(event.resource.owner_scope_id.is_none());
+                Some(event.kind)
+            }
+            _ => None,
+        })
+        .collect();
+    use webtest_observation::ResourceEventKind as K;
+    assert_eq!(
+        history,
+        [K::AcquireStarted, K::Ready, K::ReleaseStarted, K::Released]
+    );
+    assert!(matches!(
+        records.last().unwrap().event,
+        ExecutionEvent::RunFinished { .. }
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_bridge_startup_exports_terminal_process_and_endpoint_cleanup() {
+    let directory = fixture(
+        "[app]\ncommand = 'sh'\nargs = ['-c', 'exec sleep 60']\n[server.app]\nadapter = 'bridge'\ntransport = 'tcp'\nschema = 'app-schema.json'\nstartup_timeout = '20ms'\n[trace]\nmode = 'retain-on-failure'\n",
+        "test \"pass\" { expect 1 == 1 }",
+    );
+    fs::write(
+        directory.path().join("app-schema.json"),
+        include_str!("../../../protocol/examples/app-schema.json"),
+    )
+    .unwrap();
+    let output = run(directory.path(), "json", "1");
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let report = report(&output);
+    assert_eq!(report["traces"].as_array().unwrap().len(), 1, "{report}");
+    let captured = trace(&report, 0);
+    let resources: Vec<_> = captured
+        .records()
+        .iter()
+        .filter_map(|record| match &record.event {
+            ExecutionEvent::Resource { event, .. } => Some(event),
+            _ => None,
+        })
+        .collect();
+    use webtest_observation::{ResourceEventKind as K, ResourceKind};
+    for kind in [
+        ResourceKind::ApplicationProcess,
+        ResourceKind::BridgeEndpoint,
+    ] {
+        let history: Vec<_> = resources
+            .iter()
+            .filter(|event| event.resource.resource_kind == kind)
+            .map(|event| event.kind)
+            .collect();
+        assert_eq!(
+            history,
+            [
+                K::AcquireStarted,
+                K::AcquireFailed,
+                K::ReleaseStarted,
+                K::Released
+            ]
+        );
+    }
+    assert!(matches!(
+        captured.records().last().unwrap().event,
+        ExecutionEvent::RunFinished {
+            failure: Some(_),
+            ..
+        }
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn worker_application_terminal_facts_share_one_invocation_journal() {
+    let directory = fixture(
+        "[app]\ncommand = 'sh'\nargs = ['-c', 'exec sleep 60']\n",
+        "test \"a\" { expect 1 == 1 } test \"b\" { expect 2 == 2 } test \"c\" { expect 3 == 3 }",
+    );
+    let output = run(directory.path(), "json", "3");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let report = report(&output);
+    let events = report["application_events"].as_array().unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|record| record["kind"] == "resource"
+                && record["payload"]["event"]["kind"] == "released")
+            .count(),
+        3,
+        "{report}"
     );
 }

@@ -1,6 +1,8 @@
 //! Provider schemas, calls, results, errors, registry, and native server-provider contracts.
 
 #[cfg(feature = "native")]
+pub mod http;
+#[cfg(feature = "native")]
 pub mod process;
 
 use std::{
@@ -11,10 +13,7 @@ use std::{
 };
 
 #[cfg(feature = "native")]
-use std::{
-    io::Read,
-    path::{Component, Path},
-};
+use std::path::{Component, Path};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -649,16 +648,16 @@ impl Default for FsProviderConfig {
 #[cfg(feature = "native")]
 struct HttpProvider {
     config: HttpProviderConfig,
-    agent: ureq::Agent,
+    client: http::HttpClient,
 }
 
 #[cfg(feature = "native")]
 impl HttpProvider {
     fn new(config: HttpProviderConfig) -> Self {
-        let agent = ureq::AgentBuilder::new()
-            .redirects(if config.follow_redirects { 10 } else { 0 })
-            .build();
-        Self { config, agent }
+        Self {
+            client: http::HttpClient::new(config.follow_redirects),
+            config,
+        }
     }
 }
 
@@ -690,91 +689,62 @@ impl ServerProvider for HttpProvider {
             }
             url = parsed.into();
         }
-        let arguments = call.arguments.clone();
-        let limit = self.config.max_response_bytes;
-        let agent = self.agent.clone();
-        let timeout = effective_timeout(&arguments, context.timeout);
-        tokio::task::spawn_blocking(move || {
-            let mut request = agent.request(&method, &url).timeout(timeout);
-            if let Some(headers) = record_argument(&arguments, "headers")? {
-                for (name, value) in headers {
-                    if let Value::String(value) = value {
-                        request = request.set(name, value);
-                    }
+        let arguments = &call.arguments;
+        let mut headers = BTreeMap::new();
+        if let Some(values) = record_argument(arguments, "headers")? {
+            for (name, value) in values {
+                if let Value::String(value) = value {
+                    headers.insert(name.to_ascii_lowercase(), value.clone());
                 }
             }
-            if let Some(Value::String(cookie)) = arguments.get("cookie") {
-                request = request.set("cookie", cookie);
-            }
-            let response = if let Some(json) = arguments.get("json") {
-                let json = value_to_json(json).ok_or_else(|| ProviderError::InvalidArgument {
-                    message: "HTTP json body is not serializable".into(),
-                })?;
-                let body = serde_json::to_string(&json).map_err(|error| {
-                    ProviderError::InvalidArgument {
-                        message: error.to_string(),
-                    }
-                })?;
-                request
-                    .set("content-type", "application/json")
-                    .send_string(&body)
-            } else if let Some(Value::String(text)) = arguments.get("text") {
-                request.send_string(text)
-            } else if let Some(Value::Bytes(bytes)) = arguments.get("bytes") {
-                request.send_bytes(bytes)
-            } else if let Some(form) = record_argument(&arguments, "form")? {
-                let mut serializer = url::form_urlencoded::Serializer::new(String::new());
-                for (name, value) in form {
-                    serializer.append_pair(name, scalar_string(value)?.as_ref());
-                }
-                request
-                    .set("content-type", "application/x-www-form-urlencoded")
-                    .send_string(&serializer.finish())
-            } else {
-                request.call()
-            };
-            let response = match response {
-                Ok(response) => response,
-                Err(ureq::Error::Status(_, response)) => response,
-                Err(error) => {
-                    return Err(ProviderError::HttpTransport {
-                        message: error.to_string(),
-                    });
-                }
-            };
-            let status = response.status();
-            let headers = response
-                .headers_names()
-                .into_iter()
-                .filter_map(|name| response.header(&name).map(|value| (name, value.to_owned())))
-                .collect();
-            let mut reader = response.into_reader().take((limit + 1) as u64);
-            let mut body = Vec::new();
-            reader
-                .read_to_end(&mut body)
-                .map_err(|error| ProviderError::HttpTransport {
+        }
+        if let Some(Value::String(cookie)) = arguments.get("cookie") {
+            headers.insert("cookie".into(), cookie.clone());
+        }
+        let body = if let Some(json) = arguments.get("json") {
+            let json = value_to_json(json).ok_or_else(|| ProviderError::InvalidArgument {
+                message: "HTTP json body is not serializable".into(),
+            })?;
+            headers.insert("content-type".into(), "application/json".into());
+            Some(
+                serde_json::to_vec(&json).map_err(|error| ProviderError::InvalidArgument {
                     message: error.to_string(),
-                })?;
-            if body.len() > limit {
-                return Err(ProviderError::ResponseTooLarge { limit });
+                })?,
+            )
+        } else if let Some(Value::String(text)) = arguments.get("text") {
+            Some(text.as_bytes().to_vec())
+        } else if let Some(Value::Bytes(bytes)) = arguments.get("bytes") {
+            Some(bytes.clone())
+        } else if let Some(form) = record_argument(arguments, "form")? {
+            let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+            for (name, value) in form {
+                serializer.append_pair(name, scalar_string(value)?.as_ref());
             }
-            let json = serde_json::from_slice(&body)
-                .ok()
-                .map(value_from_json)
-                .map(Box::new);
-            Ok(ProviderResult {
-                value: Value::Response(ResponseValue {
-                    status,
-                    headers,
+            headers.insert(
+                "content-type".into(),
+                "application/x-www-form-urlencoded".into(),
+            );
+            Some(serializer.finish().into_bytes())
+        } else {
+            None
+        };
+        let response = self
+            .client
+            .execute(
+                http::HttpRequest {
+                    method: &method,
+                    url: &url,
+                    headers: &headers,
                     body,
-                    json,
-                }),
-            })
+                    timeout: effective_timeout(arguments, context.effective_timeout()),
+                    max_response_bytes: self.config.max_response_bytes,
+                },
+                context.execution.as_deref(),
+            )
+            .await?;
+        Ok(ProviderResult {
+            value: Value::Response(response),
         })
-        .await
-        .map_err(|error| ProviderError::HttpTransport {
-            message: error.to_string(),
-        })?
     }
 }
 

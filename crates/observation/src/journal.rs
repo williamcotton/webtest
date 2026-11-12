@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, num::NonZeroUsize, time::Duration};
 
 use crate::{ExecutionEvent, ExecutionId};
 
-pub const EVENT_JOURNAL_SCHEMA_VERSION: u32 = 8;
+pub const EVENT_JOURNAL_SCHEMA_VERSION: u32 = 9;
 
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
@@ -136,6 +136,7 @@ pub enum ReplayDecodeError {
 /// Bounded replay index. Out-of-order delivery is legal, including gaps in a
 /// subscriber projection. Exact duplicates never consume additional capacity.
 pub struct ReplayJournal {
+    schema_version: u32,
     capacity: NonZeroUsize,
     records: BTreeMap<EventIdentity, RecordedEvent>,
 }
@@ -143,9 +144,25 @@ pub struct ReplayJournal {
 impl ReplayJournal {
     pub fn new(capacity: NonZeroUsize) -> Self {
         Self {
+            schema_version: EVENT_JOURNAL_SCHEMA_VERSION,
             capacity,
             records: BTreeMap::new(),
         }
+    }
+
+    /// Select a known archive schema explicitly. Live replay defaults to the
+    /// current schema; older archives retain their original envelopes unchanged.
+    pub fn for_schema(capacity: NonZeroUsize, schema_version: u32) -> Result<Self, ReplayError> {
+        if !matches!(schema_version, 8 | EVENT_JOURNAL_SCHEMA_VERSION) {
+            return Err(ReplayError::UnsupportedSchema {
+                found: schema_version,
+            });
+        }
+        Ok(Self {
+            schema_version,
+            capacity,
+            records: BTreeMap::new(),
+        })
     }
 
     /// Decode one complete JSON record within a caller-selected byte budget.
@@ -168,7 +185,7 @@ impl ReplayJournal {
             schema_version: u32,
         }
         let header: Header = serde_json::from_slice(input).map_err(ReplayDecodeError::Json)?;
-        if header.schema_version != EVENT_JOURNAL_SCHEMA_VERSION {
+        if header.schema_version != self.schema_version {
             return Err(ReplayDecodeError::Replay(ReplayError::UnsupportedSchema {
                 found: header.schema_version,
             }));
@@ -178,9 +195,16 @@ impl ReplayJournal {
     }
 
     pub fn insert(&mut self, record: RecordedEvent) -> Result<ReplayOutcome, ReplayError> {
-        if record.schema_version != EVENT_JOURNAL_SCHEMA_VERSION {
+        if record.schema_version != self.schema_version {
             return Err(ReplayError::UnsupportedSchema {
                 found: record.schema_version,
+            });
+        }
+        if self.schema_version == 8
+            && matches!(&record.event, ExecutionEvent::Resource { scope, event, .. } if scope.is_none() || event.resource.owner_scope_id.is_none())
+        {
+            return Err(ReplayError::MetadataMismatch {
+                identity: record.identity,
             });
         }
         if record.identity.execution_id != record.event.execution_id() {
@@ -406,7 +430,10 @@ mod wire_tests {
             replay.insert_json(&serde_json::to_vec(&unknown).unwrap(), limit),
             Err(ReplayDecodeError::Json(_))
         ));
-        for version in [7, 9] {
+        for version in [
+            EVENT_JOURNAL_SCHEMA_VERSION - 1,
+            EVENT_JOURNAL_SCHEMA_VERSION + 1,
+        ] {
             unknown["schema_version"] = version.into();
             assert!(
                 matches!(replay.insert_json(&serde_json::to_vec(&unknown).unwrap(), limit), Err(ReplayDecodeError::Replay(ReplayError::UnsupportedSchema { found })) if found == version)
@@ -487,7 +514,7 @@ mod wire_tests {
         assert_eq!(
             json,
             serde_json::json!({
-                "schema_version": 8, "execution_id": "00000000000000000000000000000009", "event_sequence": 0,
+                "schema_version": 9, "execution_id": "00000000000000000000000000000009", "event_sequence": 0,
                 "timestamp": {"since_unix_epoch": {"secs":123,"nanos":0}, "elapsed":{"secs":0,"nanos":5}},
                 "execution_context": {}, "kind": "run_started", "payload": {"execution_id":"00000000000000000000000000000009"}
             })

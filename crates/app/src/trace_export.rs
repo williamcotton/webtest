@@ -51,6 +51,28 @@ pub(crate) fn export(
     project_path: &str,
     result: &webtest_runtime::RunResult,
 ) -> Result<PathBuf, AppError> {
+    export_records(
+        project,
+        metadata,
+        Some((source, plan, project_path)),
+        result,
+    )
+}
+
+pub(crate) fn export_application(
+    project: &Project,
+    metadata: TraceMetadata,
+    result: &webtest_runtime::RunResult,
+) -> Result<PathBuf, AppError> {
+    export_records(project, metadata, None, result)
+}
+
+fn export_records(
+    project: &Project,
+    metadata: TraceMetadata,
+    source: Option<(&str, &webtest_plan::TestPlan, &str)>,
+    result: &webtest_runtime::RunResult,
+) -> Result<PathBuf, AppError> {
     let execution_id = result.execution_id.ok_or_else(|| {
         AppError::infrastructure("trace export requires an allocated execution identity")
     })?;
@@ -115,13 +137,16 @@ pub(crate) fn export(
         TraceInput {
             metadata,
             records: &result.journal,
-            sources: &[SourceInput {
-                execution_id,
-                file_id: plan.file,
-                revision: plan.source_revision,
-                project_path,
-                text: include_sources.then_some(source),
-            }],
+            sources: &source
+                .map(|(source, plan, project_path)| SourceInput {
+                    execution_id,
+                    file_id: plan.file,
+                    revision: plan.source_revision,
+                    project_path,
+                    text: include_sources.then_some(source),
+                })
+                .into_iter()
+                .collect::<Vec<_>>(),
             attachments: &attachments,
         },
         limits,
