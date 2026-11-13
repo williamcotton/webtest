@@ -154,6 +154,18 @@
           ],
           "type": [
             "entity.name.type.webtest"
+          ],
+          "parameter": [
+            "variable.parameter.webtest"
+          ],
+          "namespace": [
+            "entity.name.namespace.webtest"
+          ],
+          "fixture": [
+            "entity.name.type.fixture.webtest"
+          ],
+          "test": [
+            "entity.name.function.test.webtest"
           ]
         }
       }
@@ -188,7 +200,8 @@
     "package": "npm run compile && vsce package",
     "smoke": "npm run package && node ./scripts/package-smoke.mjs",
     "smoke:cursor": "npm run smoke && node ./scripts/cursor-smoke.mjs",
-    "smoke:activation": "npm run compile && node ./test/run.mjs"
+    "smoke:activation": "npm run compile && node ./test/run.mjs",
+    "test:testing": "npm run compile && node --test test/testing-api.cjs"
   },
   "dependencies": {
     "vscode-languageclient": "^10.0.0"

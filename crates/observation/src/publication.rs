@@ -14,6 +14,12 @@ pub struct ObservationPublication {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PublishedObservation {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub related_locations: Vec<webtest_text::SourceLocation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_declaration_id: Option<webtest_model::TestDeclarationId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant_id: Option<webtest_model::TestVariantId>,
     pub test_id: TestId,
     pub step_id: Option<StepId>,
     pub start: u32,
@@ -24,6 +30,9 @@ pub struct PublishedObservation {
 impl From<RuntimeObservation> for PublishedObservation {
     fn from(value: RuntimeObservation) -> Self {
         Self {
+            related_locations: value.related_locations,
+            test_declaration_id: value.test_declaration_id,
+            variant_id: value.variant_id,
             test_id: value.test_id,
             step_id: value.step_id,
             start: value.range.start().into(),
@@ -48,6 +57,9 @@ impl ObservationPublication {
                     return None;
                 }
                 Some(RuntimeObservation {
+                    related_locations: value.related_locations,
+                    test_declaration_id: value.test_declaration_id,
+                    variant_id: value.variant_id,
                     execution_id: self.execution_id,
                     file,
                     source_revision: self.revision,

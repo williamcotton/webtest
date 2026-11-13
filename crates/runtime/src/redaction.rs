@@ -482,7 +482,7 @@ pub(crate) fn redact_run_error(
                 .collect(),
         },
         E::Internal(message) => E::Internal(redact_text(message, secrets)),
-        error @ (E::ExecutionIdentity(_) | E::JournalOverflow(_)) => error,
+        error @ (E::ExecutionIdentity(_) | E::FixtureBudget(_) | E::JournalOverflow(_)) => error,
     }
 }
 
@@ -507,9 +507,128 @@ pub(crate) fn redact_cleanup_failure(
         C::Internal { message } => C::Internal {
             message: redact_text(message, secrets),
         },
+        C::Runtime {
+            failure,
+            failure_class,
+        } => C::Runtime {
+            failure: Box::new(redact_runtime_failure(*failure, secrets, query_parameters)),
+            failure_class,
+        },
+        C::Execution {
+            failure,
+            failure_class,
+        } => C::Execution {
+            failure: Box::new(redact_execution_failure(
+                *failure,
+                secrets,
+                query_parameters,
+            )),
+            failure_class,
+        },
         cause @ C::TimedOut { .. } => cause,
     };
     error
+}
+
+fn redact_execution_failure(
+    error: webtest_observation::ExecutionFailure,
+    secrets: &[String],
+    query_parameters: &[String],
+) -> webtest_observation::ExecutionFailure {
+    use webtest_observation::ExecutionFailure as E;
+    match error {
+        E::IdentityAllocation {
+            raw_os_error,
+            message,
+        } => E::IdentityAllocation {
+            raw_os_error,
+            message: redact_text(message, secrets),
+        },
+        E::Browser(error) => E::Browser(redact_browser_error(error, secrets, query_parameters)),
+        E::Provider(error) => E::Provider(error.redacted(secrets)),
+        E::Cleanup(error) => E::Cleanup(redact_cleanup_failure(error, secrets, query_parameters)),
+        E::Multiple { primary, secondary } => E::Multiple {
+            primary: Box::new(redact_execution_failure(
+                *primary,
+                secrets,
+                query_parameters,
+            )),
+            secondary: secondary
+                .into_iter()
+                .map(|e| redact_execution_failure(e, secrets, query_parameters))
+                .collect(),
+        },
+        E::Internal { message } => E::Internal {
+            message: redact_text(message, secrets),
+        },
+        error @ (E::FixtureBudget(_) | E::JournalOverflow(_)) => error,
+    }
+}
+fn redact_runtime_failure(
+    error: webtest_observation::RuntimeFailure,
+    secrets: &[String],
+    query_parameters: &[String],
+) -> webtest_observation::RuntimeFailure {
+    use webtest_observation::{RuntimeFailure as E, ValueDiff as D};
+    match error {
+        E::Browser(error) => E::Browser(redact_browser_error(error, secrets, query_parameters)),
+        E::Provider(error) => E::Provider(error.redacted(secrets)),
+        E::Assertion { message, diff } => E::Assertion {
+            message: redact_text(message, secrets),
+            diff: match diff {
+                D::Scalar { expected, actual } => D::Scalar {
+                    expected: expected.map(|v| redact_text(v, secrets)),
+                    actual: redact_text(actual, secrets),
+                },
+                D::String {
+                    common_prefix_chars,
+                    expected_segment,
+                    actual_segment,
+                } => D::String {
+                    common_prefix_chars,
+                    expected_segment: redact_text(expected_segment, secrets),
+                    actual_segment: redact_text(actual_segment, secrets),
+                },
+                D::Contains {
+                    expected_item,
+                    actual,
+                } => D::Contains {
+                    expected_item: redact_text(expected_item, secrets),
+                    actual: redact_text(actual, secrets),
+                },
+                D::Record {
+                    missing_fields,
+                    unexpected_fields,
+                    mismatched_fields,
+                } => D::Record {
+                    missing_fields: missing_fields
+                        .into_iter()
+                        .map(|v| redact_text(v, secrets))
+                        .collect(),
+                    unexpected_fields: unexpected_fields
+                        .into_iter()
+                        .map(|v| redact_text(v, secrets))
+                        .collect(),
+                    mismatched_fields: mismatched_fields
+                        .into_iter()
+                        .map(|v| redact_text(v, secrets))
+                        .collect(),
+                },
+                diff @ D::List { .. } => diff,
+            },
+        },
+        E::Decode { message } => E::Decode {
+            message: redact_text(message, secrets),
+        },
+        E::Evaluation { code, message } => E::Evaluation {
+            code,
+            message: redact_text(message, secrets),
+        },
+        E::Internal { message } => E::Internal {
+            message: redact_text(message, secrets),
+        },
+        error @ E::TestTimeout { .. } => error,
+    }
 }
 
 #[cfg(test)]

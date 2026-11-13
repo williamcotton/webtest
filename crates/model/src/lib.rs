@@ -13,12 +13,78 @@ pub struct StepId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct BindingId(pub u32);
 
+/// A runtime occurrence of one fixture acquisition, independent of authored IDs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct FixtureInstanceId(pub u64);
+
 /// Static structural identity. Runtime occurrences never reuse this as an execution ID.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PlanNodeId(pub [u8; 32]);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PlanDeclarationId(pub [u8; 32]);
+
+/// Stable source-semantic keys, independent of runtime occurrence allocation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvalidSemanticIdentity;
+impl fmt::Display for InvalidSemanticIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("semantic identity must be 64 lowercase hexadecimal digits")
+    }
+}
+impl std::error::Error for InvalidSemanticIdentity {}
+macro_rules! semantic_identity {
+    ($($name:ident),* $(,)?) => {$(
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub struct $name(pub [u8; 32]);
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                for byte in self.0 { write!(formatter, "{byte:02x}")?; } Ok(())
+            }
+        }
+        impl std::str::FromStr for $name {
+            type Err=InvalidSemanticIdentity;
+            fn from_str(text:&str)->Result<Self,Self::Err> {
+                if text.len()!=64 || !text.bytes().all(|byte|byte.is_ascii_digit()||(b'a'..=b'f').contains(&byte)) {return Err(InvalidSemanticIdentity);}
+                let mut bytes=[0;32];
+                for (index,byte) in bytes.iter_mut().enumerate() {*byte=u8::from_str_radix(&text[index*2..index*2+2],16).map_err(|_|InvalidSemanticIdentity)?;}
+                Ok(Self(bytes))
+            }
+        }
+        impl Serialize for $name {fn serialize<S:serde::Serializer>(&self,serializer:S)->Result<S::Ok,S::Error> {serializer.collect_str(self)}}
+        impl<'de> Deserialize<'de> for $name {fn deserialize<D:serde::Deserializer<'de>>(deserializer:D)->Result<Self,D::Error> {let text=String::deserialize(deserializer)?;text.parse().map_err(serde::de::Error::custom)}}
+    )*};
+}
+semantic_identity!(
+    WorkspaceId,
+    ModuleId,
+    FunctionId,
+    FixtureId,
+    ParameterId,
+    SymbolId,
+    TestDeclarationId,
+    TestVariantId
+);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FixtureLifetime {
+    #[default]
+    Test,
+    File,
+    Worker,
+    Suite,
+}
+impl FixtureLifetime {
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::Test => 0,
+            Self::File => 1,
+            Self::Worker => 2,
+            Self::Suite => 3,
+        }
+    }
+}
 
 /// Shared static/runtime access policy. Mutable or order-sensitive resources are
 /// exclusive; overlapping shared access requires an explicit resource contract.
@@ -213,6 +279,26 @@ impl Type {
         }
     }
 
+    pub fn member_names(&self) -> Vec<String> {
+        match self {
+            Self::Record(fields) => fields.keys().cloned().collect(),
+            Self::Response(_) => ["status", "headers", "body", "text", "json"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            Self::ProcessResult => [
+                "exit_code",
+                "stdout",
+                "stderr",
+                "stdout_bytes",
+                "stderr_bytes",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            _ => Vec::new(),
+        }
+    }
     pub fn member_missing_is_null(&self, name: &str) -> bool {
         match self {
             Self::Record(fields) => fields.get(name).is_some_and(|field| field.optional),
@@ -492,6 +578,17 @@ mod tests {
             documentation: String::new(),
             secret: false,
         }
+    }
+
+    #[test]
+    fn semantic_ids_are_canonical_hex_and_keep_all_bits() {
+        let id = TestVariantId([0xab; 32]);
+        let encoded = serde_json::to_string(&id).unwrap();
+        assert_eq!(encoded, format!("\"{}\"", "ab".repeat(32)));
+        assert_eq!(serde_json::from_str::<TestVariantId>(&encoded).unwrap(), id);
+        assert!("AB".repeat(32).parse::<TestVariantId>().is_err());
+        assert!("0".repeat(63).parse::<TestVariantId>().is_err());
+        assert!(serde_json::from_str::<TestVariantId>("[0,1]").is_err());
     }
 
     #[test]

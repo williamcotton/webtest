@@ -46,7 +46,7 @@ fn fixture() -> Vec<RecordedEvent> {
     journal.record(ExecutionEvent::RunStarted { execution_id: b }, time);
     let event = ExecutionEvent::AttachmentCreated {
         execution_id: a,
-        test_id: TestId(0),
+        test_id: Some(TestId(0)),
         step_id: StepId(3),
         attachment: Attachment {
             artifact: Artifact {
@@ -539,7 +539,7 @@ fn viewer_escapes_untrusted_facts_and_preserves_scope_source_and_output_links() 
     let mut records = fixture();
     records[2].event = ExecutionEvent::OutputCaptured {
         execution_id: records[2].identity.execution_id,
-        test_id: TestId(0),
+        test_id: Some(TestId(0)),
         step_id: StepId(3),
         provider: attack.into(),
         operation: "run".into(),

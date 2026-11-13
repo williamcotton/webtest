@@ -254,6 +254,14 @@ pub fn render_html(trace: &VerifiedTrace, max_bytes: usize) -> Result<String, Re
 
 fn label(record: &RecordedEvent) -> String {
     match &record.event {
+        ExecutionEvent::FixtureAcquired {
+            fixture,
+            acquisition_execution_id,
+            ..
+        } => format!(
+            "Fixture {} instance {} acquired from {} ({:?})",
+            fixture.fixture, fixture.instance.0, acquisition_execution_id, fixture.owner
+        ),
         ExecutionEvent::Scope { event, .. } => format!(
             "{} {}",
             event.kind(),

@@ -83,6 +83,43 @@ The results establish the provider boundary, authoritative section ownership and
 
 After configuring `[app]` and implementing `app.echo`, run `webtest check` and then `webtest test tests/example.webtest --reporter json`. Use any structured failure's code and reference queries to return to the narrowest relevant `describe` topic.
 
+## Reuse typed workspace declarations
+
+Query `webtest describe language.import`, `webtest describe language.fn`, `webtest describe language.fixture`, and `webtest describe statement.use` before introducing reusable declarations. `webtest describe project.declarations --reporter json` reports the current project's exported helpers, fixtures, tests, types, capabilities, documentation, source revisions, and default test variants through static analysis. Its results are bounded and mark truncation.
+
+Files are modules inside `[project].source_roots`; `test_roots` selects executable test files. Named imports accept explicit aliases, relative paths, and `project/` paths. Omitting an extension adds `.webtest`. Helpers and fixtures must use explicit `export` to be imported. Imports cannot escape source roots or form cycles. Use the canonical formatter after editing imports.
+
+```webtest
+// support/users.webtest
+export fn normalized_email(value: String) -> String = lower(value)
+
+export fixture user_email(value: String) -> String scope test {
+    setup {
+        let email = normalized_email(value)
+        provide email
+    }
+    teardown {
+        expect email == normalized_email(value)
+    }
+}
+```
+
+```webtest
+// tests/users.webtest
+import { user_email } from "../support/users.webtest"
+
+test "normalized email" {
+    let email = use user_email(value: "ALICE@example.com")
+    expect email == "alice@example.com"
+}
+```
+
+Use test lifetime by default. A fixture acquired inside retry belongs to that attempt and is reacquired on the next attempt. Explicit file, worker, and suite lifetimes require `shareable` and transferable results; fixture parameters are transferable values. Acquire native dependencies inside setup. Longer-lived fixtures cannot depend on shorter-lived ones. Setup runs once per definition, owner, and argument set; teardown retains setup locals, runs in reverse dependency order, and is awaited on failure or cancellation. Shared teardown failures remain run failures even if consumer assertions pass.
+
+Helpers require typed parameters and a declared result. Pure expression helpers preserve argument order and short-circuit evaluation; statement helpers use `provide` and inferred or declared capability. Calls must be acyclic. Do not add host callbacks, dynamic imports, or recursive functions as substitutes.
+
+Cursor's Testing view discovers declaration and default variant identities from the shared language service. Run and Debug use synchronized buffers; selection and `webtest test --variant <id>` use variant IDs rather than display labels. Definitions, references, rename, import completions, repair actions, inlay hints, and semantic tokens use the same Rust workspace analysis. DAP shows helper frames and fixture setup/teardown tasks with redacted locals. Invalid project/schema inputs block execution until repaired.
+
 ## Test anatomy
 
 A complete system test may create application state on the server, pass transferable typed values into the browser flow, and use semantic locators:

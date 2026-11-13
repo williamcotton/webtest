@@ -35,7 +35,12 @@ impl LspProjectEditors {
         } else {
             path.parent().unwrap_or(path).to_path_buf()
         };
-        self.editor_for_project(&project(&[input])?)
+        let editor = self.editor_for_project(&project(&[input])?)?;
+        let canonical = canonical_event_path(path);
+        editor
+            .register_path_alias(path.display().to_string(), canonical.display().to_string())
+            .map_err(AppError::internal)?;
+        Ok(editor)
     }
 
     pub(crate) fn editor_for_project(
@@ -47,9 +52,11 @@ impl LspProjectEditors {
         }
 
         let options = runner_options(project);
+        let mut invalid_inputs = false;
         let runtime_providers = match runtime_provider_registry(project, &options) {
             Ok(providers) => providers,
             Err(error) => {
+                invalid_inputs = true;
                 tracing::error!(
                     project_root = %project.root.display(),
                     %error,
@@ -61,10 +68,20 @@ impl LspProjectEditors {
                 }
             }
         };
+        let mut database = crate::project_analysis::workspace_with_providers(
+            project,
+            runtime_providers.registry.clone(),
+        )?;
+        if invalid_inputs {
+            let mut configuration = database.workspace_configuration();
+            configuration.invalid_inputs = true;
+            database.configure_workspace(configuration);
+        }
         let candidate = LspProjectEditor {
-            editor: Arc::new(EditorService::with_provider_registry(
+            editor: Arc::new(EditorService::with_analysis_database(
                 options.clone(),
                 runtime_providers.registry,
+                database,
             )),
             app_provider: runtime_providers.app,
             schema_path: configured_app_schema_path(project),
@@ -75,8 +92,83 @@ impl LspProjectEditors {
         Ok(Arc::clone(&project.editor))
     }
 
+    pub(crate) fn resolve_imports(&self, path: &Path) -> Result<bool, AppError> {
+        let selected = self
+            .lock()
+            .iter()
+            .filter(|(root, _)| path.starts_with(root))
+            .max_by_key(|(root, _)| root.components().count())
+            .map(|(root, cached)| (root.clone(), cached.editor.clone()));
+        let Some((root, editor)) = selected else {
+            return Ok(false);
+        };
+        let path = path.display().to_string();
+        if editor
+            .import_candidates(&path)
+            .map_err(AppError::internal)?
+            .is_empty()
+        {
+            return Ok(false);
+        }
+        let project = project(std::slice::from_ref(&root))?;
+        let roots = webtest_project::workspace_source_roots(&project).map_err(AppError::usage)?;
+        let mut attempted = std::collections::BTreeSet::new();
+        let mut changed = false;
+        loop {
+            let mut installed = false;
+            for candidate in editor
+                .import_candidates(&path)
+                .map_err(AppError::internal)?
+            {
+                if !attempted.insert(candidate.clone()) {
+                    continue;
+                }
+                let canonical = match std::fs::canonicalize(&candidate) {
+                    Ok(path) => path,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(AppError::usage(error)),
+                };
+                if !roots.iter().any(|root| canonical.starts_with(root)) {
+                    return Err(AppError::usage(
+                        "import resolves outside configured source roots",
+                    ));
+                }
+                let source = crate::project_context::read_source(&canonical)?;
+                editor
+                    .install_disk_module(canonical.display().to_string(), source, candidate)
+                    .map_err(AppError::internal)?;
+                installed = true;
+                changed = true;
+            }
+            if !installed {
+                return Ok(changed);
+            }
+        }
+    }
     pub(crate) fn reload_for_changed_path(&self, path: &Path) -> Result<bool, AppError> {
         let path = canonical_event_path(path);
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "webtest")
+        {
+            let editors = self
+                .lock()
+                .iter()
+                .filter(|(root, _)| path.starts_with(root))
+                .map(|(root, project)| (root.clone(), project.editor.clone()))
+                .collect::<Vec<_>>();
+            for (root, editor) in &editors {
+                let project = project(std::slice::from_ref(root))?;
+                let inputs = crate::project_analysis::workspace_with_providers(
+                    &project,
+                    editor.provider_registry(),
+                )?;
+                editor
+                    .replace_disk_inputs(inputs.source_inputs(), inputs.source_aliases())
+                    .map_err(AppError::internal)?;
+            }
+            return Ok(!editors.is_empty());
+        }
         let roots = self
             .lock()
             .iter()
@@ -95,9 +187,13 @@ impl LspProjectEditors {
                 let project = project(std::slice::from_ref(&root))?;
                 let options = runner_options(&project);
                 let providers = runtime_provider_registry(&project, &options)?;
-                Ok::<_, AppError>((project, options, providers))
+                let inputs = crate::project_analysis::workspace_with_providers(
+                    &project,
+                    providers.registry.clone(),
+                )?;
+                Ok::<_, AppError>((project, options, providers, inputs))
             })();
-            let (project, options, providers) = match refreshed {
+            let (project, options, providers, inputs) = match refreshed {
                 Ok(refreshed) => refreshed,
                 Err(error) => {
                     self.invalidate_cached_project(&root);
@@ -114,7 +210,14 @@ impl LspProjectEditors {
                 })?;
                 cached
                     .editor
-                    .reconfigure(options.clone(), providers.registry);
+                    .reconfigure_workspace_inputs(
+                        options.clone(),
+                        providers.registry,
+                        inputs.workspace_configuration(),
+                        inputs.source_inputs(),
+                        inputs.source_aliases(),
+                    )
+                    .map_err(AppError::internal)?;
                 cached.schema_path = configured_app_schema_path(&project);
                 cached.runner_options = options;
                 std::mem::replace(&mut cached.app_provider, providers.app)
@@ -135,6 +238,7 @@ impl LspProjectEditors {
             cached
                 .editor
                 .reconfigure(cached.runner_options.clone(), providers);
+            cached.editor.invalidate_project_inputs();
             cached.app_provider.take()
         };
         shutdown_replaced_provider(previous_provider);
@@ -265,5 +369,52 @@ mod tests {
             "{diagnostics:#?}"
         );
         editors.shutdown().await.expect("provider shutdown");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn synchronized_imports_resolve_directory_aliases_without_overwriting_disk_baselines() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("tests")).unwrap();
+        std::fs::create_dir(directory.path().join("support")).unwrap();
+        std::fs::write(
+            directory.path().join("webtest.toml"),
+            "[project]\ntest_roots = ['tests']\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("support/helpers.webtest"),
+            "export fn normalize(value: String) -> String = lower(value)",
+        )
+        .unwrap();
+        let disk = "test \"disk\" {}";
+        let path = directory.path().join("tests/run.webtest");
+        std::fs::write(&path, disk).unwrap();
+        std::os::unix::fs::symlink(
+            directory.path().join("support"),
+            directory.path().join("alias"),
+        )
+        .unwrap();
+        let project = project(std::slice::from_ref(&path)).unwrap();
+        let editors = LspProjectEditors::default();
+        let editor = editors.editor_for_project(&project).unwrap();
+        let path = std::fs::canonicalize(path).unwrap();
+        let source = "import { normalize } from \"../alias/helpers\" test \"unsaved\" { let value = normalize(\"É\") expect value == \"é\" }";
+        let file = editor.open_document(path.display().to_string(), source);
+        assert!(
+            editor
+                .diagnostics(file)
+                .unwrap()
+                .iter()
+                .any(|diagnostic| diagnostic.code == "semantic.missing_module")
+        );
+        assert!(editors.resolve_imports(&path).unwrap());
+        assert!(
+            editor.diagnostics(file).unwrap().is_empty(),
+            "{:?}",
+            editor.diagnostics(file)
+        );
+        assert!(!editors.resolve_imports(&path).unwrap());
+        editor.close_document(file);
+        assert_eq!(editor.source(file).unwrap().as_ref(), disk);
     }
 }

@@ -220,7 +220,7 @@ pub fn read(bytes: &[u8], limits: TraceLimits) -> Result<VerifiedTrace, TraceErr
     }
     if !matches!(
         header.event_schema_version,
-        8 | EVENT_JOURNAL_SCHEMA_VERSION
+        8 | 9 | EVENT_JOURNAL_SCHEMA_VERSION
     ) {
         return Err(TraceError::UnsupportedEventSchema(
             header.event_schema_version,

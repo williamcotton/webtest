@@ -8,6 +8,8 @@ import {
     ServerOptions,
 } from "vscode-languageclient/node";
 
+import { registerTesting } from "./testing";
+
 let client: LanguageClient | undefined;
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
@@ -31,7 +33,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             configuration.stopOnEntry ??= false;
             return configuration;
         },
-        resolveDebugConfigurationWithSubstitutedVariables: (_folder, configuration) => {
+        resolveDebugConfigurationWithSubstitutedVariables: (folder, configuration) => {
+            const workspaceFolder = folder ?? vscode.workspace.getWorkspaceFolder(vscode.Uri.file(String(configuration.program)));
+            configuration.sources = Object.fromEntries(vscode.workspace.textDocuments
+                .filter((document) => document.languageId === "webtest" && document.uri.scheme === "file"
+                    && vscode.workspace.getWorkspaceFolder(document.uri)?.uri.toString() === workspaceFolder?.uri.toString())
+                .map((document) => [document.uri.fsPath, document.getText()]));
             if (typeof configuration.program === "string") {
                 const program = path.resolve(configuration.program);
                 const document = vscode.workspace.textDocuments.find(
@@ -87,12 +94,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         "**/webtest.toml",
     );
     const projectJsonWatcher = vscode.workspace.createFileSystemWatcher("**/*.json");
-    context.subscriptions.push(projectConfigurationWatcher, projectJsonWatcher);
+    const sourceWatcher = vscode.workspace.createFileSystemWatcher("**/*.webtest");
+    context.subscriptions.push(projectConfigurationWatcher, projectJsonWatcher, sourceWatcher);
     const clientOptions: LanguageClientOptions = {
         documentSelector: [{ scheme: "file", language: "webtest" }],
         initializationOptions: { projectFileEvents: true },
         synchronize: {
-            fileEvents: [projectConfigurationWatcher, projectJsonWatcher],
+            fileEvents: [projectConfigurationWatcher, projectJsonWatcher, sourceWatcher],
         },
     };
 
@@ -139,7 +147,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     );
 
     try {
+        context.subscriptions.push(client.onNotification("webtest/resyncRequired", (params: { uri: string }) => {
+            const document = vscode.workspace.textDocuments.find(candidate => candidate.uri.toString() === params.uri);
+            if (document && client) {
+                void client.sendNotification("textDocument/didChange", {
+                    textDocument: { uri: params.uri, version: document.version },
+                    contentChanges: [{ text: document.getText() }],
+                });
+            }
+        }));
         await client.start();
+        registerTesting(context, client);
     } catch (error) {
         void vscode.window.showErrorMessage(
             `Could not start the WebTest language server at ${serverPath}. ` +

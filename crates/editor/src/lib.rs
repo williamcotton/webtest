@@ -1,5 +1,8 @@
 //! Protocol-independent editor services used by both LSP and future WASM hosts.
 
+mod workspace_run;
+pub use workspace_run::{PreparedWorkspaceRun, WorkspaceRunSummary, WorkspaceTestResult};
+
 use std::sync::{Arc, Mutex, RwLock};
 
 use thiserror::Error;
@@ -11,25 +14,9 @@ use webtest_browser::{BrowserError, BrowserHost, Locator};
 use webtest_observation::{ObservationStore, RuntimeFailureCode, RuntimeObservationKind};
 use webtest_provider::ProviderRegistry;
 use webtest_runtime::{RunResult, Runner, RunnerOptions};
-use webtest_syntax::SyntaxKind;
 use webtest_text::{FileId, TextRange};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SemanticTokenKind {
-    Keyword,
-    String,
-    Comment,
-    Function,
-    Variable,
-    Property,
-    Type,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SemanticToken {
-    pub range: TextRange,
-    pub kind: SemanticTokenKind,
-}
+pub use webtest_analysis::{SemanticToken, SemanticTokenKind};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hover {
@@ -45,15 +32,28 @@ pub enum EditorError {
     Browser(#[from] BrowserError),
     #[error("the file has static errors and cannot be executed")]
     StaticErrors,
+    #[error("workspace revision changed; refresh test discovery before running")]
+    StaleDiscovery,
+    #[error("selected variants are missing, exceed the query limit, or have static errors")]
+    InvalidVariants,
 }
 
 pub struct EditorService {
-    database: RwLock<AnalysisDatabase>,
+    database: Mutex<AnalysisDatabase>,
+    disk: Mutex<DiskInputs>,
     observations: Arc<ObservationStore>,
     runtime: RwLock<RuntimeConfiguration>,
     configuration: Mutex<()>,
 }
 
+#[derive(Default)]
+struct DiskInputs {
+    sources: std::collections::HashMap<String, Arc<str>>,
+    open: std::collections::HashSet<FileId>,
+    aliases: Vec<String>,
+}
+
+#[derive(Clone)]
 struct RuntimeConfiguration {
     runner_options: RunnerOptions,
     providers: ProviderRegistry,
@@ -79,8 +79,27 @@ impl EditorService {
         runner_options: RunnerOptions,
         providers: ProviderRegistry,
     ) -> Self {
+        let database = AnalysisDatabase::with_provider_registry(providers.clone());
+        Self::with_analysis_database(runner_options, providers, database)
+    }
+    pub fn with_analysis_database(
+        runner_options: RunnerOptions,
+        providers: ProviderRegistry,
+        mut database: AnalysisDatabase,
+    ) -> Self {
+        database.set_provider_registry(providers.clone());
+        let disk = DiskInputs {
+            sources: database.source_inputs().into_iter().collect(),
+            open: Default::default(),
+            aliases: database
+                .source_aliases()
+                .into_iter()
+                .map(|(alias, _)| alias)
+                .collect(),
+        };
         Self {
-            database: RwLock::new(AnalysisDatabase::with_provider_registry(providers.clone())),
+            disk: Mutex::new(disk),
+            database: Mutex::new(database),
             observations: Arc::new(ObservationStore::default()),
             runtime: RwLock::new(RuntimeConfiguration {
                 runner_options,
@@ -90,6 +109,9 @@ impl EditorService {
         }
     }
 
+    pub fn provider_registry(&self) -> ProviderRegistry {
+        self.read_runtime().providers.clone()
+    }
     pub fn reconfigure(&self, runner_options: RunnerOptions, providers: ProviderRegistry) {
         let _configuration = self.lock_configuration();
         self.write_database()
@@ -101,6 +123,22 @@ impl EditorService {
         self.observations.clear();
     }
 
+    pub fn snapshot(&self) -> EditorSnapshot {
+        let _configuration = self.lock_configuration();
+        EditorSnapshot {
+            analysis: self.read_database().snapshot(),
+            observations: self.observations.clone(),
+            runtime: self.read_runtime().clone(),
+            observation_revision: self.observations.generation(),
+        }
+    }
+    pub fn analysis_snapshot(&self) -> webtest_analysis::AnalysisSnapshot {
+        let _configuration = self.lock_configuration();
+        self.read_database().snapshot()
+    }
+    pub fn analysis_revision(&self) -> u64 {
+        self.read_database().workspace_revision()
+    }
     pub fn observations(&self) -> Arc<ObservationStore> {
         Arc::clone(&self.observations)
     }
@@ -134,15 +172,35 @@ impl EditorService {
         };
         let revision = batch.revision;
         let execution = batch.execution_id;
-        let Some(values) = batch.into_observations(file, &source) else {
+        let Some(mut values) = batch.into_observations(file, &source) else {
             return false;
         };
+        for observation in &mut values {
+            for related in &mut observation.related_locations {
+                let Some(file) = database.file_for_path(&related.path) else {
+                    return false;
+                };
+                let Ok(source) = database.source(file) else {
+                    return false;
+                };
+                if webtest_text::SourceRevision::of(&source) != related.revision
+                    || !source.is_char_boundary(usize::from(related.origin.range.start()))
+                    || !source.is_char_boundary(usize::from(related.origin.range.end()))
+                {
+                    return false;
+                }
+                related.origin.file = file;
+            }
+        }
         self.observations
             .complete_publication(file, revision, ticket, execution, values)
     }
 
     pub fn open_document(&self, path: impl Into<String>, text: impl Into<String>) -> FileId {
-        self.write_database().open_file(path, text)
+        let mut disk = self.disk.lock().unwrap_or_else(|e| e.into_inner());
+        let file = self.write_database().open_file(path, text);
+        disk.open.insert(file);
+        file
     }
 
     pub fn update_document(&self, file: FileId, text: impl Into<String>) {
@@ -151,11 +209,191 @@ impl EditorService {
         self.observations.clear_for_file(file);
     }
 
+    /// Native hosts may resolve only these canonical analyzer-produced candidates.
+    pub fn import_candidates(&self, path: &str) -> Result<Vec<String>, EditorError> {
+        let database = self.write_database();
+        let Some(file) = database.file_for_path(path) else {
+            return Ok(Vec::new());
+        };
+        Ok(database.module_graph(file)?.required_inputs.clone())
+    }
+    /// Install host-read disk content without overwriting a synchronized buffer.
+    pub fn install_disk_module(
+        &self,
+        canonical: String,
+        text: String,
+        alias: String,
+    ) -> Result<(), EditorError> {
+        let mut disk = self.disk.lock().unwrap_or_else(|error| error.into_inner());
+        let mut database = self.write_database();
+        let existing = database.file_for_path(&canonical);
+        let file = if let Some(file) = existing.filter(|file| disk.open.contains(file)) {
+            file
+        } else {
+            database.open_file(canonical.clone(), text.clone())
+        };
+        disk.sources.insert(canonical, Arc::from(text));
+        database.alias_file(&alias, file)?;
+        if !disk.aliases.contains(&alias) {
+            disk.aliases.push(alias);
+        }
+        self.observations.clear();
+        Ok(())
+    }
+    pub fn register_path_alias(&self, alias: String, canonical: String) -> Result<(), EditorError> {
+        let mut database = self.write_database();
+        let file = database
+            .file_for_path(&canonical)
+            .unwrap_or_else(|| database.open_file(canonical, ""));
+        database.alias_file(&alias, file)?;
+        Ok(())
+    }
+    pub fn set_document_uri(&self, file: FileId, uri: String) -> Result<(), EditorError> {
+        Ok(self.write_database().set_document_uri(file, Some(uri))?)
+    }
+    pub fn set_document_version(
+        &self,
+        file: FileId,
+        version: webtest_text::DocumentVersion,
+    ) -> Result<(), EditorError> {
+        Ok(self.write_database().set_document_version(file, version)?)
+    }
+    pub fn update_document_versioned(
+        &self,
+        file: FileId,
+        text: String,
+        version: webtest_text::DocumentVersion,
+    ) -> Result<(), EditorError> {
+        let mut database = self.write_database();
+        let _ = database.source(file)?;
+        database.set_file_text(file, text);
+        database.set_document_version(file, version)?;
+        self.observations.clear_for_file(file);
+        Ok(())
+    }
     pub fn close_document(&self, file: FileId) {
-        self.write_database().close_file(file);
+        let mut disk = self.disk.lock().unwrap_or_else(|e| e.into_inner());
+        let mut database = self.write_database();
+        disk.open.remove(&file);
+        if let Ok(path) = database.path(file).map(str::to_owned) {
+            if let Some(text) = disk.sources.get(&path) {
+                let _ = database.set_document_uri(file, None);
+                database.set_file_text(file, text.to_string());
+                let _ = database.clear_document_version(file);
+            } else {
+                database.close_file(file);
+            }
+        }
         self.observations.clear_for_file(file);
     }
 
+    pub fn reconfigure_workspace_inputs(
+        &self,
+        runner_options: RunnerOptions,
+        providers: ProviderRegistry,
+        configuration: webtest_analysis::WorkspaceConfiguration,
+        sources: Vec<(String, Arc<str>)>,
+        aliases: Vec<(String, String)>,
+    ) -> Result<(), EditorError> {
+        let _configuration = self.lock_configuration();
+        self.replace_disk_inputs(sources, aliases)?;
+        let mut database = self.write_database();
+        database.configure_workspace(configuration);
+        database.set_provider_registry(providers.clone());
+        *self.write_runtime() = RuntimeConfiguration {
+            runner_options,
+            providers,
+        };
+        self.observations.clear();
+        Ok(())
+    }
+    pub fn invalidate_project_inputs(&self) {
+        let _configuration = self.lock_configuration();
+        let mut database = self.write_database();
+        let mut configuration = database.workspace_configuration();
+        configuration.invalid_inputs = true;
+        database.configure_workspace(configuration);
+        self.observations.clear();
+    }
+    pub fn configure_workspace(&self, configuration: webtest_analysis::WorkspaceConfiguration) {
+        let _configuration = self.lock_configuration();
+        self.write_database().configure_workspace(configuration);
+        self.observations.clear();
+    }
+    pub fn replace_disk_inputs(
+        &self,
+        sources: Vec<(String, Arc<str>)>,
+        aliases: Vec<(String, String)>,
+    ) -> Result<(), EditorError> {
+        let mut disk = self.disk.lock().unwrap_or_else(|e| e.into_inner());
+        let mut database = self.write_database();
+        let sources = sources
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        for old in disk
+            .sources
+            .keys()
+            .filter(|path| !sources.contains_key(*path))
+        {
+            if let Some(file) = database.file_for_path(old)
+                && !disk.open.contains(&file)
+            {
+                database.close_file(file);
+                self.observations.clear_for_file(file);
+            }
+        }
+        for (path, text) in &sources {
+            let existing = database.file_for_path(path);
+            if existing.is_some_and(|file| disk.open.contains(&file)) {
+                continue;
+            }
+            let changed = existing.is_none_or(|file| {
+                database
+                    .source(file)
+                    .is_ok_and(|previous| previous != *text)
+            });
+            if changed {
+                let file = database.open_file(path, text.to_string());
+                self.observations.clear_for_file(file);
+            }
+        }
+        for old in &disk.aliases {
+            if !aliases.iter().any(|(alias, _)| alias == old) {
+                database.remove_alias(old);
+            }
+        }
+        for (alias, target) in &aliases {
+            if let Some(file) = database.file_for_path(target) {
+                database.alias_file(alias, file)?;
+            }
+        }
+        disk.aliases = aliases.into_iter().map(|(alias, _)| alias).collect();
+        disk.sources = sources;
+        Ok(())
+    }
+    pub fn update_disk_source(&self, path: String, text: Option<String>) {
+        let mut disk = self.disk.lock().unwrap_or_else(|e| e.into_inner());
+        let mut database = self.write_database();
+        let file = database.file_for_path(&path);
+        match text {
+            Some(text) => {
+                disk.sources.insert(path.clone(), Arc::from(text.as_str()));
+                if file.is_none_or(|file| !disk.open.contains(&file)) {
+                    let file = database.open_file(path, text);
+                    self.observations.clear_for_file(file);
+                }
+            }
+            None => {
+                disk.sources.remove(&path);
+                if let Some(file) = file
+                    && !disk.open.contains(&file)
+                {
+                    database.close_file(file);
+                    self.observations.clear_for_file(file);
+                }
+            }
+        }
+    }
     pub fn file_for_path(&self, path: &str) -> Option<FileId> {
         self.read_database().file_for_path(path)
     }
@@ -165,160 +403,11 @@ impl EditorService {
     }
 
     pub fn diagnostics(&self, file: FileId) -> Result<Vec<Diagnostic>, EditorError> {
-        let (mut diagnostics, revision) = {
-            let mut database = self.write_database();
-            (
-                database.diagnostics(file)?.as_ref().clone(),
-                database.source_revision(file)?,
-            )
-        };
-        diagnostics.extend(
-            self.observations
-                .observations_for(file, revision)
-                .into_iter()
-                .map(|observation| match observation.kind {
-                    RuntimeObservationKind::TestTimeout {
-                        timeout_ms,
-                        active_step,
-                    } => Diagnostic {
-                        range: observation.range,
-                        severity: DiagnosticSeverity::Error,
-                        code: RuntimeFailureCode::TestTimeout.diagnostic_code(),
-                        message: format!("Test timed out after {timeout_ms}ms."),
-                        source: DiagnosticSource::Runtime,
-                        semantic_details: Some(serde_json::json!({
-                            "timeout_ms": timeout_ms,
-                            "active_step_id": active_step.map(|step| step.0),
-                        })),
-                        repair_hints: Vec::new(),
-                        reference_queries: Vec::new(),
-                    },
-                    RuntimeObservationKind::BrowserFailure {
-                        code,
-                        message,
-                        locator,
-                        page_url,
-                        candidates,
-                        actionability,
-                        artifacts,
-                        elapsed_ms,
-                        repair_hints,
-                        ..
-                    } => Diagnostic {
-                        range: observation.range,
-                        severity: DiagnosticSeverity::Error,
-                        code: code.diagnostic_code(),
-                        message: friendly_runtime_message(code, locator.as_ref(), &message),
-                        source: DiagnosticSource::Runtime,
-                        semantic_details: Some(serde_json::json!({
-                            "requested_locator": locator.as_ref().map(ToString::to_string),
-                            "page_url": page_url,
-                            "candidates": candidates,
-                            "actionability": actionability,
-                            "artifacts": artifacts,
-                            "elapsed_ms": elapsed_ms,
-                        })),
-                        repair_hints,
-                        reference_queries: locator.as_ref().map_or_else(
-                            || {
-                                code.default_reference_queries()
-                                    .iter()
-                                    .map(|query| (*query).to_owned())
-                                    .collect()
-                            },
-                            |locator| vec![locator_reference_query(locator).to_owned()],
-                        ),
-                    },
-                    RuntimeObservationKind::ValueFailure {
-                        code,
-                        message,
-                        path,
-                        expected,
-                        actual,
-                        diff: _,
-                    } => {
-                        let mut details = message;
-                        if let Some(path) = &path {
-                            details.push_str(&format!(" Path: {path}."));
-                        }
-                        if let (Some(expected), Some(actual)) = (&expected, &actual) {
-                            details.push_str(&format!(" Expected {expected}; got {actual}."));
-                        }
-                        Diagnostic {
-                            range: observation.range,
-                            severity: DiagnosticSeverity::Error,
-                            code: code.diagnostic_code(),
-                            message: details,
-                            source: DiagnosticSource::Runtime,
-                            semantic_details: Some(serde_json::json!({
-                                "path": path,
-                                "expected": expected,
-                                "actual": actual,
-                            })),
-                            repair_hints: Vec::new(),
-                            reference_queries: code
-                                .default_reference_queries()
-                                .iter()
-                                .map(|query| (*query).to_owned())
-                                .collect(),
-                        }
-                    }
-                    RuntimeObservationKind::LocatorNotFound { locator, .. } => Diagnostic {
-                        range: observation.range,
-                        severity: DiagnosticSeverity::Error,
-                        code: RuntimeFailureCode::LocatorNotFound.diagnostic_code(),
-                        message: format!(
-                            "No element with {} was found during the last test run.",
-                            locator_description(&locator)
-                        ),
-                        source: DiagnosticSource::Runtime,
-                        semantic_details: Some(serde_json::json!({
-                            "requested_locator": locator.to_string(),
-                        })),
-                        repair_hints: Vec::new(),
-                        reference_queries: vec![locator_reference_query(&locator).into()],
-                    },
-                    RuntimeObservationKind::LocatorAmbiguous {
-                        locator, matches, ..
-                    } => Diagnostic {
-                        range: observation.range,
-                        severity: DiagnosticSeverity::Error,
-                        code: RuntimeFailureCode::LocatorAmbiguous.diagnostic_code(),
-                        message: format!(
-                            "The locator {locator} matched {matches} elements during the last test run."
-                        ),
-                        source: DiagnosticSource::Runtime,
-                        semantic_details: Some(serde_json::json!({
-                            "requested_locator": locator.to_string(),
-                            "matches": matches,
-                        })),
-                        repair_hints: Vec::new(),
-                        reference_queries: vec![locator_reference_query(&locator).into()],
-                    },
-                    RuntimeObservationKind::LocatorNotVisible { locator, .. } => Diagnostic {
-                        range: observation.range,
-                        severity: DiagnosticSeverity::Error,
-                        code: RuntimeFailureCode::LocatorNotVisible.diagnostic_code(),
-                        message: format!(
-                            "The element with {} was not visible during the last test run.",
-                            locator_description(&locator)
-                        ),
-                        source: DiagnosticSource::Runtime,
-                        semantic_details: Some(serde_json::json!({
-                            "requested_locator": locator.to_string(),
-                            "visible": false,
-                        })),
-                        repair_hints: Vec::new(),
-                        reference_queries: vec![locator_reference_query(&locator).into()],
-                    },
-                }),
-        );
-        Ok(diagnostics)
+        self.snapshot().diagnostics(file)
     }
 
     pub fn format(&self, file: FileId) -> Result<String, EditorError> {
-        let parse = self.write_database().parse(file)?;
-        Ok(webtest_format::format_file(&parse))
+        self.snapshot().format(file)
     }
 
     pub fn hover(
@@ -326,17 +415,7 @@ impl EditorService {
         file: FileId,
         offset: webtest_text::TextSize,
     ) -> Result<Option<Hover>, EditorError> {
-        let mut database = self.write_database();
-        if let Some(documentation) = database.documentation_at(file, offset)? {
-            return Ok(Some(Hover {
-                range: documentation.range,
-                contents: documentation.contents,
-            }));
-        }
-        Ok(database.type_at(file, offset)?.map(|fact| Hover {
-            range: fact.range,
-            contents: format!("{} ({})", fact.ty, fact.capability),
-        }))
+        self.snapshot().hover(file, offset)
     }
 
     pub fn completions(
@@ -344,7 +423,7 @@ impl EditorService {
         file: FileId,
         offset: webtest_text::TextSize,
     ) -> Result<Vec<Completion>, EditorError> {
-        Ok(self.write_database().completions(file, offset)?)
+        Ok(self.analysis_snapshot().completions(file, offset)?)
     }
 
     pub fn signature_help(
@@ -352,118 +431,21 @@ impl EditorService {
         file: FileId,
         offset: webtest_text::TextSize,
     ) -> Result<Option<Signature>, EditorError> {
-        Ok(self.write_database().signature_help(file, offset)?)
+        Ok(self.analysis_snapshot().signature_help(file, offset)?)
     }
 
     pub fn semantic_tokens(&self, file: FileId) -> Result<Vec<SemanticToken>, EditorError> {
-        let parse = self.write_database().parse(file)?;
-        Ok(parse
-            .syntax()
-            .descendants_with_tokens()
-            .filter_map(|element| element.into_token())
-            .filter_map(|token| {
-                let parent = token.parent().map(|node| node.kind());
-                let kind = match token.kind() {
-                    SyntaxKind::RetryKw | SyntaxKind::BackoffKw | SyntaxKind::MaxKw
-                        if parent == Some(SyntaxKind::RetryStmt) =>
-                    {
-                        SemanticTokenKind::Keyword
-                    }
-                    SyntaxKind::RaceKw if parent == Some(SyntaxKind::RaceStmt) => {
-                        SemanticTokenKind::Keyword
-                    }
-                    SyntaxKind::ProvideKw if parent == Some(SyntaxKind::ProvideStmt) => {
-                        SemanticTokenKind::Keyword
-                    }
-                    SyntaxKind::ParallelKw if parent == Some(SyntaxKind::ParallelStmt) => {
-                        SemanticTokenKind::Keyword
-                    }
-                    SyntaxKind::TimeoutKw if parent == Some(SyntaxKind::TimeoutStmt) => {
-                        SemanticTokenKind::Keyword
-                    }
-                    SyntaxKind::TestKw
-                    | SyntaxKind::BrowserKw
-                    | SyntaxKind::ServerKw
-                    | SyntaxKind::LetKw
-                    | SyntaxKind::TrueKw
-                    | SyntaxKind::FalseKw
-                    | SyntaxKind::NullKw
-                    | SyntaxKind::ContainsKw
-                    | SyntaxKind::MatchesKw
-                    | SyntaxKind::OpenKw
-                    | SyntaxKind::ClickKw
-                    | SyntaxKind::FillKw
-                    | SyntaxKind::TypeKw
-                    | SyntaxKind::PressKw
-                    | SyntaxKind::KeyKw
-                    | SyntaxKind::WithKw
-                    | SyntaxKind::CheckKw
-                    | SyntaxKind::UncheckKw
-                    | SyntaxKind::SelectKw
-                    | SyntaxKind::OptionKw
-                    | SyntaxKind::HoverKw
-                    | SyntaxKind::WaitKw
-                    | SyntaxKind::ExpectKw
-                    | SyntaxKind::WithinKw
-                    | SyntaxKind::VisibleKw
-                    | SyntaxKind::HiddenKw
-                    | SyntaxKind::AttachedKw
-                    | SyntaxKind::DetachedKw
-                    | SyntaxKind::EnabledKw
-                    | SyntaxKind::DisabledKw
-                    | SyntaxKind::CheckedKw
-                    | SyntaxKind::UncheckedKw => SemanticTokenKind::Keyword,
-                    SyntaxKind::IdKw
-                    | SyntaxKind::RoleKw
-                    | SyntaxKind::LabelKw
-                    | SyntaxKind::TextKw
-                    | SyntaxKind::PlaceholderKw
-                    | SyntaxKind::TestIdKw
-                    | SyntaxKind::CssKw
-                    | SyntaxKind::XPathKw
-                    | SyntaxKind::UrlKw => SemanticTokenKind::Function,
-                    SyntaxKind::String => SemanticTokenKind::String,
-                    SyntaxKind::LineComment => SemanticTokenKind::Comment,
-                    SyntaxKind::Ident
-                    | SyntaxKind::TimeoutKw
-                    | SyntaxKind::ParallelKw
-                    | SyntaxKind::RaceKw
-                    | SyntaxKind::ProvideKw
-                    | SyntaxKind::RetryKw
-                    | SyntaxKind::BackoffKw
-                    | SyntaxKind::MaxKw
-                        if matches!(parent, Some(SyntaxKind::LetStmt | SyntaxKind::NameExpr)) =>
-                    {
-                        SemanticTokenKind::Variable
-                    }
-                    SyntaxKind::Ident
-                    | SyntaxKind::TimeoutKw
-                    | SyntaxKind::ParallelKw
-                    | SyntaxKind::RaceKw
-                    | SyntaxKind::ProvideKw
-                    | SyntaxKind::RetryKw
-                    | SyntaxKind::BackoffKw
-                    | SyntaxKind::MaxKw
-                        if parent == Some(SyntaxKind::MemberExpr) =>
-                    {
-                        SemanticTokenKind::Property
-                    }
-                    SyntaxKind::Ident
-                        if matches!(
-                            parent,
-                            Some(SyntaxKind::NamedType | SyntaxKind::GenericType)
-                        ) =>
-                    {
-                        SemanticTokenKind::Type
-                    }
-                    _ => return None,
-                };
-                Some(SemanticToken {
-                    range: token.text_range(),
-                    kind,
-                })
-            })
-            .collect())
+        self.snapshot().semantic_tokens(file)
+    }
+
+    /// Capture runtime configuration and all selected plans before starting any host work.
+    pub fn prepare_variants(
+        &self,
+        expected_revision: u64,
+        variants: &std::collections::BTreeSet<webtest_model::TestVariantId>,
+    ) -> Result<PreparedWorkspaceRun, EditorError> {
+        self.snapshot()
+            .prepare_variants(expected_revision, variants)
     }
 
     pub async fn run_file(
@@ -496,15 +478,15 @@ impl EditorService {
         Ok(runner.run(&plan, browser).await)
     }
 
-    fn read_database(&self) -> std::sync::RwLockReadGuard<'_, AnalysisDatabase> {
+    fn read_database(&self) -> std::sync::MutexGuard<'_, AnalysisDatabase> {
         self.database
-            .read()
+            .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn write_database(&self) -> std::sync::RwLockWriteGuard<'_, AnalysisDatabase> {
+    fn write_database(&self) -> std::sync::MutexGuard<'_, AnalysisDatabase> {
         self.database
-            .write()
+            .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
@@ -566,6 +548,236 @@ fn friendly_runtime_message(
     }
 }
 
+/// A request-scoped immutable analysis view. Drop it before host I/O.
+pub struct EditorSnapshot {
+    observation_revision: u64,
+    runtime: RuntimeConfiguration,
+    analysis: webtest_analysis::AnalysisSnapshot,
+    observations: Arc<ObservationStore>,
+}
+impl std::ops::Deref for EditorSnapshot {
+    type Target = webtest_analysis::AnalysisSnapshot;
+    fn deref(&self) -> &Self::Target {
+        &self.analysis
+    }
+}
+impl std::ops::DerefMut for EditorSnapshot {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.analysis
+    }
+}
+impl EditorSnapshot {
+    pub fn observation_revision(&self) -> u64 {
+        self.observation_revision
+    }
+    pub fn prepare_variants(
+        &mut self,
+        expected_revision: u64,
+        variants: &std::collections::BTreeSet<webtest_model::TestVariantId>,
+    ) -> Result<PreparedWorkspaceRun, EditorError> {
+        if self.analysis.workspace_revision() != expected_revision {
+            return Err(EditorError::StaleDiscovery);
+        }
+        if variants.is_empty() || variants.len() > 10_000 {
+            return Err(EditorError::InvalidVariants);
+        }
+        let plans = self
+            .analysis
+            .plans_for_variants(variants)?
+            .ok_or(EditorError::InvalidVariants)?;
+        Ok(PreparedWorkspaceRun {
+            workspace_revision: expected_revision,
+            plans,
+            runner: Runner::new(self.observations.clone())
+                .with_options(self.runtime.runner_options.clone())
+                .with_provider_registry(self.runtime.providers.clone()),
+        })
+    }
+    pub fn diagnostics(&mut self, file: FileId) -> Result<Vec<Diagnostic>, EditorError> {
+        let (mut diagnostics, revision) = {
+            let database = &mut self.analysis;
+            (
+                database.diagnostics(file)?.as_ref().clone(),
+                database.source_revision(file)?,
+            )
+        };
+        diagnostics.extend(
+            self.observations
+                .observations_for(file, revision)
+                .into_iter()
+                .map(|observation| {
+                    let related_locations=observation.related_locations;
+                    match observation.kind {
+                    RuntimeObservationKind::TestTimeout {
+                        timeout_ms,
+                        active_step,
+                    } => Diagnostic {
+            related_locations:related_locations.clone(),
+                        range: observation.range,
+                        severity: DiagnosticSeverity::Error,
+                        code: RuntimeFailureCode::TestTimeout.diagnostic_code(),
+                        message: format!("Test timed out after {timeout_ms}ms."),
+                        source: DiagnosticSource::Runtime,
+                        semantic_details: Some(serde_json::json!({
+                            "timeout_ms": timeout_ms,
+                            "active_step_id": active_step.map(|step| step.0),
+                        })),
+                        repair_hints: Vec::new(),
+                        reference_queries: Vec::new(),
+                    },
+                    RuntimeObservationKind::BrowserFailure {
+                        code,
+                        message,
+                        locator,
+                        page_url,
+                        candidates,
+                        actionability,
+                        artifacts,
+                        elapsed_ms,
+                        repair_hints,
+                        ..
+                    } => Diagnostic {
+            related_locations:related_locations.clone(),
+                        range: observation.range,
+                        severity: DiagnosticSeverity::Error,
+                        code: code.diagnostic_code(),
+                        message: friendly_runtime_message(code, locator.as_ref(), &message),
+                        source: DiagnosticSource::Runtime,
+                        semantic_details: Some(serde_json::json!({
+                            "requested_locator": locator.as_ref().map(ToString::to_string),
+                            "page_url": page_url,
+                            "candidates": candidates,
+                            "actionability": actionability,
+                            "artifacts": artifacts,
+                            "elapsed_ms": elapsed_ms,
+                        })),
+                        repair_hints,
+                        reference_queries: locator.as_ref().map_or_else(
+                            || {
+                                code.default_reference_queries()
+                                    .iter()
+                                    .map(|query| (*query).to_owned())
+                                    .collect()
+                            },
+                            |locator| vec![locator_reference_query(locator).to_owned()],
+                        ),
+                    },
+                    RuntimeObservationKind::ValueFailure {
+                        code,
+                        message,
+                        path,
+                        expected,
+                        actual,
+                        diff: _,
+                    } => {
+                        let mut details = message;
+                        if let Some(path) = &path {
+                            details.push_str(&format!(" Path: {path}."));
+                        }
+                        if let (Some(expected), Some(actual)) = (&expected, &actual) {
+                            details.push_str(&format!(" Expected {expected}; got {actual}."));
+                        }
+                        Diagnostic {
+            related_locations:related_locations.clone(),
+                            range: observation.range,
+                            severity: DiagnosticSeverity::Error,
+                            code: code.diagnostic_code(),
+                            message: details,
+                            source: DiagnosticSource::Runtime,
+                            semantic_details: Some(serde_json::json!({
+                                "path": path,
+                                "expected": expected,
+                                "actual": actual,
+                            })),
+                            repair_hints: Vec::new(),
+                            reference_queries: code
+                                .default_reference_queries()
+                                .iter()
+                                .map(|query| (*query).to_owned())
+                                .collect(),
+                        }
+                    }
+                    RuntimeObservationKind::LocatorNotFound { locator, .. } => Diagnostic {
+            related_locations:related_locations.clone(),
+                        range: observation.range,
+                        severity: DiagnosticSeverity::Error,
+                        code: RuntimeFailureCode::LocatorNotFound.diagnostic_code(),
+                        message: format!(
+                            "No element with {} was found during the last test run.",
+                            locator_description(&locator)
+                        ),
+                        source: DiagnosticSource::Runtime,
+                        semantic_details: Some(serde_json::json!({
+                            "requested_locator": locator.to_string(),
+                        })),
+                        repair_hints: Vec::new(),
+                        reference_queries: vec![locator_reference_query(&locator).into()],
+                    },
+                    RuntimeObservationKind::LocatorAmbiguous {
+                        locator, matches, ..
+                    } => Diagnostic {
+            related_locations:related_locations.clone(),
+                        range: observation.range,
+                        severity: DiagnosticSeverity::Error,
+                        code: RuntimeFailureCode::LocatorAmbiguous.diagnostic_code(),
+                        message: format!(
+                            "The locator {locator} matched {matches} elements during the last test run."
+                        ),
+                        source: DiagnosticSource::Runtime,
+                        semantic_details: Some(serde_json::json!({
+                            "requested_locator": locator.to_string(),
+                            "matches": matches,
+                        })),
+                        repair_hints: Vec::new(),
+                        reference_queries: vec![locator_reference_query(&locator).into()],
+                    },
+                    RuntimeObservationKind::LocatorNotVisible { locator, .. } => Diagnostic {
+            related_locations:related_locations.clone(),
+                        range: observation.range,
+                        severity: DiagnosticSeverity::Error,
+                        code: RuntimeFailureCode::LocatorNotVisible.diagnostic_code(),
+                        message: format!(
+                            "The element with {} was not visible during the last test run.",
+                            locator_description(&locator)
+                        ),
+                        source: DiagnosticSource::Runtime,
+                        semantic_details: Some(serde_json::json!({
+                            "requested_locator": locator.to_string(),
+                            "visible": false,
+                        })),
+                        repair_hints: Vec::new(),
+                        reference_queries: vec![locator_reference_query(&locator).into()],
+                    },
+                }}),
+        );
+        Ok(diagnostics)
+    }
+    pub fn format(&mut self, file: FileId) -> Result<String, EditorError> {
+        let parse = self.analysis.parse(file)?;
+        Ok(webtest_format::format_file(&parse))
+    }
+    pub fn hover(
+        &mut self,
+        file: FileId,
+        offset: webtest_text::TextSize,
+    ) -> Result<Option<Hover>, EditorError> {
+        let database = &mut self.analysis;
+        if let Some(documentation) = database.documentation_at(file, offset)? {
+            return Ok(Some(Hover {
+                range: documentation.range,
+                contents: documentation.contents,
+            }));
+        }
+        Ok(database.type_at(file, offset)?.map(|fact| Hover {
+            range: fact.range,
+            contents: format!("{} ({})", fact.ty, fact.capability),
+        }))
+    }
+    pub fn semantic_tokens(&mut self, file: FileId) -> Result<Vec<SemanticToken>, EditorError> {
+        Ok(self.analysis.semantic_tokens(file)?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -587,6 +799,9 @@ mod tests {
             execution_id: ExecutionId::from_u128(42),
             revision,
             observations: vec![PublishedObservation {
+                related_locations: Vec::new(),
+                test_declaration_id: None,
+                variant_id: None,
                 test_id: webtest_model::TestId(0),
                 step_id: None,
                 start: 0,
@@ -684,6 +899,9 @@ mod tests {
         .enumerate()
         {
             editor.observations().record(RuntimeObservation {
+                related_locations: Vec::new(),
+                test_declaration_id: None,
+                variant_id: None,
                 execution_id: ExecutionId::from_u128((index as u64 + 1) as u128),
                 file,
                 source_revision: revision,
@@ -929,6 +1147,9 @@ mod tests {
         editor
             .observations()
             .record(webtest_observation::RuntimeObservation {
+                related_locations: Vec::new(),
+                test_declaration_id: None,
+                variant_id: None,
                 execution_id: webtest_observation::ExecutionId::from_u128(1),
                 file,
                 source_revision: webtest_text::SourceRevision::of(source),

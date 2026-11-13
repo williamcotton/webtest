@@ -17,12 +17,20 @@ pub fn format_file(parse: &Parse) -> String {
         let structural_brace = token.parent().is_some_and(|parent| {
             matches!(
                 parent.kind(),
-                SyntaxKind::RecordExpr | SyntaxKind::RecordType
+                SyntaxKind::RecordExpr | SyntaxKind::RecordType | SyntaxKind::ImportDecl
             )
         });
         match kind {
             SyntaxKind::Whitespace => {}
             SyntaxKind::LineComment => {
+                if !line_start
+                    && token.prev_token().is_some_and(|previous| {
+                        previous.kind() == SyntaxKind::Whitespace && previous.text().contains('\n')
+                    })
+                {
+                    output.push('\n');
+                    line_start = true;
+                }
                 if line_start {
                     push_indent(&mut output, indent);
                 } else if !output.ends_with([' ', '\n']) {
@@ -130,28 +138,48 @@ pub fn format_file(parse: &Parse) -> String {
                 line_start = false;
             }
             _ => {
-                let starts_statement = matches!(
-                    kind,
-                    SyntaxKind::TestKw
-                        | SyntaxKind::BrowserKw
-                        | SyntaxKind::ServerKw
-                        | SyntaxKind::LetKw
-                        | SyntaxKind::OpenKw
-                        | SyntaxKind::EvaluateKw
-                        | SyntaxKind::ClickKw
-                        | SyntaxKind::FillKw
-                        | SyntaxKind::TypeKw
-                        | SyntaxKind::PressKw
-                        | SyntaxKind::CheckKw
-                        | SyntaxKind::UncheckKw
-                        | SyntaxKind::SelectKw
-                        | SyntaxKind::HoverKw
-                        | SyntaxKind::WaitKw
-                        | SyntaxKind::ExpectKw
-                ) || (kind == SyntaxKind::RetryKw
-                    && token
-                        .parent()
-                        .is_some_and(|parent| parent.kind() == SyntaxKind::RetryStmt))
+                let declaration_header = token.parent().is_some_and(|parent| {
+                    matches!(
+                        parent.kind(),
+                        SyntaxKind::FixtureDecl
+                            | SyntaxKind::FunctionDecl
+                            | SyntaxKind::FixtureSetup
+                            | SyntaxKind::FixtureTeardown
+                    )
+                });
+                let starts_statement = (!declaration_header
+                    && matches!(
+                        kind,
+                        SyntaxKind::TestKw
+                            | SyntaxKind::BrowserKw
+                            | SyntaxKind::ServerKw
+                            | SyntaxKind::LetKw
+                            | SyntaxKind::OpenKw
+                            | SyntaxKind::EvaluateKw
+                            | SyntaxKind::ClickKw
+                            | SyntaxKind::FillKw
+                            | SyntaxKind::TypeKw
+                            | SyntaxKind::PressKw
+                            | SyntaxKind::CheckKw
+                            | SyntaxKind::UncheckKw
+                            | SyntaxKind::SelectKw
+                            | SyntaxKind::HoverKw
+                            | SyntaxKind::WaitKw
+                            | SyntaxKind::ExpectKw
+                    ))
+                    || matches!(
+                        kind,
+                        SyntaxKind::ImportKw
+                            | SyntaxKind::ExportKw
+                            | SyntaxKind::SetupKw
+                            | SyntaxKind::TeardownKw
+                    )
+                    || (matches!(kind, SyntaxKind::FnKw | SyntaxKind::FixtureKw)
+                        && previous != Some(SyntaxKind::ExportKw))
+                    || (kind == SyntaxKind::RetryKw
+                        && token
+                            .parent()
+                            .is_some_and(|parent| parent.kind() == SyntaxKind::RetryStmt))
                     || (kind == SyntaxKind::TimeoutKw
                         && token
                             .parent()
@@ -220,6 +248,16 @@ fn needs_space(previous: Option<SyntaxKind>, current: SyntaxKind) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_declarations_preserve_documentation_and_inline_headers() {
+        let source = "import{seed as value}from \"./support\"\n/// helper docs\nexport fn normalize(value:String)->String=lower(value)\n/// fixture docs\nexport fixture email()->String scope test{setup server{provide \"ok\"}teardown server{expect 1==1}}";
+        let expected = "import { seed as value } from \"./support\"\n/// helper docs\nexport fn normalize(value: String) -> String = lower(value)\n/// fixture docs\nexport fixture email() -> String scope test {\n    setup server {\n        provide \"ok\"\n    }\n    teardown server {\n        expect 1 == 1\n    }\n}\n";
+        let formatted = format_file(&webtest_syntax::parse(source));
+        assert_eq!(formatted, expected);
+        assert!(webtest_syntax::parse(&formatted).errors().is_empty());
+        assert_eq!(format_file(&webtest_syntax::parse(&formatted)), expected);
+    }
 
     #[test]
     fn formats_parallel_and_contextual_names_without_losing_comments() {

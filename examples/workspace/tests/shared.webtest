@@ -1,0 +1,7 @@
+import { normalized_email as normalize, suite_seed } from "../support/users.webtest"
+test "another file shares the suite seed" {
+    let seed = use suite_seed()
+    let email = normalize("CAROL@example.com")
+    expect seed == 7
+    expect email == "carol@example.com"
+}

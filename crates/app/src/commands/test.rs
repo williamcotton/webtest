@@ -10,7 +10,7 @@ use crate::{
     chrome::LazyChromeHost,
     cli::TestReporter,
     error::AppError,
-    project_analysis::analyze_file,
+    project_analysis::{analyze_file, workspace_for},
     project_context::{display_path, nanos, project},
     provider_composition::{runtime_application_observed, runtime_provider_registry_observed},
     report::{
@@ -32,6 +32,7 @@ pub(crate) async fn run_test(
     headed: bool,
     reporter: TestReporter,
     jobs: JobLimit,
+    variants: Vec<webtest_model::TestVariantId>,
 ) -> Result<ExitClass, AppError> {
     let project = project(&paths)?;
     let mut report = base_report("test", &project);
@@ -66,10 +67,12 @@ pub(crate) async fn run_test(
     if let Some(progress) = &progress {
         record_progress_error(progress.checking(project.files.len()), &mut progress_error);
     }
+    let mut database = workspace_for(&project)?;
+    let captured_sources = crate::project_analysis::capture_sources(&database, &project)?;
     let mut prepared = Vec::with_capacity(project.files.len());
     for file in &project.files {
         let started = Instant::now();
-        let analyzed = match analyze_file(&project, file) {
+        let analyzed = match analyze_file(&project, file, &mut database) {
             Ok(analyzed) => analyzed,
             Err(error) => {
                 if let Some(progress) = &progress {
@@ -83,6 +86,24 @@ pub(crate) async fn run_test(
             .iter()
             .any(|diagnostic| diagnostic.severity == "error");
         prepared.push((file, analyzed, started.elapsed(), has_static_errors));
+    }
+    if !variants.is_empty() {
+        let selected = variants
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let known = prepared
+            .iter()
+            .flat_map(|(_, analyzed, _, _)| analyzed.plan.tests.iter().map(|test| test.variant_id))
+            .collect::<std::collections::BTreeSet<_>>();
+        if let Some(unknown) = selected.difference(&known).next() {
+            return Err(AppError::usage(format!(
+                "unknown executable test variant `{unknown}`"
+            )));
+        }
+        prepared.retain_mut(|(_, analyzed, _, _)| {
+            analyzed.plan = Arc::new(analyzed.plan.select_variants(&selected));
+            !analyzed.plan.tests.is_empty()
+        });
     }
     let files_with_errors = prepared
         .iter()
@@ -192,6 +213,7 @@ pub(crate) async fn run_test(
             file_report.execution_error = Some(ExecutionFailureReport {
                 class: FailureClass::Infrastructure,
                 failure: FailureReport {
+                    source: None,
                     diagnostic_schema_version: webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
                     repair_hint_schema_version: webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
                     code: webtest_observation::RuntimeFailureCode::from(error)
@@ -296,7 +318,7 @@ pub(crate) async fn run_test(
         }
         file_report.tests = std::mem::take(&mut result.tests)
             .into_iter()
-            .map(|test| test_report(test, source, plan))
+            .map(|test| test_report(test, source, plan, &captured_sources))
             .collect();
         let tests_exit_class = file_report
             .tests
@@ -423,18 +445,17 @@ pub(crate) async fn run_test(
             }
         }
 
-        for ((index, source, plan, _, _, _), result) in runnable.iter().zip(&results) {
+        for ((index, _, plan, _, _, _), result) in runnable.iter().zip(&results) {
             let Some(execution_id) = result.execution_id else {
                 continue;
             };
             let file = &report.files[*index].path;
             let exported = match &metadata {
-                Ok(metadata) => crate::trace_export::export(
+                Ok(metadata) => crate::trace_export::export_sources(
                     &project,
                     metadata.clone(),
-                    source,
+                    &captured_sources,
                     plan,
-                    file,
                     result,
                 ),
                 Err(error) => Err(AppError::infrastructure(error)),
@@ -539,8 +560,11 @@ fn test_report(
     test: webtest_runtime::TestResult,
     source: &str,
     plan: &webtest_plan::TestPlan,
+    sources: &crate::project_analysis::CapturedSources,
 ) -> TestReport {
     let test_id = test.test_id;
+    let test_declaration_id = test.test_declaration_id;
+    let variant_id = test.variant_id;
     let (outcome, failure_class, reason, timeout_nanos, failure, exit_class) = match test.outcome {
         TestOutcome::Passed => (
             TestReportOutcome::Passed,
@@ -555,7 +579,7 @@ fn test_report(
             Some(FailureClass::Test),
             None,
             None,
-            Some(step_failure_report(*failure, source)),
+            Some(captured_step_failure(*failure, source, plan, sources)),
             ExitClass::TestFailure,
         ),
         TestOutcome::TimedOut {
@@ -580,6 +604,7 @@ fn test_report(
                         })
                         .unwrap_or(planned.origin);
                     FailureReport {
+                        source: None,
                         diagnostic_schema_version: webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
                         repair_hint_schema_version: webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
                         code: webtest_observation::RuntimeFailureCode::TestTimeout
@@ -632,12 +657,26 @@ fn test_report(
                 Some(failure.failure_class()),
                 Some(failure.to_string()),
                 None,
-                Some(aborted_test_failure_report(&failure, prior_outcome, source)),
+                Some(aborted_test_failure_report(
+                    &failure,
+                    prior_outcome.clone(),
+                    prior_outcome
+                        .as_deref()
+                        .and_then(|prior| match prior {
+                            webtest_runtime::PriorTestOutcome::Failed(failure) => {
+                                sources.get(&failure.step.origin.file)
+                            }
+                            _ => None,
+                        })
+                        .map_or(source, |source| source.text.as_ref()),
+                )),
                 exit_class,
             )
         }
     };
     TestReport {
+        test_declaration_id: Some(test_declaration_id),
+        variant_id: Some(variant_id),
         branches: test
             .branches
             .into_iter()
@@ -652,6 +691,8 @@ fn test_report(
                     scope: branch.scope,
                     result: test_report(
                         webtest_runtime::TestResult {
+                            test_declaration_id,
+                            variant_id,
                             test_id,
                             name,
                             outcome: branch.outcome,
@@ -661,6 +702,7 @@ fn test_report(
                         },
                         source,
                         plan,
+                        sources,
                     ),
                 }
             })
@@ -674,4 +716,28 @@ fn test_report(
         duration_nanos: nanos(test.duration),
         failure,
     }
+}
+
+fn captured_step_failure(
+    failure: webtest_runtime::StepFailure,
+    fallback: &str,
+    plan: &webtest_plan::TestPlan,
+    sources: &crate::project_analysis::CapturedSources,
+) -> FailureReport {
+    let origin = failure.step.origin;
+    let source = sources.get(&origin.file);
+    let mut report = step_failure_report(
+        failure,
+        source.map_or(fallback, |source| source.text.as_ref()),
+    );
+    if origin.file != plan.file
+        && let (Some(source), Some(span)) = (source, report.span.as_ref())
+    {
+        report.source = Some(crate::source_output::machine_source(
+            &source.path,
+            &crate::project_context::revision_hex(source.revision),
+            span,
+        ));
+    }
+    report
 }

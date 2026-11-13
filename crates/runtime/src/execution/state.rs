@@ -30,6 +30,20 @@ pub(super) struct ValueTransfer {
 }
 
 impl TestExecutionState {
+    pub(super) fn accept_fixture(&mut self, value: crate::fixtures::FixtureValue) -> Value {
+        self.accept_transfer(ValueTransfer {
+            value: value.value,
+            secrets: value.secrets,
+            redacted_fields: value.redacted_fields,
+        })
+    }
+    pub(super) fn seed_metadata(&mut self, secrets: Vec<String>, redacted_fields: Vec<String>) {
+        self.accept_transfer(ValueTransfer {
+            value: Value::Null,
+            secrets,
+            redacted_fields,
+        });
+    }
     pub(super) fn transfer(&self, value: Value) -> ValueTransfer {
         ValueTransfer {
             value,
@@ -79,6 +93,21 @@ impl TestExecutionState {
 
     /// Transfer only immutable values into a sibling. Resource handles and their
     /// ownership stay in the source branch; local writes remain independently owned.
+    pub(super) fn isolated(&self) -> Self {
+        let mut state = Self::new(self.redacted_fields.clone(), self.project_root.clone());
+        state.secrets = self.secrets.clone();
+        state
+    }
+    pub(super) fn merge_metadata(&mut self, other: Self) {
+        self.secrets.extend(other.secrets);
+        self.secrets.sort();
+        self.secrets.dedup();
+        self.redacted_fields.extend(other.redacted_fields);
+        self.redacted_fields.sort();
+        self.redacted_fields.dedup();
+        self.owned_temporary_directories
+            .extend(other.owned_temporary_directories);
+    }
     pub(super) fn transferable_snapshot(&self) -> Self {
         let environment: HashMap<_, _> = self
             .environment
@@ -113,11 +142,9 @@ impl TestExecutionState {
 
     pub(super) fn bind(&mut self, id: BindingId, name: Option<&str>, value: Value) {
         self.environment.insert(id, value);
-        self.binding_names.insert(
-            id,
-            name.map(str::to_owned)
-                .unwrap_or_else(|| format!("binding_{}", id.0)),
-        );
+        if let Some(name) = name {
+            self.binding_names.insert(id, name.to_owned());
+        }
     }
 
     pub(super) fn prepare_provider_arguments(&mut self, call: &ServerProviderCall) {

@@ -78,7 +78,47 @@ pub(crate) fn analysis_database_for_project(
     if let Some(manifest) = app_manifest(project)? {
         providers.register_schema(manifest.provider_schema());
     }
-    Ok(AnalysisDatabase::with_provider_registry(providers))
+    analysis_database_with_providers(project, providers)
+}
+
+pub(crate) fn analysis_database_with_providers(
+    project: &Project,
+    providers: ProviderRegistry,
+) -> Result<AnalysisDatabase, AppError> {
+    let mut database = AnalysisDatabase::with_provider_registry(providers);
+    database.configure_workspace(workspace_configuration(project)?);
+    Ok(database)
+}
+
+pub(crate) fn workspace_configuration(
+    project: &Project,
+) -> Result<webtest_analysis::WorkspaceConfiguration, AppError> {
+    let mut roots = project
+        .config
+        .project
+        .source_roots
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<std::collections::BTreeSet<_>>();
+    for root in webtest_project::workspace_source_roots(project).map_err(AppError::usage)? {
+        if let Ok(relative) = root.strip_prefix(&project.root) {
+            roots.insert(relative.display().to_string());
+        }
+    }
+    Ok(webtest_analysis::WorkspaceConfiguration {
+        root: project.root.display().to_string(),
+        source_roots: roots.into_iter().collect(),
+        case_sensitive: !cfg!(any(target_os = "macos", target_os = "windows")),
+        resolved_configuration: serde_json::to_value(&project.config)
+            .map_err(AppError::internal)?,
+        toolchain_identity: format!(
+            "webtest/{}/plan-{}/runtime-{}",
+            env!("CARGO_PKG_VERSION"),
+            webtest_plan::PLAN_FORMAT_VERSION,
+            webtest_plan::RUNTIME_SEMANTICS_VERSION
+        ),
+        ..Default::default()
+    })
 }
 
 pub(crate) fn runtime_provider_registry(

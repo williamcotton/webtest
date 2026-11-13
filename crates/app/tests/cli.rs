@@ -467,7 +467,7 @@ fn check_without_paths_discovers_configured_tests_in_order() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON report");
-    assert_eq!(report["schema_version"], 13);
+    assert_eq!(report["schema_version"], 14);
     let paths = report["files"]
         .as_array()
         .expect("files")
@@ -603,8 +603,8 @@ fn build_emits_a_versioned_typed_plan_deterministically() {
     let first_bytes = fs::read(&first).expect("first plan");
     assert_eq!(first_bytes, fs::read(&second).expect("second plan"));
     let plan: serde_json::Value = serde_json::from_slice(&first_bytes).expect("plan JSON");
-    assert_eq!(plan["format_version"], 9);
-    assert_eq!(plan["runtime_semantics_version"], 6);
+    assert_eq!(plan["format_version"], 10);
+    assert_eq!(plan["runtime_semantics_version"], 7);
     assert_eq!(plan["required_host_capabilities"][0], "server");
     assert_eq!(
         plan["tests"][0]["required_host_capabilities"],
@@ -1025,7 +1025,7 @@ fn parallel_reports_every_branch_failure_in_deterministic_source_order() {
         if reporter == "json" || reporter == "events" {
             let test = if reporter == "json" {
                 let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-                assert_eq!(value["schema_version"], 13);
+                assert_eq!(value["schema_version"], 14);
                 value["files"][0]["tests"][0].clone()
             } else {
                 let events: Vec<serde_json::Value> = text
@@ -1036,7 +1036,7 @@ fn parallel_reports_every_branch_failure_in_deterministic_source_order() {
                     .iter()
                     .find(|event| event["type"] == "test_result")
                     .unwrap();
-                assert_eq!(aggregate["schema_version"], 13);
+                assert_eq!(aggregate["schema_version"], 14);
                 aggregate["test"].clone()
             };
             assert_eq!(test["outcome"], "failed");
@@ -1099,7 +1099,7 @@ fn public_race_reports_the_winner_and_retains_failed_alternatives() {
         let stdout = String::from_utf8(output.stdout).unwrap();
         if reporter == "json" {
             let report: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-            assert_eq!(report["schema_version"], 13);
+            assert_eq!(report["schema_version"], 14);
             let test = &report["files"][0]["tests"][0];
             assert_eq!(test["outcome"], "passed");
             assert_eq!(test["branches"][0]["race_winner"], false);
@@ -1173,7 +1173,7 @@ fn public_retry_reports_every_attempt_and_rejects_unsafe_work_before_execution()
                 .collect();
             assert_eq!(attempts.len(), 4);
             for (index, attempt) in attempts.iter().enumerate() {
-                assert_eq!(attempt["schema_version"], 13);
+                assert_eq!(attempt["schema_version"], 14);
                 assert_eq!(
                     attempt["attempt"],
                     serde_json::json!({"ordinal": index / 2 + 1, "max_attempts": 2})
@@ -1424,7 +1424,7 @@ fn execution_identities_are_canonical_and_disjoint_across_cli_processes() {
             let events: Vec<_> = records.iter().filter(|r| r["execution_id"] == id).collect();
             assert!(events.len() > 10);
             for (sequence, record) in events.iter().enumerate() {
-                assert_eq!(record["schema_version"], 13);
+                assert_eq!(record["schema_version"], 14);
                 assert_eq!(record["event_sequence"], sequence);
                 assert_eq!(record["file"], start["file"]);
             }
@@ -1472,7 +1472,7 @@ fn event_report_retains_typed_browser_startup_failure_and_terminal_abort() {
         .iter()
         .find(|r| r["type"] == "scope_aborted")
         .unwrap();
-    assert_eq!(abort["schema_version"], 13);
+    assert_eq!(abort["schema_version"], 14);
     assert_eq!(abort["code"], "runtime.browser_crashed");
     assert_eq!(abort["failure_class"], "infrastructure");
     assert_eq!(abort["execution_failure"]["kind"], "browser");
@@ -1492,4 +1492,90 @@ fn event_report_retains_typed_browser_startup_failure_and_terminal_abort() {
         .unwrap();
     assert_eq!(terminal["execution_failure"], abort["execution_failure"]);
     assert_eq!(terminal["outcome"], "aborted");
+}
+
+#[test]
+fn imported_helpers_check_run_and_build_from_one_captured_workspace() {
+    let directory = tempfile::tempdir().unwrap();
+    write(
+        &directory.path().join("webtest.toml"),
+        "[project]\ntest_roots = [\"tests\"]\nsource_roots = [\"tests\", \"support\"]\n",
+    );
+    write(
+        &directory.path().join("support/helpers.webtest"),
+        r#"
+        export fn email(name: String) -> String = lower(name) + "@example.com"
+        export fn next(value: Int) -> Int { let result = value + 1 provide result }
+    "#,
+    );
+    write(
+        &directory.path().join("tests/first.webtest"),
+        r#"
+        import { email, next } from "project/support/helpers"
+        test "imported" { expect email("ALICE") == "alice@example.com" let result = next(3) expect result == 4 }
+    "#,
+    );
+    for args in [
+        vec!["check", "--reporter", "json"],
+        vec!["test", "--reporter", "json"],
+        vec!["build", "--emit", "plan.json"],
+    ] {
+        let output = webtest(directory.path()).args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let plan: serde_json::Value =
+        serde_json::from_slice(&fs::read(directory.path().join("plan.json")).unwrap()).unwrap();
+    assert_eq!(plan["source_files"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn variant_filter_and_reports_address_distinct_executions_with_duplicate_labels() {
+    let directory = tempfile::tempdir().unwrap();
+    write(
+        &directory.path().join("tests.webtest"),
+        "test \"same\" { expect false }\ntest \"same\" { expect true }\n",
+    );
+    let built = webtest(directory.path())
+        .args(["build", "--emit", "plan.json"])
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let plan: serde_json::Value =
+        serde_json::from_slice(&fs::read(directory.path().join("plan.json")).unwrap()).unwrap();
+    let tests = plan["tests"].as_array().unwrap();
+    assert_ne!(
+        tests[0]["test_declaration_id"],
+        tests[1]["test_declaration_id"]
+    );
+    assert_ne!(tests[0]["variant_id"], tests[1]["variant_id"]);
+    let variant = tests[1]["variant_id"].as_str().unwrap();
+    let output = webtest(directory.path())
+        .args(["test", "--reporter", "json", "--variant", variant])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["summary"]["passed"], 1);
+    assert_eq!(report["summary"]["failed"], 0);
+    assert_eq!(report["files"][0]["tests"][0]["variant_id"], variant);
+    let unknown = "00".repeat(32);
+    let output = webtest(directory.path())
+        .args(["test", "--variant", &unknown])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unknown executable test variant"));
 }

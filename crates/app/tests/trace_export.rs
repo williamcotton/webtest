@@ -86,7 +86,7 @@ fn concurrent_file_traces_preserve_sources_failures_and_unique_nonoverwriting_pa
     let first = run(directory.path(), "json", "5");
     assert_eq!(first.status.code(), Some(1));
     let first = report(&first);
-    assert_eq!(first["schema_version"], 13);
+    assert_eq!(first["schema_version"], 14);
     assert_eq!(first["traces"].as_array().unwrap().len(), 2);
     let captured = trace(&first, 0);
     let mapping = &captured.manifest().sources[0];
@@ -412,5 +412,53 @@ fn worker_application_terminal_facts_share_one_invocation_journal() {
             .count(),
         3,
         "{report}"
+    );
+}
+
+#[test]
+fn imported_helper_and_fixture_sources_are_captured_and_failures_use_their_own_text() {
+    let root_source = "import { verify, seed } from \"../support/helpers\"\ntest \"helper\" { verify() }\ntest \"fixture\" { let value = use seed() expect value == 7 }\n";
+    let library = "export fn verify() -> Null {\n expect 1 == 2\n}\nexport fixture seed() -> Int scope suite shareable { setup { provide 7 } teardown { expect 2 == 3 } }\n";
+    let directory = fixture(
+        "[project]\ntest_roots = ['tests']\nsource_roots = ['tests', 'support']\n[trace]\nmode = 'on'\nsources = true\n",
+        root_source,
+    );
+    fs::create_dir(directory.path().join("support")).unwrap();
+    fs::write(directory.path().join("support/helpers.webtest"), library).unwrap();
+    let output = run(directory.path(), "json", "2");
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let value = report(&output);
+    let failure = &value["files"][0]["tests"][0]["failure"];
+    assert_eq!(failure["source"]["path"], "support/helpers.webtest");
+    assert!(
+        failure["span"]["source_line"]
+            .as_str()
+            .unwrap()
+            .contains("expect 1 == 2")
+    );
+    let captured = trace(&value, 0);
+    assert_eq!(captured.manifest().sources.len(), 2);
+    assert!(
+        captured
+            .manifest()
+            .sources
+            .iter()
+            .any(|source| captured.source(source.execution_id, source.file_id) == Some(library))
+    );
+    assert!(
+        captured.manifest().sources.iter().any(|source| captured
+            .source(source.execution_id, source.file_id)
+            == Some(root_source))
+    );
+    assert!(
+        captured
+            .records()
+            .iter()
+            .any(|record| record.metadata.execution_context.fixture.is_some())
     );
 }

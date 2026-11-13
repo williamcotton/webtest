@@ -23,6 +23,7 @@ pub(super) fn core_constructs() -> BTreeMap<String, ConstructDescription> {
         .chain(type_constructs())
         .chain(capability_constructs())
         .chain(super::app_bridge::constructs())
+        .chain(super::workspace_catalog::constructs())
     {
         constructs.insert(construct.id.clone(), construct);
     }
@@ -122,6 +123,7 @@ pub(super) fn constraint(
 
 pub(super) fn example(name: &str, source: &str, source_kind: &str, context: &str) -> SourceExample {
     SourceExample {
+        inputs: BTreeMap::new(),
         name: name.into(),
         source: source.into(),
         source_kind: source_kind.into(),
@@ -348,7 +350,7 @@ fn provide_construct() -> ConstructDescription {
         "provide",
         "statement",
         "provide <expression>",
-        "Complete the current race branch with a transferable result value.",
+        "Return a value from a race branch, helper, or fixture setup.",
     );
     value.parameters = vec![parameter(
         "expression",
@@ -359,18 +361,22 @@ fn provide_construct() -> ConstructDescription {
         "value",
         "expression",
     )];
-    value.result_rule = Some("The inferred transferable expression type; a bound race additionally requires compatible types across all branches.".into());
+    value.result_rule = Some("The declared helper or fixture result type, or a transferable race result. A bound race requires compatible types across all branches.".into());
     value.search_terms = vec!["provide".into(), "return".into(), "winner value".into()];
-    value.allowed_contexts = vec!["race_branch".into()];
+    value.allowed_contexts = vec![
+        "race_branch".into(),
+        "helper_body".into(),
+        "fixture_setup".into(),
+    ];
     value.produces_value = Some(true);
-    value.effects = vec!["Evaluate one pure expression in the branch environment, then finish lexical teardown before the branch can win.".into(), "Transfer only the winner value and its redaction metadata to a bound race; discarded and losing values never enter parent bindings.".into()];
+    value.effects = vec!["Evaluate one pure expression in the current environment and return it from the helper or fixture setup, or finish lexical teardown before a race branch can win.".into(), "Transfer only the winner value and its redaction metadata to a bound race; discarded and losing values never enter parent bindings.".into()];
     value.failure_modes =
         vec!["Expression evaluation retains its structured typed failure.".into()];
     value.constraints = vec![constraint(
         "lexical_result",
         "analysis",
         "expression",
-        "Provide must be the final statement of a race branch, possibly inside its retry, timeout, or capability block. A nested parallel branch cannot provide to an enclosing race. Provider calls must be evaluated in a let binding before provide.",
+        "Provide terminates a helper body or fixture setup with its declared result. In a race it must be the final statement of a branch, possibly inside its retry, timeout, or capability block. A nested parallel branch cannot provide to an enclosing race. Provider calls must be evaluated in a let binding before provide.",
     )];
     value.examples = vec![
         example(

@@ -55,6 +55,9 @@ jobs:
         env:
           WEBTEST_CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
 
+      - name: Check workspace responsiveness and invalidation budgets
+        run: cargo run --release -p webtest-analysis --example workspace_benchmark -- --check
+
       - name: Check WASM target
         run: cargo check -p webtest-wasm -p webtest-trace --target wasm32-unknown-unknown
 
@@ -63,6 +66,10 @@ jobs:
 
       - name: Install VS Code extension dependencies
         run: npm ci
+        working-directory: editors/vscode
+
+      - name: Test Testing API selection and result routing
+        run: npm run test:testing
         working-directory: editors/vscode
 
       - name: Run VS Code extension VSIX smoke test

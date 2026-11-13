@@ -3,7 +3,7 @@ use webtest_text::{TextRange, TextSize};
 
 use crate::{SyntaxError, SyntaxKind, SyntaxNode, lexer};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Parse {
     green: GreenNode,
     errors: Vec<SyntaxError>,
@@ -65,6 +65,10 @@ impl<'a> Parser<'a> {
             match self.current() {
                 SyntaxKind::Eof => break,
                 SyntaxKind::TestKw => self.test_decl(),
+                SyntaxKind::ImportKw => self.import_decl(),
+                SyntaxKind::ExportKw | SyntaxKind::FnKw | SyntaxKind::FixtureKw => {
+                    self.reusable_decl()
+                }
                 _ => self.unexpected("syntax.expected_test", "expected `test` declaration"),
             }
         }
@@ -73,6 +77,263 @@ impl<'a> Parser<'a> {
             green: self.builder.finish(),
             errors: self.errors,
         }
+    }
+
+    fn declaration_name(&mut self) {
+        self.eat_trivia();
+        if self.name_token(self.current()) {
+            self.bump();
+        } else {
+            self.error_here(
+                "syntax.expected_declaration_name",
+                "expected declaration name",
+            );
+        }
+    }
+
+    fn import_decl(&mut self) {
+        self.start(SyntaxKind::ImportDecl);
+        self.bump();
+        if self.expect(
+            SyntaxKind::LBrace,
+            "syntax.expected_import_names",
+            "expected `{` with named imports",
+        ) {
+            loop {
+                self.eat_trivia();
+                if matches!(
+                    self.current(),
+                    SyntaxKind::RBrace | SyntaxKind::Eof | SyntaxKind::FromKw
+                ) {
+                    break;
+                }
+                let before = self.position;
+                self.start(SyntaxKind::ImportBinding);
+                self.declaration_name();
+                self.eat_trivia();
+                if self.current() == SyntaxKind::AsKw {
+                    self.bump();
+                    self.declaration_name();
+                }
+                self.finish();
+                self.eat_trivia();
+                if self.current() == SyntaxKind::Comma {
+                    self.bump();
+                } else if self.position == before {
+                    self.unexpected("syntax.invalid_import", "expected named import");
+                } else if self.current() != SyntaxKind::RBrace {
+                    break;
+                }
+            }
+            self.expect(
+                SyntaxKind::RBrace,
+                "syntax.expected_import_close",
+                "expected `}` after import names",
+            );
+        }
+        self.expect(
+            SyntaxKind::FromKw,
+            "syntax.expected_from",
+            "expected `from` after import names",
+        );
+        self.expect(
+            SyntaxKind::String,
+            "syntax.expected_module_path",
+            "expected module path string",
+        );
+        self.finish();
+    }
+
+    fn parameters(&mut self) {
+        self.start(SyntaxKind::ParameterList);
+        if self.expect(
+            SyntaxKind::LParen,
+            "syntax.expected_parameters",
+            "expected `(` before parameters",
+        ) {
+            loop {
+                self.eat_trivia();
+                if matches!(
+                    self.current(),
+                    SyntaxKind::RParen
+                        | SyntaxKind::Eof
+                        | SyntaxKind::Arrow
+                        | SyntaxKind::LBrace
+                        | SyntaxKind::Equal
+                ) {
+                    break;
+                }
+                if matches!(
+                    self.current(),
+                    SyntaxKind::TestKw
+                        | SyntaxKind::FnKw
+                        | SyntaxKind::FixtureKw
+                        | SyntaxKind::ExportKw
+                        | SyntaxKind::ImportKw
+                ) {
+                    break;
+                }
+                let before = self.position;
+                self.start(SyntaxKind::Parameter);
+                self.declaration_name();
+                self.expect(
+                    SyntaxKind::Colon,
+                    "syntax.expected_parameter_type",
+                    "expected `:` and parameter type",
+                );
+                self.type_expression();
+                self.finish();
+                self.eat_trivia();
+                if self.current() == SyntaxKind::Comma {
+                    self.bump();
+                } else if self.position == before {
+                    self.unexpected("syntax.invalid_parameter", "expected typed parameter");
+                } else {
+                    break;
+                }
+            }
+            self.expect(
+                SyntaxKind::RParen,
+                "syntax.expected_parameters_close",
+                "expected `)` after parameters",
+            );
+        }
+        self.finish();
+    }
+
+    fn reusable_decl(&mut self) {
+        let fixture = self.current() == SyntaxKind::FixtureKw
+            || (self.current() == SyntaxKind::ExportKw
+                && self.nth_non_trivia(1) == SyntaxKind::FixtureKw);
+        self.start(if fixture {
+            SyntaxKind::FixtureDecl
+        } else {
+            SyntaxKind::FunctionDecl
+        });
+        if self.current() == SyntaxKind::ExportKw {
+            self.bump();
+        }
+        if !self.expect(
+            if fixture {
+                SyntaxKind::FixtureKw
+            } else {
+                SyntaxKind::FnKw
+            },
+            "syntax.expected_reusable_declaration",
+            "expected `fn` or `fixture` after export",
+        ) {
+            self.finish();
+            return;
+        }
+        self.declaration_name();
+        self.parameters();
+        self.expect(
+            SyntaxKind::Arrow,
+            "syntax.expected_result_arrow",
+            "expected `->` and declared result type",
+        );
+        self.type_expression();
+        self.eat_trivia();
+        if !fixture {
+            let domain = match self.current() {
+                SyntaxKind::ServerKw => {
+                    self.bump();
+                    BlockDomain::Server
+                }
+                SyntaxKind::BrowserKw => {
+                    self.bump();
+                    BlockDomain::Browser
+                }
+                _ => BlockDomain::Test,
+            };
+            self.eat_trivia();
+            if self.current() == SyntaxKind::Equal {
+                self.bump();
+                self.require_expression("expected helper result expression");
+            } else {
+                self.braced_block(SyntaxKind::Block, domain);
+            }
+        } else {
+            if self.current() == SyntaxKind::ScopeKw {
+                self.bump();
+                self.eat_trivia();
+                if matches!(
+                    self.current(),
+                    SyntaxKind::TestKw
+                        | SyntaxKind::FileKw
+                        | SyntaxKind::WorkerKw
+                        | SyntaxKind::SuiteKw
+                ) {
+                    self.bump();
+                } else {
+                    self.error_here(
+                        "syntax.expected_fixture_lifetime",
+                        "expected test, file, worker, or suite lifetime",
+                    );
+                    if self.current() == SyntaxKind::Ident {
+                        self.bump();
+                    }
+                }
+            }
+            self.eat_trivia();
+            if self.current() == SyntaxKind::ShareableKw {
+                self.bump();
+            }
+            if self.expect(
+                SyntaxKind::LBrace,
+                "syntax.expected_fixture_body",
+                "expected fixture body",
+            ) {
+                loop {
+                    self.eat_trivia();
+                    if matches!(
+                        self.current(),
+                        SyntaxKind::RBrace
+                            | SyntaxKind::Eof
+                            | SyntaxKind::TestKw
+                            | SyntaxKind::FnKw
+                            | SyntaxKind::FixtureKw
+                            | SyntaxKind::ExportKw
+                            | SyntaxKind::ImportKw
+                    ) {
+                        break;
+                    }
+                    let kind = match self.current() {
+                        SyntaxKind::SetupKw => SyntaxKind::FixtureSetup,
+                        SyntaxKind::TeardownKw => SyntaxKind::FixtureTeardown,
+                        _ => {
+                            self.unexpected(
+                                "syntax.expected_fixture_phase",
+                                "expected setup or teardown",
+                            );
+                            continue;
+                        }
+                    };
+                    self.start(kind);
+                    self.bump();
+                    self.eat_trivia();
+                    let (body_kind, domain) = match self.current() {
+                        SyntaxKind::ServerKw => {
+                            self.bump();
+                            (SyntaxKind::ServerBlock, BlockDomain::Server)
+                        }
+                        SyntaxKind::BrowserKw => {
+                            self.bump();
+                            (SyntaxKind::BrowserBlock, BlockDomain::Browser)
+                        }
+                        _ => (SyntaxKind::Block, BlockDomain::Test),
+                    };
+                    self.braced_block(body_kind, domain);
+                    self.finish();
+                }
+                self.expect(
+                    SyntaxKind::RBrace,
+                    "syntax.expected_fixture_close",
+                    "expected `}` after fixture phases",
+                );
+            }
+        }
+        self.finish();
     }
 
     fn test_decl(&mut self) {
@@ -106,6 +367,17 @@ impl<'a> Parser<'a> {
                 }
                 SyntaxKind::Eof => {
                     self.error_here("syntax.expected_rbrace", "expected `}` to close block");
+                    break;
+                }
+                SyntaxKind::TestKw
+                | SyntaxKind::FnKw
+                | SyntaxKind::FixtureKw
+                | SyntaxKind::ExportKw
+                | SyntaxKind::ImportKw => {
+                    self.error_here(
+                        "syntax.expected_rbrace",
+                        "expected `}` before the next declaration",
+                    );
                     break;
                 }
                 _ => self.statement(domain),
@@ -291,17 +563,7 @@ impl<'a> Parser<'a> {
         self.start(SyntaxKind::LetStmt);
         self.bump();
         self.eat_trivia();
-        if matches!(
-            self.current(),
-            SyntaxKind::Ident
-                | SyntaxKind::TimeoutKw
-                | SyntaxKind::ParallelKw
-                | SyntaxKind::RaceKw
-                | SyntaxKind::ProvideKw
-                | SyntaxKind::RetryKw
-                | SyntaxKind::BackoffKw
-                | SyntaxKind::MaxKw
-        ) {
+        if crate::is_binding_name_kind(self.current()) {
             self.bump();
         } else {
             self.error_here(
@@ -454,6 +716,9 @@ impl<'a> Parser<'a> {
                 "syntax.expected_locator_state",
                 "expected locator state after `.`",
             );
+            if self.current() == SyntaxKind::Ident {
+                self.bump();
+            }
         }
     }
 
@@ -544,6 +809,12 @@ impl<'a> Parser<'a> {
         self.eat_trivia();
         let checkpoint = self.builder.checkpoint();
         match self.current() {
+            SyntaxKind::UseKw => {
+                self.start(SyntaxKind::UseExpr);
+                self.bump();
+                self.require_expression("expected fixture call after `use`");
+                self.finish();
+            }
             SyntaxKind::Bang | SyntaxKind::Minus => {
                 self.start(SyntaxKind::UnaryExpr);
                 self.bump();
@@ -821,7 +1092,8 @@ impl<'a> Parser<'a> {
     fn expression_start(&self, kind: SyntaxKind) -> bool {
         matches!(
             kind,
-            SyntaxKind::String
+            SyntaxKind::UseKw
+                | SyntaxKind::String
                 | SyntaxKind::Int
                 | SyntaxKind::Float
                 | SyntaxKind::Duration
@@ -837,28 +1109,7 @@ impl<'a> Parser<'a> {
     }
 
     fn name_token(&self, kind: SyntaxKind) -> bool {
-        matches!(
-            kind,
-            SyntaxKind::Ident
-                | SyntaxKind::TimeoutKw
-                | SyntaxKind::ParallelKw
-                | SyntaxKind::RaceKw
-                | SyntaxKind::ProvideKw
-                | SyntaxKind::RetryKw
-                | SyntaxKind::BackoffKw
-                | SyntaxKind::MaxKw
-                | SyntaxKind::NameKw
-                | SyntaxKind::IdKw
-                | SyntaxKind::RoleKw
-                | SyntaxKind::LabelKw
-                | SyntaxKind::TextKw
-                | SyntaxKind::PlaceholderKw
-                | SyntaxKind::TestIdKw
-                | SyntaxKind::CssKw
-                | SyntaxKind::XPathKw
-                | SyntaxKind::UrlKw
-                | SyntaxKind::OptionKw
-        )
+        crate::is_name_kind(kind)
     }
 
     fn expect(&mut self, kind: SyntaxKind, code: &'static str, message: &'static str) -> bool {

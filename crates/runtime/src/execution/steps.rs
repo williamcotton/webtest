@@ -27,6 +27,20 @@ pub(super) async fn execute_step(
         page.set_operation_context(Some(context.clone()));
     }
     match &step.operation {
+        TestOperation::AcquireFixture(_) => Err(StepError::Internal(
+            "fixture acquisition must be dispatched by its owned execution scope".into(),
+        )),
+        TestOperation::Return(operation) => {
+            let value = evaluate(&operation.expression, state.environment())?;
+            let value =
+                crate::evaluation::decode_value(&value, &operation.result_type, "return", None)
+                    .map_err(|_| {
+                        StepError::Internal(
+                            "helper returned a value incompatible with its plan".into(),
+                        )
+                    })?;
+            Ok(StepCompletion::Provided(value))
+        }
         TestOperation::Provide(operation) => {
             let value = evaluate(&operation.expression, state.environment())?;
             if !crate::evaluation::runtime_transferable(&value) {

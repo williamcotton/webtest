@@ -57,6 +57,24 @@ impl PendingFailure {
             elapsed_ms,
         }
     }
+    pub(super) fn from_fixture(
+        step: &PlannedStep,
+        scope: &webtest_observation::ScopeEvent,
+        failure: crate::StepFailure,
+        location: webtest_text::SourceLocation,
+    ) -> Self {
+        let mut step = step.clone();
+        step.origin_chain.push(location);
+        Self {
+            metadata: scope.into(),
+            step,
+            error: failure.error,
+            evidence: failure.evidence,
+            inspection: failure.inspection,
+            secondary_failures: failure.secondary_failures,
+            elapsed_ms: 0,
+        }
+    }
     pub(super) fn interruption_cleanup(&self) -> Result<(), webtest_observation::CleanupCause> {
         match &self.error {
             StepError::Provider(webtest_provider::ProviderError::Cancelled {
@@ -79,7 +97,7 @@ impl PendingFailure {
 
 pub(super) struct FailureInput<'a> {
     pub(super) plan: &'a TestPlan,
-    pub(super) test_id: TestId,
+    pub(super) test_id: Option<TestId>,
     pub(super) execution_id: ExecutionId,
     pub(super) pending: PendingFailure,
     pub(super) artifact_deadline: tokio::time::Instant,
@@ -199,7 +217,7 @@ pub(super) async fn process_failure(input: FailureInput<'_>) -> Result<StepFailu
 struct FinishFailureInput<'a> {
     metadata: webtest_observation::EventMetadata,
     plan: &'a TestPlan,
-    test_id: TestId,
+    test_id: Option<TestId>,
     step: &'a PlannedStep,
     execution_id: ExecutionId,
     error: StepError,
@@ -264,10 +282,22 @@ async fn finish_failure(input: FinishFailureInput<'_>) -> Result<StepFailure, Ru
                     .join(format!("execution-{}-attempt-{}", execution_id, attempt.0))
             },
         );
+        let owner = if let Some(test) = test_id {
+            crate::artifacts::ArtifactOwner::Test(test)
+        } else if let Some(fixture) = metadata.execution_context.fixture {
+            crate::artifacts::ArtifactOwner::Fixture {
+                instance: fixture.instance,
+                phase: fixture.phase,
+            }
+        } else {
+            return Err(RunError::Internal(
+                "artifact owner is absent from the failure context".into(),
+            ));
+        };
         write_artifacts(
             &directory,
             execution_id,
-            test_id,
+            owner,
             step.id,
             artifact_deadline,
             &mut evidence,
@@ -305,7 +335,9 @@ async fn finish_failure(input: FinishFailureInput<'_>) -> Result<StepFailure, Ru
             ),
         );
     }
-    if failure_class == FailureClass::Test {
+    if failure_class == FailureClass::Test
+        && let Some(test_id) = test_id
+    {
         record_observation(
             observations,
             plan,
@@ -371,7 +403,7 @@ async fn finish_failure(input: FinishFailureInput<'_>) -> Result<StepFailure, Ru
 fn provider_failure_event(
     call: &ServerProviderCall,
     execution_id: ExecutionId,
-    test_id: TestId,
+    test_id: Option<TestId>,
     step: &PlannedStep,
     error: &StepError,
     elapsed_ms: u64,
@@ -454,9 +486,22 @@ fn record_observation(
         StepError::Internal(_) => return,
     };
     observations.record(RuntimeObservation {
+        related_locations: step.origin_chain.clone(),
+        test_declaration_id: plan
+            .tests
+            .iter()
+            .find(|test| test.id == test_id)
+            .map(|test| test.test_declaration_id),
+        variant_id: plan
+            .tests
+            .iter()
+            .find(|test| test.id == test_id)
+            .map(|test| test.variant_id),
         execution_id,
-        file: plan.file,
-        source_revision: plan.source_revision,
+        file: step.origin.file,
+        source_revision: plan
+            .source_revision_for(step.origin.file)
+            .unwrap_or(plan.source_revision),
         test_id,
         step_id: Some(step.id),
         range: step.origin.range,
@@ -563,6 +608,7 @@ mod tests {
         let root = tempfile::tempdir().expect("temporary root");
         let file = FileId::new(91);
         let step = PlannedStep {
+            origin_chain: Vec::new(),
             id: StepId(7),
             origin: SyntaxOrigin::new(file, TextRange::new(TextSize::new(4), TextSize::new(12))),
             operation: TestOperation::Browser(BrowserOperation::Click {
@@ -570,6 +616,8 @@ mod tests {
             }),
         };
         let plan = TestPlan {
+            fixtures: Vec::new(),
+            source_files: Vec::new(),
             file,
             source_revision: SourceRevision::of("failure"),
             required_host_capabilities: Vec::new(),
@@ -613,7 +661,7 @@ mod tests {
 
         let failure = process_failure(FailureInput {
             plan: &plan,
-            test_id: TestId(3),
+            test_id: Some(TestId(3)),
             execution_id,
             pending,
             artifact_deadline: tokio::time::Instant::now(),

@@ -28,6 +28,9 @@ async fn allocation_failure_clears_observations_without_execution_or_fabricated_
     let store = Arc::new(ObservationStore::default());
     store.begin_execution(plan.file, ExecutionId::from_u128(1));
     store.record(RuntimeObservation {
+        related_locations: Vec::new(),
+        test_declaration_id: None,
+        variant_id: None,
         execution_id: ExecutionId::from_u128(1),
         file: plan.file,
         source_revision: plan.source_revision,

@@ -26,6 +26,17 @@ impl SourceRevision {
         Self(*blake3::hash(source.as_bytes()).as_bytes())
     }
 
+    /// Length-delimited hashing for canonical semantic inputs without staging
+    /// a large serialized workspace document.
+    pub fn of_parts<'a>(parts: impl IntoIterator<Item = &'a [u8]>) -> Self {
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"webtest-source-parts/v1");
+        for part in parts {
+            hash.update(&(part.len() as u64).to_le_bytes());
+            hash.update(part);
+        }
+        Self(*hash.finalize().as_bytes())
+    }
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
@@ -96,6 +107,27 @@ impl SyntaxOrigin {
     pub const fn new(file: FileId, range: TextRange) -> Self {
         Self { file, range }
     }
+}
+
+/// A revision-bound source link. Hosts supply paths; this DTO performs no I/O.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceLocation {
+    pub path: String,
+    pub origin: SyntaxOrigin,
+    pub revision: SourceRevision,
+}
+
+/// Length-delimited semantic identity hashing shared by lowering and portable plans.
+pub fn semantic_key(parent: &[u8; 32], kind: &str, name: &str, ordinal: u32) -> [u8; 32] {
+    let parent = parent
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    *SourceRevision::of(&format!(
+        "webtest-semantic/v1/{parent}/{kind}/{}/{name}/{ordinal}",
+        name.len()
+    ))
+    .as_bytes()
 }
 
 #[cfg(test)]

@@ -31,14 +31,19 @@ pub struct AuthorFacingLanguage {
 pub fn author_facing_language() -> AuthorFacingLanguage {
     AuthorFacingLanguage {
         grammar: [
-            ("source_file", "<test_declaration>*"),
+            ("source_file", "(<import_declaration> | <function_declaration> | <fixture_declaration> | <test_declaration>)*"),
+            ("import_declaration", "import { <Identifier> [as <Identifier>] (, <Identifier> [as <Identifier>])* } from <StringLiteral>"),
+            ("function_declaration", "[export] fn <Identifier>(<typed_parameters>?) -> <Type> (= <expression> | [server | browser] <flow_block>)"),
+            ("fixture_declaration", "[export] fixture <Identifier>(<typed_parameters>?) -> <Type> [scope (test | file | worker | suite)] [shareable] { setup [server | browser] <flow_block> [teardown [server | browser] <flow_block>] }"),
+            ("typed_parameters", "<Identifier>: <Type> (, <Identifier>: <Type>)*"),
+            ("fixture_use", "use <Identifier>(<argument_list>?)"),
             ("test_declaration", "test <StringLiteral> <flow_block>"),
             ("flow_block", "{ <flow_statement>* }"),
             (
                 "flow_statement",
                 "<retry_statement> | <race_statement> | <provide_statement> | <parallel_statement> | <timeout_statement> | <let_binding> | <server_block> | <browser_block> | <value_assertion> | <expression_statement>",
             ),
-            ("let_binding", "let <Identifier> [: <Type>] = (<expression> | <race_statement>)"),
+            ("let_binding", "let <Identifier> [: <Type>] = (<expression> | <fixture_use> | <race_statement>)"),
             ("server_block", "server { <server_statement>* }"),
             (
                 "server_statement",
@@ -75,7 +80,7 @@ pub fn author_facing_language() -> AuthorFacingLanguage {
         lexical_forms: [
             (
                 "Identifier",
-                "ASCII letter or underscore followed by ASCII letters, digits, underscores, or hyphens",
+                "Unicode XID start or underscore followed by Unicode XID continuation, underscores, or hyphens; reserved words are excluded where a declaration name is required",
             ),
             (
                 "StringLiteral",
@@ -143,12 +148,12 @@ pub fn author_facing_language() -> AuthorFacingLanguage {
         .collect(),
         comment_forms: vec!["// line comment".into()],
         composition: vec![
-            "top-level declarations are tests".into(),
+            "files are modules containing imports, exported or private typed helpers/fixtures, and tests".into(),
             "server and browser are capability scopes inside a test flow".into(),
             "retry takes 1 to 64 total attempts and repeats only safe effects after eligible failures, with fresh local state and resource generations, awaited teardown, and bounded cancellable backoff; retry/backoff/max remain contextual names".into(),
             "timeout inherits its enclosing capability domain; its bindings remain local and its deadline cannot extend an ancestor deadline".into(),
             "race chooses the first completed successful child, cancels losers with RaceLost, and awaits teardown; a bound race requires compatible transferable provide results from every child".into(),
-            "provide ends its race branch and must be its final statement; race and provide remain contextual binding/member names".into(),
+            "provide returns from a helper or fixture setup, or ends a race branch; it is the final statement of that result scope".into(),
             "parallel runs 1 to 64 direct child blocks from transferable binding snapshots; branch-local values do not merge and concurrent browser branches own lexical contexts".into(),
             "timeout is contextual and remains usable as a binding, member, or provider parameter name".into(),
             "a binding is visible only after its declaration in the enclosing sequential flow"

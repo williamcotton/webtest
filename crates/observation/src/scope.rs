@@ -6,8 +6,16 @@ use webtest_text::{SourceRevision, SyntaxOrigin};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionContext {
-    pub test_execution_id: TestExecutionId,
-    pub test_id: TestId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_declaration_id: Option<webtest_model::TestDeclarationId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant_id: Option<webtest_model::TestVariantId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixture: Option<crate::FixtureExecutionContext>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_execution_id: Option<TestExecutionId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_id: Option<TestId>,
     pub task_path: Vec<u32>,
     pub scope_id: ExecutionScopeId,
     #[serde(skip_serializing_if = "Option::is_none")]

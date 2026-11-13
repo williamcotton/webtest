@@ -129,6 +129,8 @@ impl Page for FakePage {
 fn plan(revision: SourceRevision) -> TestPlan {
     let file = FileId::new(0);
     TestPlan {
+        fixtures: Vec::new(),
+        source_files: Vec::new(),
         file,
         source_revision: revision,
         required_host_capabilities: vec![Capability::Browser],
@@ -140,6 +142,7 @@ fn plan(revision: SourceRevision) -> TestPlan {
             SyntaxOrigin::new(file, TextRange::empty(TextSize::new(0))),
             revision,
             vec![PlannedStep {
+                origin_chain: Vec::new(),
                 id: StepId(0),
                 origin: SyntaxOrigin::new(
                     file,
@@ -157,6 +160,7 @@ fn plan(revision: SourceRevision) -> TestPlan {
 fn debugger_step_bindings_include_evaluated_redacted_provider_arguments() {
     let file = FileId::new(0);
     let step = PlannedStep {
+        origin_chain: Vec::new(),
         id: StepId(0),
         origin: SyntaxOrigin::new(file, TextRange::empty(TextSize::new(0))),
         operation: TestOperation::ServerProviderCall(ServerProviderCall {
@@ -199,6 +203,7 @@ fn debugger_step_bindings_include_evaluated_redacted_provider_arguments() {
 fn debugger_step_bindings_keep_server_values_visible_in_later_steps() {
     let file = FileId::new(0);
     let step = PlannedStep {
+        origin_chain: Vec::new(),
         id: StepId(2),
         origin: SyntaxOrigin::new(file, TextRange::empty(TextSize::new(0))),
         operation: TestOperation::Browser(BrowserOperation::Navigate {
@@ -371,4 +376,104 @@ fn repair_hints_are_failure_specific_bounded_and_never_claim_actionability_heali
     assert!(!rendered.contains("secret-value"));
     let hints = repair_hints_for_error(&redacted, &inspection);
     assert!(!format!("{hints:?}").contains("private"));
+}
+
+#[tokio::test]
+async fn imported_pure_helpers_evaluate_parameters_once_and_preserve_short_circuit() {
+    let mut database = webtest_analysis::AnalysisDatabase::default();
+    database.configure_workspace(webtest_analysis::WorkspaceConfiguration {
+        root: "/project".into(),
+        ..Default::default()
+    });
+    database.open_file(
+        "/project/support.webtest",
+        r#"
+        export fn email(name: String) -> String = lower(name) + "@example.com"
+        export fn divide(value: Int) -> Float = 10 / value
+        export fn twice(value: Float) -> Float = value + value
+        export fn record(value: Int) -> { value: Int } = { value: value }
+    "#,
+    );
+    let file = database.open_file(
+        "/project/test.webtest",
+        r#"
+        import { email, divide, twice, record } from "./support"
+        test "helpers" {
+            let value = 3
+            expect email(name: "ALICE") == "alice@example.com"
+            expect record(7) matches { value: Int }
+            expect twice(divide(value: value + 2)) == 4
+            expect (false && divide(0) == 1) == false
+        }
+    "#,
+    );
+    let diagnostics = database.diagnostics(file).unwrap();
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    let plan = database.test_plan(file).unwrap();
+    let store = Arc::new(ObservationStore::default());
+    let runner = Runner::new(store);
+    let starts = Arc::new(AtomicUsize::new(0));
+    let host = FakeHost {
+        result: Ok(()),
+        starts: Arc::clone(&starts),
+    };
+    let result = runner.run(&plan, &host).await;
+    assert!(
+        result
+            .tests
+            .iter()
+            .all(|test| matches!(test.outcome, TestOutcome::Passed)),
+        "{result:?}"
+    );
+    assert_eq!(starts.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn statement_helpers_keep_isolated_bindings_and_cross_file_scope_revisions() {
+    let mut database = webtest_analysis::AnalysisDatabase::default();
+    database.configure_workspace(webtest_analysis::WorkspaceConfiguration {
+        root: "/project".into(),
+        ..Default::default()
+    });
+    let library = r#"
+        export fn add(value: Int) -> Int { let other = value + 1 provide other }
+        export fn twice(value: Int) -> Int { let first = add(value) let second = add(first) provide second }
+    "#;
+    let lib = database.open_file("/project/support.webtest", library);
+    let file = database.open_file("/project/test.webtest",r#"
+        import { twice } from "./support"
+        test "helpers" { let value = 9 let result = twice(value: value) expect result == 11 expect value == 9 }
+    "#);
+    let diagnostics = database.diagnostics(file).unwrap();
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    let plan = database.test_plan(file).unwrap();
+    assert!(plan.validate_tree().is_ok(), "{:?}", plan.validate_tree());
+    let runner = Runner::new(Arc::new(ObservationStore::default()));
+    let host = FakeHost {
+        result: Ok(()),
+        starts: Arc::new(AtomicUsize::new(0)),
+    };
+    let result = runner.run(&plan, &host).await;
+    assert!(
+        result
+            .tests
+            .iter()
+            .all(|test| matches!(test.outcome, TestOutcome::Passed)),
+        "{result:?}"
+    );
+    assert!(result.journal.iter().any(|record| {
+        record
+            .metadata
+            .origin
+            .is_some_and(|origin| origin.file == lib)
+            && record.metadata.source_revision == Some(SourceRevision::of(library))
+    }));
+    let mut stale = (*plan).clone();
+    stale
+        .source_files
+        .iter_mut()
+        .find(|source| source.file == lib)
+        .unwrap()
+        .revision = SourceRevision::of("changed");
+    assert!(stale.validate_tree().is_err());
 }

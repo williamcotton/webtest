@@ -16,6 +16,7 @@ pub(crate) fn diagnostic_report(
 ) -> DiagnosticReport {
     let span = source_span(source, diagnostic.range);
     DiagnosticReport {
+        related_locations: diagnostic.related_locations.clone(),
         diagnostic_schema_version: webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
         repair_hint_schema_version: webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
         severity: match diagnostic.severity {
@@ -65,6 +66,7 @@ pub(crate) fn config_diagnostics(
             {
                 let span = source_span(source, step.origin.range);
                 diagnostics.push(DiagnosticReport {
+                    related_locations: Vec::new(),
                     diagnostic_schema_version: webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
                     repair_hint_schema_version: webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
                     severity: "error".into(),
@@ -83,6 +85,7 @@ pub(crate) fn config_diagnostics(
             if timeout.is_some_and(|timeout| timeout > project.config.timeouts.test) {
                 let span = source_span(source, step.origin.range);
                 diagnostics.push(DiagnosticReport {
+                    related_locations: Vec::new(),
                     diagnostic_schema_version: webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
                     repair_hint_schema_version: webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
                     severity: "error".into(),

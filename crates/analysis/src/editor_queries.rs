@@ -7,7 +7,7 @@ use crate::facts::{
 };
 use webtest_model::Type;
 use webtest_provider::{OperationSchema, ProviderRegistry};
-use webtest_syntax::{Parse, SyntaxKind, SyntaxNode, SyntaxToken};
+use webtest_syntax::{Parse, SyntaxKind, SyntaxNode};
 use webtest_text::TextSize;
 
 pub(crate) fn completions(
@@ -22,10 +22,13 @@ pub(crate) fn completions(
         let range = node.text_range();
         u32::from(range.start()) <= offset_u32 && u32::from(range.end()) >= offset_u32
     };
-    if let Some(call) = syntax
+    if !syntax
         .descendants()
-        .filter(|node| node.kind() == SyntaxKind::CallExpr && containing(node))
-        .min_by_key(|node| node.text_range().len())
+        .any(|node| node.kind() == SyntaxKind::MemberExpr && containing(&node))
+        && let Some(call) = syntax
+            .descendants()
+            .filter(|node| node.kind() == SyntaxKind::CallExpr && containing(node))
+            .min_by_key(|node| node.text_range().len())
         && let Some((provider, operation)) = provider_operation_tokens(&call)
         && let Some(operation) = providers
             .schema(&provider)
@@ -54,6 +57,7 @@ pub(crate) fn completions(
                 documentation: parameter.documentation.clone(),
                 kind: CompletionKind::Parameter,
                 insert_text: format!("{}: ", parameter.name),
+                ..Default::default()
             })
             .collect();
     }
@@ -62,66 +66,70 @@ pub(crate) fn completions(
         .filter(|node| node.kind() == SyntaxKind::MemberExpr && containing(node))
         .min_by_key(|node| node.text_range().len())
     {
-        let tokens = meaningful_tokens(&member);
-        if let Some(provider) = tokens.first().map(|token| token.text().to_string())
-            && tokens.iter().any(|token| token.kind() == SyntaxKind::Dot)
+        use rowan::ast::AstNode;
+        let provider = webtest_syntax::ast::MemberExpr::cast(member.clone()).and_then(|member| {
+            match member.receiver()? {
+                webtest_syntax::ast::Expr::Name(name) => Some(name.name()?.text().to_owned()),
+                _ => None,
+            }
+        });
+        if let Some(provider) = provider
             && let Some(schema) = providers.schema(&provider)
         {
             return schema
                 .operations
                 .values()
+                .filter(|operation| {
+                    crate::workspace_editor::context_domain(parsed, offset).is_none_or(|domain| {
+                        operation.capability == webtest_model::Capability::Pure
+                            || operation.capability == domain
+                    })
+                })
                 .map(|operation| Completion {
                     label: operation.name.0.clone(),
                     detail: provider_signature(&provider, operation),
                     documentation: operation.documentation.clone(),
                     kind: CompletionKind::Function,
                     insert_text: format!("{}(", operation.name.0),
+                    ..Default::default()
                 })
                 .collect();
         }
         if let Some(receiver) = member.children().next() {
             let receiver_fact = type_facts
                 .iter()
-                .filter(|fact| {
-                    fact.range.contains(receiver.text_range().start())
-                        || fact.range == receiver.text_range()
-                })
-                .min_by_key(|fact| fact.range.len())
+                .find(|fact| fact.range == receiver.text_range())
                 .or_else(|| {
-                    // A half-typed `value.` is deliberately absent from HIR because the member
-                    // token is missing. Recover the receiver's declaration fact from the
-                    // lossless CST so completion remains useful while editing.
-                    let receiver_name = meaningful_tokens(&receiver)
-                        .first()
-                        .map(|token| token.text().to_string())?;
-                    syntax
-                        .descendants()
-                        .filter(|node| {
-                            node.kind() == SyntaxKind::LetStmt
-                                && node.text_range().end() <= member.text_range().start()
-                        })
-                        .filter_map(|declaration| {
-                            let tokens = meaningful_tokens(&declaration);
-                            let name = tokens.get(1)?;
-                            (name.text() == receiver_name).then_some(name.text_range())
-                        })
-                        .last()
-                        .and_then(|range| type_facts.iter().find(|fact| fact.range == range))
+                    type_facts
+                        .iter()
+                        .filter(|fact| receiver.text_range().contains_range(fact.range))
+                        .max_by_key(|fact| fact.range.len())
                 });
             let Some(fact) = receiver_fact else {
                 return Vec::new();
             };
-            let Type::Record(fields) = &fact.ty else {
-                return Vec::new();
-            };
-            return fields
-                .iter()
-                .map(|(name, field)| Completion {
-                    label: name.clone(),
-                    detail: field.ty.to_string(),
-                    documentation: field.documentation.clone(),
-                    kind: CompletionKind::Property,
-                    insert_text: name.clone(),
+            return fact
+                .ty
+                .member_names()
+                .into_iter()
+                .filter_map(|name| {
+                    let ty = fact.ty.member(&name)?;
+                    let documentation = if let Type::Record(fields) = &fact.ty {
+                        fields
+                            .get(&name)
+                            .map(|field| field.documentation.clone())
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    Some(Completion {
+                        label: name.clone(),
+                        detail: ty.to_string(),
+                        documentation,
+                        kind: CompletionKind::Property,
+                        insert_text: name,
+                        ..Default::default()
+                    })
                 })
                 .collect();
         }
@@ -148,20 +156,45 @@ pub(crate) fn signature_help(
     let operation = providers
         .schema(&provider)
         .and_then(|schema| schema.operation(&operation_name))?;
-    let active_parameter = call
+    let current = call
         .children()
         .filter(|node| node.kind() == SyntaxKind::CallArg)
-        .take_while(|node| u32::from(node.text_range().start()) <= offset_u32)
-        .count()
-        .saturating_sub(1)
+        .enumerate()
+        .filter(|(_, node)| node.text_range().start() <= offset)
+        .last();
+    let active_parameter = current
+        .map_or(0, |(index, node)| {
+            named_argument_token(&node)
+                .and_then(|name| {
+                    operation
+                        .parameters
+                        .iter()
+                        .position(|parameter| parameter.name == name)
+                })
+                .unwrap_or(index)
+        })
         .min(operation.parameters.len().saturating_sub(1));
     Some(Signature {
+        symbol: None,
+        capability: Some(operation.capability),
+        lifetime: None,
         label: provider_signature(&provider, operation),
         documentation: operation.documentation.clone(),
         parameters: operation
             .parameters
             .iter()
             .map(|parameter| SignatureParameter {
+                name: parameter.name.clone(),
+                ty: Some(parameter.ty.clone()),
+                optional: !parameter.required,
+                default: if parameter.secret {
+                    None
+                } else {
+                    parameter
+                        .default
+                        .as_ref()
+                        .and_then(webtest_model::value_to_json)
+                },
                 label: format!("{}: {}", parameter.name, parameter.ty),
                 documentation: parameter.documentation.clone(),
             })
@@ -177,11 +210,16 @@ pub(crate) fn documentation_at(
 ) -> Option<DocumentationFact> {
     let syntax = parsed.syntax();
     let offset_u32 = u32::from(offset);
-    for call in syntax.descendants().filter(|node| {
-        node.kind() == SyntaxKind::CallExpr
-            && u32::from(node.text_range().start()) <= offset_u32
-            && u32::from(node.text_range().end()) >= offset_u32
-    }) {
+    let mut calls = syntax
+        .descendants()
+        .filter(|node| {
+            node.kind() == SyntaxKind::CallExpr
+                && u32::from(node.text_range().start()) <= offset_u32
+                && u32::from(node.text_range().end()) >= offset_u32
+        })
+        .collect::<Vec<_>>();
+    calls.sort_by_key(|node| node.text_range().len());
+    for call in calls {
         if let Some((provider, operation_name)) = provider_operation_tokens(&call)
             && let Some(operation) = providers
                 .schema(&provider)
@@ -202,30 +240,25 @@ pub(crate) fn documentation_at(
     None
 }
 
-fn meaningful_tokens(node: &SyntaxNode) -> Vec<SyntaxToken> {
-    node.descendants_with_tokens()
-        .filter_map(|element| element.into_token())
-        .filter(|token| !token.kind().is_trivia())
-        .collect()
-}
-
 fn provider_operation_tokens(node: &SyntaxNode) -> Option<(String, String)> {
-    let tokens = meaningful_tokens(node);
-    let dot = tokens
-        .iter()
-        .position(|token| token.kind() == SyntaxKind::Dot)?;
+    use rowan::ast::AstNode;
+    use webtest_syntax::ast;
+    let call = ast::CallExpr::cast(node.clone())?;
+    let ast::Expr::Member(member) = call.callee()? else {
+        return None;
+    };
+    let ast::Expr::Name(receiver) = member.receiver()? else {
+        return None;
+    };
     Some((
-        tokens.get(dot.checked_sub(1)?)?.text().into(),
-        tokens.get(dot + 1)?.text().into(),
+        receiver.name()?.text().to_owned(),
+        member.member()?.text().to_owned(),
     ))
 }
 
 fn named_argument_token(node: &SyntaxNode) -> Option<String> {
-    let tokens = meaningful_tokens(node);
-    tokens
-        .iter()
-        .any(|token| token.kind() == SyntaxKind::Colon)
-        .then(|| tokens.first().map(|token| token.text().into()))?
+    use rowan::ast::AstNode;
+    webtest_syntax::ast::CallArg::cast(node.clone())?.name()
 }
 
 fn provider_signature(provider: &str, operation: &OperationSchema) -> String {
@@ -379,7 +412,14 @@ mod tests {
             offset(source, "json") + TextSize::from(1),
         )
         .expect("signature");
-        assert_eq!(signature.active_parameter, 2);
+        assert_eq!(
+            signature.active_parameter,
+            signature
+                .parameters
+                .iter()
+                .position(|parameter| parameter.name == "json")
+                .unwrap()
+        );
         assert!(signature.parameters.len() > signature.active_parameter);
     }
 

@@ -21,6 +21,7 @@ pub enum DiagnosticSource {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Diagnostic {
+    pub related_locations: Vec<webtest_text::SourceLocation>,
     pub range: TextRange,
     pub severity: DiagnosticSeverity,
     pub code: &'static str,

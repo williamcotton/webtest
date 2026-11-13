@@ -11,6 +11,7 @@ use webtest_model::ExecutionScopeId;
 struct CancellationState {
     cause: Option<Cancellation>,
     cancelled_at: Option<Instant>,
+    cleanup_started_at: Option<Instant>,
     children: Vec<Weak<CancellationInner>>,
 }
 #[derive(Debug, Default)]
@@ -33,6 +34,9 @@ impl CancellationToken {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.children.retain(|child| child.strong_count() != 0);
         state.children.push(Arc::downgrade(&child.0));
+        if let Some(at) = state.cleanup_started_at {
+            child.start_cleanup_at(at);
+        }
         if let (Some(cause), Some(at)) = (state.cause, state.cancelled_at) {
             child.cancel_at(cause, at);
         }
@@ -72,7 +76,8 @@ impl CancellationToken {
             }
             state.cause = Some(cause);
             state.cancelled_at = Some(at);
-            std::mem::take(&mut state.children)
+            state.children.retain(|child| child.strong_count() != 0);
+            state.children.clone()
         };
         accepted(cause);
         self.0.wake.notify_waiters();
@@ -83,12 +88,37 @@ impl CancellationToken {
 
     /// Cancellation establishes one monotonic cleanup epoch, including for
     /// descendants polled or created later. Scheduling delays cannot reset it.
-    pub(crate) fn cleanup_deadline(&self, timeout: Duration) -> Instant {
+    pub(crate) fn start_cleanup_at(&self, at: Instant) {
+        let children = {
+            let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state
+                .cleanup_started_at
+                .is_some_and(|existing| existing <= at)
+            {
+                return;
+            }
+            state.cleanup_started_at = Some(at);
+            state.children.retain(|child| child.strong_count() != 0);
+            state.children.clone()
+        };
+        for child in children.into_iter().filter_map(|child| child.upgrade()) {
+            Self(child).start_cleanup_at(at);
+        }
+    }
+    pub(crate) fn cleanup_started_at(&self) -> Option<Instant> {
         self.0
             .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|e| e.into_inner())
+            .cleanup_started_at
+    }
+    pub(crate) fn cleanup_deadline(&self, timeout: Duration) -> Instant {
+        let state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        state
             .cancelled_at
+            .into_iter()
+            .chain(state.cleanup_started_at)
+            .min()
             .unwrap_or_else(Instant::now)
             + timeout
     }
@@ -213,6 +243,38 @@ mod tests {
         root.child().cancel(cause);
         assert!(root.cause().is_none());
         assert!(root.child().cause().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn normal_cleanup_shares_one_epoch_without_inventing_a_cancellation() {
+        let parent = CancellationToken::default();
+        let first = parent.child();
+        let at = Instant::now();
+        parent.start_cleanup_at(at);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let late = parent.child();
+        for token in [&parent, &first, &late] {
+            assert!(token.cause().is_none());
+            assert_eq!(
+                token.cleanup_deadline(Duration::from_secs(3)),
+                at + Duration::from_secs(3)
+            );
+        }
+        parent.start_cleanup_at(Instant::now());
+        parent.cancel(Cancellation {
+            reason: webtest_host::CancellationReason::RunnerShutdown,
+            causing_scope_id: ExecutionScopeId(1),
+        });
+        assert_eq!(
+            late.cleanup_deadline(Duration::from_secs(3)),
+            at + Duration::from_secs(3)
+        );
+        let newest = parent.child();
+        assert_eq!(
+            newest.cleanup_deadline(Duration::from_secs(3)),
+            at + Duration::from_secs(3)
+        );
+        assert_eq!(newest.cause(), parent.cause());
     }
 
     #[tokio::test(start_paused = true)]

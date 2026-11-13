@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, num::NonZeroUsize, time::Duration};
 
 use crate::{ExecutionEvent, ExecutionId};
 
-pub const EVENT_JOURNAL_SCHEMA_VERSION: u32 = 9;
+pub const EVENT_JOURNAL_SCHEMA_VERSION: u32 = 10;
 
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
@@ -153,7 +153,7 @@ impl ReplayJournal {
     /// Select a known archive schema explicitly. Live replay defaults to the
     /// current schema; older archives retain their original envelopes unchanged.
     pub fn for_schema(capacity: NonZeroUsize, schema_version: u32) -> Result<Self, ReplayError> {
-        if !matches!(schema_version, 8 | EVENT_JOURNAL_SCHEMA_VERSION) {
+        if !matches!(schema_version, 8 | 9 | EVENT_JOURNAL_SCHEMA_VERSION) {
             return Err(ReplayError::UnsupportedSchema {
                 found: schema_version,
             });
@@ -514,7 +514,7 @@ mod wire_tests {
         assert_eq!(
             json,
             serde_json::json!({
-                "schema_version": 9, "execution_id": "00000000000000000000000000000009", "event_sequence": 0,
+                "schema_version": EVENT_JOURNAL_SCHEMA_VERSION, "execution_id": "00000000000000000000000000000009", "event_sequence": 0,
                 "timestamp": {"since_unix_epoch": {"secs":123,"nanos":0}, "elapsed":{"secs":0,"nanos":5}},
                 "execution_context": {}, "kind": "run_started", "payload": {"execution_id":"00000000000000000000000000000009"}
             })

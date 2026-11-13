@@ -11,6 +11,9 @@ use webtest_model::{
 };
 use webtest_text::{FileId, SourceRevision, SyntaxOrigin};
 
+mod fixtures;
+pub use fixtures::{FixtureAcquire, FixtureDefinition, FixtureParameter};
+mod expressions;
 mod resources;
 mod retry;
 pub use retry::{
@@ -27,11 +30,13 @@ pub use tree::{
 mod compatibility;
 pub use compatibility::{PlanCompatibilityError, PlanExecutionInputs};
 
-pub const PLAN_FORMAT_VERSION: u32 = 9;
-pub const RUNTIME_SEMANTICS_VERSION: u32 = 6;
+pub const PLAN_FORMAT_VERSION: u32 = 10;
+pub const RUNTIME_SEMANTICS_VERSION: u32 = 7;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PlanEnvelope {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fixtures: Vec<FixtureDefinition>,
     pub format_version: u32,
     pub runtime_semantics_version: u32,
     pub project_input_fingerprint: SourceRevision,
@@ -57,20 +62,54 @@ impl PlanEnvelope {
         project_identity: impl Into<String>,
         provider_schema_hashes: BTreeMap<String, String>,
     ) -> Self {
-        Self {
+        let path = path.into();
+        let mut envelope = Self {
             format_version: PLAN_FORMAT_VERSION,
             runtime_semantics_version: RUNTIME_SEMANTICS_VERSION,
             project_input_fingerprint: SourceRevision::of("webtest-inputs/v1/portable"),
             compiler_version: env!("CARGO_PKG_VERSION").into(),
             project_identity: project_identity.into(),
-            source_files: vec![PlanSourceFile {
-                file: plan.file,
-                path: path.into(),
-                revision: plan.source_revision,
-            }],
+            source_files: if plan.source_files.is_empty() {
+                vec![PlanSourceFile {
+                    file: plan.file,
+                    path: path.clone(),
+                    revision: plan.source_revision,
+                }]
+            } else {
+                plan.source_files.clone()
+            },
             required_host_capabilities: plan.required_host_capabilities.clone(),
             provider_schema_hashes,
             tests: plan.tests.clone(),
+            fixtures: plan.fixtures.clone(),
+        };
+        if let Some(source) = envelope
+            .source_files
+            .iter_mut()
+            .find(|source| source.file == plan.file)
+        {
+            source.path = path;
+        }
+        envelope.remap_source_links();
+        envelope
+    }
+    /// Apply a host's explicit path projection consistently to related locations.
+    pub fn remap_source_links(&mut self) {
+        let nodes = self.tests.iter_mut().map(|test| &mut test.body).chain(
+            self.fixtures
+                .iter_mut()
+                .flat_map(|fixture| [&mut fixture.setup, &mut fixture.teardown]),
+        );
+        for node in nodes {
+            for step in node.steps_mut() {
+                for link in &mut step.origin_chain {
+                    if let Some(source) = self.source_files.iter().find(|source| {
+                        source.file == link.origin.file && source.revision == link.revision
+                    }) {
+                        link.path = source.path.clone();
+                    }
+                }
+            }
         }
     }
 
@@ -118,6 +157,10 @@ impl std::error::Error for UnsupportedPlanVersion {}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TestPlan {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fixtures: Vec<FixtureDefinition>,
+    #[serde(default)]
+    pub source_files: Vec<PlanSourceFile>,
     pub file: FileId,
     pub source_revision: SourceRevision,
     pub required_host_capabilities: Vec<Capability>,
@@ -125,6 +168,42 @@ pub struct TestPlan {
 }
 
 impl TestPlan {
+    /// Select authored executable variants without changing their source or plan identities.
+    pub fn select_variants(&self, selected: &BTreeSet<webtest_model::TestVariantId>) -> Self {
+        let tests = self
+            .tests
+            .iter()
+            .filter(|test| selected.contains(&test.variant_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        Self {
+            file: self.file,
+            source_revision: self.source_revision,
+            source_files: self.source_files.clone(),
+            fixtures: self.fixtures.clone(),
+            required_host_capabilities: Self::required_capability_union(&tests),
+            tests,
+        }
+    }
+
+    pub fn source_revision_for(&self, file: FileId) -> Option<SourceRevision> {
+        self.source_files
+            .iter()
+            .find(|source| source.file == file)
+            .map(|source| source.revision)
+            .or_else(|| (self.file == file).then_some(self.source_revision))
+    }
+    pub fn sources(&self) -> Vec<(FileId, SourceRevision)> {
+        if self.source_files.is_empty() {
+            vec![(self.file, self.source_revision)]
+        } else {
+            self.source_files
+                .iter()
+                .map(|source| (source.file, source.revision))
+                .collect()
+        }
+    }
+
     pub fn required_capability_union(tests: &[PlannedTest]) -> Vec<Capability> {
         tests
             .iter()
@@ -141,6 +220,8 @@ impl TestPlan {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PlannedTest {
+    pub test_declaration_id: webtest_model::TestDeclarationId,
+    pub variant_id: webtest_model::TestVariantId,
     pub id: TestId,
     pub declaration_id: webtest_model::PlanDeclarationId,
     pub name: String,
@@ -210,6 +291,8 @@ fn is_sorted_unique(capabilities: &[Capability]) -> bool {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PlannedStep {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub origin_chain: Vec<webtest_text::SourceLocation>,
     pub id: StepId,
     pub operation: TestOperation,
     pub origin: SyntaxOrigin,
@@ -218,6 +301,8 @@ pub struct PlannedStep {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "operation", rename_all = "snake_case")]
 pub enum TestOperation {
+    AcquireFixture(FixtureAcquire),
+    Return(ProvideOperation),
     Provide(ProvideOperation),
     EvaluatePure(EvaluatePureOperation),
     ServerProviderCall(ServerProviderCall),
@@ -266,6 +351,16 @@ pub struct ServerProviderCall {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum PlanExpr {
+    /// A statically resolved, acyclic pure specialization. Arguments are evaluated
+    /// once in author order; the body has an isolated parameter environment.
+    PureCall {
+        metadata: Box<PureCallMetadata>,
+        arguments: Vec<(BindingId, PlanExpr)>,
+        body: Box<PlanExpr>,
+    },
+    Lower {
+        value: Box<PlanExpr>,
+    },
     Literal(Value),
     Binding(BindingId),
     List(Vec<PlanExpr>),
@@ -423,6 +518,8 @@ mod tests {
         let file = FileId::new(4);
         let revision = SourceRevision::of("test");
         let plan = TestPlan {
+            fixtures: Vec::new(),
+            source_files: Vec::new(),
             file,
             source_revision: revision,
             required_host_capabilities: vec![Capability::Server],
@@ -434,6 +531,7 @@ mod tests {
                 SyntaxOrigin::new(file, TextRange::default()),
                 revision,
                 vec![PlannedStep {
+                    origin_chain: Vec::new(),
                     id: StepId(0),
                     operation: TestOperation::EvaluatePure(EvaluatePureOperation {
                         expression: PlanExpr::Literal(Value::Int(1)),
@@ -509,6 +607,8 @@ mod tests {
             )
         };
         let mut plan = TestPlan {
+            fixtures: Vec::new(),
+            source_files: Vec::new(),
             file,
             source_revision: SourceRevision::of("tests"),
             required_host_capabilities: vec![Capability::Server, Capability::Browser],
@@ -532,4 +632,41 @@ mod tests {
             Err(CapabilityInvariantError::TestCapabilitiesNotSorted { test: TestId(1) })
         ));
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HelperCall {
+    pub function: webtest_model::FunctionId,
+    pub name: String,
+    pub declaration: SyntaxOrigin,
+    pub declaration_revision: SourceRevision,
+    pub arguments: Vec<HelperArgument>,
+    pub result: Option<RaceBinding>,
+    pub result_type: Type,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HelperArgument {
+    pub parameter: BindingId,
+    pub name: String,
+    pub value: PlanExpr,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HelperParameter {
+    pub binding: BindingId,
+    pub name: String,
+    pub ty: Type,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PureCallMetadata {
+    pub function: webtest_model::FunctionId,
+    pub name: String,
+    pub parameters: Vec<HelperParameter>,
+    pub result_type: Type,
+    pub body_origin: SyntaxOrigin,
+    pub declaration: SyntaxOrigin,
+    pub declaration_revision: SourceRevision,
+    pub call: SyntaxOrigin,
+    pub call_revision: SourceRevision,
 }

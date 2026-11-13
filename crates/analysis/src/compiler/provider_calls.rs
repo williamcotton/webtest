@@ -39,11 +39,7 @@ impl Compiler<'_> {
                     "`app` is reserved for the application bridge".into(),
                 );
             } else {
-                let known = self
-                    .providers
-                    .schemas()
-                    .map(|schema| schema.name.0.clone())
-                    .collect::<Vec<_>>();
+                let known = self.providers.names();
                 let candidates = nearest_strings(&known, provider, 5);
                 self.error_with_details(
                     receiver.origin.range,
@@ -218,10 +214,13 @@ impl Compiler<'_> {
             .filter(|parameter| parameter.required)
         {
             if !values.contains_key(&parameter.name) {
-                self.error(
+                self.error_with_details(
                     call_range,
                     "semantic.missing_argument",
                     format!("missing required argument `{}`", parameter.name),
+                    serde_json::json!({"parameter":parameter.name,"type":parameter.ty}),
+                    Vec::new(),
+                    vec!["provider".into()],
                 );
             }
         }

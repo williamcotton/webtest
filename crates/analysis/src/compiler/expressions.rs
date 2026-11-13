@@ -16,6 +16,9 @@ impl Compiler<'_> {
         domain: Capability,
         expected: Option<&Type>,
     ) -> TypedExpr {
+        if let Some((db, _)) = self.workspace {
+            db.unwind_if_revision_cancelled();
+        }
         let result = match &expression.kind {
             HirExprKind::Literal(literal) => match literal {
                 HirLiteral::String(value) => {
@@ -176,7 +179,7 @@ impl Compiler<'_> {
                         capability: receiver.capability,
                     }
                 } else {
-                    if receiver.ty != Type::Unknown {
+                    if receiver.ty != Type::Unknown && !member.is_empty() {
                         let known = super::type_system::known_members(&receiver.ty);
                         let candidates = nearest_strings(&known, member, 5);
                         let message = if let Some(best) = candidates.first() {
@@ -208,6 +211,9 @@ impl Compiler<'_> {
                 }
             }
             HirExprKind::Call { .. } => {
+                if let Some(call) = self.pure_helper(expression, domain) {
+                    return call;
+                }
                 if let Some(call) = self.provider_call(expression, domain) {
                     self.error(
                         expression.origin.range,
@@ -280,6 +286,14 @@ impl Compiler<'_> {
                     ty,
                     capability: Capability::Pure,
                 }
+            }
+            HirExprKind::FixtureUse(_) => {
+                self.error(
+                    expression.origin.range,
+                    "semantic.unresolved_fixture",
+                    "fixture resolution requires a workspace declaration".into(),
+                );
+                super::type_system::unknown_expr()
             }
             HirExprKind::Missing => super::type_system::unknown_expr(),
         };

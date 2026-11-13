@@ -365,6 +365,7 @@ fn plan_with_tests(
                         let step_id = StepId(next_step);
                         next_step += 1;
                         PlannedStep {
+                            origin_chain: Vec::new(),
                             id: step_id,
                             origin: origin(file, step_id.0 + 10),
                             operation,
@@ -375,6 +376,8 @@ fn plan_with_tests(
         })
         .collect();
     TestPlan {
+        fixtures: Vec::new(),
+        source_files: Vec::new(),
         file,
         source_revision: SourceRevision::of("lifecycle"),
         required_host_capabilities: capabilities,
@@ -389,6 +392,9 @@ fn test_capabilities(
     let mut capabilities = BTreeSet::new();
     for operation in operations {
         match operation {
+            TestOperation::AcquireFixture(call) => {
+                capabilities.extend(call.required_capabilities.iter().copied());
+            }
             TestOperation::ServerProviderCall(_) => {
                 capabilities.insert(Capability::Server);
             }
@@ -402,7 +408,9 @@ fn test_capabilities(
             TestOperation::Assertion(webtest_plan::AssertionOperation::Value { .. }) => {
                 capabilities.insert(Capability::Test);
             }
-            TestOperation::EvaluatePure(_) | TestOperation::Provide(_) => {}
+            TestOperation::EvaluatePure(_)
+            | TestOperation::Provide(_)
+            | TestOperation::Return(_) => {}
         }
     }
     if capabilities.is_empty() && plan_capabilities.contains(&Capability::Pure) {
@@ -429,6 +437,10 @@ fn compile_source(source: &str) -> TestPlan {
 mod abort_journal;
 #[path = "lifecycle/cancellation_journal.rs"]
 mod cancellation_journal;
+#[path = "lifecycle/fixtures.rs"]
+mod fixtures;
+#[path = "lifecycle/helpers.rs"]
+mod helpers;
 #[path = "lifecycle/identity.rs"]
 mod identity;
 #[path = "lifecycle/jobs.rs"]
@@ -838,7 +850,8 @@ fn event_names(events: &[ExecutionEvent]) -> Vec<&'static str> {
         .filter(|event| {
             !matches!(
                 event,
-                ExecutionEvent::OutputCaptured { .. }
+                ExecutionEvent::FixtureAcquired { .. }
+                    | ExecutionEvent::OutputCaptured { .. }
                     | ExecutionEvent::CancellationRequested { .. }
                     | ExecutionEvent::ScopeAborted { .. }
                     | ExecutionEvent::AttachmentCreated { .. }
@@ -849,7 +862,8 @@ fn event_names(events: &[ExecutionEvent]) -> Vec<&'static str> {
             )
         })
         .map(|event| match event {
-            ExecutionEvent::OutputCaptured { .. }
+            ExecutionEvent::FixtureAcquired { .. }
+            | ExecutionEvent::OutputCaptured { .. }
             | ExecutionEvent::CancellationRequested { .. }
             | ExecutionEvent::ScopeAborted { .. }
             | ExecutionEvent::AttachmentCreated { .. }
@@ -916,7 +930,9 @@ impl RunEventSink for ArtifactCheckingEventSink {
         };
         let stem = format!(
             "test-{}-step-{}-execution-{}",
-            test_id.0, step_id.0, execution_id
+            test_id.expect("test-owned attachment").0,
+            step_id.0,
+            execution_id
         );
         self.artifacts_ready.store(
             [
@@ -1583,6 +1599,9 @@ async fn observations_are_cleared_before_lazy_browser_start_can_fail() {
         ],
     );
     store.record(RuntimeObservation {
+        related_locations: Vec::new(),
+        test_declaration_id: None,
+        variant_id: None,
         execution_id: ExecutionId::from_u128(1),
         file: plan.file,
         source_revision: plan.source_revision,
@@ -1749,7 +1768,10 @@ async fn context_aware_control_observes_internal_failures_without_user_diagnosti
     let frame = context.frames.last().unwrap();
     assert_eq!(frame.kind, webtest_runtime::DebugScopeKind::Operation);
     assert_eq!(frame.scope.origin, plan.tests[0].steps()[0].origin);
-    assert_eq!(frame.scope.execution_context.test_id, plan.tests[0].id);
+    assert_eq!(
+        frame.scope.execution_context.test_id,
+        Some(plan.tests[0].id)
+    );
     assert_eq!(result.aborted(), 1);
     assert!(
         store
@@ -1766,6 +1788,9 @@ async fn internal_step_failure_aborts_with_typed_events_and_no_user_observation(
         vec![vec![missing_binding()], vec![pure(Value::Null)]],
     );
     store.record(RuntimeObservation {
+        related_locations: Vec::new(),
+        test_declaration_id: None,
+        variant_id: None,
         execution_id: ExecutionId::from_u128(1),
         file: plan.file,
         source_revision: plan.source_revision,
@@ -1841,6 +1866,9 @@ async fn internal_step_failure_aborts_with_typed_events_and_no_user_observation(
     ));
 
     store.record(RuntimeObservation {
+        related_locations: Vec::new(),
+        test_declaration_id: None,
+        variant_id: None,
         execution_id: result.execution_id.expect("run started"),
         file: plan.file,
         source_revision: plan.source_revision,

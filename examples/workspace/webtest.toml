@@ -1,0 +1,7 @@
+[project]
+test_roots = ["tests"]
+source_roots = ["tests", "support"]
+
+[trace]
+mode = "retain-on-failure"
+sources = true

@@ -126,6 +126,8 @@ pub enum RunError {
     #[error(transparent)]
     JournalOverflow(crate::JournalOverflow),
     #[error(transparent)]
+    FixtureBudget(webtest_observation::FixtureBudgetExceeded),
+    #[error(transparent)]
     Browser(#[from] BrowserError),
     #[error(transparent)]
     Provider(#[from] ProviderError),
@@ -150,6 +152,7 @@ impl RunError {
                 message: error.to_string(),
             },
             Self::JournalOverflow(error) => F::JournalOverflow(*error),
+            Self::FixtureBudget(error) => F::FixtureBudget(*error),
             Self::Browser(error) => F::Browser(error.clone()),
             Self::Provider(error) => F::Provider(error.clone()),
             Self::Cleanup(error) => F::Cleanup(error.clone()),
@@ -170,6 +173,7 @@ impl RunError {
             Self::Cleanup(failure) => failure.code(),
             Self::ExecutionIdentity(_) => RuntimeFailureCode::ExecutionIdentityUnavailable,
             Self::JournalOverflow(_) => RuntimeFailureCode::JournalCapacityExceeded,
+            Self::FixtureBudget(_) => RuntimeFailureCode::FixtureBudgetExceeded,
             Self::Multiple { primary, .. } => primary.code(),
             Self::Internal(_) => RuntimeFailureCode::InternalError,
         }
@@ -180,6 +184,7 @@ impl RunError {
             Self::ExecutionIdentity(_)
             | Self::Browser(_)
             | Self::Provider(_)
+            | Self::FixtureBudget(_)
             | Self::JournalOverflow(_) => FailureClass::Infrastructure,
             Self::Cleanup(failure) => failure.failure_class(),
             Self::Multiple { primary, .. } => primary.failure_class(),

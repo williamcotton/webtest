@@ -4,6 +4,8 @@ pub mod ast;
 mod error;
 mod kind;
 mod lexer;
+#[cfg(test)]
+mod module_tests;
 mod parser;
 mod reference;
 
@@ -401,4 +403,65 @@ mod retry_tests {
         assert_eq!(retry.max_backoff().unwrap().syntax().text(), "1s");
         assert_eq!(retry.flow_statements().count(), 1);
     }
+}
+
+pub use lexer::{is_valid_identifier, keyword_kind};
+pub fn is_name_kind(kind: SyntaxKind) -> bool {
+    matches!(
+        kind,
+        SyntaxKind::Ident
+            | SyntaxKind::ScopeKw
+            | SyntaxKind::FileKw
+            | SyntaxKind::WorkerKw
+            | SyntaxKind::SuiteKw
+            | SyntaxKind::SetupKw
+            | SyntaxKind::TeardownKw
+            | SyntaxKind::ShareableKw
+            | SyntaxKind::FromKw
+            | SyntaxKind::AsKw
+            | SyntaxKind::TimeoutKw
+            | SyntaxKind::ParallelKw
+            | SyntaxKind::RaceKw
+            | SyntaxKind::ProvideKw
+            | SyntaxKind::RetryKw
+            | SyntaxKind::BackoffKw
+            | SyntaxKind::MaxKw
+            | SyntaxKind::NameKw
+            | SyntaxKind::IdKw
+            | SyntaxKind::RoleKw
+            | SyntaxKind::LabelKw
+            | SyntaxKind::TextKw
+            | SyntaxKind::PlaceholderKw
+            | SyntaxKind::TestIdKw
+            | SyntaxKind::CssKw
+            | SyntaxKind::XPathKw
+            | SyntaxKind::UrlKw
+            | SyntaxKind::OptionKw
+    )
+}
+
+pub fn is_binding_name_kind(kind: SyntaxKind) -> bool {
+    matches!(
+        kind,
+        SyntaxKind::Ident
+            | SyntaxKind::ScopeKw
+            | SyntaxKind::FileKw
+            | SyntaxKind::WorkerKw
+            | SyntaxKind::SuiteKw
+            | SyntaxKind::SetupKw
+            | SyntaxKind::TeardownKw
+            | SyntaxKind::ShareableKw
+            | SyntaxKind::FromKw
+            | SyntaxKind::AsKw
+            | SyntaxKind::TimeoutKw
+            | SyntaxKind::ParallelKw
+            | SyntaxKind::RaceKw
+            | SyntaxKind::ProvideKw
+            | SyntaxKind::RetryKw
+            | SyntaxKind::BackoffKw
+            | SyntaxKind::MaxKw
+    )
+}
+pub fn is_valid_binding_identifier(name: &str) -> bool {
+    lexer::is_valid_binding_identifier(name)
 }

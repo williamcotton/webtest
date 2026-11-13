@@ -9,6 +9,7 @@ mod error;
 mod evaluation;
 mod events;
 mod execution;
+pub mod fixtures;
 mod host_resources;
 mod identity;
 pub use host_resources::HostResourceJournal;

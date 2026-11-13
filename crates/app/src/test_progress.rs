@@ -267,7 +267,8 @@ impl HumanTestProgress {
                     writeln!(state.output, "test {name:?} ... SKIPPED")?;
                 }
                 ExecutionEvent::RunFinished { .. } => {}
-                ExecutionEvent::OutputCaptured { .. }
+                ExecutionEvent::FixtureAcquired { .. }
+                | ExecutionEvent::OutputCaptured { .. }
                 | ExecutionEvent::CancellationRequested { .. }
                 | ExecutionEvent::ScopeAborted { .. }
                 | ExecutionEvent::Wait { .. }

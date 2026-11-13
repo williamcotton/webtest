@@ -8,6 +8,7 @@ pub(crate) fn collect(parsed: &Parse) -> Vec<Diagnostic> {
         .errors()
         .iter()
         .map(|error| Diagnostic {
+            related_locations: Vec::new(),
             range: error.range,
             severity: DiagnosticSeverity::Error,
             code: error.code,
@@ -81,6 +82,7 @@ fn invalid_duration_diagnostics(parsed: &Parse) -> Vec<Diagnostic> {
             }
             .is_some();
             (!valid).then(|| Diagnostic {
+                related_locations: Vec::new(),
                 range: token.text_range(),
                 severity: DiagnosticSeverity::Error,
                 code: "semantic.invalid_duration",

@@ -6,6 +6,40 @@ This specification expands Milestone F in [`future-functionality.md`](./future-f
 
 Milestone F turns the one-file analysis cache into a dependency-tracked workspace and adds modules, reusable declarations, fixtures, and full protocol-neutral editor intelligence. The same semantic database answers editor, CLI, and machine-description queries; the native LSP remains an adapter over Rust editor services.
 
+### Implementation status — 2026-11-13
+
+The implementation covers the delivery slices below and automated acceptance passes. Interactive Cursor acceptance remains unverified because computer-use access was not approved.
+
+Salsa 0.26.2 tracks explicit source, configuration, canonical aliases, missing paths, and individual provider schemas. Shared queries cover parsing, HIR, module resolution, callable signatures, compilation, and editor services. Request snapshots support typed cancellation; completed results remain immutable. Selective invalidation, unrelated-input reuse, bounded memo retention, and 1,000-edit tests exercise the database boundary.
+
+The canonical lossless parser, typed AST/HIR, analysis, and plan compiler support Unicode module imports/exports, typed pure and statement helpers, and fixtures. Resolution reports missing/private/ambiguous/case-colliding imports and shortest cycles. Helpers retain isolated bindings, argument order, evaluation-once semantics, lazy boolean evaluation, typed returns, and cross-file source revisions. Both helper forms have explicit runtime scopes and DAP safe points.
+
+Fixture setup and teardown use the existing statement compiler and runtime resource driver. The owned coordinator caches one terminal acquisition per definition, lifetime owner, and argument set; abandoned waiters do not abandon setup. Test/attempt, file, worker, and suite owners close through scheduler boundaries, await partial setup and native cleanup, and tear down successful acquisitions in reverse order. Setup bindings remain available to teardown; new acquisition during teardown is rejected statically. Shared results require explicit shareability and transferable values. Native results remain test-scoped. Retry reacquires test fixtures while retaining longer-lived instances. Typed scope/acquisition facts link consumers to actual fixture owners without fabricated test identities; primary and cleanup failures remain separate.
+
+Shared Rust services supply import/auto-import and typed completion, named-argument signatures, hover, definitions, references, rename, symbols, folding, selection ranges, versioned repair actions, inlay hints, and semantic tokens. Static `project.declarations` description exposes bounded exported helper/fixture metadata and authored tests. The portable Workspace facade accepts explicit source/version/URI, configuration, alias, and offline-schema transactions and uses the same query implementation. Invalid schema replacement evicts stale operations.
+
+The LSP applies transactional incremental UTF-16 edits, requests full resynchronization after invalid changes, cancels stale queries, and guards publication by source revision and observation generation. Native source/configuration/schema refresh preserves synchronized buffers, resolves newly added imports, and republishes dependent open documents. Multiple workspace folders are explicitly rejected.
+
+Discovery separates authored declaration IDs from default variant IDs. The Testing API maps the shared tree to Run/Debug profiles, selection/exclusion, synchronized snapshot execution, cancellation, and source-linked results. Selected files execute through one scheduler invocation so suite fixtures share correctly. DAP captures dependency sources and unsaved overrides, supports helper and fixture phase breakpoints/frames, and retains the snapshot on restart. Automated Testing API tests exercise routing and result handling; a live Cursor walkthrough has not been performed.
+
+CLI reports and trace capture use captured dependency sources rather than rereading changed files. Cross-file failures retain their source location and related declaration links. Plan format 10, runtime semantics 7, native journal schema 10, and report schema 14 version the new identities and fixture contexts. Trace reading retains compatibility with native journal schemas 8 and 9.
+
+The benchmark now contains 1,000 actual imported modules and 5,000 declarations, including helpers and fixtures, with a 1,000-module import chain and malformed inputs. Original numeric budgets remain unchanged; raw measurements and workload details live under `benchmarks/workspace`. Installed language descriptions, authoring skill/bootstrap parity, syntax reference, and the runnable `examples/workspace` project document the delivered surface.
+
+### Acceptance evidence
+
+Verified on Apple Silicon/macOS on 2026-11-13:
+
+- `cargo test --workspace -- --test-threads=1`: 689 tests passed, none failed or ignored, including native Chrome, LSP/DAP protocol, fixture lifecycle, journal replay, and cross-file trace coverage.
+- The final shared-formatter refinement has a dedicated declaration/documentation regression and a follow-up analysis/editor/WASM library run.
+- `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets -- -D warnings`.
+- Portable `webtest-wasm` and `webtest-trace` target checks with the installed rustup stable `wasm32-unknown-unknown` toolchain.
+- The release workspace benchmark with `--check`: initial analysis 719.03 ms, completion p95 188.21 µs, 100 local edits 20.20 ms; unchanged budgets 1,000 ms, 1,000 µs, and 100 ms.
+- Extension `npm run test:testing`: three automated Testing API regressions; `npm run smoke`: compiled and packaged VSIX with shared discovery/run/cancellation entry points.
+- `examples/workspace`: canonical formatting, zero static diagnostics, three passing tests with two workers, and bounded static project description.
+
+These are automated results, not a live Cursor walkthrough. No Cursor UI state was inspected or changed after computer-use access was declined. CI retains the isolated extension-host activation check; that GUI check was not run locally. Existing Milestone E boundaries, including Windows CLI-to-LSP publication and browser capture controls, remain outside this milestone.
+
 ## 1. Outcome
 
 A multi-file project remains responsive while users import helpers/fixtures, navigate and rename symbols, complete typed provider calls and returned values, discover tests, and receive current static/runtime information:
@@ -156,7 +190,7 @@ Definition, references, rename, hover, and signature help operate on stable `Fun
 
 A fixture declares parameters, result type, capability, dependencies, lifetime, setup, provided value, teardown, and optional bounded human documentation. It lowers to explicit resource/plan scopes from Milestone E; teardown is never hidden in an SDK callback.
 
-Fixture dependencies form an acyclic graph. Acquisition follows dependency order; teardown runs in reverse successful-acquisition order exactly once.
+Fixture dependencies form an acyclic graph and are acquired during setup; teardown uses retained bindings and cannot acquire new fixtures. Acquisition follows dependency order; teardown runs in reverse successful-acquisition order exactly once.
 
 ### 7.2 Lifetimes
 

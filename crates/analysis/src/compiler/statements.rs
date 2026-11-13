@@ -30,6 +30,9 @@ impl Compiler<'_> {
         let mut children = Vec::new();
         let mut provided = false;
         for (ordinal, statement) in statements.iter().enumerate() {
+            if let Some((db, _)) = self.workspace {
+                db.unwind_if_revision_cancelled();
+            }
             let unreachable = provided;
             provided |= statement_provides(statement);
             let mut child_path = path.clone();
@@ -78,6 +81,7 @@ impl Compiler<'_> {
                     let names = self.names.clone();
                     let mut body_path = child_path.clone();
                     body_path.push(0);
+                    self.resource_depth += 1;
                     let body = self.compile_sequence(
                         test,
                         block.body_origin,
@@ -85,6 +89,7 @@ impl Compiler<'_> {
                         domain,
                         body_path,
                     );
+                    self.resource_depth -= 1;
                     self.bindings = bindings;
                     self.names = names;
                     webtest_plan::PlanNode::timeout(
@@ -120,12 +125,34 @@ impl Compiler<'_> {
                     }
                 }
                 _ => {
+                    if let Some(node) =
+                        self.statement_helper(statement, domain, test, child_path.clone())
+                    {
+                        children.push(node);
+                        continue;
+                    }
                     let mut steps = Vec::new();
                     self.compile_statement(statement, domain, &mut steps);
-                    let Some(step) = steps.into_iter().next() else {
+                    if steps.is_empty() {
                         continue;
+                    }
+                    let mut operations = steps
+                        .into_iter()
+                        .map(|step| self.expand_pure_operation(test, self.revision, step))
+                        .collect::<Vec<_>>();
+                    let mut node = if operations.len() == 1 {
+                        operations.remove(0)
+                    } else {
+                        webtest_plan::PlanNode::sequence(
+                            test,
+                            statement.origin(),
+                            self.revision,
+                            Vec::new(),
+                            operations,
+                        )
                     };
-                    webtest_plan::PlanNode::operation(test, self.revision, child_path, step)
+                    node.rebase(test, child_path);
+                    node
                 }
             };
             if unreachable {
@@ -194,6 +221,7 @@ impl Compiler<'_> {
                 .filter_map(|(id, binding)| (!binding.ty.is_transferable()).then_some(*id)),
         );
         self.retry_depth += 1;
+        self.resource_depth += 1;
         let mut child_path = path.clone();
         child_path.push(0);
         let body = self.compile_sequence(
@@ -204,6 +232,7 @@ impl Compiler<'_> {
             child_path,
         );
         self.retry_depth -= 1;
+        self.resource_depth -= 1;
         self.retry_captures = captures;
         self.bindings = bindings;
         self.names = names;
@@ -246,6 +275,7 @@ impl Compiler<'_> {
                 ),
             );
         }
+        let outer_return = std::mem::replace(&mut self.provide_is_return, false);
         let outer_provides = self.provide_types.take();
         let annotation = block
             .binding
@@ -310,6 +340,7 @@ impl Compiler<'_> {
             children.push(child);
         }
         self.provide_types = outer_provides;
+        self.provide_is_return = outer_return;
         self.bindings = bindings;
         self.names = names;
         self.concurrent_captures = outer_captures;
@@ -412,7 +443,18 @@ impl Compiler<'_> {
             HirStmt::Let(binding) => self.compile_let(binding, domain, steps),
             HirStmt::Provide(statement) => {
                 let value = self.infer_expr(&statement.expression, domain, None);
-                if !value.ty.is_transferable() {
+                if self.provide_is_return
+                    && !value.ty.is_transferable()
+                    && self.resource_depth > self.return_boundary_depth
+                {
+                    self.error(
+                        statement.expression.origin.range,
+                        "semantic.non_transferable_scope_result",
+                        "a native resource cannot be returned across a scope that tears it down"
+                            .into(),
+                    );
+                }
+                if !self.provide_is_return && !value.ty.is_transferable() {
                     self.error(
                         statement.expression.origin.range,
                         "semantic.non_transferable_race_result",
@@ -431,14 +473,27 @@ impl Compiler<'_> {
                 self.push_step(
                     steps,
                     statement.expression.origin,
-                    TestOperation::Provide(webtest_plan::ProvideOperation {
-                        expression: value.expression,
-                        result_type: value.ty,
-                    }),
+                    if self.provide_is_return {
+                        TestOperation::Return(webtest_plan::ProvideOperation {
+                            expression: value.expression,
+                            result_type: value.ty,
+                        })
+                    } else {
+                        TestOperation::Provide(webtest_plan::ProvideOperation {
+                            expression: value.expression,
+                            result_type: value.ty,
+                        })
+                    },
                 );
             }
             HirStmt::Expression(statement) => {
-                if let Some(call) = self.provider_call(&statement.expression, domain) {
+                if let Some(call) = self.fixture_acquire(&statement.expression, domain) {
+                    self.push_step(
+                        steps,
+                        statement.expression.origin,
+                        TestOperation::AcquireFixture(call),
+                    );
+                } else if let Some(call) = self.provider_call(&statement.expression, domain) {
                     self.push_step(
                         steps,
                         statement.expression.origin,
@@ -497,6 +552,64 @@ impl Compiler<'_> {
             );
         } else {
             self.names.insert(binding.name.clone(), binding.name_origin);
+        }
+
+        if let Some(mut call) = self.fixture_acquire(&binding.value, domain) {
+            let mut result_type = call.result_type.clone();
+            let annotation = binding
+                .annotation
+                .as_ref()
+                .map(|annotation| self.lower_type(annotation));
+            let decode = annotation.as_ref().is_some_and(|expected| {
+                result_type == Type::Json && super::type_system::decodable_type(expected)
+            });
+            let result_id = if decode {
+                let id = webtest_model::BindingId(self.next_temporary);
+                self.next_temporary = self.next_temporary.saturating_sub(1);
+                id
+            } else {
+                binding.id
+            };
+            if let Some(expected) = annotation {
+                if !decode {
+                    self.expect_type(binding.value.origin.range, &expected, &result_type);
+                }
+                result_type = expected;
+            }
+            call.result_binding = Some(result_id);
+            call.result_name = (!decode).then(|| binding.name.clone());
+            self.push_step(
+                steps,
+                binding.value.origin,
+                TestOperation::AcquireFixture(call),
+            );
+            if decode {
+                self.push_step(
+                    steps,
+                    binding.value.origin,
+                    TestOperation::EvaluatePure(EvaluatePureOperation {
+                        expression: PlanExpr::Decode {
+                            value: Box::new(PlanExpr::Binding(result_id)),
+                            target: result_type.clone(),
+                            response_operation: None,
+                        },
+                        result_binding: Some(binding.id),
+                        result_name: Some(binding.name.clone()),
+                        result_type: result_type.clone(),
+                    }),
+                );
+            }
+            self.bindings.insert(
+                binding.id,
+                BindingState {
+                    name: binding.name.clone(),
+                    ty: result_type.clone(),
+                    domain,
+                    provider_operation: None,
+                },
+            );
+            self.type_fact(binding.name_origin.range, result_type, Capability::Pure);
+            return;
         }
 
         if let Some(call) = self.provider_call(&binding.value, domain) {
@@ -669,6 +782,7 @@ impl Compiler<'_> {
         operation: TestOperation,
     ) {
         steps.push(PlannedStep {
+            origin_chain: self.call_origin_chain(),
             id: StepId(self.next_step),
             operation,
             origin,

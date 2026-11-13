@@ -104,6 +104,8 @@ mod tests {
         let file = FileId::new(1);
         let revision = SourceRevision::of("test");
         let plan = TestPlan {
+            fixtures: Vec::new(),
+            source_files: Vec::new(),
             file,
             source_revision: revision,
             required_host_capabilities: vec![Capability::Server],

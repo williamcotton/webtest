@@ -56,11 +56,11 @@ struct Frame {
     id: i64,
     name: String,
     location: StepLocation,
+    path: PathBuf,
     variables: DapVariableStore,
 }
 struct Snapshot {
     context: DebugContext,
-    path: PathBuf,
     frames: Vec<Frame>, // innermost first
 }
 struct Task {
@@ -181,7 +181,7 @@ impl DebugState {
             .map(|snapshot| {
                 snapshot.frames.iter().map(|frame| json!({
                 "id":frame.id, "name":frame.name,
-                "source":{"name":source_name(&snapshot.path), "path":snapshot.path},
+                "source":{"name":source_name(&frame.path), "path":frame.path},
                 "line":frame.location.line, "column":frame.location.column,
                 "endLine":frame.location.end_line, "endColumn":frame.location.end_column,
             })).collect::<Vec<_>>()
@@ -295,7 +295,7 @@ impl DebugState {
     fn snapshot(
         &self,
         program: &LoadedProgram,
-        test: &PlannedTest,
+        test_name: &str,
         step: &PlannedStep,
         context: &DebugContext,
         bindings: BTreeMap<String, webtest_model::Value>,
@@ -308,15 +308,30 @@ impl DebugState {
             .rev()
             .enumerate()
             .map(|(index, scope)| {
-                let location = StepLocation::new(&program.source, scope.scope.origin.range);
+                let source = program.source_for(scope.scope.origin.file);
+                let location = StepLocation::new(
+                    source.map_or(program.source.as_ref(), |source| source.text.as_ref()),
+                    scope.scope.origin.range,
+                );
+                let path =
+                    source.map_or_else(|| program.path.clone(), |source| source.path.clone());
                 let name = if index == 0 {
                     operation_name(&step.operation)
                 } else if index == context.frames.len() - 1 {
-                    format!("test {:?}", test.name)
+                    scope
+                        .display_name
+                        .clone()
+                        .unwrap_or_else(|| format!("test {test_name:?}"))
+                } else if let Some(name) = &scope.display_name {
+                    name.clone()
                 } else if let Some(attempt) = scope.attempt {
                     format!("attempt {}/{}", attempt.ordinal, attempt.max_attempts)
                 } else {
                     match scope.kind {
+                        DebugScopeKind::FixtureLifetime => "fixture lifetime",
+                        DebugScopeKind::FixtureSetup => "fixture setup",
+                        DebugScopeKind::FixtureTeardown => "fixture teardown",
+                        DebugScopeKind::Helper => "helper",
                         DebugScopeKind::Sequence => "sequence",
                         DebugScopeKind::Parallel => "parallel",
                         DebugScopeKind::Race => "race",
@@ -351,8 +366,13 @@ impl DebugState {
                 }
                 if index == 0 {
                     values.insert(
-                        "test".into(),
-                        webtest_model::Value::String(test.name.clone()),
+                        if scope.scope.execution_context.fixture.is_some() {
+                            "fixture"
+                        } else {
+                            "test"
+                        }
+                        .into(),
+                        webtest_model::Value::String(test_name.to_owned()),
                     );
                     values.insert(
                         "operation".into(),
@@ -402,20 +422,20 @@ impl DebugState {
                     id,
                     name,
                     location,
+                    path,
                     variables,
                 }
             })
             .collect();
         Snapshot {
             context: context.clone(),
-            path: program.path.clone(),
             frames,
         }
     }
 
     async fn safe_point(
         &self,
-        test: &PlannedTest,
+        test_name: &str,
         step: &PlannedStep,
         context: &DebugContext,
         bindings: BTreeMap<String, webtest_model::Value>,
@@ -429,14 +449,17 @@ impl DebugState {
         };
         self.flush_thread_events().await;
         let mut wake = self.wake.subscribe();
-        let location = StepLocation::new(&program.source, step.origin.range);
+        let Some(source) = program.source_for(step.origin.file) else {
+            return;
+        };
+        let location = StepLocation::new(&source.text, step.origin.range);
         let revision_matches = lock(&self.breakpoint_revisions)
-            .get(&program.path)
-            .is_none_or(|revision| *revision == program.plan.source_revision);
+            .get(&source.path)
+            .is_none_or(|revision| *revision == source.revision);
         let breakpoint = error.is_none()
             && revision_matches
             && lock(&self.breakpoints)
-                .get(&program.path)
+                .get(&source.path)
                 .is_some_and(|lines| lines.contains(&location.line));
         let exception = error.is_some_and(|error| self.catches(step, error));
         let key = (context.execution_id, context.task_id);
@@ -469,7 +492,8 @@ impl DebugState {
             let Some(task) = tasks.tasks.get_mut(&key) else {
                 return;
             };
-            task.snapshot = Some(self.snapshot(&program, test, step, context, bindings, error));
+            task.snapshot =
+                Some(self.snapshot(&program, test_name, step, context, bindings, error));
             (task.id, epoch, reason)
         };
         let _parked = Parked {
@@ -528,6 +552,53 @@ impl DebugState {
 
 #[async_trait]
 impl RunControl for DebugState {
+    fn fixture_task_started(
+        &self,
+        fixture: &webtest_plan::FixtureDefinition,
+        context: &DebugContext,
+    ) {
+        let mut tasks = lock(&self.tasks);
+        let id = tasks.next_thread;
+        tasks.next_thread += 1;
+        tasks.tasks.insert(
+            (context.execution_id, context.task_id),
+            Task {
+                id,
+                name: format!("fixture {} / task {}", fixture.name, context.task_id.0),
+                snapshot: None,
+            },
+        );
+        tasks.events.push(json!({"reason":"started","threadId":id}));
+    }
+    async fn before_fixture_step(
+        &self,
+        fixture: &webtest_plan::FixtureDefinition,
+        step: &PlannedStep,
+        context: &DebugContext,
+        bindings: Option<BTreeMap<String, webtest_model::Value>>,
+    ) {
+        self.safe_point(
+            &fixture.name,
+            step,
+            context,
+            bindings.unwrap_or_default(),
+            None,
+        )
+        .await;
+    }
+    async fn after_fixture_step_failure(
+        &self,
+        fixture: &webtest_plan::FixtureDefinition,
+        step: &PlannedStep,
+        context: &DebugContext,
+        error: &StepError,
+        bindings: &BTreeMap<String, webtest_model::Value>,
+    ) {
+        if self.catches(step, error) || lock(&self.tasks).paused {
+            self.safe_point(&fixture.name, step, context, bindings.clone(), Some(error))
+                .await;
+        }
+    }
     fn task_started(&self, test: &PlannedTest, context: &DebugContext) {
         let mut tasks = lock(&self.tasks);
         let id = tasks.next_thread;
@@ -584,8 +655,14 @@ impl RunControl for DebugState {
         context: &DebugContext,
         bindings: Option<BTreeMap<String, webtest_model::Value>>,
     ) {
-        self.safe_point(test, step, context, bindings.unwrap_or_default(), None)
-            .await;
+        self.safe_point(
+            &test.name,
+            step,
+            context,
+            bindings.unwrap_or_default(),
+            None,
+        )
+        .await;
     }
     async fn after_step_failure_in_context(
         &self,
@@ -596,7 +673,7 @@ impl RunControl for DebugState {
         bindings: &BTreeMap<String, webtest_model::Value>,
     ) {
         if self.catches(step, error) || lock(&self.tasks).paused {
-            self.safe_point(test, step, context, bindings.clone(), Some(error))
+            self.safe_point(&test.name, step, context, bindings.clone(), Some(error))
                 .await;
         }
     }
@@ -674,6 +751,68 @@ mod tests {
             .resume(&request("continue", id), command)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn imported_helper_breakpoints_and_frames_use_captured_module_sources() {
+        let root = "import { verify } from \"./helpers.webtest\"\ntest \"caller\" { verify(7) }";
+        let helper = "export fn verify(value: Int) -> Null {\n expect value == 7\n}";
+        let state = state("test \"placeholder\" {}");
+        let mut database = AnalysisDatabase::default();
+        database.configure_workspace(webtest_analysis::WorkspaceConfiguration {
+            root: "/workspace".into(),
+            ..Default::default()
+        });
+        let file = database.open_file("/workspace/root.webtest", root);
+        database.open_file("/workspace/helpers.webtest", helper);
+        let program = LoadedProgram::from_database(
+            PathBuf::from("/workspace/root.webtest"),
+            database,
+            file,
+            &[],
+        )
+        .unwrap();
+        assert!(
+            program
+                .locations_for(Path::new("/workspace/helpers.webtest"))
+                .iter()
+                .any(|location| location.line == 2)
+        );
+        let captured = program
+            .source_at_path(Path::new("/workspace/helpers.webtest"))
+            .unwrap();
+        lock(&state.breakpoint_revisions).insert(captured.path.clone(), captured.revision);
+        lock(&state.breakpoints).insert(captured.path.clone(), HashSet::from([2]));
+        *lock(&state.program) = Some(program);
+        let running = run(&state);
+        parked(&state, 1).await;
+        {
+            let tasks = lock(&state.tasks);
+            let snapshot = tasks
+                .tasks
+                .values()
+                .find_map(|task| task.snapshot.as_ref())
+                .unwrap();
+            assert_eq!(
+                snapshot.frames[0].path,
+                PathBuf::from("/workspace/helpers.webtest")
+            );
+            assert_eq!(snapshot.frames[0].location.line, 2);
+            assert!(
+                snapshot
+                    .frames
+                    .iter()
+                    .any(|frame| frame.path == Path::new("/workspace/root.webtest"))
+            );
+            assert!(
+                snapshot
+                    .frames
+                    .iter()
+                    .any(|frame| frame.name == "helper verify")
+            );
+        }
+        resume(&state, ResumeCommand::Continue).await;
+        assert_eq!(running.await.unwrap().passed(), 1);
     }
 
     #[tokio::test]
@@ -901,6 +1040,78 @@ mod tests {
         assert_eq!(lock(&state.tasks).tasks.len(), 1);
         state.cancel_execution();
         state.join_execution().await;
+        assert!(lock(&state.tasks).tasks.is_empty());
+    }
+    #[tokio::test]
+    async fn pure_helper_body_breakpoints_show_parameter_values_and_helper_frames() {
+        let state = state(
+            "fn normalize(value: String) -> String =\n lower(value)\ntest \"consumer\" { let normalized = normalize(\"É\") expect normalized == \"é\" }",
+        );
+        lock(&state.breakpoints).insert(PathBuf::from("/debug.webtest"), HashSet::from([2]));
+        let running = run(&state);
+        parked(&state, 1).await;
+        {
+            let mut tasks = lock(&state.tasks);
+            let snapshot = tasks
+                .tasks
+                .values_mut()
+                .find_map(|task| task.snapshot.as_mut())
+                .unwrap();
+            assert!(
+                snapshot
+                    .frames
+                    .iter()
+                    .any(|frame| frame.name == "helper normalize")
+            );
+            let frame = &mut snapshot.frames[0];
+            let variables = frame.variables.variables(frame.variables.root_reference);
+            assert!(
+                variables
+                    .iter()
+                    .any(|value| value["name"] == "value" && value["value"] == "\"É\"")
+            );
+        }
+        resume(&state, ResumeCommand::Continue).await;
+        assert_eq!(running.await.unwrap().passed(), 1);
+    }
+    #[tokio::test]
+    async fn fixture_setup_and_teardown_have_owned_threads_frames_and_retained_locals() {
+        let state = state(
+            "fixture seed() -> Int scope test {\n setup {\n let saved = 7\n provide saved\n }\n teardown {\n expect saved == 7\n }\n}\ntest \"consumer\" { let value = use seed() expect value == 7 }",
+        );
+        lock(&state.breakpoints).insert(PathBuf::from("/debug.webtest"), HashSet::from([4, 7]));
+        let running = run(&state);
+        for phase in ["fixture setup", "fixture teardown"] {
+            parked(&state, 1).await;
+            {
+                let mut tasks = lock(&state.tasks);
+                let task = tasks
+                    .tasks
+                    .values_mut()
+                    .find(|task| task.snapshot.is_some())
+                    .unwrap();
+                assert!(task.name.starts_with("fixture seed"));
+                let snapshot = task.snapshot.as_mut().unwrap();
+                assert!(
+                    snapshot.frames.iter().any(|frame| frame.name == phase),
+                    "{:?}",
+                    snapshot
+                        .frames
+                        .iter()
+                        .map(|frame| &frame.name)
+                        .collect::<Vec<_>>()
+                );
+                let frame = &mut snapshot.frames[0];
+                let values = frame.variables.variables(frame.variables.root_reference);
+                assert!(
+                    values
+                        .iter()
+                        .any(|value| value["name"] == "saved" && value["value"] == "7")
+                );
+            }
+            resume(&state, ResumeCommand::Continue).await;
+        }
+        assert_eq!(running.await.unwrap().passed(), 1);
         assert!(lock(&state.tasks).tasks.is_empty());
     }
 }

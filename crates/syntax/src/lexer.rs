@@ -133,6 +133,10 @@ pub(crate) fn lex(source: &str) -> Vec<Token> {
                 offset += 1;
                 SyntaxKind::Plus
             }
+            b'-' if bytes.get(offset + 1) == Some(&b'>') => {
+                offset += 2;
+                SyntaxKind::Arrow
+            }
             b'-' => {
                 offset += 1;
                 SyntaxKind::Minus
@@ -174,13 +178,33 @@ pub(crate) fn lex(source: &str) -> Vec<Token> {
                     kind
                 }
             }
-            byte if is_ident_start(byte) => {
-                offset += 1;
-                while offset < bytes.len() && is_ident_continue(bytes[offset]) {
-                    offset += 1;
+            _ if source[offset..].chars().next().is_some_and(is_ident_start) => {
+                offset += source[offset..].chars().next().map_or(1, char::len_utf8);
+                while let Some(character) = source[offset..].chars().next() {
+                    if !is_ident_continue(character)
+                        || (character == '-' && bytes.get(offset + 1) == Some(&b'>'))
+                    {
+                        break;
+                    }
+                    offset += character.len_utf8();
                 }
                 match &source[start..offset] {
                     "test" => SyntaxKind::TestKw,
+                    "import" => SyntaxKind::ImportKw,
+                    "export" => SyntaxKind::ExportKw,
+                    "from" => SyntaxKind::FromKw,
+                    "as" => SyntaxKind::AsKw,
+                    "fn" => SyntaxKind::FnKw,
+                    "fixture" => SyntaxKind::FixtureKw,
+                    "scope" => SyntaxKind::ScopeKw,
+                    "file" => SyntaxKind::FileKw,
+                    "worker" => SyntaxKind::WorkerKw,
+                    "suite" => SyntaxKind::SuiteKw,
+                    "setup" => SyntaxKind::SetupKw,
+                    "teardown" => SyntaxKind::TeardownKw,
+                    "use" => SyntaxKind::UseKw,
+                    "shareable" => SyntaxKind::ShareableKw,
+
                     "browser" => SyntaxKind::BrowserKw,
                     "server" => SyntaxKind::ServerKw,
                     "timeout" => SyntaxKind::TimeoutKw,
@@ -250,10 +274,25 @@ pub(crate) fn lex(source: &str) -> Vec<Token> {
     tokens
 }
 
-const fn is_ident_start(byte: u8) -> bool {
-    byte.is_ascii_alphabetic() || byte == b'_'
+fn is_ident_start(character: char) -> bool {
+    unicode_ident::is_xid_start(character) || character == '_'
+}
+fn is_ident_continue(character: char) -> bool {
+    unicode_ident::is_xid_continue(character) || character == '-'
 }
 
-const fn is_ident_continue(byte: u8) -> bool {
-    is_ident_start(byte) || byte.is_ascii_digit() || byte == b'-'
+/// Validates names using exactly the lexer and contextual-name contract.
+pub fn is_valid_identifier(name: &str) -> bool {
+    let tokens = lex(name);
+    tokens.len() == 1 && crate::is_name_kind(tokens[0].kind)
+}
+
+pub fn is_valid_binding_identifier(name: &str) -> bool {
+    let tokens = lex(name);
+    tokens.len() == 1 && crate::is_binding_name_kind(tokens[0].kind)
+}
+
+pub fn keyword_kind(text: &str) -> Option<SyntaxKind> {
+    let tokens = lex(text);
+    (tokens.len() == 1 && tokens[0].kind.is_keyword()).then(|| tokens[0].kind)
 }

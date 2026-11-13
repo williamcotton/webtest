@@ -56,7 +56,7 @@ pub(crate) fn validate(
     }
     if !matches!(
         manifest.event_schema_version,
-        8 | EVENT_JOURNAL_SCHEMA_VERSION
+        8 | 9 | EVENT_JOURNAL_SCHEMA_VERSION
     ) {
         return Err(TraceError::UnsupportedEventSchema(
             manifest.event_schema_version,

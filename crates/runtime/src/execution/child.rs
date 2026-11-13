@@ -52,6 +52,7 @@ pub(super) async fn execute_child(
     let _debug_task = crate::control::DebugTaskGuard::new(
         services.control,
         services.test,
+        services.fixture,
         scope.debug_context(services.execution_id),
     );
     branch.session_owner = Some(scope.event.clone());
@@ -169,6 +170,21 @@ pub(super) async fn execute_child(
         drop(branch.page.take());
         None
     };
+    if scope
+        .fixture_boundary
+        .as_ref()
+        .is_some_and(|boundary| boundary.scope_id == scope.id())
+    {
+        scope
+            .context
+            .cancellation
+            .start_cleanup_at(cleanup.instant() - cleanup_timeout);
+        if let Some(access) = services.fixture_access {
+            branch
+                .cleanup_failures
+                .extend(access.close_test(&scope).await);
+        }
+    }
     branch.cleanup_failures.extend(
         branch
             .temporary
@@ -233,7 +249,7 @@ pub(super) async fn execute_child(
             services.events,
             services.event_sink,
             services.execution_id,
-            Some(services.test.id),
+            services.test.map(|test| test.id),
             Some(&scope.event),
             failure,
         );
@@ -294,7 +310,7 @@ pub(super) async fn execute_child(
     }
 }
 
-async fn finalize_body(
+pub(super) async fn finalize_body(
     services: &ExecutionServices<'_>,
     body: TestBodyOutcome,
     scope: &webtest_observation::ScopeEvent,
@@ -303,7 +319,7 @@ async fn finalize_body(
     match body {
         TestBodyOutcome::PendingFailure(pending) => match process_failure(FailureInput {
             plan: services.plan,
-            test_id: services.test.id,
+            test_id: services.test.map(|test| test.id),
             execution_id: services.execution_id,
             pending: *pending,
             artifact_deadline: services.deadline.at,
@@ -324,22 +340,24 @@ async fn finalize_body(
             active_step,
             origin,
         }) => {
-            let active = active_step
-                .and_then(|id| services.test.steps().into_iter().find(|step| step.id == id));
-            emit_test_timeout(
-                scope,
-                active_operation,
-                services.plan,
-                services.test,
-                active,
-                services.execution_id,
-                services.events,
-                services.event_sink,
-                services.providers,
-                services.observations,
-                timeout,
-                origin,
-            );
+            if let Some(test) = services.test {
+                let active =
+                    active_step.and_then(|id| test.steps().into_iter().find(|step| step.id == id));
+                emit_test_timeout(
+                    scope,
+                    active_operation,
+                    services.plan,
+                    test,
+                    active,
+                    services.execution_id,
+                    services.events,
+                    services.event_sink,
+                    services.providers,
+                    services.observations,
+                    timeout,
+                    origin,
+                );
+            }
             ProvisionalTestOutcome::TimedOut {
                 timeout,
                 active_step,

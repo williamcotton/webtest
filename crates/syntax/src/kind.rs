@@ -135,6 +135,30 @@ pub enum SyntaxKind {
     BackoffKw,
     MaxKw,
     RetryStmt,
+    ImportKw,
+    ExportKw,
+    FromKw,
+    AsKw,
+    FnKw,
+    FixtureKw,
+    ScopeKw,
+    FileKw,
+    WorkerKw,
+    SuiteKw,
+    SetupKw,
+    TeardownKw,
+    UseKw,
+    ShareableKw,
+    Arrow,
+    ImportDecl,
+    ImportBinding,
+    FunctionDecl,
+    ParameterList,
+    Parameter,
+    FixtureDecl,
+    FixtureSetup,
+    FixtureTeardown,
+    UseExpr,
     Eof,
 }
 
@@ -147,6 +171,20 @@ impl SyntaxKind {
         matches!(
             self,
             Self::TestKw
+                | Self::ImportKw
+                | Self::ExportKw
+                | Self::FromKw
+                | Self::AsKw
+                | Self::FnKw
+                | Self::FixtureKw
+                | Self::ScopeKw
+                | Self::FileKw
+                | Self::WorkerKw
+                | Self::SuiteKw
+                | Self::SetupKw
+                | Self::TeardownKw
+                | Self::UseKw
+                | Self::ShareableKw
                 | Self::TimeoutKw
                 | Self::ParallelKw
                 | Self::RaceKw
@@ -365,7 +403,31 @@ impl Language for WebtestLanguage {
             129 => SyntaxKind::BackoffKw,
             130 => SyntaxKind::MaxKw,
             131 => SyntaxKind::RetryStmt,
-            132 => SyntaxKind::Eof,
+            132 => SyntaxKind::ImportKw,
+            133 => SyntaxKind::ExportKw,
+            134 => SyntaxKind::FromKw,
+            135 => SyntaxKind::AsKw,
+            136 => SyntaxKind::FnKw,
+            137 => SyntaxKind::FixtureKw,
+            138 => SyntaxKind::ScopeKw,
+            139 => SyntaxKind::FileKw,
+            140 => SyntaxKind::WorkerKw,
+            141 => SyntaxKind::SuiteKw,
+            142 => SyntaxKind::SetupKw,
+            143 => SyntaxKind::TeardownKw,
+            144 => SyntaxKind::UseKw,
+            145 => SyntaxKind::ShareableKw,
+            146 => SyntaxKind::Arrow,
+            147 => SyntaxKind::ImportDecl,
+            148 => SyntaxKind::ImportBinding,
+            149 => SyntaxKind::FunctionDecl,
+            150 => SyntaxKind::ParameterList,
+            151 => SyntaxKind::Parameter,
+            152 => SyntaxKind::FixtureDecl,
+            153 => SyntaxKind::FixtureSetup,
+            154 => SyntaxKind::FixtureTeardown,
+            155 => SyntaxKind::UseExpr,
+            156 => SyntaxKind::Eof,
             _ => SyntaxKind::Error,
         }
     }

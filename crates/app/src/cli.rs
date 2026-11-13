@@ -54,6 +54,9 @@ pub(crate) enum Command {
         /// Maximum concurrent tests (1–64); 1 preserves sequential execution.
         #[arg(long, default_value_t = webtest_runtime::JobLimit::default())]
         jobs: webtest_runtime::JobLimit,
+        /// Run only these stable executable variant IDs (repeat for multiple tests).
+        #[arg(long = "variant")]
+        variants: Vec<webtest_model::TestVariantId>,
         #[arg(long, value_enum, default_value_t = TestReporter::Human)]
         reporter: TestReporter,
     },

@@ -69,6 +69,11 @@ impl PlanNode {
     /// slot; its children still retain their individual access requirements.
     pub fn required_resources(&self) -> Vec<ResourceUse> {
         let resources = match &self.kind {
+            PlanNodeKind::Operation { step }
+                if matches!(step.operation, crate::TestOperation::AcquireFixture(_)) =>
+            {
+                return Vec::new();
+            }
             PlanNodeKind::Operation { .. } => {
                 if self.required_capabilities.contains(&Capability::Browser) {
                     return vec![ResourceUse {
@@ -78,12 +83,17 @@ impl PlanNode {
                 }
                 return Vec::new();
             }
-            PlanNodeKind::Sequence { children }
+            PlanNodeKind::Conditional {
+                branches: children, ..
+            }
+            | PlanNodeKind::Sequence { children }
             | PlanNodeKind::Parallel { children, .. }
             | PlanNodeKind::Race { children, .. } => {
                 merged(children.iter().flat_map(Self::required_resources))
             }
-            PlanNodeKind::Retry { child, .. } | PlanNodeKind::Timeout { child, .. } => {
+            PlanNodeKind::Retry { child, .. }
+            | PlanNodeKind::Timeout { child, .. }
+            | PlanNodeKind::Helper { body: child, .. } => {
                 return child.required_resources();
             }
             PlanNodeKind::ResourceScope {

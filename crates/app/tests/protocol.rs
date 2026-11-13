@@ -1697,3 +1697,198 @@ fn dap_concurrent_threads_frames_steps_restart_and_disconnect() {
     assert_eq!(request(&mut dap, "disconnect", json!({}))["success"], true);
     dap.wait_for_exit();
 }
+
+#[test]
+fn lsp_workspace_navigation_and_incremental_unicode_recovery_are_revision_safe() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("webtest.toml"),
+        "[project]\nname = \"workspace\"\n",
+    )
+    .unwrap();
+    let library = directory.path().join("library.webtest");
+    std::fs::write(
+        &library,
+        "export fn identité(value: String) -> String = value\n",
+    )
+    .unwrap();
+    let path = directory.path().join("test.webtest");
+    let source = "import { identité as alias } from \"./library\"\ntest \"é😀\" { let üser = alias(value: \"é😀\") expect üser == \"é😀\" }\n";
+    std::fs::write(&path, source).unwrap();
+    let uri = format!("file://{}", path.display());
+    let library_uri = format!(
+        "file://{}",
+        std::fs::canonicalize(&library).unwrap().display()
+    );
+    let mut lsp = ProtocolProcess::spawn(&["lsp"], directory.path());
+    lsp.send(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}));
+    assert_eq!(
+        lsp.receive(|message| message["id"] == 1)["result"]["capabilities"]["textDocumentSync"],
+        2
+    );
+    lsp.send(json!({"jsonrpc":"2.0","method":"initialized","params":{}}));
+    lsp.send(json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":uri,"languageId":"webtest","version":1,"text":source}}}));
+    let diagnostics = lsp.receive(|message| {
+        message["method"] == "textDocument/publishDiagnostics" && message["params"]["version"] == 1
+    });
+    assert_eq!(diagnostics["params"]["diagnostics"], json!([]));
+    lsp.send(json!({"jsonrpc":"2.0","id":20,"method":"textDocument/inlayHint","params":{"textDocument":{"uri":uri},"range":{"start":{"line":0,"character":0},"end":{"line":2,"character":0}}}}));
+    let hints = lsp.receive(|message| message["id"] == 20);
+    assert!(
+        hints["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|hint| hint["label"] == ": String"),
+        "{hints}"
+    );
+    let line = source.lines().nth(1).unwrap();
+    let call = line[..line.find("alias(").unwrap()].encode_utf16().count();
+    lsp.send(json!({"jsonrpc":"2.0","id":2,"method":"textDocument/definition","params":{"textDocument":{"uri":uri},"position":{"line":1,"character":call}}}));
+    let definition = lsp.receive(|message| message["id"] == 2);
+    assert_eq!(definition["result"]["uri"], library_uri, "{definition}");
+    lsp.send(json!({"jsonrpc":"2.0","id":3,"method":"textDocument/rename","params":{"textDocument":{"uri":uri},"position":{"line":1,"character":call},"newName":"renamed"}}));
+    let rename = lsp.receive(|message| message["id"] == 3);
+    let documents = rename["result"]["documentChanges"].as_array().unwrap();
+    assert_eq!(documents.len(), 1);
+    assert_eq!(documents[0]["textDocument"]["version"], 1);
+    assert_eq!(documents[0]["edits"].as_array().unwrap().len(), 2);
+    let start = line[..line.find("üser").unwrap()].encode_utf16().count();
+    lsp.send(json!({"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":uri,"version":2},"contentChanges":[{"range":{"start":{"line":1,"character":start},"end":{"line":1,"character":start+4}},"text":"person"},{"range":{"start":{"line":1,"character":line[..line.rfind("üser").unwrap()].encode_utf16().count()+2},"end":{"line":1,"character":line[..line.rfind("üser").unwrap()].encode_utf16().count()+6}},"text":"person"}]}}));
+    let diagnostics = lsp.receive(|message| {
+        message["method"] == "textDocument/publishDiagnostics" && message["params"]["version"] == 2
+    });
+    assert_eq!(
+        diagnostics["params"]["diagnostics"],
+        json!([]),
+        "{diagnostics}"
+    );
+    lsp.send(json!({"jsonrpc":"2.0","id":4,"method":"textDocument/documentSymbol","params":{"textDocument":{"uri":uri}}}));
+    let symbols = lsp.receive(|message| message["id"] == 4);
+    assert!(
+        symbols["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|symbol| symbol["name"] == "person"),
+        "{symbols}"
+    );
+    // Split the emoji in the test name. The previous accepted source remains
+    // intact; no semantic request is served until a full replacement arrives.
+    lsp.send(json!({"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":uri,"version":3},"contentChanges":[{"range":{"start":{"line":1,"character":8},"end":{"line":1,"character":8}},"text":"bad"}]}}));
+    lsp.receive(|message| message["method"] == "webtest/resyncRequired");
+    lsp.send(json!({"jsonrpc":"2.0","id":5,"method":"textDocument/documentSymbol","params":{"textDocument":{"uri":uri}}}));
+    assert!(lsp.receive(|message| message["id"] == 5)["result"].is_null());
+    lsp.send(json!({"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":uri,"version":3},"contentChanges":[{"text":"test \"recovered\" {}\n"}]}}));
+    lsp.receive(|message| {
+        message["method"] == "textDocument/publishDiagnostics" && message["params"]["version"] == 3
+    });
+    lsp.send(json!({"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":uri,"version":2},"contentChanges":[{"text":"broken"}]}}));
+    lsp.send(json!({"jsonrpc":"2.0","id":6,"method":"textDocument/documentSymbol","params":{"textDocument":{"uri":uri}}}));
+    let symbols = lsp.receive(|message| message["id"] == 6);
+    assert!(
+        symbols["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|symbol| symbol["name"] == "recovered")
+    );
+    lsp.send(json!({"jsonrpc":"2.0","id":8,"method":"webtest/discoverTests","params":{"workDoneToken":"discovery"}}));
+    let discovery = lsp.receive(|message| message["id"] == 8);
+    assert_eq!(discovery["result"]["kind"], "test_discovery", "{discovery}");
+    assert_eq!(
+        discovery["result"]["modules"][0]["tests"][0]["label"],
+        "recovered"
+    );
+    assert_eq!(
+        discovery["result"]["modules"][0]["tests"][0]["variants"][0]["key"],
+        "default"
+    );
+    let declaration = discovery["result"]["modules"][0]["tests"][0]["id"]
+        .as_str()
+        .unwrap();
+    let variant = discovery["result"]["modules"][0]["tests"][0]["variants"][0]["id"]
+        .as_str()
+        .unwrap();
+    assert_eq!(declaration.len(), 64);
+    assert_eq!(variant.len(), 64);
+    assert_ne!(declaration, variant);
+    lsp.send(
+        json!({"jsonrpc":"2.0","id":23,"method":"webtest/describeProject","params":{"uri":uri}}),
+    );
+    let description = lsp.receive(|message| message["id"] == 23);
+    assert_eq!(description["result"]["kind"], "project_declarations");
+    assert!(
+        description["result"]["declarations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["id"] == declaration && entry["default_variant"] == variant)
+    );
+    lsp.send(json!({"jsonrpc":"2.0","id":21,"method":"webtest/runVariants","params":{"uri":uri,"workspace_revision":discovery["result"]["workspace_revision"],"variants":[variant],"run_id":"selected-test"}}));
+    let executed = lsp.receive(|message| message["id"] == 21);
+    assert_eq!(
+        executed["result"]["tests"][0]["variant_id"], variant,
+        "{executed}"
+    );
+    assert_eq!(
+        executed["result"]["tests"][0]["outcome"], "passed",
+        "{executed}"
+    );
+    lsp.send(json!({"jsonrpc":"2.0","id":22,"method":"webtest/runVariants","params":{"uri":uri,"workspace_revision":0,"variants":[variant],"run_id":"stale-test"}}));
+    assert!(lsp.receive(|message| message["id"] == 22)["error"].is_object());
+    lsp.receive(|message| {
+        message["method"] == "$/progress"
+            && message["params"]["token"] == "discovery"
+            && message["params"]["value"]["kind"] == "begin"
+    });
+    lsp.receive(|message| {
+        message["method"] == "$/progress"
+            && message["params"]["token"] == "discovery"
+            && message["params"]["value"]["kind"] == "end"
+    });
+    lsp.send(json!({"jsonrpc":"2.0","id":7,"method":"shutdown","params":null}));
+    lsp.receive(|message| message["id"] == 7);
+    lsp.send(json!({"jsonrpc":"2.0","method":"exit","params":null}));
+    lsp.wait_for_exit();
+}
+
+#[test]
+fn lsp_republishes_importers_after_a_synchronized_dependency_edit() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("webtest.toml"), "").unwrap();
+    let library = directory.path().join("library.webtest");
+    let root = directory.path().join("test.webtest");
+    let old = "export fn value() -> String = \"old\"";
+    let source =
+        "import { value } from \"./library\" test \"consumer\" { let result: Int = value() }";
+    std::fs::write(&library, old).unwrap();
+    std::fs::write(&root, source).unwrap();
+    let root_uri = format!("file://{}", root.display());
+    let library_uri = format!("file://{}", library.display());
+    let mut lsp = ProtocolProcess::spawn(&["lsp"], directory.path());
+    lsp.send(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}));
+    lsp.receive(|message| message["id"] == 1);
+    lsp.send(json!({"jsonrpc":"2.0","method":"initialized","params":{}}));
+    for (uri, text) in [(&root_uri, source), (&library_uri, old)] {
+        lsp.send(json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":uri,"languageId":"webtest","version":1,"text":text}}}));
+    }
+    lsp.receive(|message| {
+        message["method"] == "textDocument/publishDiagnostics"
+            && message["params"]["uri"] == root_uri
+            && message["params"]["diagnostics"]
+                .as_array()
+                .is_some_and(|values| !values.is_empty())
+    });
+    lsp.send(json!({"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":library_uri,"version":2},"contentChanges":[{"text":"export fn value() -> Int = 7"}]}}));
+    let refreshed = lsp.receive(|message| {
+        message["method"] == "textDocument/publishDiagnostics"
+            && message["params"]["uri"] == root_uri
+            && message["params"]["diagnostics"] == json!([])
+    });
+    assert_eq!(refreshed["params"]["version"], 1);
+    lsp.send(json!({"jsonrpc":"2.0","id":2,"method":"shutdown","params":null}));
+    lsp.receive(|message| message["id"] == 2);
+    lsp.send(json!({"jsonrpc":"2.0","method":"exit","params":null}));
+    lsp.wait_for_exit();
+}

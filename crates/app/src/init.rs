@@ -651,6 +651,17 @@ mod tests {
         assert!(WEBTEST_SKILL.contains("webtest describe control.race"));
         assert!(WEBTEST_SKILL.contains("webtest describe statement.provide"));
         assert!(WEBTEST_SKILL.contains("webtest describe control.retry"));
+        for query in [
+            "language.import",
+            "language.fn",
+            "language.fixture",
+            "statement.use",
+            "project.declarations",
+        ] {
+            assert!(WEBTEST_SKILL.contains(&format!("webtest describe {query}")));
+        }
+        assert!(WEBTEST_SKILL.contains("source_roots"));
+        assert!(WEBTEST_SKILL.contains("variant IDs"));
         assert!(WEBTEST_SKILL.contains("`attempt_started` / `attempt_finished`"));
         assert!(WEBTEST_SKILL.contains("`attachment_created`"));
         assert!(WEBTEST_SKILL.contains("`execution_identity_unavailable`"));

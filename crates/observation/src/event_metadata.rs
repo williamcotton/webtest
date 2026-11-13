@@ -11,6 +11,12 @@ use webtest_text::{SourceRevision, SyntaxOrigin};
 /// (for example, a skipped test has a TestId but no TestExecutionId).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixture: Option<crate::FixtureExecutionContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_declaration_id: Option<webtest_model::TestDeclarationId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant_id: Option<webtest_model::TestVariantId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub test_id: Option<TestId>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -43,8 +49,11 @@ impl From<&ScopeEvent> for EventMetadata {
         let context = &scope.execution_context;
         Self {
             execution_context: EventContext {
-                test_id: Some(context.test_id),
-                test_execution_id: Some(context.test_execution_id),
+                fixture: context.fixture,
+                test_declaration_id: context.test_declaration_id,
+                variant_id: context.variant_id,
+                test_id: context.test_id,
+                test_execution_id: context.test_execution_id,
                 task_path: Some(context.task_path.clone()),
                 scope_id: Some(context.scope_id),
                 parent_scope_id: context.parent_scope_id,
@@ -73,24 +82,25 @@ impl ExecutionEvent {
 
     pub const fn test_id(&self) -> Option<TestId> {
         match self {
-            Self::Scope { event, .. } => Some(event.execution_context.test_id),
+            Self::Scope { event, .. } => event.execution_context.test_id,
             Self::CancellationRequested { scope, .. }
             | Self::ScopeAborted { scope, .. }
             | Self::Attempt { scope, .. }
-            | Self::Wait { scope, .. } => Some(scope.execution_context.test_id),
+            | Self::Wait { scope, .. } => scope.execution_context.test_id,
             Self::Resource { scope, .. } => match scope {
-                Some(scope) => Some(scope.execution_context.test_id),
+                Some(scope) => scope.execution_context.test_id,
                 None => None,
             },
-            Self::OutputCaptured { test_id, .. }
+            Self::FixtureAcquired { test_id, .. }
+            | Self::OutputCaptured { test_id, .. }
             | Self::AttachmentCreated { test_id, .. }
-            | Self::TestStarted { test_id, .. }
             | Self::StepStarted { test_id, .. }
             | Self::StepPassed { test_id, .. }
             | Self::ProviderCallStarted { test_id, .. }
             | Self::ProviderCallFinished { test_id, .. }
             | Self::ProviderCallFailed { test_id, .. }
-            | Self::StepFailed { test_id, .. }
+            | Self::StepFailed { test_id, .. } => *test_id,
+            Self::TestStarted { test_id, .. }
             | Self::TestTimedOut { test_id, .. }
             | Self::TestFinished { test_id, .. }
             | Self::TestSkipped { test_id, .. } => Some(*test_id),
@@ -101,7 +111,8 @@ impl ExecutionEvent {
 
     pub const fn step_id(&self) -> Option<webtest_model::StepId> {
         match self {
-            Self::OutputCaptured { step_id, .. }
+            Self::FixtureAcquired { step_id, .. }
+            | Self::OutputCaptured { step_id, .. }
             | Self::AttachmentCreated { step_id, .. }
             | Self::StepStarted { step_id, .. }
             | Self::StepPassed { step_id, .. }
@@ -132,11 +143,17 @@ impl EventMetadata {
         let context = &self.execution_context;
         let scoped = context.scope_id.is_some();
         context.test_id == event.test_id()
-            && context.test_execution_id.is_some() == scoped
+            && context.test_declaration_id.is_some() == context.variant_id.is_some()
+            && (context.test_id.is_some() || context.test_declaration_id.is_none())
+            && (context.test_execution_id.is_some() || context.fixture.is_some()) == scoped
+            && (context.fixture.is_none()
+                || (context.test_execution_id.is_none()
+                    && context.test_id.is_none()
+                    && context.test_declaration_id.is_none()))
             && context.task_path.is_some() == scoped
             && context.plan_node_id.is_some() == scoped
             && (!scoped
-                || (context.test_id.is_some()
+                || ((context.test_id.is_some() || context.fixture.is_some())
                     && self.origin.is_some()
                     && self.source_revision.is_some()))
             && (scoped
@@ -161,8 +178,11 @@ mod tests {
     fn scope() -> ScopeEvent {
         ScopeEvent {
             execution_context: ExecutionContext {
-                test_id: TestId(1),
-                test_execution_id: TestExecutionId(2),
+                fixture: None,
+                test_declaration_id: None,
+                variant_id: None,
+                test_id: Some(TestId(1)),
+                test_execution_id: Some(TestExecutionId(2)),
                 task_path: vec![0, 2],
                 scope_id: ExecutionScopeId(3),
                 parent_scope_id: Some(ExecutionScopeId(2)),
@@ -216,6 +236,54 @@ mod tests {
     }
 
     #[test]
+    fn fixture_scope_replay_keeps_real_lifetime_ownership_without_a_test_occurrence() {
+        let mut scope = scope();
+        let context = &mut scope.execution_context;
+        context.test_id = None;
+        context.test_execution_id = None;
+        context.attempt_id = None;
+        context.fixture = Some(crate::FixtureExecutionContext {
+            fixture: webtest_model::FixtureId([9; 32]),
+            instance: webtest_model::FixtureInstanceId(4),
+            owner: crate::FixtureOwnerKey::Suite {
+                invocation: ExecutionId::from_u128(1),
+            },
+            phase: crate::FixturePhase::Setup,
+        });
+        let event = ExecutionEvent::Scope {
+            execution_id: ExecutionId::from_u128(1),
+            event: scope,
+        };
+        let metadata = event.metadata();
+        assert!(metadata.agrees_with(&event));
+        let json = serde_json::to_value(&metadata).unwrap();
+        assert!(json["execution_context"].get("test_id").is_none());
+        assert!(json["execution_context"].get("test_execution_id").is_none());
+        assert_eq!(
+            json["execution_context"]["fixture"]["owner"]["kind"],
+            "suite"
+        );
+        let mut journal = EventJournal::default();
+        let record = journal
+            .record(
+                event,
+                EventTime {
+                    since_unix_epoch: Duration::ZERO,
+                    elapsed: Duration::ZERO,
+                },
+            )
+            .clone();
+        let mut replay = ReplayJournal::new(NonZeroUsize::new(4).unwrap());
+        assert_eq!(replay.insert(record.clone()), Ok(ReplayOutcome::Inserted));
+        let mut wrong = record;
+        wrong.metadata.execution_context.test_id = Some(TestId(123));
+        assert!(matches!(
+            replay.insert(wrong),
+            Err(ReplayError::MetadataMismatch { .. })
+        ));
+    }
+
+    #[test]
     fn replay_rejects_context_disagreement_and_treats_source_changes_as_identity_conflicts() {
         let mut source = EventJournal::default();
         let record = source
@@ -241,7 +309,7 @@ mod tests {
         let mut operation = record.clone();
         operation.event = ExecutionEvent::StepPassed {
             execution_id: ExecutionId::from_u128(1),
-            test_id: TestId(1),
+            test_id: Some(TestId(1)),
             step_id: webtest_model::StepId(3),
         };
         operation.identity.event_sequence.0 += 1;

@@ -12,6 +12,10 @@ use crate::{
     source_output::source_span,
 };
 
+fn report_test_id(test: impl Into<Option<webtest_model::TestId>>) -> Option<u32> {
+    test.into().map(|test| test.0)
+}
+
 fn runtime_message(error: &BrowserError) -> String {
     match error {
         BrowserError::LocatorNotFound { locator } => {
@@ -51,6 +55,7 @@ pub(crate) fn run_error_message(error: &RunError) -> String {
 
 pub(crate) fn run_failure_report(error: &RunError) -> FailureReport {
     FailureReport {
+        source: None,
         diagnostic_schema_version: webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
         repair_hint_schema_version: webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
         code: run_error_code(error),
@@ -133,6 +138,9 @@ fn run_error_semantic_details(error: &RunError) -> serde_json::Value {
             "primary": run_error_semantic_details(primary),
             "secondary": secondary.iter().map(run_error_semantic_details).collect::<Vec<_>>(),
         }),
+        RunError::FixtureBudget(budget) => {
+            serde_json::json!({"code":error.code().short_code(), "failure_class":error.failure_class(), "budget":budget})
+        }
         RunError::ExecutionIdentity(_)
         | RunError::Browser(_)
         | RunError::Provider(_)
@@ -148,6 +156,18 @@ fn run_error_semantic_details(error: &RunError) -> serde_json::Value {
 
 fn cleanup_failure_details(failure: &CleanupFailure) -> serde_json::Value {
     let cause = match &failure.cause {
+        CleanupCause::Execution {
+            failure,
+            failure_class,
+        } => {
+            serde_json::json!({"kind":"execution", "failure":failure, "failure_class":failure_class})
+        }
+        CleanupCause::Runtime {
+            failure,
+            failure_class,
+        } => {
+            serde_json::json!({"kind":"runtime", "failure":failure, "failure_class":failure_class})
+        }
         CleanupCause::Provider(error) => serde_json::json!({"kind": "provider", "error": error}),
         CleanupCause::Browser(error) => serde_json::json!({
             "kind": "browser",
@@ -190,7 +210,16 @@ pub(crate) fn step_failure_report(mut failure: StepFailure, source: &str) -> Fai
             });
         }
     }
-    let semantic_details = step_semantic_details(&failure);
+    let mut semantic_details = step_semantic_details(&failure);
+    if !failure.step.origin_chain.is_empty() {
+        let details = semantic_details.get_or_insert_with(|| serde_json::json!({}));
+        if let Some(details) = details.as_object_mut() {
+            details.insert(
+                "related_locations".into(),
+                serde_json::json!(failure.step.origin_chain),
+            );
+        }
+    }
     let page = failure
         .inspection
         .as_ref()
@@ -206,6 +235,7 @@ pub(crate) fn step_failure_report(mut failure: StepFailure, source: &str) -> Fai
                 })
         });
     FailureReport {
+        source: None,
         diagnostic_schema_version: webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
         repair_hint_schema_version: webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
         code: step_error_code(&failure.error),
@@ -347,6 +377,24 @@ pub(crate) fn event_reports<'a>(
     events
         .into_iter()
         .map(|event| match event {
+            ExecutionEvent::FixtureAcquired {
+                execution_id,
+                test_id,
+                step_id,
+                fixture,
+                acquisition_execution_id,
+            } => {
+                let mut event = event_report(
+                    path,
+                    "fixture_acquired",
+                    Some(*execution_id),
+                    report_test_id(*test_id),
+                    Some(step_id.0),
+                );
+                event.fixture = Some(*fixture);
+                event.acquisition_execution_id = Some(*acquisition_execution_id);
+                event
+            }
             ExecutionEvent::OutputCaptured {
                 execution_id,
                 test_id,
@@ -359,7 +407,7 @@ pub(crate) fn event_reports<'a>(
                     path,
                     "output_captured",
                     Some(*execution_id),
-                    Some(test_id.0),
+                    report_test_id(*test_id),
                     Some(step_id.0),
                 );
                 event.name = Some(format!("{provider}.{operation}"));
@@ -375,7 +423,7 @@ pub(crate) fn event_reports<'a>(
                     path,
                     "cancellation_requested",
                     Some(*execution_id),
-                    Some(scope.execution_context.test_id.0),
+                    scope.execution_context.test_id.map(|test| test.0),
                     None,
                 );
                 event.scope = Some(scope.clone());
@@ -393,7 +441,7 @@ pub(crate) fn event_reports<'a>(
                     path,
                     "scope_aborted",
                     Some(*execution_id),
-                    Some(scope.execution_context.test_id.0),
+                    scope.execution_context.test_id.map(|test| test.0),
                     None,
                 );
                 event.scope = Some(scope.clone());
@@ -413,7 +461,7 @@ pub(crate) fn event_reports<'a>(
                     path,
                     "attachment_created",
                     Some(*execution_id),
-                    Some(test_id.0),
+                    report_test_id(*test_id),
                     Some(step_id.0),
                 );
                 event.attachment = Some(attachment.clone());
@@ -433,7 +481,7 @@ pub(crate) fn event_reports<'a>(
                     path,
                     kind,
                     Some(*execution_id),
-                    Some(scope.execution_context.test_id.0),
+                    scope.execution_context.test_id.map(|test| test.0),
                     None,
                 );
                 event.scope = Some(scope.clone());
@@ -454,7 +502,7 @@ pub(crate) fn event_reports<'a>(
                     path,
                     kind,
                     Some(*execution_id),
-                    Some(scope.execution_context.test_id.0),
+                    scope.execution_context.test_id.map(|test| test.0),
                     None,
                 );
                 event.scope = Some(scope.clone());
@@ -472,7 +520,7 @@ pub(crate) fn event_reports<'a>(
                     Some(*execution_id),
                     scope
                         .as_ref()
-                        .map(|scope| scope.execution_context.test_id.0),
+                        .and_then(|scope| scope.execution_context.test_id.map(|test| test.0)),
                     None,
                 );
                 event.scope = scope.clone();
@@ -487,7 +535,7 @@ pub(crate) fn event_reports<'a>(
                     path,
                     scope.kind(),
                     Some(*execution_id),
-                    Some(scope.execution_context.test_id.0),
+                    scope.execution_context.test_id.map(|test| test.0),
                     None,
                 );
                 event.scope = Some(scope.clone());
@@ -505,7 +553,7 @@ pub(crate) fn event_reports<'a>(
                     path,
                     "test_started",
                     Some(*execution_id),
-                    Some(test_id.0),
+                    report_test_id(*test_id),
                     None,
                 );
                 event.name = Some(name.clone());
@@ -519,7 +567,7 @@ pub(crate) fn event_reports<'a>(
                 path,
                 "step_started",
                 Some(*execution_id),
-                Some(test_id.0),
+                report_test_id(*test_id),
                 Some(step_id.0),
             ),
             ExecutionEvent::StepPassed {
@@ -530,7 +578,7 @@ pub(crate) fn event_reports<'a>(
                 path,
                 "step_passed",
                 Some(*execution_id),
-                Some(test_id.0),
+                report_test_id(*test_id),
                 Some(step_id.0),
             ),
             ExecutionEvent::ProviderCallStarted {
@@ -546,7 +594,7 @@ pub(crate) fn event_reports<'a>(
                     path,
                     "provider_call_started",
                     Some(*execution_id),
-                    Some(test_id.0),
+                    report_test_id(*test_id),
                     Some(step_id.0),
                 );
                 event.name = Some(format!("{provider}.{operation}"));
@@ -568,7 +616,7 @@ pub(crate) fn event_reports<'a>(
                     path,
                     "provider_call_finished",
                     Some(*execution_id),
-                    Some(test_id.0),
+                    report_test_id(*test_id),
                     Some(step_id.0),
                 );
                 event.name = Some(format!("{provider}.{operation}"));
@@ -593,7 +641,7 @@ pub(crate) fn event_reports<'a>(
                     path,
                     "provider_call_failed",
                     Some(*execution_id),
-                    Some(test_id.0),
+                    report_test_id(*test_id),
                     Some(step_id.0),
                 );
                 event.name = Some(format!("{provider}.{operation}"));
@@ -617,7 +665,7 @@ pub(crate) fn event_reports<'a>(
                     path,
                     "step_failed",
                     Some(*execution_id),
-                    Some(test_id.0),
+                    report_test_id(*test_id),
                     Some(step_id.0),
                 );
                 let (code, message) = runtime_failure_report(failure);
@@ -645,7 +693,7 @@ pub(crate) fn event_reports<'a>(
                     path,
                     "test_timed_out",
                     Some(*execution_id),
-                    Some(test_id.0),
+                    report_test_id(*test_id),
                     active_step.map(|step| step.0),
                 );
                 event.outcome = Some("timed_out".into());
@@ -687,7 +735,7 @@ pub(crate) fn event_reports<'a>(
                     path,
                     "test_finished",
                     Some(*execution_id),
-                    Some(test_id.0),
+                    report_test_id(*test_id),
                     None,
                 );
                 event.outcome = Some(test_outcome_name(*outcome).into());
@@ -713,7 +761,7 @@ pub(crate) fn event_reports<'a>(
                     path,
                     "test_skipped",
                     Some(*execution_id),
-                    Some(test_id.0),
+                    report_test_id(*test_id),
                     None,
                 );
                 event.name = Some(name.clone());
@@ -781,6 +829,8 @@ fn event_report(
     step_id: Option<u32>,
 ) -> EventReport {
     EventReport {
+        fixture: None,
+        acquisition_execution_id: None,
         execution_failure: None,
         prior_outcome: None,
         cancellation: None,
@@ -873,6 +923,9 @@ mod tests {
         };
         let metadata = EventMetadata {
             execution_context: EventContext {
+                fixture: None,
+                test_declaration_id: None,
+                variant_id: None,
                 test_id: Some(TestId(2)),
                 test_execution_id: Some(TestExecutionId(1)),
                 task_path: Some(vec![0, 1]),
@@ -892,7 +945,7 @@ mod tests {
         journal.record_with_metadata(
             ExecutionEvent::OutputCaptured {
                 execution_id: ExecutionId::from_u128(1),
-                test_id: TestId(2),
+                test_id: Some(TestId(2)),
                 step_id: StepId(3),
                 provider: "process".into(),
                 operation: "run".into(),
@@ -906,7 +959,7 @@ mod tests {
         );
         let reports = journal_event_reports("tests/output.webtest", journal.records());
         let json = serde_json::to_value(&reports[0]).unwrap();
-        assert_eq!(json["schema_version"], 13);
+        assert_eq!(json["schema_version"], crate::report::REPORT_SCHEMA_VERSION);
         assert_eq!(json["type"], "output_captured");
         assert_eq!(json["name"], "process.run");
         assert_eq!(json["step_id"], 3);
@@ -925,8 +978,11 @@ mod tests {
         };
         let scope = ScopeEvent {
             execution_context: ExecutionContext {
-                test_id: TestId(2),
-                test_execution_id: TestExecutionId(1),
+                fixture: None,
+                test_declaration_id: None,
+                variant_id: None,
+                test_id: Some(TestId(2)),
+                test_execution_id: Some(TestExecutionId(1)),
                 task_path: vec![0, 1],
                 scope_id: ExecutionScopeId(3),
                 parent_scope_id: Some(ExecutionScopeId(2)),
@@ -960,7 +1016,7 @@ mod tests {
         );
         let reports = journal_event_reports("tests/a.webtest", journal.records());
         let json = serde_json::to_value(&reports[0]).unwrap();
-        assert_eq!(json["schema_version"], 13);
+        assert_eq!(json["schema_version"], crate::report::REPORT_SCHEMA_VERSION);
         assert_eq!(json["type"], "cancellation_requested");
         assert_eq!(json["cancellation"], "race_lost");
         assert_eq!(
@@ -998,6 +1054,9 @@ mod tests {
         };
         let metadata = EventMetadata {
             execution_context: EventContext {
+                fixture: None,
+                test_declaration_id: None,
+                variant_id: None,
                 test_id: Some(TestId(2)),
                 test_execution_id: Some(TestExecutionId(1)),
                 task_path: Some(vec![0, 1]),
@@ -1017,7 +1076,7 @@ mod tests {
         journal.record_with_metadata(
             ExecutionEvent::AttachmentCreated {
                 execution_id: ExecutionId::from_u128(1),
-                test_id: TestId(2),
+                test_id: Some(TestId(2)),
                 step_id: StepId(3),
                 attachment: attachment.clone(),
             },
@@ -1029,7 +1088,7 @@ mod tests {
         );
         let reports = journal_event_reports("tests/a.webtest", journal.records());
         let json = serde_json::to_value(&reports[0]).unwrap();
-        assert_eq!(json["schema_version"], 13);
+        assert_eq!(json["schema_version"], crate::report::REPORT_SCHEMA_VERSION);
         assert_eq!(json["type"], "attachment_created");
         assert_eq!(
             json["attachment"],
@@ -1171,17 +1230,17 @@ mod tests {
             },
             ExecutionEvent::StepStarted {
                 execution_id,
-                test_id,
+                test_id: Some(test_id),
                 step_id,
             },
             ExecutionEvent::StepPassed {
                 execution_id,
-                test_id,
+                test_id: Some(test_id),
                 step_id,
             },
             ExecutionEvent::ProviderCallStarted {
                 execution_id,
-                test_id,
+                test_id: Some(test_id),
                 step_id,
                 provider: "app".into(),
                 operation: "echo".into(),
@@ -1190,7 +1249,7 @@ mod tests {
             },
             ExecutionEvent::ProviderCallFinished {
                 execution_id,
-                test_id,
+                test_id: Some(test_id),
                 step_id,
                 provider: "app".into(),
                 operation: "echo".into(),
@@ -1200,7 +1259,7 @@ mod tests {
             },
             ExecutionEvent::ProviderCallFailed {
                 execution_id,
-                test_id,
+                test_id: Some(test_id),
                 step_id,
                 provider: "app".into(),
                 operation: "echo".into(),
@@ -1212,7 +1271,7 @@ mod tests {
             },
             ExecutionEvent::StepFailed {
                 execution_id,
-                test_id,
+                test_id: Some(test_id),
                 step_id,
                 failure_class: FailureClass::Internal,
                 failure: RuntimeFailure::Internal {

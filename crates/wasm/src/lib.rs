@@ -1,5 +1,8 @@
 //! Stable DTO-oriented facade for browser/editor builds of the language core.
 
+mod workspace;
+pub use workspace::{PortableWorkspace, WorkspaceInputs, WorkspaceQuery, WorkspaceSource};
+
 use serde::Serialize;
 use webtest_analysis::{AnalysisDatabase, DiagnosticSeverity};
 use webtest_app_bridge::AppManifest;
@@ -17,6 +20,8 @@ pub struct PortableDiagnostic {
     severity: String,
     message: String,
     source_revision: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    related_locations: Vec<webtest_text::SourceLocation>,
     semantic_details: Option<serde_json::Value>,
     repair_hints: Vec<webtest_feedback::RepairHint>,
     reference_queries: Vec<String>,
@@ -145,6 +150,7 @@ fn portable_diagnostic(
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect(),
+        related_locations: diagnostic.related_locations.clone(),
         semantic_details: diagnostic.semantic_details.clone(),
         repair_hints: diagnostic.repair_hints.clone(),
         reference_queries: diagnostic.reference_queries.clone(),

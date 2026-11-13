@@ -20,10 +20,13 @@ pub(crate) async fn run_lsp(chrome_path: Option<PathBuf>) -> Result<ExitClass, A
                 .editor_for_path(path)
                 .map_err(|error| error.to_string())
         }),
-        Arc::new(move |path| {
-            changed_projects
-                .reload_for_changed_path(path)
-                .map_err(|error| error.to_string())
+        Arc::new(move |path, synchronized| {
+            if synchronized {
+                changed_projects.resolve_imports(path)
+            } else {
+                changed_projects.reload_for_changed_path(path)
+            }
+            .map_err(|error| error.to_string())
         }),
         Some(project.root.clone()),
     )

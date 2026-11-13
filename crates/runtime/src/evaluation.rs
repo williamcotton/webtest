@@ -13,6 +13,19 @@ pub(crate) fn evaluate(
     environment: &HashMap<BindingId, Value>,
 ) -> Result<Value, StepError> {
     match expression {
+        PlanExpr::PureCall {
+            arguments, body, ..
+        } => {
+            let mut locals = HashMap::new();
+            for (parameter, argument) in arguments {
+                locals.insert(*parameter, evaluate(argument, environment)?);
+            }
+            evaluate(body, &locals)
+        }
+        PlanExpr::Lower { value } => match evaluate(value, environment)? {
+            Value::String(value) => Ok(Value::String(value.to_lowercase())),
+            _ => Err(StepError::Internal("lower requires a typed String".into())),
+        },
         PlanExpr::Literal(value) => Ok(value.clone()),
         PlanExpr::Binding(binding) => environment.get(binding).cloned().ok_or_else(|| {
             StepError::Internal(format!("binding {} has no runtime value", binding.0))

@@ -1,0 +1,13 @@
+import { user_email, suite_seed } from "../support/users.webtest"
+test "normalize a user email" {
+    let email = use user_email(value: "ALICE@example.com")
+    let seed = use suite_seed()
+    expect email == "alice@example.com"
+    expect seed == 7
+}
+test "retry owns its test fixture" {
+    retry 2 {
+        let email = use user_email(value: "BOB@example.com")
+        expect email == "bob@example.com"
+    }
+}

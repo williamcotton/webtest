@@ -33,6 +33,7 @@ mod browser;
 mod child;
 mod concurrent;
 mod failure;
+pub(crate) mod fixtures;
 mod output;
 mod provider;
 pub(crate) mod resource;
@@ -51,7 +52,8 @@ pub(crate) use browser::{bounded_timeout, browser_locator, browser_state};
 pub(crate) use scheduler::FailureSignal;
 
 #[derive(Default)]
-pub(crate) struct RootExecutionPolicy {
+pub(crate) struct RootExecutionPolicy<'a> {
+    pub fixtures: Option<&'a fixtures::FixtureAccess>,
     pub close_session: bool,
     pub primary_failure: Option<FailureSignal>,
 }
@@ -121,11 +123,11 @@ pub(crate) async fn execute_test(
     ids: scopes::ExecutionIds,
     resources: &crate::ResourceRegistry,
     waits: &crate::WaitRegistry,
-    policy: RootExecutionPolicy,
+    policy: RootExecutionPolicy<'_>,
 ) -> ExecutedTest {
     let test_started = StdInstant::now();
     let deadline = TestDeadline::new(options.test_timeout);
-    let scope_factory = scopes::ScopeFactory::new(ids, test.id);
+    let scope_factory = scopes::ScopeFactory::new(ids, test);
     let root = scope_factory.root(&test.body, deadline.at);
     emit_event_in_scope(
         &root.event,
@@ -137,8 +139,12 @@ pub(crate) async fn execute_test(
             name: test.name.clone(),
         },
     );
-    let _debug_task =
-        crate::control::DebugTaskGuard::new(control, test, root.debug_context(execution_id));
+    let _debug_task = crate::control::DebugTaskGuard::new(
+        control,
+        Some(test),
+        None,
+        root.debug_context(execution_id),
+    );
     let root_scope = root.event.clone();
     let root_context = root.context.clone();
     let _journal_root = events.register_root(&root_context, &root_scope, execution_id, event_sink);
@@ -152,7 +158,9 @@ pub(crate) async fn execute_test(
     let services = ExecutionServices {
         plan,
         observations,
-        test,
+        test: Some(test),
+        fixture: None,
+        fixture_access: policy.fixtures,
         execution_id,
         events,
         event_sink,
@@ -247,7 +255,7 @@ pub(crate) async fn execute_test(
         Some(TestBodyOutcome::PendingFailure(pending)) => {
             let failure_result = process_failure(FailureInput {
                 plan,
-                test_id: test.id,
+                test_id: Some(test.id),
                 execution_id,
                 pending: *pending,
                 artifact_deadline: deadline.at,
@@ -368,6 +376,14 @@ pub(crate) async fn execute_test(
             },
         );
     }
+    root_context.cancellation.start_cleanup_at(
+        resource_cleanup_deadline.map_or_else(Instant::now, |at| at - options.cleanup_timeout),
+    );
+    if let Some(access) = policy.fixtures {
+        branch
+            .cleanup_failures
+            .extend(access.close_test(&root).await);
+    }
     drop(branch.page.take());
     let cleanup_deadline = resource_cleanup_deadline.map_or_else(
         || crate::cleanup::CleanupDeadline::new(options.cleanup_timeout),
@@ -481,6 +497,8 @@ pub(crate) async fn execute_test(
     );
     ExecutedTest {
         result: TestResult {
+            test_declaration_id: test.test_declaration_id,
+            variant_id: test.variant_id,
             test_id: test.id,
             name: test.name.clone(),
             outcome,
@@ -520,8 +538,13 @@ async fn execute_test_body(
     branch: &mut branch::BranchState,
     root: &scopes::ExecutionScope,
 ) -> TestBodyOutcome {
+    let Some(test) = services.test else {
+        return TestBodyOutcome::Provisional(ProvisionalTestOutcome::Aborted {
+            failure: RunError::Internal("test body has no test owner".into()),
+        });
+    };
     TreeExecution { services, branch }
-        .body(&services.test.body, root)
+        .body(&test.body, root)
         .await
 }
 
@@ -531,7 +554,9 @@ async fn execute_test_body(
 struct ExecutionServices<'a> {
     plan: &'a TestPlan,
     observations: &'a ObservationStore,
-    test: &'a PlannedTest,
+    test: Option<&'a PlannedTest>,
+    fixture: Option<&'a webtest_plan::FixtureDefinition>,
+    fixture_access: Option<&'a fixtures::FixtureAccess>,
     execution_id: ExecutionId,
     events: &'a EventBuffer,
     event_sink: Option<&'a dyn RunEventSink>,
@@ -629,6 +654,33 @@ impl TreeExecution<'_, '_> {
     ) -> std::pin::Pin<Box<dyn Future<Output = TestBodyOutcome> + Send + 'a>> {
         Box::pin(async move {
             match &node.kind {
+                webtest_plan::PlanNodeKind::Conditional {
+                    condition,
+                    branches,
+                } => {
+                    match crate::evaluation::evaluate(condition, self.branch.bindings.environment())
+                    {
+                        Ok(webtest_model::Value::Bool(value)) => {
+                            if let Some(branch) = branches.get(usize::from(!value)) {
+                                self.node(branch, scope).await
+                            } else {
+                                TestBodyOutcome::Provisional(ProvisionalTestOutcome::Aborted {
+                                    failure: RunError::Internal(
+                                        "conditional branch is absent".into(),
+                                    ),
+                                })
+                            }
+                        }
+                        _ => TestBodyOutcome::Provisional(ProvisionalTestOutcome::Aborted {
+                            failure: RunError::Internal(
+                                "conditional predicate was not evaluated before its scope".into(),
+                            ),
+                        }),
+                    }
+                }
+                webtest_plan::PlanNodeKind::Helper { call, body } => {
+                    self.helper_node(call, body, scope).await
+                }
                 webtest_plan::PlanNodeKind::Retry { child, settings } => {
                     self.retry_node(child, *settings, scope).await
                 }
@@ -676,6 +728,48 @@ impl TreeExecution<'_, '_> {
         })
     }
 
+    async fn helper_node(
+        &mut self,
+        call: &webtest_plan::HelperCall,
+        body: &webtest_plan::PlanNode,
+        scope: &scopes::ExecutionScope,
+    ) -> TestBodyOutcome {
+        let mut locals = self.branch.bindings.isolated();
+        for argument in &call.arguments {
+            match crate::evaluation::evaluate(&argument.value, self.branch.bindings.environment()) {
+                Ok(value) => locals.bind(argument.parameter, Some(&argument.name), value),
+                Err(_) => {
+                    return TestBodyOutcome::Provisional(ProvisionalTestOutcome::Aborted {
+                        failure: crate::RunError::Internal(
+                            "helper argument was not evaluated before entering its scope".into(),
+                        ),
+                    });
+                }
+            }
+        }
+        let caller = std::mem::replace(&mut self.branch.bindings, locals);
+        let provided = self.branch.provided.take();
+        let outcome = self.node(body, scope).await;
+        let result = self.branch.provided.take();
+        let locals = std::mem::replace(&mut self.branch.bindings, caller);
+        self.branch.bindings.merge_metadata(locals);
+        self.branch.provided = provided;
+        if matches!(
+            outcome,
+            TestBodyOutcome::Provisional(ProvisionalTestOutcome::Passed)
+        ) {
+            let value = result.unwrap_or(webtest_model::Value::Null);
+            if let Some(binding) = &call.result {
+                self.branch.bindings.bind(
+                    binding.id,
+                    (!binding.name.is_empty()).then_some(binding.name.as_str()),
+                    value,
+                );
+            }
+        }
+        outcome
+    }
+
     async fn resource_node(
         &mut self,
         resource: webtest_plan::ResourcePlan,
@@ -694,6 +788,15 @@ impl TreeExecution<'_, '_> {
         body: &webtest_plan::PlanNode,
         owner: &scopes::ExecutionScope,
     ) -> TestBodyOutcome {
+        self.browser_resource_body(fixtures::BrowserBody::Node(body), owner)
+            .await
+    }
+    async fn browser_resource_body(
+        &mut self,
+        body: fixtures::BrowserBody<'_>,
+        owner: &scopes::ExecutionScope,
+    ) -> TestBodyOutcome {
+        let fixture_lifetime = matches!(&body, fixtures::BrowserBody::Fixture(_));
         if self.branch.page.is_some() {
             return TestBodyOutcome::Provisional(ProvisionalTestOutcome::Aborted {
                 failure: resource_invariant(crate::ResourceInvariant::AccessConflict),
@@ -733,7 +836,12 @@ impl TreeExecution<'_, '_> {
             },
             |created| async {
                 self.branch.page = Some(created);
-                let result = self.node(body, owner).await;
+                let result = match body {
+                    fixtures::BrowserBody::Node(body) => self.node(body, owner).await,
+                    fixtures::BrowserBody::Fixture(body) => {
+                        self.fixture_lifetime_body(body, owner).await
+                    }
+                };
                 if context.cancellation.cause().is_some()
                     && let TestBodyOutcome::PendingFailure(pending) = &result
                     && let Err(cause) = pending.interruption_cleanup()
@@ -806,6 +914,12 @@ impl TreeExecution<'_, '_> {
                 .push(resource_cleanup_invariant(error));
         }
         self.branch.session = session;
+        if fixture_lifetime {
+            owner
+                .context
+                .cancellation
+                .start_cleanup_at(result.cleanup_deadline - cleanup_timeout);
+        }
         self.branch.cleanup_failures.extend(
             result
                 .secondary
@@ -839,7 +953,11 @@ impl TreeExecution<'_, '_> {
                 )
                 .await,
         );
-        if let Err(error) = services.resources.validate_owner_finished(owner.id()) {
+        // Fixture lifetime validation follows its owned session teardown in the
+        // native driver. Ordinary lexical contexts have a distinct session owner.
+        if !fixture_lifetime
+            && let Err(error) = services.resources.validate_owner_finished(owner.id())
+        {
             self.branch
                 .cleanup_failures
                 .push(resource_cleanup_invariant(error));
@@ -991,6 +1109,8 @@ impl TreeExecution<'_, '_> {
     ) -> TestBodyOutcome {
         let host_context = std::sync::Arc::new(scope.context.clone());
         let test = self.services.test;
+        let fixture = self.services.fixture;
+        let test_id = test.map(|test| test.id);
         let execution_id = self.services.execution_id;
         let events = self.services.events;
         let event_sink = self.services.event_sink;
@@ -1024,12 +1144,28 @@ impl TreeExecution<'_, '_> {
         }
         if let Some(control) = control {
             let debug_context = scope.debug_context(execution_id);
-            let bindings = if control.should_capture_bindings(test, step) {
+            let capture = if let Some(test) = test {
+                control.should_capture_bindings(test, step)
+            } else {
+                fixture
+                    .is_some_and(|fixture| control.should_capture_fixture_bindings(fixture, step))
+            };
+            let bindings = if capture {
                 Some(state.visible_step_bindings(step))
             } else {
                 None
             };
-            let before_step = control.before_step_in_context(test, step, &debug_context, bindings);
+            let before_step = async {
+                if let Some(test) = test {
+                    control
+                        .before_step_in_context(test, step, &debug_context, bindings)
+                        .await;
+                } else if let Some(fixture) = fixture {
+                    control
+                        .before_fixture_step(fixture, step, &debug_context, bindings)
+                        .await;
+                }
+            };
             tokio::select! {
                 biased;
                 _ = host_context.cancellation.cancelled() => {},
@@ -1050,7 +1186,7 @@ impl TreeExecution<'_, '_> {
             event_sink,
             ExecutionEvent::StepStarted {
                 execution_id,
-                test_id: test.id,
+                test_id,
                 step_id: step.id,
             },
         );
@@ -1061,7 +1197,7 @@ impl TreeExecution<'_, '_> {
                 event_sink,
                 ExecutionEvent::ProviderCallStarted {
                     execution_id,
-                    test_id: test.id,
+                    test_id,
                     step_id: step.id,
                     provider: call.provider.clone(),
                     operation: call.operation.clone(),
@@ -1071,19 +1207,67 @@ impl TreeExecution<'_, '_> {
             );
         }
         let step_started = StdInstant::now();
-        let completion = execute_step(
-            providers,
-            options,
-            page,
-            step,
-            state,
-            host_context
-                .remaining()
-                .unwrap_or(deadline.remaining())
-                .min(deadline.remaining()),
-            host_context.clone(),
-        )
-        .await;
+        let completion = if let TestOperation::AcquireFixture(call) = &step.operation {
+            let Some(access) = self.services.fixture_access else {
+                return TestBodyOutcome::Provisional(ProvisionalTestOutcome::Aborted {
+                    failure: RunError::Internal("fixture coordinator is absent".into()),
+                });
+            };
+            let acquired = tokio::select! { biased;
+                cause = host_context.cancellation.cancelled() => return TestBodyOutcome::Provisional(ProvisionalTestOutcome::Cancelled { reason: cause.reason }),
+                acquired = access.acquire(self.services.plan, call, scope, state) => acquired,
+            };
+            match acquired {
+                Ok(value) => {
+                    emit_event_in_scope(
+                        &scope.event,
+                        events,
+                        event_sink,
+                        ExecutionEvent::FixtureAcquired {
+                            execution_id,
+                            test_id,
+                            step_id: step.id,
+                            fixture: webtest_observation::FixtureExecutionContext {
+                                fixture: call.fixture,
+                                instance: value.instance,
+                                owner: value.owner,
+                                phase: webtest_observation::FixturePhase::Lifetime,
+                            },
+                            acquisition_execution_id: value.acquisition_execution_id,
+                        },
+                    );
+                    let value = state.accept_fixture(value);
+                    if let Some(binding) = call.result_binding {
+                        state.bind(binding, call.result_name.as_deref(), value);
+                    }
+                    Ok(steps::StepCompletion::Completed)
+                }
+                Err(fixtures::FixtureAcquisitionError::Argument(error)) => Err(error),
+                Err(fixtures::FixtureAcquisitionError::Fixture(error)) => {
+                    return fixtures::acquisition_failure(
+                        self.services.plan,
+                        error,
+                        step,
+                        scope,
+                        &mut self.branch.cleanup_failures,
+                    );
+                }
+            }
+        } else {
+            execute_step(
+                providers,
+                options,
+                page,
+                step,
+                state,
+                host_context
+                    .remaining()
+                    .unwrap_or(deadline.remaining())
+                    .min(deadline.remaining()),
+                host_context.clone(),
+            )
+            .await
+        };
         let completion = match completion {
             Ok(steps::StepCompletion::ProviderOutput(outputs)) => {
                 if let TestOperation::ServerProviderCall(call) = &step.operation {
@@ -1094,7 +1278,7 @@ impl TreeExecution<'_, '_> {
                             event_sink,
                             ExecutionEvent::OutputCaptured {
                                 execution_id,
-                                test_id: test.id,
+                                test_id,
                                 step_id: step.id,
                                 provider: call.provider.clone(),
                                 operation: call.operation.clone(),
@@ -1170,7 +1354,7 @@ impl TreeExecution<'_, '_> {
                         event_sink,
                         ExecutionEvent::ProviderCallFinished {
                             execution_id,
-                            test_id: test.id,
+                            test_id,
                             step_id: step.id,
                             provider: call.provider.clone(),
                             operation: call.operation.clone(),
@@ -1186,7 +1370,7 @@ impl TreeExecution<'_, '_> {
                     event_sink,
                     ExecutionEvent::StepPassed {
                         execution_id,
-                        test_id: test.id,
+                        test_id,
                         step_id: step.id,
                     },
                 );
@@ -1227,11 +1411,30 @@ impl TreeExecution<'_, '_> {
                 {
                     let bindings = state.visible_step_bindings(step);
                     let debug_context = scope.debug_context(execution_id);
-                    tokio::select! {
-                        biased;
-                        _ = host_context.cancellation.cancelled() => {},
-                        _ = control.after_step_failure_in_context(test, step, &debug_context, &error, &bindings) => {},
-                    }
+                    let after = async {
+                        if let Some(test) = test {
+                            control
+                                .after_step_failure_in_context(
+                                    test,
+                                    step,
+                                    &debug_context,
+                                    &error,
+                                    &bindings,
+                                )
+                                .await;
+                        } else if let Some(fixture) = fixture {
+                            control
+                                .after_fixture_step_failure(
+                                    fixture,
+                                    step,
+                                    &debug_context,
+                                    &error,
+                                    &bindings,
+                                )
+                                .await;
+                        }
+                    };
+                    tokio::select! { biased; _ = host_context.cancellation.cancelled() => {}, _ = after => {} }
                 }
                 let pending = prepare_failure(PrepareFailureInput {
                     step,
@@ -1277,6 +1480,9 @@ fn emit_test_timeout(
     metadata.origin = origin
         .or_else(|| active_step.map(|step| step.origin))
         .or(Some(test.origin));
+    metadata.source_revision = metadata
+        .origin
+        .and_then(|origin| plan.source_revision_for(origin.file));
     emit_event_with_metadata(
         metadata.clone(),
         events,
@@ -1300,7 +1506,7 @@ fn emit_test_timeout(
                 event_sink,
                 ExecutionEvent::ProviderCallFailed {
                     execution_id,
-                    test_id: test.id,
+                    test_id: Some(test.id),
                     step_id: step.id,
                     provider: call.provider.clone(),
                     operation: call.operation.clone(),
@@ -1318,7 +1524,7 @@ fn emit_test_timeout(
             event_sink,
             ExecutionEvent::StepFailed {
                 execution_id,
-                test_id: test.id,
+                test_id: Some(test.id),
                 step_id: step.id,
                 failure_class: FailureClass::Test,
                 failure: RuntimeFailure::TestTimeout {
@@ -1330,16 +1536,24 @@ fn emit_test_timeout(
             },
         );
     }
-    let (step_id, range) = active_step.map_or((None, test.origin.range), |step| {
-        (Some(step.id), step.origin.range)
-    });
+    let step_id = active_step.map(|step| step.id);
+    let failure_origin = origin
+        .or_else(|| active_step.map(|step| step.origin))
+        .unwrap_or(test.origin);
     observations.record(RuntimeObservation {
+        related_locations: active_step
+            .map(|step| step.origin_chain.clone())
+            .unwrap_or_default(),
+        test_declaration_id: Some(test.test_declaration_id),
+        variant_id: Some(test.variant_id),
         execution_id,
-        file: plan.file,
-        source_revision: plan.source_revision,
+        file: failure_origin.file,
+        source_revision: plan
+            .source_revision_for(failure_origin.file)
+            .unwrap_or(plan.source_revision),
         test_id: test.id,
         step_id,
-        range: origin.map_or(range, |origin| origin.range),
+        range: failure_origin.range,
         kind: RuntimeObservationKind::TestTimeout {
             timeout_ms,
             active_step: step_id,

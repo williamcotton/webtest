@@ -16,6 +16,7 @@ const files = await readZip(vsix);
 for (const required of [
     "extension/package.json",
     "extension/out/extension.js",
+    "extension/out/testing.js",
     "extension/language-configuration.json",
     "extension/LICENSE.txt",
 ]) {
@@ -50,6 +51,11 @@ for (const marker of [
     "sourceText",
 ]) {
     assert.ok(extension.includes(marker), `compiled extension is missing ${marker}`);
+}
+
+const testing = files.get("extension/out/testing.js").toString("utf8");
+for (const marker of ["createTestController", "webtest/discoverTests", "webtest/runVariants", "webtest/cancelRun", "variant_id"]) {
+    assert.ok(testing.includes(marker), `compiled Testing API adapter is missing ${marker}`);
 }
 
 console.log(`VSIX smoke passed: ${path.basename(vsix)} (${files.size} files)`);

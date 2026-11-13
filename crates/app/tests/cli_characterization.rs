@@ -47,7 +47,7 @@ fn help_surface_is_byte_stable() {
         ),
         (
             &["test", "--help"],
-            "Execute WebTest files in Chrome\n\nUsage: webtest test [OPTIONS] [PATHS]...\n\nArguments:\n  [PATHS]...  \n\nOptions:\n      --chrome-path <CHROME_PATH>  \n      --headed                     Show the Chrome window while tests run\n      --jobs <JOBS>                Maximum concurrent tests (1–64); 1 preserves sequential execution [default: 1]\n      --reporter <REPORTER>        [default: human] [possible values: human, concise, json, junit, events]\n  -h, --help                       Print help\n",
+            "Execute WebTest files in Chrome\n\nUsage: webtest test [OPTIONS] [PATHS]...\n\nArguments:\n  [PATHS]...  \n\nOptions:\n      --chrome-path <CHROME_PATH>  \n      --headed                     Show the Chrome window while tests run\n      --jobs <JOBS>                Maximum concurrent tests (1–64); 1 preserves sequential execution [default: 1]\n      --variant <VARIANTS>         Run only these stable executable variant IDs (repeat for multiple tests)\n      --reporter <REPORTER>        [default: human] [possible values: human, concise, json, junit, events]\n  -h, --help                       Print help\n",
         ),
         (
             &["inspect", "--help"],
@@ -133,7 +133,7 @@ fn check_reporters_preserve_output_and_exit_class() {
     assert_eq!(json.status.code(), Some(0));
     assert!(json.stderr.is_empty());
     let json: serde_json::Value = serde_json::from_slice(&json.stdout).expect("JSON report");
-    assert_eq!(json["schema_version"], 13);
+    assert_eq!(json["schema_version"], 14);
     assert_eq!(json["command"], "check");
     assert_eq!(json["exit_class"], "success");
     assert_eq!(json["files"][0]["path"], "tests/example.webtest");
@@ -246,8 +246,8 @@ fn build_is_deterministic_and_description_json_remains_machine_clean() {
     );
     let plan: serde_json::Value =
         serde_json::from_slice(&fs::read(first).expect("plan")).expect("plan JSON");
-    assert_eq!(plan["format_version"], 9);
-    assert_eq!(plan["runtime_semantics_version"], 6);
+    assert_eq!(plan["format_version"], 10);
+    assert_eq!(plan["runtime_semantics_version"], 7);
     assert_eq!(plan["tests"][0]["id"], 0);
     assert_eq!(
         plan["tests"][0]["required_host_capabilities"],

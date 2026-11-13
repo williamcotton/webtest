@@ -60,7 +60,11 @@ impl Compiler<'_> {
             }
             BinaryOperator::Subtract | BinaryOperator::Multiply | BinaryOperator::Divide => {
                 if numeric(left) && numeric(right) {
-                    numeric_result(left, right)
+                    if operator == BinaryOperator::Divide {
+                        Type::Float
+                    } else {
+                        numeric_result(left, right)
+                    }
                 } else {
                     self.error(
                         range,
@@ -211,24 +215,7 @@ impl Compiler<'_> {
 }
 
 pub(super) fn known_members(ty: &Type) -> Vec<String> {
-    match ty {
-        Type::Record(fields) => fields.keys().cloned().collect(),
-        Type::Response(_) => ["status", "headers", "body", "text", "json"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect(),
-        Type::ProcessResult => [
-            "exit_code",
-            "stdout",
-            "stderr",
-            "stdout_bytes",
-            "stderr_bytes",
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect(),
-        _ => Vec::new(),
-    }
+    ty.member_names()
 }
 
 pub(super) fn typed(value: Value, ty: Type) -> TypedExpr {
@@ -243,26 +230,31 @@ pub(super) fn unknown_expr() -> TypedExpr {
     typed(Value::Null, Type::Unknown)
 }
 
+pub(super) fn named_types() -> &'static [(&'static str, Type)] {
+    &[
+        ("Null", Type::Null),
+        ("Bool", Type::Bool),
+        ("Int", Type::Int),
+        ("Float", Type::Float),
+        ("String", Type::String),
+        ("Duration", Type::Duration),
+        ("Url", Type::Url),
+        ("Json", Type::Json),
+        ("StatusCode", Type::StatusCode),
+        ("Headers", Type::Headers),
+        ("Bytes", Type::Bytes),
+        ("ProcessResult", Type::ProcessResult),
+        ("FilePath", Type::FilePath),
+        ("TempDirectory", Type::TempDirectory),
+        ("Locator", Type::Locator),
+        ("BrowserPage", Type::BrowserPage),
+    ]
+}
 fn named_type(name: &str) -> Option<Type> {
-    Some(match name {
-        "Null" => Type::Null,
-        "Bool" => Type::Bool,
-        "Int" => Type::Int,
-        "Float" => Type::Float,
-        "String" => Type::String,
-        "Duration" => Type::Duration,
-        "Url" => Type::Url,
-        "Json" => Type::Json,
-        "StatusCode" => Type::StatusCode,
-        "Headers" => Type::Headers,
-        "Bytes" => Type::Bytes,
-        "ProcessResult" => Type::ProcessResult,
-        "FilePath" => Type::FilePath,
-        "TempDirectory" => Type::TempDirectory,
-        "Locator" => Type::Locator,
-        "BrowserPage" => Type::BrowserPage,
-        _ => return None,
-    })
+    named_types()
+        .iter()
+        .find(|(candidate, _)| *candidate == name)
+        .map(|(_, ty)| ty.clone())
 }
 
 pub(super) fn decodable_type(ty: &Type) -> bool {

@@ -12,7 +12,7 @@ use webtest_project::Project;
 
 use crate::{error::AppError, project_context::normalized_path};
 
-pub(crate) const REPORT_SCHEMA_VERSION: u32 = 13;
+pub(crate) const REPORT_SCHEMA_VERSION: u32 = 14;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -109,6 +109,8 @@ pub struct FileReport {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct DiagnosticReport {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub related_locations: Vec<webtest_text::SourceLocation>,
     pub diagnostic_schema_version: u32,
     pub repair_hint_schema_version: u32,
     pub severity: String,
@@ -126,6 +128,10 @@ pub struct DiagnosticReport {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct TestReport {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_declaration_id: Option<webtest_model::TestDeclarationId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variant_id: Option<webtest_model::TestVariantId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub branches: Vec<BranchReport>,
     pub name: String,
@@ -165,7 +171,10 @@ fn write_branches(output: &mut dyn Write, path: &str, branches: &[BranchReport])
             if let Some(span) = &failure.span {
                 write_source_diagnostic(
                     output,
-                    path,
+                    failure
+                        .source
+                        .as_ref()
+                        .map_or(path, |source| source.path.as_str()),
                     "error",
                     &failure.code,
                     &failure.message,
@@ -225,6 +234,8 @@ pub enum RunReportOutcome {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct FailureReport {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<MachineSourceReport>,
     pub diagnostic_schema_version: u32,
     pub repair_hint_schema_version: u32,
     pub code: String,
@@ -298,6 +309,10 @@ pub struct SummaryReport {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct EventReport {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fixture: Option<webtest_observation::FixtureExecutionContext>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acquisition_execution_id: Option<webtest_observation::ExecutionId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output: Option<webtest_observation::CapturedOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -538,7 +553,10 @@ impl CommandReport {
                     if let Some(span) = &failure.span {
                         write_source_diagnostic(
                             output,
-                            &file.path,
+                            failure
+                                .source
+                                .as_ref()
+                                .map_or(&file.path, |source| &source.path),
                             "error",
                             &failure.code,
                             &failure.message,
@@ -1003,6 +1021,8 @@ mod tests {
             duration_nanos: 12,
             diagnostics: Vec::new(),
             tests: vec![TestReport {
+                test_declaration_id: None,
+                variant_id: None,
                 branches: Vec::new(),
                 name: "a < b".into(),
                 exit_class: ExitClass::TestFailure,
@@ -1012,6 +1032,7 @@ mod tests {
                 timeout_nanos: None,
                 duration_nanos: 10,
                 failure: Some(FailureReport {
+                    source: None,
                     diagnostic_schema_version: webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
                     repair_hint_schema_version: webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
                     code: "runtime.locator_not_found".into(),
@@ -1087,6 +1108,8 @@ mod tests {
             diagnostics: Vec::new(),
             tests: vec![
                 TestReport {
+                    test_declaration_id: None,
+                    variant_id: None,
                     branches: Vec::new(),
                     name: "active".into(),
                     exit_class: ExitClass::TestFailure,
@@ -1098,6 +1121,8 @@ mod tests {
                     failure: None,
                 },
                 TestReport {
+                    test_declaration_id: None,
+                    variant_id: None,
                     branches: Vec::new(),
                     name: "later".into(),
                     exit_class: ExitClass::TestFailure,
@@ -1132,6 +1157,7 @@ mod tests {
             }],
         );
         let failure = FailureReport {
+            source: None,
             diagnostic_schema_version: webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
             repair_hint_schema_version: webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
             code: "runtime.internal_error".into(),
@@ -1182,7 +1208,7 @@ mod tests {
                 },
                 ExecutionEvent::StepStarted {
                     execution_id,
-                    test_id,
+                    test_id: Some(test_id),
                     step_id,
                 },
                 ExecutionEvent::TestTimedOut {
@@ -1214,6 +1240,8 @@ mod tests {
             duration_nanos: 250_000_000,
             diagnostics: Vec::new(),
             tests: vec![TestReport {
+                test_declaration_id: None,
+                variant_id: None,
                 branches: Vec::new(),
                 name: "slow".into(),
                 exit_class: ExitClass::TestFailure,
@@ -1223,6 +1251,7 @@ mod tests {
                 timeout_nanos: Some(250_000_000),
                 duration_nanos: 250_000_000,
                 failure: Some(FailureReport {
+                    source: None,
                     diagnostic_schema_version: webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION,
                     repair_hint_schema_version: webtest_feedback::REPAIR_HINT_SCHEMA_VERSION,
                     code: "runtime.test_timeout".into(),
@@ -1316,7 +1345,7 @@ mod tests {
         assert_eq!(value["exit_class"], "test_failure");
         assert_eq!(
             String::from_utf8(json).expect("UTF-8 JSON"),
-            include_str!("../tests/fixtures/report-v13.json")
+            include_str!("../tests/fixtures/report-v14.json")
         );
 
         let mut events = Vec::new();
@@ -1328,7 +1357,7 @@ mod tests {
             let value: serde_json::Value = serde_json::from_str(line).expect("json line");
             assert_eq!(value["schema_version"], REPORT_SCHEMA_VERSION);
         }
-        assert_eq!(events, include_str!("../tests/fixtures/report-v13.jsonl"));
+        assert_eq!(events, include_str!("../tests/fixtures/report-v14.jsonl"));
     }
 
     #[test]
@@ -1355,11 +1384,11 @@ mod tests {
             ),
             (
                 Reporter::Json,
-                include_str!("../tests/fixtures/cancellation-v13.json"),
+                include_str!("../tests/fixtures/cancellation-v14.json"),
             ),
             (
                 Reporter::Events,
-                include_str!("../tests/fixtures/cancellation-v13.jsonl"),
+                include_str!("../tests/fixtures/cancellation-v14.jsonl"),
             ),
             (
                 Reporter::Junit,
@@ -1481,6 +1510,8 @@ mod tests {
             .take()
             .expect("execution error");
         report.files[0].tests = vec![TestReport {
+            test_declaration_id: None,
+            variant_id: None,
             branches: Vec::new(),
             name: "active".into(),
             exit_class: ExitClass::Internal,

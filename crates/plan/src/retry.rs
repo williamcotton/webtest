@@ -73,7 +73,8 @@ impl TestOperation {
     /// the fingerprinted schema, never from the runtime failure's retryable bit.
     pub fn is_retry_safe(&self) -> bool {
         match self {
-            Self::EvaluatePure(_) | Self::Provide(_) | Self::Assertion(_) => true,
+            Self::AcquireFixture(call) => call.retry_safe,
+            Self::EvaluatePure(_) | Self::Provide(_) | Self::Return(_) | Self::Assertion(_) => true,
             Self::ServerProviderCall(call) => call.retry_safe,
             Self::Browser(operation) => matches!(
                 operation,
@@ -95,15 +96,18 @@ impl PlanNode {
                     }]
                 }
             }
-            PlanNodeKind::Sequence { children }
+            PlanNodeKind::Conditional {
+                branches: children, ..
+            }
+            | PlanNodeKind::Sequence { children }
             | PlanNodeKind::Parallel { children, .. }
             | PlanNodeKind::Race { children, .. } => children
                 .iter()
                 .flat_map(Self::retry_safety_violations)
                 .collect(),
-            PlanNodeKind::Retry { child, .. } | PlanNodeKind::Timeout { child, .. } => {
-                child.retry_safety_violations()
-            }
+            PlanNodeKind::Retry { child, .. }
+            | PlanNodeKind::Timeout { child, .. }
+            | PlanNodeKind::Helper { body: child, .. } => child.retry_safety_violations(),
             PlanNodeKind::ResourceScope { resource, body } => {
                 let mut violations = Vec::new();
                 if !resource.is_retry_safe() {

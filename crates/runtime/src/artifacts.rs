@@ -10,6 +10,36 @@ use webtest_model::{StepId, TestId};
 pub use webtest_observation::{Artifact, ArtifactKind};
 use webtest_observation::{Attachment, ExecutionId};
 
+#[derive(Clone, Copy)]
+pub(crate) enum ArtifactOwner {
+    Test(TestId),
+    Fixture {
+        instance: webtest_model::FixtureInstanceId,
+        phase: webtest_observation::FixturePhase,
+    },
+}
+impl From<TestId> for ArtifactOwner {
+    fn from(test: TestId) -> Self {
+        Self::Test(test)
+    }
+}
+impl ArtifactOwner {
+    fn label(self) -> String {
+        match self {
+            Self::Test(test) => format!("test-{}", test.0),
+            Self::Fixture { instance, phase } => format!(
+                "fixture-{}-{}",
+                instance.0,
+                match phase {
+                    webtest_observation::FixturePhase::Lifetime => "lifetime",
+                    webtest_observation::FixturePhase::Setup => "setup",
+                    webtest_observation::FixturePhase::Teardown => "teardown",
+                }
+            ),
+        }
+    }
+}
+
 const MAX_CAPTURE_FAILURE_CHARS: usize = 1_024;
 const PERSISTENCE_DEADLINE_FAILURE: &str =
     "artifact persistence exceeded the remaining test budget";
@@ -37,7 +67,7 @@ impl ArtifactFilesystem for TokioArtifactFilesystem {
 pub(crate) async fn write_artifacts(
     directory: &Path,
     execution_id: ExecutionId,
-    test_id: TestId,
+    owner: impl Into<ArtifactOwner> + Send,
     step_id: StepId,
     deadline: Instant,
     evidence: &mut PageEvidence,
@@ -47,7 +77,7 @@ pub(crate) async fn write_artifacts(
         &TokioArtifactFilesystem,
         directory,
         execution_id,
-        test_id,
+        owner.into(),
         step_id,
         deadline,
         evidence,
@@ -61,7 +91,7 @@ async fn write_artifacts_with(
     filesystem: &dyn ArtifactFilesystem,
     directory: &Path,
     execution_id: ExecutionId,
-    test_id: TestId,
+    owner: impl Into<ArtifactOwner> + Send,
     step_id: StepId,
     deadline: Instant,
     evidence: &mut PageEvidence,
@@ -86,8 +116,10 @@ async fn write_artifacts_with(
         }
     }
     let stem = format!(
-        "test-{}-step-{}-execution-{}",
-        test_id.0, step_id.0, execution_id
+        "{}-step-{}-execution-{}",
+        owner.into().label(),
+        step_id.0,
+        execution_id
     );
     let mut artifacts = Vec::new();
     if let Some(png) = evidence.screenshot_png.clone()

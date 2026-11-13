@@ -38,6 +38,7 @@ pub enum ExecutionFailure {
         message: String,
     },
     JournalOverflow(JournalOverflow),
+    FixtureBudget(crate::FixtureBudgetExceeded),
     Browser(webtest_browser::BrowserError),
     Provider(webtest_provider::ProviderError),
     Cleanup(CleanupFailure),
@@ -55,6 +56,7 @@ impl ExecutionFailure {
         match self {
             Self::IdentityAllocation { .. } => RuntimeFailureCode::ExecutionIdentityUnavailable,
             Self::JournalOverflow(_) => RuntimeFailureCode::JournalCapacityExceeded,
+            Self::FixtureBudget(_) => RuntimeFailureCode::FixtureBudgetExceeded,
             Self::Browser(error) => error.into(),
             Self::Provider(error) => error.into(),
             Self::Cleanup(error) => error.code(),
@@ -65,6 +67,7 @@ impl ExecutionFailure {
     pub fn failure_class(&self) -> FailureClass {
         match self {
             Self::IdentityAllocation { .. }
+            | Self::FixtureBudget(_)
             | Self::JournalOverflow(_)
             | Self::Browser(_)
             | Self::Provider(_) => FailureClass::Infrastructure,

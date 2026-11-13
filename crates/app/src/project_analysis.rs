@@ -23,10 +23,16 @@ pub(crate) struct AnalyzedFile {
 pub(crate) fn analyze_file(
     project: &Project,
     file: &DiscoveredFile,
+    database: &mut AnalysisDatabase,
 ) -> Result<AnalyzedFile, AppError> {
-    let source = read_source(&file.path)?;
+    let file_id = database
+        .file_for_path(&file.path.display().to_string())
+        .ok_or_else(|| AppError::internal("workspace source was not loaded"))?;
+    let source = database
+        .source(file_id)
+        .map_err(AppError::internal)?
+        .to_string();
     let source_revision = revision_hex(SourceRevision::of(&source));
-    let (mut database, file_id) = database_for(project, &file.path, &source)?;
     let diagnostics = database.diagnostics(file_id).map_err(AppError::internal)?;
     let mut diagnostics = diagnostics
         .iter()
@@ -51,10 +57,18 @@ pub(crate) fn analyze_file(
 }
 
 pub(crate) fn analyze_project(project: &Project) -> Result<CommandReport, AppError> {
+    let mut database = workspace_for(project)?;
+    analyze_workspace(project, &mut database)
+}
+
+pub(crate) fn analyze_workspace(
+    project: &Project,
+    database: &mut AnalysisDatabase,
+) -> Result<CommandReport, AppError> {
     let mut report = base_report("check", project);
     for file in &project.files {
         let started = Instant::now();
-        let analyzed = analyze_file(project, file)?;
+        let analyzed = analyze_file(project, file, database)?;
         let has_errors = analyzed
             .diagnostics
             .iter()
@@ -83,12 +97,120 @@ pub(crate) fn analyze_project(project: &Project) -> Result<CommandReport, AppErr
     Ok(report)
 }
 
-pub(crate) fn database_for(
+pub(crate) fn workspace_for(project: &Project) -> Result<AnalysisDatabase, AppError> {
+    load_workspace(project, analysis_database_for_project(project)?)
+}
+pub(crate) fn workspace_with_providers(
     project: &Project,
-    path: &Path,
-    source: &str,
-) -> Result<(AnalysisDatabase, FileId), AppError> {
-    let mut database = analysis_database_for_project(project)?;
-    let file = database.open_file(path.display().to_string(), source);
-    Ok((database, file))
+    providers: webtest_provider::ProviderRegistry,
+) -> Result<AnalysisDatabase, AppError> {
+    load_workspace(
+        project,
+        crate::provider_composition::analysis_database_with_providers(project, providers)?,
+    )
+}
+fn load_workspace(
+    project: &Project,
+    mut database: AnalysisDatabase,
+) -> Result<AnalysisDatabase, AppError> {
+    let mut roots = Vec::new();
+    for file in webtest_project::workspace_sources(project)
+        .map_err(AppError::usage)?
+        .iter()
+        .chain(&project.files)
+    {
+        roots.push(database.open_file(file.path.display().to_string(), read_source(&file.path)?));
+    }
+    for root in roots {
+        populate_imports(project, &mut database, root)?;
+    }
+    Ok(database)
+}
+
+/// Native I/O feeds only candidates produced by canonical module resolution.
+/// Canonical aliases share one source input; symlinks cannot escape source roots.
+pub(crate) fn populate_imports(
+    project: &Project,
+    database: &mut AnalysisDatabase,
+    root: FileId,
+) -> Result<(), AppError> {
+    let roots = webtest_project::workspace_source_roots(project).map_err(AppError::usage)?;
+    let mut attempted = std::collections::BTreeSet::new();
+    loop {
+        let graph = database.module_graph(root).map_err(AppError::internal)?;
+        let mut changed = false;
+        for candidate in &graph.required_inputs {
+            if !attempted.insert(candidate.clone()) || database.file_for_path(candidate).is_some() {
+                continue;
+            }
+            let path = Path::new(candidate);
+            let canonical = match std::fs::canonicalize(path) {
+                Ok(path) => path,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(AppError::usage(format!(
+                        "cannot resolve module {}: {error}",
+                        path.display()
+                    )));
+                }
+            };
+            if !roots.iter().any(|root| canonical.starts_with(root)) {
+                return Err(AppError::usage(format!(
+                    "module {} resolves outside configured source roots",
+                    path.display()
+                )));
+            }
+            let file = if let Some(file) = database.file_for_path(&canonical.display().to_string())
+            {
+                file
+            } else {
+                if attempted.len() > 16_384 {
+                    return Err(AppError::usage("module input limit exceeded"));
+                }
+                database.open_file(canonical.display().to_string(), read_source(&canonical)?)
+            };
+            database
+                .alias_file(candidate, file)
+                .map_err(AppError::internal)?;
+            changed = true;
+        }
+        if !changed {
+            return Ok(());
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct CapturedSource {
+    pub path: String,
+    pub text: Arc<str>,
+    pub revision: SourceRevision,
+}
+pub(crate) type CapturedSources = std::collections::HashMap<FileId, CapturedSource>;
+pub(crate) fn capture_sources(
+    database: &AnalysisDatabase,
+    project: &Project,
+) -> Result<CapturedSources, AppError> {
+    database
+        .source_inputs()
+        .into_iter()
+        .map(|(path, text)| {
+            let file = database
+                .file_for_path(&path)
+                .ok_or_else(|| AppError::internal("captured source has no file identity"))?;
+            let path = Path::new(&path)
+                .strip_prefix(&project.root)
+                .unwrap_or(Path::new(&path))
+                .to_string_lossy()
+                .replace('\\', "/");
+            Ok((
+                file,
+                CapturedSource {
+                    path,
+                    revision: SourceRevision::of(&text),
+                    text,
+                },
+            ))
+        })
+        .collect()
 }

@@ -1,5 +1,10 @@
 //! Structured execution events and revision-safe source observations.
 
+mod fixture;
+pub use fixture::{
+    FixtureBudgetExceeded, FixtureBudgetKind, FixtureExecutionContext, FixtureOwnerKey,
+    FixturePhase,
+};
 mod execution_failure;
 pub use execution_failure::{ExecutionFailure, JournalOverflow, PriorScopeOutcome};
 mod identity;
@@ -32,7 +37,7 @@ use std::{collections::BTreeMap, collections::HashMap, path::PathBuf, sync::Mute
 use webtest_browser::{CandidateEvidence, Locator, PageSummary};
 use webtest_feedback::{FailureClass, RepairHint};
 use webtest_model::{StepId, TestId};
-use webtest_text::{FileId, SourceRevision, TextRange};
+use webtest_text::{FileId, SourceRevision, SyntaxOrigin, TextRange};
 
 /// Stable machine identity for every implemented runtime failure.
 ///
@@ -96,6 +101,8 @@ pub enum RuntimeFailureCode {
     ExecutionIdentityUnavailable,
     JournalCapacityExceeded,
     CleanupScopeFailed,
+    CleanupFixtureFailed,
+    FixtureBudgetExceeded,
     CleanupBrowserContextFailed,
     CleanupBrowserSessionFailed,
     CleanupTemporaryDirectoryFailed,
@@ -160,6 +167,8 @@ impl RuntimeFailureCode {
             Self::ExecutionIdentityUnavailable => "execution_identity_unavailable",
             Self::JournalCapacityExceeded => "journal_capacity_exceeded",
             Self::CleanupScopeFailed => "cleanup_scope_failed",
+            Self::CleanupFixtureFailed => "cleanup_fixture_failed",
+            Self::FixtureBudgetExceeded => "fixture_budget_exceeded",
             Self::CleanupBrowserContextFailed => "cleanup_browser_context_failed",
             Self::CleanupBrowserSessionFailed => "cleanup_browser_session_failed",
             Self::CleanupTemporaryDirectoryFailed => "cleanup_temporary_directory_failed",
@@ -224,6 +233,8 @@ impl RuntimeFailureCode {
             Self::ExecutionIdentityUnavailable => "runtime.execution_identity_unavailable",
             Self::JournalCapacityExceeded => "runtime.journal_capacity_exceeded",
             Self::CleanupScopeFailed => "runtime.cleanup_scope_failed",
+            Self::CleanupFixtureFailed => "runtime.cleanup_fixture_failed",
+            Self::FixtureBudgetExceeded => "runtime.fixture_budget_exceeded",
             Self::CleanupBrowserContextFailed => "runtime.cleanup_browser_context_failed",
             Self::CleanupBrowserSessionFailed => "runtime.cleanup_browser_session_failed",
             Self::CleanupTemporaryDirectoryFailed => "runtime.cleanup_temporary_directory_failed",
@@ -288,6 +299,8 @@ impl RuntimeFailureCode {
             "execution_identity_unavailable" => Some(Self::ExecutionIdentityUnavailable),
             "journal_capacity_exceeded" => Some(Self::JournalCapacityExceeded),
             "cleanup_scope_failed" => Some(Self::CleanupScopeFailed),
+            "cleanup_fixture_failed" => Some(Self::CleanupFixtureFailed),
+            "fixture_budget_exceeded" => Some(Self::FixtureBudgetExceeded),
             "cleanup_browser_context_failed" => Some(Self::CleanupBrowserContextFailed),
             "cleanup_browser_session_failed" => Some(Self::CleanupBrowserSessionFailed),
             "cleanup_temporary_directory_failed" => Some(Self::CleanupTemporaryDirectoryFailed),
@@ -464,8 +477,18 @@ pub enum RunOutcomeKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FixtureCleanup {
+    pub fixture: webtest_model::FixtureId,
+    pub instance: webtest_model::FixtureInstanceId,
+    pub phase: crate::FixturePhase,
+    pub origin: SyntaxOrigin,
+    pub revision: SourceRevision,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CleanupResource {
+    Fixture(Box<FixtureCleanup>),
     ExecutionScope {
         scope_id: webtest_model::ExecutionScopeId,
     },
@@ -534,11 +557,23 @@ impl From<std::io::Error> for CleanupIoFailure {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", content = "details", rename_all = "snake_case")]
 pub enum CleanupCause {
+    Execution {
+        failure: Box<crate::ExecutionFailure>,
+        failure_class: FailureClass,
+    },
+    Runtime {
+        failure: Box<RuntimeFailure>,
+        failure_class: FailureClass,
+    },
     Provider(webtest_provider::ProviderError),
-    TimedOut { timeout_ms: u64 },
+    TimedOut {
+        timeout_ms: u64,
+    },
     Browser(webtest_browser::BrowserError),
     Io(CleanupIoFailure),
-    Internal { message: String },
+    Internal {
+        message: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -550,6 +585,16 @@ pub struct CleanupFailure {
 impl CleanupFailure {
     pub const fn failure_class(&self) -> FailureClass {
         match self.cause {
+            CleanupCause::Execution {
+                failure_class: FailureClass::Internal,
+                ..
+            } => FailureClass::Internal,
+            CleanupCause::Execution { .. } => FailureClass::Infrastructure,
+            CleanupCause::Runtime {
+                failure_class: FailureClass::Internal,
+                ..
+            } => FailureClass::Internal,
+            CleanupCause::Runtime { .. } => FailureClass::Infrastructure,
             CleanupCause::Provider(_)
             | CleanupCause::TimedOut { .. }
             | CleanupCause::Browser(_)
@@ -560,6 +605,7 @@ impl CleanupFailure {
 
     pub const fn code(&self) -> RuntimeFailureCode {
         match self.resource {
+            CleanupResource::Fixture(_) => RuntimeFailureCode::CleanupFixtureFailed,
             CleanupResource::ExecutionScope { .. } => RuntimeFailureCode::CleanupScopeFailed,
             CleanupResource::BrowserContext => RuntimeFailureCode::CleanupBrowserContextFailed,
             CleanupResource::BrowserSession => RuntimeFailureCode::CleanupBrowserSessionFailed,
@@ -571,6 +617,9 @@ impl CleanupFailure {
 
     pub fn message(&self) -> String {
         let resource = match &self.resource {
+            CleanupResource::Fixture(context) => {
+                format!("fixture {} {:?}", context.fixture, context.phase)
+            }
             CleanupResource::ExecutionScope { scope_id } => {
                 format!("execution scope {}", scope_id.0)
             }
@@ -581,6 +630,12 @@ impl CleanupFailure {
             }
         };
         let cause = match &self.cause {
+            CleanupCause::Execution { failure, .. } => {
+                format!("execution failure ({})", failure.code().short_code())
+            }
+            CleanupCause::Runtime { failure, .. } => {
+                format!("runtime failure ({})", failure.code().short_code())
+            }
             CleanupCause::Provider(error) => error.to_string(),
             CleanupCause::Browser(error) => error.to_string(),
             CleanupCause::Io(error) => error.message.clone(),
@@ -689,9 +744,18 @@ impl RuntimeFailure {
     deny_unknown_fields
 )]
 pub enum ExecutionEvent {
+    FixtureAcquired {
+        execution_id: ExecutionId,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        test_id: Option<TestId>,
+        step_id: StepId,
+        fixture: crate::FixtureExecutionContext,
+        acquisition_execution_id: ExecutionId,
+    },
     OutputCaptured {
         execution_id: ExecutionId,
-        test_id: TestId,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        test_id: Option<TestId>,
         step_id: StepId,
         provider: String,
         operation: String,
@@ -713,7 +777,8 @@ pub enum ExecutionEvent {
     },
     AttachmentCreated {
         execution_id: ExecutionId,
-        test_id: TestId,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        test_id: Option<TestId>,
         step_id: StepId,
         attachment: Attachment,
     },
@@ -747,17 +812,20 @@ pub enum ExecutionEvent {
     },
     StepStarted {
         execution_id: ExecutionId,
-        test_id: TestId,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        test_id: Option<TestId>,
         step_id: StepId,
     },
     StepPassed {
         execution_id: ExecutionId,
-        test_id: TestId,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        test_id: Option<TestId>,
         step_id: StepId,
     },
     ProviderCallStarted {
         execution_id: ExecutionId,
-        test_id: TestId,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        test_id: Option<TestId>,
         step_id: StepId,
         provider: String,
         operation: String,
@@ -766,7 +834,8 @@ pub enum ExecutionEvent {
     },
     ProviderCallFinished {
         execution_id: ExecutionId,
-        test_id: TestId,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        test_id: Option<TestId>,
         step_id: StepId,
         provider: String,
         operation: String,
@@ -776,7 +845,8 @@ pub enum ExecutionEvent {
     },
     ProviderCallFailed {
         execution_id: ExecutionId,
-        test_id: TestId,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        test_id: Option<TestId>,
         step_id: StepId,
         provider: String,
         operation: String,
@@ -788,7 +858,8 @@ pub enum ExecutionEvent {
     },
     StepFailed {
         execution_id: ExecutionId,
-        test_id: TestId,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        test_id: Option<TestId>,
         step_id: StepId,
         failure_class: FailureClass,
         failure: RuntimeFailure,
@@ -837,7 +908,8 @@ pub enum ExecutionEvent {
 impl ExecutionEvent {
     pub const fn execution_id(&self) -> ExecutionId {
         match self {
-            Self::OutputCaptured { execution_id, .. }
+            Self::FixtureAcquired { execution_id, .. }
+            | Self::OutputCaptured { execution_id, .. }
             | Self::CancellationRequested { execution_id, .. }
             | Self::ScopeAborted { execution_id, .. }
             | Self::AttachmentCreated { execution_id, .. }
@@ -868,7 +940,8 @@ impl ExecutionEvent {
             Self::ProviderCallFailed { code, .. } | Self::CleanupFailed { code, .. } => Some(*code),
             Self::StepFailed { failure, .. } => Some(failure.code()),
             Self::TestTimedOut { .. } => Some(RuntimeFailureCode::TestTimeout),
-            Self::OutputCaptured { .. }
+            Self::FixtureAcquired { .. }
+            | Self::OutputCaptured { .. }
             | Self::CancellationRequested { .. }
             | Self::AttachmentCreated { .. }
             | Self::Attempt { .. }
@@ -889,6 +962,9 @@ impl ExecutionEvent {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeObservation {
+    pub related_locations: Vec<webtest_text::SourceLocation>,
+    pub test_declaration_id: Option<webtest_model::TestDeclarationId>,
+    pub variant_id: Option<webtest_model::TestVariantId>,
     pub execution_id: ExecutionId,
     pub file: FileId,
     pub source_revision: SourceRevision,
@@ -955,7 +1031,9 @@ impl RuntimeObservationKind {
 pub struct ObservationStore {
     observations: Mutex<HashMap<(FileId, SourceRevision), Vec<RuntimeObservation>>>,
     latest_executions: Mutex<HashMap<FileId, ObservationOwner>>,
+    execution_sources: Mutex<HashMap<FileId, Vec<FileId>>>,
     next_publication: std::sync::atomic::AtomicU64,
+    generation: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -965,6 +1043,14 @@ enum ObservationOwner {
 }
 
 impl ObservationStore {
+    pub fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Acquire)
+    }
+    fn changed(&self) {
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
     /// A publication ticket orders external starts independently of execution IDs.
     pub fn begin_publication(&self, file: FileId) -> u64 {
         let mut latest = self
@@ -976,10 +1062,9 @@ impl ObservationStore {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
         latest.insert(file, ObservationOwner::Publication(ticket));
-        self.observations
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|(stored, _), _| *stored != file);
+        let mut observations = self.observations.lock().unwrap_or_else(|e| e.into_inner());
+        observations.retain(|(stored, _), _| *stored != file);
+        self.changed();
         ticket
     }
 
@@ -1006,10 +1091,9 @@ impl ObservationStore {
             return false;
         }
         latest.insert(file, ObservationOwner::Execution(execution));
-        self.observations
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert((file, revision), values);
+        let mut observations = self.observations.lock().unwrap_or_else(|e| e.into_inner());
+        observations.insert((file, revision), values);
+        self.changed();
         true
     }
     pub fn clear(&self) {
@@ -1018,39 +1102,80 @@ impl ObservationStore {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         latest.clear();
-        self.observations
+        self.execution_sources
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|e| e.into_inner())
             .clear();
+        let mut observations = self.observations.lock().unwrap_or_else(|e| e.into_inner());
+        observations.clear();
+        self.changed();
     }
 
     pub fn clear_for_file(&self, file: FileId) {
         let mut latest = self
             .latest_executions
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        latest.remove(&file);
-        let mut observations = self
-            .observations
+            .unwrap_or_else(|e| e.into_inner());
+        let mut sources = self
+            .execution_sources
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        observations.retain(|(stored_file, _), _| *stored_file != file);
+            .unwrap_or_else(|e| e.into_inner());
+        let roots = sources
+            .iter()
+            .filter(|(root, targets)| **root == file || targets.contains(&file))
+            .map(|(root, _)| *root)
+            .chain(std::iter::once(file))
+            .collect::<Vec<_>>();
+        let mut executions = Vec::new();
+        for root in roots {
+            sources.remove(&root);
+            if let Some(ObservationOwner::Execution(execution)) = latest.remove(&root) {
+                executions.push(execution);
+            }
+        }
+        let mut observations = self.observations.lock().unwrap_or_else(|e| e.into_inner());
+        for ((stored, _), values) in observations.iter_mut() {
+            if *stored == file {
+                values.clear();
+            } else {
+                values.retain(|value| !executions.contains(&value.execution_id));
+            }
+        }
+        self.changed();
     }
 
-    /// Starting a run invalidates earlier runs immediately, including in-flight publishers.
     pub fn begin_execution(&self, file: FileId, execution: ExecutionId) {
+        self.begin_workspace_execution(file, &[file], execution);
+    }
+    /// One root owns a batch across its captured dependency sources. Shared
+    /// helper files retain contributions from independently executing roots.
+    pub fn begin_workspace_execution(
+        &self,
+        root: FileId,
+        files: &[FileId],
+        execution: ExecutionId,
+    ) {
         let mut latest = self
             .latest_executions
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        latest.insert(file, ObservationOwner::Execution(execution));
-        self.observations
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = latest.insert(root, ObservationOwner::Execution(execution));
+        self.execution_sources
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .retain(|(stored_file, _), _| *stored_file != file);
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(root, files.to_vec());
+        let mut observations = self.observations.lock().unwrap_or_else(|e| e.into_inner());
+        for ((file, _), values) in observations.iter_mut() {
+            values.retain(|value| {
+                previous != Some(ObservationOwner::Execution(value.execution_id))
+                    && (*file != root
+                        || latest
+                            .values()
+                            .any(|owner| *owner == ObservationOwner::Execution(value.execution_id)))
+            });
+        }
+        self.changed();
     }
-
-    /// Commits one complete batch only if this is still the most recently started run.
     pub fn complete_execution(
         &self,
         file: FileId,
@@ -1058,23 +1183,48 @@ impl ObservationStore {
         execution: ExecutionId,
         values: Vec<RuntimeObservation>,
     ) -> bool {
+        self.complete_workspace_execution(file, &[(file, revision)], execution, values)
+    }
+    /// The complete dependency batch commits under one lock, or not at all.
+    pub fn complete_workspace_execution(
+        &self,
+        root: FileId,
+        sources: &[(FileId, SourceRevision)],
+        execution: ExecutionId,
+        values: Vec<RuntimeObservation>,
+    ) -> bool {
         let latest = self
             .latest_executions
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if latest.get(&file) != Some(&ObservationOwner::Execution(execution))
+            .unwrap_or_else(|e| e.into_inner());
+        if latest.get(&root) != Some(&ObservationOwner::Execution(execution))
             || values.iter().any(|value| {
-                value.file != file
-                    || value.source_revision != revision
-                    || value.execution_id != execution
+                value.execution_id != execution
+                    || !sources.contains(&(value.file, value.source_revision))
             })
         {
             return false;
         }
-        self.observations
+        let owned = self
+            .execution_sources
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert((file, revision), values);
+            .unwrap_or_else(|e| e.into_inner());
+        if owned.get(&root).is_none_or(|files| {
+            files.len() != sources.len() || sources.iter().any(|(file, _)| !files.contains(file))
+        }) {
+            return false;
+        }
+        let mut observations = self.observations.lock().unwrap_or_else(|e| e.into_inner());
+        for stored in observations.values_mut() {
+            stored.retain(|value| value.execution_id != execution);
+        }
+        for value in values {
+            observations
+                .entry((value.file, value.source_revision))
+                .or_default()
+                .push(value);
+        }
+        self.changed();
         true
     }
 
@@ -1086,6 +1236,7 @@ impl ObservationStore {
         for values in observations.values_mut() {
             values.retain(|observation| observation.execution_id != execution_id);
         }
+        self.changed();
     }
 
     pub fn replace_for_file_revision(
@@ -1094,19 +1245,18 @@ impl ObservationStore {
         revision: SourceRevision,
         values: Vec<RuntimeObservation>,
     ) {
-        self.observations
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert((file, revision), values);
+        let mut observations = self.observations.lock().unwrap_or_else(|e| e.into_inner());
+        observations.insert((file, revision), values);
+        self.changed();
     }
 
     pub fn record(&self, observation: RuntimeObservation) {
-        self.observations
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        let mut observations = self.observations.lock().unwrap_or_else(|e| e.into_inner());
+        observations
             .entry((observation.file, observation.source_revision))
             .or_default()
             .push(observation);
+        self.changed();
     }
 
     pub fn observations_for(
@@ -1138,6 +1288,9 @@ mod tests {
         let old = ExecutionId::from_u128(u128::MAX);
         let new = ExecutionId::from_u128(1);
         let observation = |execution_id| RuntimeObservation {
+            related_locations: Vec::new(),
+            test_declaration_id: None,
+            variant_id: None,
             execution_id,
             file,
             source_revision: revision,
@@ -1163,11 +1316,66 @@ mod tests {
     }
 
     #[test]
+    fn workspace_batches_preserve_shared_helper_contributions_and_clear_dependents() {
+        let store = ObservationStore::default();
+        let first = FileId::new(1);
+        let second = FileId::new(2);
+        let helper = FileId::new(3);
+        let revision = SourceRevision::of("source");
+        let one = ExecutionId::from_u128(1);
+        let two = ExecutionId::from_u128(2);
+        let observation = |execution_id, file| RuntimeObservation {
+            related_locations: Vec::new(),
+            test_declaration_id: None,
+            variant_id: None,
+            execution_id,
+            file,
+            source_revision: revision,
+            test_id: TestId(0),
+            step_id: None,
+            range: TextRange::default(),
+            kind: RuntimeObservationKind::TestTimeout {
+                timeout_ms: 1,
+                active_step: None,
+            },
+        };
+        store.begin_workspace_execution(first, &[first, helper], one);
+        store.begin_workspace_execution(second, &[second, helper], two);
+        assert!(store.complete_workspace_execution(
+            first,
+            &[(first, revision), (helper, revision)],
+            one,
+            vec![observation(one, helper), observation(one, first)]
+        ));
+        assert!(store.complete_workspace_execution(
+            second,
+            &[(second, revision), (helper, revision)],
+            two,
+            vec![observation(two, helper)]
+        ));
+        assert_eq!(store.observations_for(helper, revision).len(), 2);
+        store.begin_workspace_execution(first, &[first, helper], one);
+        assert_eq!(store.observations_for(helper, revision).len(), 1);
+        store.clear_for_file(helper);
+        assert!(store.observations_for(first, revision).is_empty());
+        assert!(store.observations_for(helper, revision).is_empty());
+        assert!(!store.complete_workspace_execution(
+            second,
+            &[(second, revision), (helper, revision)],
+            two,
+            vec![]
+        ));
+    }
+
+    #[test]
     fn observations_are_partitioned_by_source_revision() {
         let store = ObservationStore::default();
         let file = FileId::new(1);
         let revision = SourceRevision::of("a");
         store.record(RuntimeObservation {
+            related_locations: Vec::new(),
+            test_declaration_id: None,
+            variant_id: None,
             execution_id: ExecutionId::from_u128(1),
             file,
             source_revision: revision,
@@ -1199,7 +1407,7 @@ mod tests {
 
         let event = ExecutionEvent::StepFailed {
             execution_id: ExecutionId::from_u128(1),
-            test_id: TestId(2),
+            test_id: Some(TestId(2)),
             step_id: StepId(3),
             failure_class: FailureClass::Test,
             failure,

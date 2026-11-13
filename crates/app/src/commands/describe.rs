@@ -12,7 +12,6 @@ use crate::{
     cli::ReferenceReporter,
     error::AppError,
     project_context::{normalized_path, read_source, revision_hex},
-    provider_composition::analysis_database_for_project,
     report::ExitClass,
     runtime_configuration::resolved_runtime_configuration,
 };
@@ -77,7 +76,7 @@ pub(crate) fn run_describe(
     };
     let database = resolved_project
         .as_ref()
-        .map(analysis_database_for_project)
+        .map(crate::project_analysis::workspace_for)
         .transpose()?
         .unwrap_or_default();
     let response = database.describe(request, project_reference, limits);
@@ -104,6 +103,24 @@ fn write_description_human(
     output: &mut dyn Write,
 ) -> Result<(), AppError> {
     match response {
+        DescriptionResponse::Project(project) => {
+            for declaration in &project.declarations {
+                writeln!(
+                    output,
+                    "{} {} ({})",
+                    declaration.kind, declaration.name, declaration.location.path
+                )
+                .map_err(AppError::infrastructure)?;
+                if !declaration.documentation.is_empty() {
+                    writeln!(output, "  {}", declaration.documentation)
+                        .map_err(AppError::infrastructure)?;
+                }
+            }
+            if project.truncated {
+                writeln!(output, "More declarations omitted by description limits.")
+                    .map_err(AppError::infrastructure)?;
+            }
+        }
         DescriptionResponse::Index(index) => {
             writeln!(output, "WebTest {} reference", index.language_version)
                 .map_err(AppError::infrastructure)?;

@@ -6,6 +6,10 @@ license.workspace = true
 
 [dependencies]
 serde.workspace = true
+async-trait.workspace = true
+webtest-model.workspace = true
+webtest-plan.workspace = true
+webtest-runtime.workspace = true
 getrandom.workspace = true
 futures.workspace = true
 tempfile.workspace = true

@@ -26,6 +26,16 @@ macro_rules! ast_node {
 }
 
 ast_node!(Root, Root);
+ast_node!(ImportDecl, ImportDecl);
+ast_node!(ImportBinding, ImportBinding);
+ast_node!(FunctionDecl, FunctionDecl);
+ast_node!(ParameterList, ParameterList);
+ast_node!(Parameter, Parameter);
+ast_node!(FixtureDecl, FixtureDecl);
+ast_node!(FixtureSetup, FixtureSetup);
+ast_node!(FixtureTeardown, FixtureTeardown);
+ast_node!(UseExpr, UseExpr);
+
 ast_node!(TestDecl, TestDecl);
 ast_node!(Block, Block);
 ast_node!(ServerBlock, ServerBlock);
@@ -309,20 +319,9 @@ impl LetStmt {
         self.syntax
             .children_with_tokens()
             .filter_map(|element| element.into_token())
-            .find(|token| {
-                matches!(
-                    token.kind(),
-                    SyntaxKind::Ident
-                        | SyntaxKind::TimeoutKw
-                        | SyntaxKind::ParallelKw
-                        | SyntaxKind::RaceKw
-                        | SyntaxKind::ProvideKw
-                        | SyntaxKind::RetryKw
-                        | SyntaxKind::BackoffKw
-                        | SyntaxKind::MaxKw
-                )
-            })
+            .find(|token| crate::is_binding_name_kind(token.kind()))
     }
+
     pub fn annotation(&self) -> Option<TypeExpr> {
         self.syntax.children().find_map(TypeExpr::cast)
     }
@@ -535,6 +534,7 @@ impl DomainStatement {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Expr {
+    Use(UseExpr),
     Literal(LiteralExpr),
     Name(NameExpr),
     List(ListExpr),
@@ -549,6 +549,7 @@ pub enum Expr {
 impl Expr {
     pub fn cast(node: SyntaxNode) -> Option<Self> {
         match node.kind() {
+            SyntaxKind::UseExpr => UseExpr::cast(node).map(Self::Use),
             SyntaxKind::LiteralExpr => LiteralExpr::cast(node).map(Self::Literal),
             SyntaxKind::NameExpr => NameExpr::cast(node).map(Self::Name),
             SyntaxKind::ListExpr => ListExpr::cast(node).map(Self::List),
@@ -564,6 +565,7 @@ impl Expr {
 
     pub fn syntax(&self) -> &SyntaxNode {
         match self {
+            Self::Use(value) => value.syntax(),
             Self::Literal(value) => value.syntax(),
             Self::Name(value) => value.syntax(),
             Self::List(value) => value.syntax(),
@@ -609,6 +611,9 @@ impl RecordExpr {
 }
 
 impl RecordField {
+    pub fn name_token(&self) -> Option<SyntaxToken> {
+        first_meaningful_token(&self.syntax)
+    }
     pub fn name(&self) -> Option<String> {
         let token = first_meaningful_token(&self.syntax)?;
         if token.kind() == SyntaxKind::String {
@@ -645,6 +650,10 @@ impl CallExpr {
 }
 
 impl CallArg {
+    pub fn name_token(&self) -> Option<SyntaxToken> {
+        self.name()?;
+        first_meaningful_token(&self.syntax)
+    }
     pub fn name(&self) -> Option<String> {
         let has_colon = self
             .syntax
@@ -752,6 +761,9 @@ impl RecordType {
 }
 
 impl TypeField {
+    pub fn name_token(&self) -> Option<SyntaxToken> {
+        first_meaningful_token(&self.syntax)
+    }
     pub fn name(&self) -> Option<String> {
         let token = first_meaningful_token(&self.syntax)?;
         if token.kind() == SyntaxKind::String {
@@ -888,4 +900,217 @@ fn parse_duration(text: &str) -> Option<Duration> {
     };
     let number = number.parse::<u64>().ok()?;
     Some(Duration::from_millis(number.saturating_mul(multiplier)))
+}
+
+impl Root {
+    pub fn imports(&self) -> impl Iterator<Item = ImportDecl> + '_ {
+        self.syntax.children().filter_map(ImportDecl::cast)
+    }
+    pub fn functions(&self) -> impl Iterator<Item = FunctionDecl> + '_ {
+        self.syntax.children().filter_map(FunctionDecl::cast)
+    }
+    pub fn fixtures(&self) -> impl Iterator<Item = FixtureDecl> + '_ {
+        self.syntax.children().filter_map(FixtureDecl::cast)
+    }
+}
+impl ImportDecl {
+    pub fn bindings(&self) -> impl Iterator<Item = ImportBinding> + '_ {
+        self.syntax.children().filter_map(ImportBinding::cast)
+    }
+    pub fn path(&self) -> Option<StringToken> {
+        direct_string(&self.syntax)
+    }
+}
+impl ImportBinding {
+    pub fn name(&self) -> Option<SyntaxToken> {
+        first_meaningful_token(&self.syntax)
+    }
+    pub fn alias(&self) -> Option<SyntaxToken> {
+        let mut tokens = self
+            .syntax
+            .children_with_tokens()
+            .filter_map(|element| element.into_token())
+            .filter(|token| !token.kind().is_trivia());
+        tokens.find(|token| token.kind() == SyntaxKind::AsKw)?;
+        tokens.next()
+    }
+}
+fn reusable_name(node: &SyntaxNode) -> Option<SyntaxToken> {
+    let mut tokens = node
+        .children_with_tokens()
+        .filter_map(|element| element.into_token())
+        .filter(|token| !token.kind().is_trivia());
+    tokens.find(|token| matches!(token.kind(), SyntaxKind::FnKw | SyntaxKind::FixtureKw))?;
+    tokens.next()
+}
+fn declaration_documentation(node: &SyntaxNode) -> String {
+    let mut comments = Vec::new();
+    let mut remaining = 4096usize;
+    let mut previous = node.first_token().and_then(|token| token.prev_token());
+    while let Some(token) = previous {
+        if token.kind() == SyntaxKind::LineComment && token.text().starts_with("///") {
+            let text: String = token
+                .text()
+                .trim_start_matches('/')
+                .trim()
+                .chars()
+                .take(remaining)
+                .collect();
+            remaining = remaining.saturating_sub(text.chars().count() + 1);
+            comments.push(text);
+            if remaining == 0 {
+                break;
+            }
+        } else if token.kind() != SyntaxKind::Whitespace || token.text().matches('\n').count() > 1 {
+            break;
+        }
+        previous = token.prev_token();
+    }
+    comments.reverse();
+    comments.join("\n")
+}
+
+macro_rules! reusable_accessors {
+    ($name:ident) => {
+        impl $name {
+            pub fn name(&self) -> Option<SyntaxToken> {
+                reusable_name(&self.syntax)
+            }
+            pub fn exported(&self) -> bool {
+                self.syntax
+                    .children_with_tokens()
+                    .filter_map(|element| element.into_token())
+                    .any(|token| token.kind() == SyntaxKind::ExportKw)
+            }
+            pub fn parameters(&self) -> impl Iterator<Item = Parameter> + '_ {
+                self.syntax
+                    .children()
+                    .filter_map(ParameterList::cast)
+                    .flat_map(|list| {
+                        list.syntax
+                            .children()
+                            .filter_map(Parameter::cast)
+                            .collect::<Vec<_>>()
+                    })
+            }
+            pub fn result_type(&self) -> Option<TypeExpr> {
+                self.syntax.children().find_map(TypeExpr::cast)
+            }
+            pub fn documentation(&self) -> String {
+                declaration_documentation(&self.syntax)
+            }
+        }
+    };
+}
+reusable_accessors!(FunctionDecl);
+reusable_accessors!(FixtureDecl);
+impl Parameter {
+    pub fn name(&self) -> Option<SyntaxToken> {
+        first_meaningful_token(&self.syntax)
+    }
+    pub fn annotation(&self) -> Option<TypeExpr> {
+        self.syntax.children().find_map(TypeExpr::cast)
+    }
+}
+impl FunctionDecl {
+    pub fn capability(&self) -> Option<DeclaredCapability> {
+        self.syntax
+            .children_with_tokens()
+            .filter_map(|element| element.into_token())
+            .find_map(|token| match token.kind() {
+                SyntaxKind::ServerKw => Some(DeclaredCapability::Server),
+                SyntaxKind::BrowserKw => Some(DeclaredCapability::Browser),
+                _ => None,
+            })
+    }
+    pub fn domain_statements(&self) -> impl Iterator<Item = DomainStatement> + '_ {
+        self.body().into_iter().flat_map(|body| {
+            body.syntax
+                .children()
+                .filter_map(DomainStatement::cast)
+                .collect::<Vec<_>>()
+        })
+    }
+
+    pub fn expression(&self) -> Option<Expr> {
+        self.syntax.children().find_map(Expr::cast)
+    }
+    pub fn body(&self) -> Option<Block> {
+        self.syntax.children().find_map(Block::cast)
+    }
+}
+impl Block {
+    pub fn statements(&self) -> impl Iterator<Item = FlowStatement> + '_ {
+        self.syntax.children().filter_map(FlowStatement::cast)
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FixtureLifetime {
+    Test,
+    File,
+    Worker,
+    Suite,
+}
+impl FixtureDecl {
+    pub fn lifetime(&self) -> FixtureLifetime {
+        let mut tokens = self
+            .syntax
+            .children_with_tokens()
+            .filter_map(|element| element.into_token());
+        if tokens
+            .find(|token| token.kind() == SyntaxKind::ScopeKw)
+            .is_none()
+        {
+            return FixtureLifetime::Test;
+        }
+        match tokens
+            .find(|token| !token.kind().is_trivia())
+            .map(|token| token.kind())
+        {
+            Some(SyntaxKind::FileKw) => FixtureLifetime::File,
+            Some(SyntaxKind::WorkerKw) => FixtureLifetime::Worker,
+            Some(SyntaxKind::SuiteKw) => FixtureLifetime::Suite,
+            _ => FixtureLifetime::Test,
+        }
+    }
+    pub fn shareable(&self) -> bool {
+        self.syntax
+            .children_with_tokens()
+            .filter_map(|element| element.into_token())
+            .any(|token| token.kind() == SyntaxKind::ShareableKw)
+    }
+    pub fn setups(&self) -> impl Iterator<Item = FixtureSetup> + '_ {
+        self.syntax.children().filter_map(FixtureSetup::cast)
+    }
+    pub fn teardowns(&self) -> impl Iterator<Item = FixtureTeardown> + '_ {
+        self.syntax.children().filter_map(FixtureTeardown::cast)
+    }
+}
+macro_rules! phase_accessors {
+    ($name:ident) => {
+        impl $name {
+            pub fn body(&self) -> Option<Block> {
+                self.syntax.children().find_map(Block::cast)
+            }
+            pub fn server_body(&self) -> Option<ServerBlock> {
+                self.syntax.children().find_map(ServerBlock::cast)
+            }
+            pub fn browser_body(&self) -> Option<BrowserBlock> {
+                self.syntax.children().find_map(BrowserBlock::cast)
+            }
+        }
+    };
+}
+phase_accessors!(FixtureSetup);
+phase_accessors!(FixtureTeardown);
+impl UseExpr {
+    pub fn call(&self) -> Option<Expr> {
+        self.syntax.children().find_map(Expr::cast)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeclaredCapability {
+    Server,
+    Browser,
 }

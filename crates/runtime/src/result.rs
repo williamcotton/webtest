@@ -23,6 +23,8 @@ pub struct StepFailure {
 
 #[derive(Clone, Debug)]
 pub struct TestResult {
+    pub test_declaration_id: webtest_model::TestDeclarationId,
+    pub variant_id: webtest_model::TestVariantId,
     pub test_id: TestId,
     pub name: String,
     pub outcome: TestOutcome,

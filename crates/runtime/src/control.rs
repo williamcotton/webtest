@@ -17,6 +17,7 @@ pub struct DebugContext {
 
 #[derive(Clone, Debug)]
 pub struct DebugScope {
+    pub display_name: Option<String>,
     pub scope: webtest_observation::ScopeEvent,
     pub kind: DebugScopeKind,
     pub attempt: Option<webtest_observation::AttemptEvent>,
@@ -24,6 +25,10 @@ pub struct DebugScope {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DebugScopeKind {
+    FixtureLifetime,
+    FixtureSetup,
+    FixtureTeardown,
+    Helper,
     Sequence,
     Parallel,
     Race,
@@ -42,11 +47,16 @@ pub(crate) struct DebugTaskGuard<'a> {
 impl<'a> DebugTaskGuard<'a> {
     pub fn new(
         control: Option<&'a dyn RunControl>,
-        test: &PlannedTest,
+        test: Option<&PlannedTest>,
+        fixture: Option<&webtest_plan::FixtureDefinition>,
         context: DebugContext,
     ) -> Self {
         if let Some(control) = control {
-            control.task_started(test, &context);
+            if let Some(test) = test {
+                control.task_started(test, &context);
+            } else if let Some(fixture) = fixture {
+                control.fixture_task_started(fixture, &context);
+            }
         }
         Self { control, context }
     }
@@ -61,6 +71,37 @@ impl Drop for DebugTaskGuard<'_> {
 
 #[async_trait]
 pub trait RunControl: Send + Sync {
+    fn fixture_task_started(
+        &self,
+        _fixture: &webtest_plan::FixtureDefinition,
+        _context: &DebugContext,
+    ) {
+    }
+    fn should_capture_fixture_bindings(
+        &self,
+        _fixture: &webtest_plan::FixtureDefinition,
+        _step: &PlannedStep,
+    ) -> bool {
+        true
+    }
+    async fn before_fixture_step(
+        &self,
+        _fixture: &webtest_plan::FixtureDefinition,
+        _step: &PlannedStep,
+        _context: &DebugContext,
+        _bindings: Option<BTreeMap<String, Value>>,
+    ) {
+    }
+    async fn after_fixture_step_failure(
+        &self,
+        _fixture: &webtest_plan::FixtureDefinition,
+        _step: &PlannedStep,
+        _context: &DebugContext,
+        _error: &StepError,
+        _bindings: &BTreeMap<String, Value>,
+    ) {
+    }
+
     fn task_started(&self, _test: &PlannedTest, _context: &DebugContext) {}
     fn task_finished(&self, _context: &DebugContext) {}
 

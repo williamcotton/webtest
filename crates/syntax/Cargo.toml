@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+unicode-ident.workspace = true
 rowan.workspace = true
 serde.workspace = true
 webtest-text.workspace = true

@@ -1,0 +1,10 @@
+{
+  "format": 1,
+  "files": 1000,
+  "declarations_per_file": 5,
+  "chain_depth": 1000,
+  "syntax_error_stride": 97,
+  "baseline_language": "milestone-f",
+  "generator": "crates/analysis/examples/workspace_benchmark.rs",
+  "runtime_specialization_depth": 8
+}

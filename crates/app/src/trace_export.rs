@@ -43,20 +43,36 @@ pub(crate) fn metadata(
     })
 }
 
-pub(crate) fn export(
+pub(crate) fn export_sources(
     project: &Project,
     metadata: TraceMetadata,
-    source: &str,
+    captured: &crate::project_analysis::CapturedSources,
     plan: &webtest_plan::TestPlan,
-    project_path: &str,
     result: &webtest_runtime::RunResult,
 ) -> Result<PathBuf, AppError> {
-    export_records(
-        project,
-        metadata,
-        Some((source, plan, project_path)),
-        result,
-    )
+    let execution_id = result.execution_id.ok_or_else(|| {
+        AppError::infrastructure("trace export requires an allocated execution identity")
+    })?;
+    let sources = plan
+        .sources()
+        .into_iter()
+        .map(|(file, revision)| {
+            let source = captured
+                .get(&file)
+                .filter(|source| source.revision == revision)
+                .ok_or_else(|| {
+                    AppError::internal("trace source snapshot does not match the executed plan")
+                })?;
+            Ok(SourceInput {
+                execution_id,
+                file_id: file,
+                revision,
+                project_path: &source.path,
+                text: Some(&source.text),
+            })
+        })
+        .collect::<Result<Vec<_>, AppError>>()?;
+    export_records(project, metadata, &sources, result)
 }
 
 pub(crate) fn export_application(
@@ -64,13 +80,13 @@ pub(crate) fn export_application(
     metadata: TraceMetadata,
     result: &webtest_runtime::RunResult,
 ) -> Result<PathBuf, AppError> {
-    export_records(project, metadata, None, result)
+    export_records(project, metadata, &[], result)
 }
 
 fn export_records(
     project: &Project,
     metadata: TraceMetadata,
-    source: Option<(&str, &webtest_plan::TestPlan, &str)>,
+    sources: &[SourceInput<'_>],
     result: &webtest_runtime::RunResult,
 ) -> Result<PathBuf, AppError> {
     let execution_id = result.execution_id.ok_or_else(|| {
@@ -137,15 +153,15 @@ fn export_records(
         TraceInput {
             metadata,
             records: &result.journal,
-            sources: &source
-                .map(|(source, plan, project_path)| SourceInput {
-                    execution_id,
-                    file_id: plan.file,
-                    revision: plan.source_revision,
-                    project_path,
-                    text: include_sources.then_some(source),
+            sources: &sources
+                .iter()
+                .map(|source| SourceInput {
+                    execution_id: source.execution_id,
+                    file_id: source.file_id,
+                    revision: source.revision,
+                    project_path: source.project_path,
+                    text: if include_sources { source.text } else { None },
                 })
-                .into_iter()
                 .collect::<Vec<_>>(),
             attachments: &attachments,
         },

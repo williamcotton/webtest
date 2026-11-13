@@ -7,7 +7,10 @@ license.workspace = true
 [dependencies]
 thiserror.workspace = true
 serde_json.workspace = true
+serde.workspace = true
+webtest-model.workspace = true
 webtest-analysis.workspace = true
+webtest-feedback.workspace = true
 webtest-browser.workspace = true
 webtest-format.workspace = true
 webtest-observation.workspace = true
@@ -21,4 +24,3 @@ webtest-text.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 webtest-browser-cdp.workspace = true
-webtest-model.workspace = true

@@ -66,6 +66,8 @@ impl Runner {
                 .tests
                 .iter()
                 .map(|test| TestResult {
+                    test_declaration_id: test.test_declaration_id,
+                    variant_id: test.variant_id,
                     test_id: test.id,
                     name: test.name.clone(),
                     outcome: TestOutcome::Skipped {
@@ -129,6 +131,20 @@ impl Runner {
         browser: &dyn BrowserHost,
         control: Option<&dyn RunControl>,
     ) -> RunResult {
+        if !plan.fixtures.is_empty() {
+            return Box::pin(jobs::run_scheduled(
+                &[jobs::TestRun {
+                    runner: self,
+                    plan,
+                    browser,
+                    control,
+                }],
+                jobs::JobLimit::default(),
+                None,
+            ))
+            .await
+            .remove(0);
+        }
         // Resolve once so every test in this run observes the same registry. An
         // explicit registry is cloned as a stable map while retaining the same
         // provider instances behind their shared references.
@@ -143,7 +159,12 @@ impl Runner {
             Ok(id) => id,
             Err(error) => return self.failed_identity(plan, error),
         };
-        self.observations.begin_execution(plan.file, execution_id);
+        let sources = plan.sources();
+        self.observations.begin_workspace_execution(
+            plan.file,
+            &sources.iter().map(|(file, _)| *file).collect::<Vec<_>>(),
+            execution_id,
+        );
         let pending_observations = ObservationStore::default();
         let ids = crate::execution::scopes::ExecutionIds::default();
         let resources = crate::ResourceRegistry::default();
@@ -338,11 +359,16 @@ impl Runner {
                 &self.options.inspection.redacted_query_parameters,
             )
         };
-        self.observations.complete_execution(
+        self.observations.complete_workspace_execution(
             plan.file,
-            plan.source_revision,
+            &sources,
             execution_id,
-            pending_observations.observations_for(plan.file, plan.source_revision),
+            sources
+                .iter()
+                .flat_map(|(file, revision)| {
+                    pending_observations.observations_for(*file, *revision)
+                })
+                .collect(),
         );
         result
     }
@@ -432,6 +458,8 @@ fn skip_tests(
             },
         );
         results.push(TestResult {
+            test_declaration_id: test.test_declaration_id,
+            variant_id: test.variant_id,
             test_id: test.id,
             name: test.name.clone(),
             outcome: TestOutcome::Skipped {

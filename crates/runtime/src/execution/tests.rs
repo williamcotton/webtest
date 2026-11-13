@@ -54,7 +54,7 @@ async fn sibling_futures_have_independent_bindings_active_operations_and_explici
     let providers = ProviderRegistry::default();
     let resources = crate::ResourceRegistry::default();
     let waits = crate::WaitRegistry::default();
-    let scopes = scopes::ScopeFactory::new(scopes::ExecutionIds::default(), test.id);
+    let scopes = scopes::ScopeFactory::new(scopes::ExecutionIds::default(), test);
     let deadline = TestDeadline::new(options.test_timeout);
     let root = scopes.root(&test.body, deadline.at);
     let control = SiblingBarrier {
@@ -72,7 +72,9 @@ async fn sibling_futures_have_independent_bindings_active_operations_and_explici
     let services = ExecutionServices {
         plan: &plan,
         observations: &observations,
-        test,
+        test: Some(test),
+        fixture: None,
+        fixture_access: None,
         execution_id: ExecutionId::from_u128(1),
         events: &events,
         event_sink: None,

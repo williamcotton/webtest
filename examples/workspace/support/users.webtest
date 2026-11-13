@@ -1,0 +1,21 @@
+/// Normalize an email without host effects.
+export fn normalized_email(value: String) -> String = lower(value)
+/// One normalized value per test execution or retry attempt.
+export fixture user_email(value: String) -> String scope test {
+    setup {
+        let email = normalized_email(value)
+        provide email
+    }
+    teardown {
+        expect email == normalized_email(value)
+    }
+}
+/// Transferable suite data can be shared by concurrent files.
+export fixture suite_seed() -> Int scope suite shareable {
+    setup {
+        provide 7
+    }
+    teardown {
+        expect 7 > 0
+    }
+}

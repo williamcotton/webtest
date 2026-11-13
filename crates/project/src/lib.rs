@@ -55,6 +55,7 @@ pub struct ProjectConfig {
 pub struct ProjectSection {
     pub name: Option<String>,
     pub test_roots: Vec<PathBuf>,
+    pub source_roots: Vec<PathBuf>,
     pub exclude: Vec<String>,
 }
 
@@ -406,6 +407,8 @@ struct RawProject {
     name: Option<String>,
     #[serde(default)]
     test_roots: Vec<PathBuf>,
+    #[serde(default)]
+    source_roots: Vec<PathBuf>,
     #[serde(default)]
     exclude: Vec<String>,
     #[serde(flatten)]
@@ -854,6 +857,9 @@ fn parse_config(
             message: "browser.viewport dimensions must be between 1 and 16384".into(),
         });
     }
+    for source_root in &raw.project.source_roots {
+        validate_project_relative(path, "project.source_roots", source_root)?;
+    }
     for test_root in &raw.project.test_roots {
         validate_project_relative(path, "project.test_roots", test_root)?;
     }
@@ -1005,6 +1011,7 @@ fn parse_config(
             project: ProjectSection {
                 name: raw.project.name,
                 test_roots: raw.project.test_roots,
+                source_roots: raw.project.source_roots,
                 exclude: raw.project.exclude,
             },
             browser: BrowserSection {
@@ -1402,6 +1409,80 @@ fn exclude_matcher(patterns: &[String]) -> Result<GlobSet, ProjectError> {
             pattern: "<set>".into(),
             message: error.to_string(),
         })
+}
+
+/// Source inventory is independent of the selected execution targets. It never
+/// follows directory symlinks; explicit import aliases are resolved by the host.
+pub fn workspace_sources(project: &Project) -> Result<Vec<DiscoveredFile>, ProjectError> {
+    let roots = workspace_source_roots(project)?
+        .into_iter()
+        .filter(|root| root.exists())
+        .collect::<Vec<_>>();
+    let mut excludes = project.config.project.exclude.clone();
+    excludes.extend(
+        [
+            "**/node_modules/**",
+            "**/target/**",
+            "node_modules",
+            "target",
+        ]
+        .map(str::to_owned),
+    );
+    let files = discover_files(&project.root, &roots, &exclude_matcher(&excludes)?)?;
+    if let Some(file) = files
+        .iter()
+        .find(|file| !roots.iter().any(|root| file.path.starts_with(root)))
+    {
+        return Err(ProjectError::InvalidConfig {
+            path: project
+                .config_path
+                .clone()
+                .unwrap_or_else(|| project.root.join(CONFIG_NAME)),
+            message: format!(
+                "module {} resolves outside configured source roots",
+                file.path.display()
+            ),
+        });
+    }
+    Ok(files)
+}
+
+/// Native source-root canonicalization; analysis receives the resolved paths.
+pub fn workspace_source_roots(project: &Project) -> Result<Vec<PathBuf>, ProjectError> {
+    let configured = if project.config.project.source_roots.is_empty() {
+        vec![project.root.clone()]
+    } else {
+        project
+            .config
+            .project
+            .source_roots
+            .iter()
+            .map(|path| project.root.join(path))
+            .collect()
+    };
+    configured
+        .into_iter()
+        .map(|path| {
+            let canonical = match fs::canonicalize(&path) {
+                Ok(canonical) => canonical,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(path),
+                Err(source) => return Err(ProjectError::Canonicalize { path, source }),
+            };
+            if !canonical.starts_with(&project.root) || !canonical.is_dir() {
+                return Err(ProjectError::InvalidConfig {
+                    path: project
+                        .config_path
+                        .clone()
+                        .unwrap_or_else(|| project.root.join(CONFIG_NAME)),
+                    message: format!(
+                        "source root {} must be a directory within the project",
+                        path.display()
+                    ),
+                });
+            }
+            Ok(canonical)
+        })
+        .collect()
 }
 
 fn discover_files(

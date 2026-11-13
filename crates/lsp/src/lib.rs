@@ -1,7 +1,9 @@
 //! Thin Tower-based LSP adapter over protocol-independent editor services.
 
+mod features;
 #[cfg(unix)]
 pub mod observation_ipc;
+mod synchronization;
 
 use std::{
     collections::HashMap,
@@ -32,6 +34,7 @@ struct Document {
     file: FileId,
     uri: Uri,
     version: i32,
+    synchronized: bool,
     editor: Arc<EditorService>,
 }
 
@@ -47,7 +50,10 @@ impl DocumentStore {
     }
 
     fn get(&self, uri: &Uri) -> Option<Document> {
-        self.lock().get(uri.as_str()).cloned()
+        self.lock()
+            .get(uri.as_str())
+            .filter(|document| document.synchronized)
+            .cloned()
     }
 
     fn remove(&self, uri: &Uri) -> Option<Document> {
@@ -73,20 +79,50 @@ struct Backend {
     browser: Arc<dyn BrowserHost>,
     project_file_changed: Arc<ProjectFileChangeHandler>,
     supports_dynamic_file_watching: AtomicBool,
+    queries: Arc<features::QueryRegistry>,
+    publications: tokio::sync::Mutex<()>,
 }
 
 pub type DocumentEditorResolver =
     dyn Fn(&Path) -> std::result::Result<Arc<EditorService>, String> + Send + Sync;
 pub type ProjectFileChangeHandler =
-    dyn Fn(&Path) -> std::result::Result<bool, String> + Send + Sync;
+    dyn Fn(&Path, bool) -> std::result::Result<bool, String> + Send + Sync;
 
 impl Backend {
+    async fn resolve_synchronized_inputs(&self, uri: &Uri) {
+        if let Some(path) = uri.to_file_path()
+            && let Err(error) = (self.project_file_changed)(&path, true)
+        {
+            self.client
+                .log_message(
+                    MessageType::ERROR,
+                    format!("could not resolve workspace imports: {error}"),
+                )
+                .await;
+        }
+    }
+    async fn publish_workspace_documents(&self, uri: &Uri) {
+        let documents = self.documents.all();
+        let editor = documents
+            .iter()
+            .find(|document| document.uri == *uri)
+            .map(|document| document.editor.clone());
+        for document in documents {
+            if editor
+                .as_ref()
+                .is_some_and(|editor| Arc::ptr_eq(editor, &document.editor))
+            {
+                self.publish(&document.uri).await;
+            }
+        }
+    }
     fn new(
         client: Client,
         browser: Arc<dyn BrowserHost>,
         default_editor: Arc<EditorService>,
         editor_for_path: Arc<DocumentEditorResolver>,
         project_file_changed: Arc<ProjectFileChangeHandler>,
+        queries: Arc<features::QueryRegistry>,
     ) -> Self {
         Self {
             client,
@@ -96,6 +132,8 @@ impl Backend {
             browser,
             project_file_changed,
             supports_dynamic_file_watching: AtomicBool::new(false),
+            queries,
+            publications: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -103,35 +141,91 @@ impl Backend {
         let Some(document) = self.documents.get(uri) else {
             return;
         };
-        let source = match document.editor.source(document.file) {
-            Ok(source) => source,
-            Err(error) => {
-                self.client
-                    .log_message(MessageType::ERROR, error.to_string())
-                    .await;
-                return;
-            }
-        };
-        let diagnostics = match document.editor.diagnostics(document.file) {
-            Ok(diagnostics) => diagnostics
-                .into_iter()
-                .map(|diagnostic| diagnostic_to_lsp(&source, diagnostic))
-                .collect(),
-            Err(error) => {
-                self.client
-                    .log_message(MessageType::ERROR, error.to_string())
-                    .await;
-                Vec::new()
-            }
-        };
-        self.client
-            .publish_diagnostics(document.uri, diagnostics, Some(document.version))
+        let file = document.file;
+        let result = self
+            .query(Some(&document), document.editor.clone(), move |snapshot| {
+                let source = snapshot.source(file).map_err(features::core_error)?;
+                let diagnostics = snapshot
+                    .diagnostics(file)
+                    .map_err(features::editor_error)?
+                    .into_iter()
+                    .map(|diagnostic| {
+                        let related = diagnostic.related_locations.clone();
+                        let mut wire = diagnostic_to_lsp(&source, diagnostic);
+                        let locations = related
+                            .into_iter()
+                            .filter_map(|location| {
+                                let source = snapshot.source(location.origin.file).ok()?;
+                                if webtest_text::SourceRevision::of(&source) != location.revision {
+                                    return None;
+                                }
+                                Some(DiagnosticRelatedInformation {
+                                    location: Location::new(
+                                        features::source_uri(
+                                            snapshot,
+                                            location.origin.file,
+                                            &location.path,
+                                        )
+                                        .ok()?,
+                                        text_range_to_lsp(&source, location.origin.range),
+                                    ),
+                                    message: "Related declaration or call site".into(),
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        wire.related_information = (!locations.is_empty()).then_some(locations);
+                        wire
+                    })
+                    .collect::<Vec<_>>();
+                Ok((
+                    diagnostics,
+                    snapshot.workspace_revision(),
+                    snapshot.observation_revision(),
+                ))
+            })
             .await;
+        match result {
+            Ok((diagnostics, revision, observation_revision)) => {
+                let _publication = self.publications.lock().await;
+                if self
+                    .documents
+                    .get(uri)
+                    .is_some_and(|current| current.version == document.version)
+                    && document.editor.analysis_revision() == revision
+                    && document.editor.observations().generation() == observation_revision
+                {
+                    self.client
+                        .publish_diagnostics(uri.clone(), diagnostics, Some(document.version))
+                        .await;
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.code,
+                    tower_lsp_server::jsonrpc::ErrorCode::RequestCancelled
+                        | tower_lsp_server::jsonrpc::ErrorCode::ContentModified
+                ) => {}
+            Err(error) => {
+                self.client
+                    .log_message(MessageType::ERROR, error.to_string())
+                    .await
+            }
+        }
     }
 }
 
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        if params
+            .workspace_folders
+            .as_ref()
+            .is_some_and(|folders| folders.len() > 1)
+        {
+            return Err(Error::invalid_params(
+                "WebTest currently supports one workspace root per language-server session",
+            ));
+        }
+
         let client_supplies_project_file_events = params
             .initialization_options
             .as_ref()
@@ -156,9 +250,18 @@ impl LanguageServer for Backend {
             capabilities: ServerCapabilities {
                 position_encoding: Some(PositionEncodingKind::UTF16),
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                    TextDocumentSyncKind::FULL,
+                    TextDocumentSyncKind::INCREMENTAL,
                 )),
+                definition_provider: Some(OneOf::Left(true)),
+                references_provider: Some(OneOf::Left(true)),
+                rename_provider: Some(OneOf::Left(true)),
+                document_symbol_provider: Some(OneOf::Left(true)),
+                workspace_symbol_provider: Some(OneOf::Left(true)),
+                folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
+                selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
                 document_formatting_provider: Some(OneOf::Left(true)),
+                inlay_hint_provider: Some(OneOf::Left(true)),
+                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 semantic_tokens_provider: Some(
                     SemanticTokensOptions {
                         work_done_progress_options: WorkDoneProgressOptions::default(),
@@ -171,8 +274,16 @@ impl LanguageServer for Backend {
                                 SemanticTokenType::VARIABLE,
                                 SemanticTokenType::PROPERTY,
                                 SemanticTokenType::TYPE,
+                                SemanticTokenType::PARAMETER,
+                                SemanticTokenType::NAMESPACE,
+                                SemanticTokenType::new("fixture"),
+                                SemanticTokenType::new("test"),
                             ],
-                            token_modifiers: Vec::new(),
+                            token_modifiers: vec![
+                                SemanticTokenModifier::DECLARATION,
+                                SemanticTokenModifier::READONLY,
+                                SemanticTokenModifier::DEPRECATED,
+                            ],
                         },
                         range: None,
                         full: Some(SemanticTokensFullOptions::Bool(true)),
@@ -211,6 +322,10 @@ impl LanguageServer for Backend {
                         glob_pattern: GlobPattern::String("**/*.json".into()),
                         kind: None,
                     },
+                    FileSystemWatcher {
+                        glob_pattern: GlobPattern::String("**/*.webtest".into()),
+                        kind: None,
+                    },
                 ],
             };
             let registration = Registration {
@@ -233,6 +348,7 @@ impl LanguageServer for Backend {
     }
 
     async fn shutdown(&self) -> Result<()> {
+        self.finish_queries().await;
         Ok(())
     }
 
@@ -260,27 +376,100 @@ impl LanguageServer for Backend {
         } else {
             Arc::clone(&self.default_editor)
         };
-        let file = editor.open_document(document.uri.as_str(), document.text);
+        let path = document
+            .uri
+            .to_file_path()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| document.uri.as_str().to_owned());
+        let file = editor.open_document(path, document.text);
+        if let Err(error) = editor.set_document_uri(file, document.uri.as_str().to_owned()) {
+            self.client
+                .log_message(MessageType::ERROR, error.to_string())
+                .await;
+            return;
+        }
+        if let Err(error) = editor.set_document_version(
+            file,
+            webtest_text::DocumentVersion(i64::from(document.version)),
+        ) {
+            self.client
+                .log_message(MessageType::ERROR, error.to_string())
+                .await;
+            return;
+        }
         self.documents.insert(Document {
             file,
             uri: document.uri.clone(),
             version: document.version,
+            synchronized: true,
             editor,
         });
-        self.publish(&document.uri).await;
+        self.resolve_synchronized_inputs(&document.uri).await;
+        self.publish_workspace_documents(&document.uri).await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let uri = params.text_document.uri;
-        let Some(mut document) = self.documents.get(&uri) else {
-            return;
+        let result = {
+            let mut documents = self.documents.lock();
+            let Some(document) = documents.get_mut(uri.as_str()) else {
+                return;
+            };
+            let full = params
+                .content_changes
+                .first()
+                .is_some_and(|change| change.range.is_none());
+            let version = params.text_document.version;
+            if version < document.version
+                || (version == document.version && (document.synchronized || !full))
+            {
+                return;
+            }
+            let result = if !document.synchronized && !full {
+                Err("document requires full synchronization".to_owned())
+            } else {
+                document
+                    .editor
+                    .source(document.file)
+                    .map_err(|error| error.to_string())
+                    .and_then(|source| {
+                        synchronization::changes(&source, &params.content_changes)
+                            .map_err(str::to_owned)
+                    })
+                    .and_then(|text| {
+                        document
+                            .editor
+                            .update_document_versioned(
+                                document.file,
+                                text,
+                                webtest_text::DocumentVersion(i64::from(version)),
+                            )
+                            .map_err(|error| error.to_string())
+                    })
+            };
+            document.version = version;
+            document.synchronized = result.is_ok();
+            result
         };
-        if let Some(change) = params.content_changes.into_iter().last() {
-            document.editor.update_document(document.file, change.text);
+        match result {
+            Ok(()) => {
+                self.resolve_synchronized_inputs(&uri).await;
+                self.publish_workspace_documents(&uri).await;
+            }
+            Err(error) => {
+                self.client
+                    .publish_diagnostics(
+                        uri.clone(),
+                        Vec::new(),
+                        Some(params.text_document.version),
+                    )
+                    .await;
+                self.client.log_message(MessageType::WARNING,format!("WebTest rejected an incremental edit for {}: {error}; a full synchronization is required",uri.as_str())).await;
+                self.client
+                    .send_notification::<ResyncRequired>(ResyncParameters { uri })
+                    .await;
+            }
         }
-        document.version = params.text_document.version;
-        self.documents.insert(document);
-        self.publish(&uri).await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -301,7 +490,7 @@ impl LanguageServer for Backend {
             let Some(path) = change.uri.to_file_path() else {
                 continue;
             };
-            match (self.project_file_changed)(&path) {
+            match (self.project_file_changed)(&path, false) {
                 Ok(changed) => reconfigured |= changed,
                 Err(error) => {
                     reconfigured = true;
@@ -319,28 +508,68 @@ impl LanguageServer for Backend {
         }
         if reconfigured {
             for document in self.documents.all() {
+                self.resolve_synchronized_inputs(&document.uri).await;
                 self.publish(&document.uri).await;
             }
         }
+    }
+
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        self.definition_request(params).await
+    }
+    async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
+        self.references_request(params).await
+    }
+    async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
+        self.rename_request(params).await
+    }
+    async fn document_symbol(
+        &self,
+        params: DocumentSymbolParams,
+    ) -> Result<Option<DocumentSymbolResponse>> {
+        self.document_symbols_request(params).await
+    }
+    async fn symbol(
+        &self,
+        params: WorkspaceSymbolParams,
+    ) -> Result<Option<WorkspaceSymbolResponse>> {
+        self.workspace_symbols_request(params).await
+    }
+    async fn folding_range(&self, params: FoldingRangeParams) -> Result<Option<Vec<FoldingRange>>> {
+        self.folding_request(params).await
+    }
+    async fn selection_range(
+        &self,
+        params: SelectionRangeParams,
+    ) -> Result<Option<Vec<SelectionRange>>> {
+        self.selection_request(params).await
+    }
+
+    async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
+        self.inlay_hints_request(params).await
+    }
+    async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        self.code_actions_request(params).await
     }
 
     async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
         let Some(document) = self.documents.get(&params.text_document.uri) else {
             return Ok(None);
         };
-        let source = document
-            .editor
-            .source(document.file)
-            .map_err(|error| Error::invalid_params(error.to_string()))?;
-        let formatted = document
-            .editor
-            .format(document.file)
-            .map_err(|error| Error::invalid_params(error.to_string()))?;
-        let full_range = text_range_to_lsp(
-            &source,
-            TextRange::new(TextSize::new(0), TextSize::from(source.len() as u32)),
-        );
-        Ok(Some(vec![TextEdit::new(full_range, formatted)]))
+        let file = document.file;
+        self.query(Some(&document), document.editor.clone(), move |snapshot| {
+            let source = snapshot.source(file).map_err(features::core_error)?;
+            let formatted = snapshot.format(file).map_err(features::editor_error)?;
+            let full_range = text_range_to_lsp(
+                &source,
+                TextRange::new(TextSize::new(0), TextSize::from(source.len() as u32)),
+            );
+            Ok(Some(vec![TextEdit::new(full_range, formatted)]))
+        })
+        .await
     }
 
     async fn semantic_tokens_full(
@@ -350,18 +579,18 @@ impl LanguageServer for Backend {
         let Some(document) = self.documents.get(&params.text_document.uri) else {
             return Ok(None);
         };
-        let source = document
-            .editor
-            .source(document.file)
-            .map_err(|error| Error::invalid_params(error.to_string()))?;
-        let tokens = document
-            .editor
-            .semantic_tokens(document.file)
-            .map_err(|error| Error::invalid_params(error.to_string()))?;
-        Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
-            result_id: None,
-            data: semantic_tokens_to_lsp(&source, &tokens),
-        })))
+        let file = document.file;
+        self.query(Some(&document), document.editor.clone(), move |snapshot| {
+            let source = snapshot.source(file).map_err(features::core_error)?;
+            let tokens = snapshot
+                .semantic_tokens(file)
+                .map_err(features::editor_error)?;
+            Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+                result_id: Some(snapshot.workspace_revision().to_string()),
+                data: semantic_tokens_to_lsp(&source, &tokens),
+            })))
+        })
+        .await
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
@@ -371,19 +600,21 @@ impl LanguageServer for Backend {
         else {
             return Ok(None);
         };
-        let source = document
-            .editor
-            .source(document.file)
-            .map_err(|error| Error::invalid_params(error.to_string()))?;
-        let offset = position_to_offset(&source, params.text_document_position_params.position);
-        let hover = document
-            .editor
-            .hover(document.file, TextSize::from(offset as u32))
-            .map_err(|error| Error::invalid_params(error.to_string()))?;
-        Ok(hover.map(|hover| Hover {
-            contents: HoverContents::Scalar(MarkedString::String(hover.contents)),
-            range: Some(text_range_to_lsp(&source, hover.range)),
-        }))
+        let file = document.file;
+        self.query(Some(&document), document.editor.clone(), move |snapshot| {
+            let source = snapshot.source(file).map_err(features::core_error)?;
+            let offset =
+                synchronization::offset(&source, params.text_document_position_params.position)
+                    .ok_or_else(|| Error::invalid_params("invalid UTF-16 position"))?;
+            let hover = snapshot
+                .hover(file, TextSize::from(offset as u32))
+                .map_err(features::editor_error)?;
+            Ok(hover.map(|hover| Hover {
+                contents: HoverContents::Scalar(MarkedString::String(hover.contents)),
+                range: Some(text_range_to_lsp(&source, hover.range)),
+            }))
+        })
+        .await
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
@@ -391,31 +622,65 @@ impl LanguageServer for Backend {
         let Some(document) = self.documents.get(&position.text_document.uri) else {
             return Ok(None);
         };
-        let source = document
-            .editor
-            .source(document.file)
-            .map_err(|error| Error::invalid_params(error.to_string()))?;
-        let offset = position_to_offset(&source, position.position);
-        let completions = document
-            .editor
-            .completions(document.file, TextSize::from(offset as u32))
-            .map_err(|error| Error::invalid_params(error.to_string()))?
-            .into_iter()
-            .map(|completion| CompletionItem {
-                label: completion.label,
-                kind: Some(match completion.kind {
-                    CoreCompletionKind::Function => CompletionItemKind::FUNCTION,
-                    CoreCompletionKind::Parameter => CompletionItemKind::FIELD,
-                    CoreCompletionKind::Property => CompletionItemKind::PROPERTY,
-                }),
-                detail: Some(completion.detail),
-                documentation: (!completion.documentation.is_empty())
-                    .then_some(Documentation::String(completion.documentation)),
-                insert_text: Some(completion.insert_text),
-                ..Default::default()
-            })
-            .collect();
-        Ok(Some(CompletionResponse::Array(completions)))
+        let file = document.file;
+        self.query(Some(&document), document.editor.clone(), move |snapshot| {
+            let source = snapshot.source(file).map_err(features::core_error)?;
+            let offset = synchronization::offset(&source, position.position)
+                .ok_or_else(|| Error::invalid_params("invalid UTF-16 position"))?;
+            let completions = snapshot
+                .completions(file, TextSize::from(offset as u32))
+                .map_err(features::core_error)?
+                .into_iter()
+                .map(|completion| CompletionItem {
+                    label: completion.label,
+                    kind: Some(match completion.kind {
+                        CoreCompletionKind::Function => CompletionItemKind::FUNCTION,
+                        CoreCompletionKind::Variable => CompletionItemKind::VARIABLE,
+                        CoreCompletionKind::Keyword => CompletionItemKind::KEYWORD,
+                        CoreCompletionKind::Namespace => CompletionItemKind::MODULE,
+                        CoreCompletionKind::Module => CompletionItemKind::FILE,
+                        CoreCompletionKind::Type => CompletionItemKind::TYPE_PARAMETER,
+                        CoreCompletionKind::Fixture => CompletionItemKind::CONSTRUCTOR,
+                        CoreCompletionKind::Parameter => CompletionItemKind::FIELD,
+                        CoreCompletionKind::Property => CompletionItemKind::PROPERTY,
+                    }),
+                    detail: Some(completion.detail),
+                    documentation: (!completion.documentation.is_empty())
+                        .then_some(Documentation::String(completion.documentation)),
+                    text_edit: completion.replacement_range.map(|range| {
+                        CompletionTextEdit::Edit(TextEdit::new(
+                            text_range_to_lsp(
+                                &source,
+                                TextRange::new(range.start.into(), range.end.into()),
+                            ),
+                            completion.insert_text.clone(),
+                        ))
+                    }),
+                    additional_text_edits: (!completion.additional_edits.is_empty()).then(|| {
+                        completion
+                            .additional_edits
+                            .into_iter()
+                            .filter(|edit| edit.origin.file == file)
+                            .map(|edit| {
+                                TextEdit::new(
+                                    text_range_to_lsp(&source, edit.origin.range),
+                                    edit.replacement,
+                                )
+                            })
+                            .collect()
+                    }),
+                    sort_text: Some(completion.sort_text),
+                    filter_text: Some(completion.filter_text),
+                    data: completion
+                        .symbol
+                        .map(|symbol| serde_json::json!({"symbol":symbol})),
+                    insert_text: Some(completion.insert_text),
+                    ..Default::default()
+                })
+                .collect();
+            Ok(Some(CompletionResponse::Array(completions)))
+        })
+        .await
     }
 
     async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
@@ -423,36 +688,37 @@ impl LanguageServer for Backend {
         let Some(document) = self.documents.get(&position.text_document.uri) else {
             return Ok(None);
         };
-        let source = document
-            .editor
-            .source(document.file)
-            .map_err(|error| Error::invalid_params(error.to_string()))?;
-        let offset = position_to_offset(&source, position.position);
-        let signature = document
-            .editor
-            .signature_help(document.file, TextSize::from(offset as u32))
-            .map_err(|error| Error::invalid_params(error.to_string()))?;
-        Ok(signature.map(|signature| SignatureHelp {
-            signatures: vec![SignatureInformation {
-                label: signature.label,
-                documentation: (!signature.documentation.is_empty())
-                    .then_some(Documentation::String(signature.documentation)),
-                parameters: Some(
-                    signature
-                        .parameters
-                        .into_iter()
-                        .map(|parameter| ParameterInformation {
-                            label: ParameterLabel::Simple(parameter.label),
-                            documentation: (!parameter.documentation.is_empty())
-                                .then_some(Documentation::String(parameter.documentation)),
-                        })
-                        .collect(),
-                ),
+        let file = document.file;
+        self.query(Some(&document), document.editor.clone(), move |snapshot| {
+            let source = snapshot.source(file).map_err(features::core_error)?;
+            let offset = synchronization::offset(&source, position.position)
+                .ok_or_else(|| Error::invalid_params("invalid UTF-16 position"))?;
+            let signature = snapshot
+                .signature_help(file, TextSize::from(offset as u32))
+                .map_err(features::core_error)?;
+            Ok(signature.map(|signature| SignatureHelp {
+                signatures: vec![SignatureInformation {
+                    label: signature.label,
+                    documentation: (!signature.documentation.is_empty())
+                        .then_some(Documentation::String(signature.documentation)),
+                    parameters: Some(
+                        signature
+                            .parameters
+                            .into_iter()
+                            .map(|parameter| ParameterInformation {
+                                label: ParameterLabel::Simple(parameter.label),
+                                documentation: (!parameter.documentation.is_empty())
+                                    .then_some(Documentation::String(parameter.documentation)),
+                            })
+                            .collect(),
+                    ),
+                    active_parameter: Some(signature.active_parameter as u32),
+                }],
+                active_signature: Some(0),
                 active_parameter: Some(signature.active_parameter as u32),
-            }],
-            active_signature: Some(0),
-            active_parameter: Some(signature.active_parameter as u32),
-        }))
+            }))
+        })
+        .await
     }
 
     async fn execute_command(&self, params: ExecuteCommandParams) -> Result<Option<LSPAny>> {
@@ -509,7 +775,7 @@ pub async fn serve_with_document_editors(
         browser,
         default_editor,
         editor_for_path,
-        Arc::new(|_| Ok(false)),
+        Arc::new(|_, _| Ok(false)),
     )
     .await;
 }
@@ -540,17 +806,26 @@ pub async fn serve_with_observations(
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
     let (target, receive_target) = tokio::sync::oneshot::channel();
-    let (service, socket) = LspService::new(|client| {
+    let queries = Arc::new(features::QueryRegistry::default());
+    let request_queries = queries.clone();
+    let (service, socket) = LspService::build(|client| {
         let backend = Backend::new(
             client.clone(),
             browser,
             default_editor,
             editor_for_path,
             project_file_changed,
+            request_queries,
         );
         let _ = target.send((client, backend.documents.clone()));
         backend
-    });
+    })
+    .custom_method("webtest/discoverTests", Backend::discover_tests)
+    .custom_method("webtest/describeProject", Backend::describe_project)
+    .custom_method("webtest/runVariants", Backend::run_variants)
+    .custom_method("webtest/cancelRun", Backend::cancel_run)
+    .custom_method("window/workDoneProgress/cancel", Backend::cancel_progress)
+    .finish();
     let server = Server::new(stdin, stdout, socket).serve(service);
     #[cfg(unix)]
     {
@@ -577,6 +852,7 @@ pub async fn serve_with_observations(
         let _ = (workspace, receive_target);
         server.await;
     }
+    queries.finish().await;
 }
 
 pub fn text_range_to_lsp(text: &str, range: TextRange) -> Range {
@@ -602,31 +878,6 @@ fn offset_to_position(text: &str, requested_offset: usize) -> Position {
         }
     }
     Position::new(line, character)
-}
-
-fn position_to_offset(text: &str, position: Position) -> usize {
-    let mut line = 0u32;
-    let mut utf16_column = 0u32;
-    for (offset, character) in text.char_indices() {
-        if line == position.line {
-            let width = character.len_utf16() as u32;
-            if utf16_column + width > position.character {
-                return offset;
-            }
-            if utf16_column == position.character {
-                return offset;
-            }
-            utf16_column += width;
-        }
-        if character == '\n' {
-            if line == position.line {
-                return offset;
-            }
-            line += 1;
-            utf16_column = 0;
-        }
-    }
-    text.len()
 }
 
 fn diagnostic_to_lsp(text: &str, diagnostic: CoreDiagnostic) -> Diagnostic {
@@ -703,8 +954,14 @@ fn semantic_tokens_to_lsp(text: &str, tokens: &[CoreSemanticToken]) -> Vec<Seman
                         CoreSemanticTokenKind::Variable => 4,
                         CoreSemanticTokenKind::Property => 5,
                         CoreSemanticTokenKind::Type => 6,
+                        CoreSemanticTokenKind::Parameter => 7,
+                        CoreSemanticTokenKind::Namespace => 8,
+                        CoreSemanticTokenKind::Fixture => 9,
+                        CoreSemanticTokenKind::Test => 10,
                     },
-                    token_modifiers_bitset: 0,
+                    token_modifiers_bitset: u32::from(token.modifiers.declaration)
+                        | (u32::from(token.modifiers.readonly) << 1)
+                        | (u32::from(token.modifiers.deprecated) << 2),
                 });
                 previous_line = start_position.line;
                 previous_start = start_position.character;
@@ -714,6 +971,16 @@ fn semantic_tokens_to_lsp(text: &str, tokens: &[CoreSemanticToken]) -> Vec<Seman
     }
 
     result
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ResyncParameters {
+    uri: Uri,
+}
+enum ResyncRequired {}
+impl tower_lsp_server::ls_types::notification::Notification for ResyncRequired {
+    type Params = ResyncParameters;
+    const METHOD: &'static str = "webtest/resyncRequired";
 }
 
 #[cfg(test)]
@@ -746,6 +1013,7 @@ mod tests {
         let diagnostic = diagnostic_to_lsp(
             text,
             CoreDiagnostic {
+                related_locations: Vec::new(),
                 range,
                 severity: DiagnosticSeverity::Error,
                 code: "semantic.unknown_member",
@@ -782,6 +1050,7 @@ mod tests {
             .map(|(needle, kind)| {
                 let start = text.find(needle).expect("token offset");
                 CoreSemanticToken {
+                    modifiers: Default::default(),
                     range: TextRange::new(
                         TextSize::from(start as u32),
                         TextSize::from((start + needle.len()) as u32),

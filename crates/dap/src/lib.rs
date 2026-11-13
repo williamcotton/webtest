@@ -120,10 +120,27 @@ impl ProtocolWriter {
     }
 }
 
+/// Native composition supplies explicit workspace inputs, including unsaved buffers.
+/// The adapter compiles them through the shared analysis database.
+pub trait WorkspaceLoader: Send + Sync {
+    fn load(
+        &self,
+        program: &Path,
+        sources: &BTreeMap<PathBuf, String>,
+    ) -> Result<AnalysisDatabase, String>;
+}
+#[derive(Clone)]
+struct CapturedSource {
+    path: PathBuf,
+    text: Arc<str>,
+    revision: webtest_text::SourceRevision,
+}
+
 #[derive(Clone)]
 struct LoadedProgram {
     path: PathBuf,
     source: Arc<str>,
+    sources: HashMap<webtest_text::FileId, CapturedSource>,
     plan: Arc<TestPlan>,
 }
 
@@ -146,6 +163,15 @@ impl LoadedProgram {
         };
         let mut database = AnalysisDatabase::with_provider_registry(providers.clone());
         let file = database.open_file(path.display().to_string(), &source);
+        Self::from_database(path, database, file, &[])
+    }
+
+    fn from_database(
+        path: PathBuf,
+        mut database: AnalysisDatabase,
+        file: webtest_text::FileId,
+        variants: &[webtest_model::TestVariantId],
+    ) -> Result<Self, String> {
         let diagnostics = database
             .diagnostics(file)
             .map_err(|error| error.to_string())?;
@@ -160,26 +186,78 @@ impl LoadedProgram {
                 diagnostic.message
             ));
         }
-        let plan = database
+        let mut plan = database
             .test_plan(file)
             .map_err(|error| error.to_string())?;
+        if !variants.is_empty() {
+            if variants
+                .iter()
+                .any(|id| !plan.tests.iter().any(|test| test.variant_id == *id))
+            {
+                return Err(
+                    "requested test variant does not belong to the launched program".into(),
+                );
+            }
+            plan = Arc::new(plan.select_variants(&variants.iter().copied().collect()));
+        }
+        let mut sources = HashMap::new();
+        for (captured_file, captured_revision) in plan.sources() {
+            let text = database
+                .source(captured_file)
+                .map_err(|error| error.to_string())?;
+            if webtest_text::SourceRevision::of(&text) != captured_revision {
+                return Err("workspace source changed while preparing debug launch".into());
+            }
+            sources.insert(
+                captured_file,
+                CapturedSource {
+                    path: normalize_path(Path::new(
+                        database
+                            .path(captured_file)
+                            .map_err(|error| error.to_string())?,
+                    )),
+                    text,
+                    revision: captured_revision,
+                },
+            );
+        }
+        let source = database.source(file).map_err(|error| error.to_string())?;
         Ok(Self {
             path,
-            source: Arc::from(source),
+            source,
+            sources,
             plan,
         })
     }
 
-    fn locations(&self) -> Vec<StepLocation> {
+    fn source_for(&self, file: webtest_text::FileId) -> Option<&CapturedSource> {
+        self.sources.get(&file)
+    }
+    fn source_at_path(&self, path: &Path) -> Option<&CapturedSource> {
+        self.sources.values().find(|source| source.path == path)
+    }
+    fn locations_for(&self, path: &Path) -> Vec<StepLocation> {
         self.plan
             .tests
             .iter()
-            .flat_map(|test| {
-                test.steps()
+            .flat_map(|test| test.steps())
+            .chain(self.plan.fixtures.iter().flat_map(|fixture| {
+                fixture
+                    .setup
+                    .steps()
                     .into_iter()
-                    .map(|step| StepLocation::new(&self.source, step.origin.range))
+                    .chain(fixture.teardown.steps())
+            }))
+            .filter_map(|step| {
+                let source = self.source_for(step.origin.file)?;
+                (source.path == path).then(|| StepLocation::new(&source.text, step.origin.range))
             })
             .collect()
+    }
+
+    #[cfg(test)]
+    fn locations(&self) -> Vec<StepLocation> {
+        self.locations_for(&self.path)
     }
 }
 
@@ -209,6 +287,7 @@ struct DebugState {
     browser: Arc<dyn BrowserHost>,
     runner_options: RunnerOptions,
     providers: ProviderRegistry,
+    workspace_loader: Option<Arc<dyn WorkspaceLoader>>,
     program: Mutex<Option<LoadedProgram>>,
     breakpoints: Mutex<HashMap<PathBuf, HashSet<u32>>>,
     breakpoint_revisions: Mutex<HashMap<PathBuf, webtest_text::SourceRevision>>,
@@ -240,6 +319,15 @@ impl DebugState {
         runner_options: RunnerOptions,
         providers: ProviderRegistry,
     ) -> Arc<Self> {
+        Self::new_with_workspace(writer, browser, runner_options, providers, None)
+    }
+    fn new_with_workspace(
+        writer: ProtocolWriter,
+        browser: Arc<dyn BrowserHost>,
+        runner_options: RunnerOptions,
+        providers: ProviderRegistry,
+        workspace_loader: Option<Arc<dyn WorkspaceLoader>>,
+    ) -> Arc<Self> {
         let (wake, _) = watch::channel(0);
         let (completion, _) = watch::channel(false);
         Arc::new(Self {
@@ -247,6 +335,7 @@ impl DebugState {
             browser,
             runner_options,
             providers,
+            workspace_loader,
             program: Mutex::new(None),
             breakpoints: Mutex::new(HashMap::new()),
             breakpoint_revisions: Mutex::new(HashMap::new()),
@@ -368,11 +457,63 @@ impl DebugState {
             .get("sourceText")
             .and_then(Value::as_str)
             .map(str::to_owned);
-        let loaded = match LoadedProgram::load_with_registry(
-            PathBuf::from(program),
-            source_override,
-            &self.providers,
-        ) {
+        let path = normalize_path(Path::new(program));
+        let variants = request
+            .arguments
+            .get("variants")
+            .cloned()
+            .map(serde_json::from_value::<Vec<webtest_model::TestVariantId>>)
+            .transpose();
+        let sources = request
+            .arguments
+            .get("sources")
+            .cloned()
+            .map(serde_json::from_value::<BTreeMap<PathBuf, String>>)
+            .transpose();
+        let loaded = (|| {
+            let variants = variants
+                .map_err(|error| format!("invalid variant selection: {error}"))?
+                .unwrap_or_default();
+            let mut sources = sources
+                .map_err(|error| format!("invalid source overrides: {error}"))?
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(path, text)| (normalize_path(&path), text))
+                .collect::<BTreeMap<_, _>>();
+            if let Some(source) = source_override {
+                sources.insert(path.clone(), source);
+            }
+            if let Some(loader) = &self.workspace_loader {
+                let database = loader.load(&path, &sources)?;
+                let file = database
+                    .file_for_path(&path.display().to_string())
+                    .ok_or("debug program was not loaded into the workspace")?;
+                LoadedProgram::from_database(path, database, file, &variants)
+            } else {
+                let mut program = LoadedProgram::load_with_registry(
+                    path.clone(),
+                    sources.remove(&path),
+                    &self.providers,
+                )?;
+                if !variants.is_empty() {
+                    if variants
+                        .iter()
+                        .any(|id| !program.plan.tests.iter().any(|test| test.variant_id == *id))
+                    {
+                        return Err(
+                            "requested test variant does not belong to the launched program".into(),
+                        );
+                    }
+                    program.plan = Arc::new(
+                        program
+                            .plan
+                            .select_variants(&variants.into_iter().collect()),
+                    );
+                }
+                Ok(program)
+            }
+        })();
+        let loaded = match loaded {
             Ok(program) => program,
             Err(error) => {
                 self.writer.failure(request, &error).await?;
@@ -417,13 +558,9 @@ impl DebugState {
             return Ok(());
         };
         let path = normalize_path(&path);
-        let program = lock(&self.program)
-            .as_ref()
-            .filter(|program| program.path == path)
-            .cloned()
-            .or_else(|| {
-                LoadedProgram::load_with_registry(path.clone(), None, &self.providers).ok()
-            });
+        let program = lock(&self.program).as_ref().cloned().or_else(|| {
+            LoadedProgram::load_with_registry(path.clone(), None, &self.providers).ok()
+        });
         let Some(program) = program else {
             self.writer
                 .response(
@@ -439,7 +576,7 @@ impl DebugState {
                 .pointer("/source/adapterData/sourceRevision")
                 .is_some_and(|revision| {
                     serde_json::from_value::<webtest_text::SourceRevision>(revision.clone()).ok()
-                        != Some(program.plan.source_revision)
+                        != program.source_at_path(&path).map(|source| source.revision)
                 })
         {
             lock(&self.breakpoints).remove(&path);
@@ -447,8 +584,11 @@ impl DebugState {
             return self.writer.response(request, json!({"breakpoints":unverified_breakpoints(
                 &requested, "Source revision differs from the launched execution; restart with the current source.") })).await;
         }
-        lock(&self.breakpoint_revisions).insert(path.clone(), program.plan.source_revision);
-        let locations = program.locations();
+        let Some(source) = program.source_at_path(&path) else {
+            return self.writer.response(request, json!({"breakpoints":unverified_breakpoints(&requested, "Source is not part of this launch")})).await;
+        };
+        lock(&self.breakpoint_revisions).insert(path.clone(), source.revision);
+        let locations = program.locations_for(&path);
         let mut verified_lines = HashSet::new();
         let breakpoints: Vec<_> = requested
             .iter()
@@ -659,6 +799,14 @@ fn run_failure_output_data(failure: &webtest_runtime::RunError) -> Value {
         }),
         webtest_runtime::RunError::Cleanup(cleanup) => {
             let cause = match &cleanup.cause {
+                webtest_runtime::CleanupCause::Execution {
+                    failure,
+                    failure_class,
+                } => json!({"kind":"execution", "failure":failure, "failure_class":failure_class}),
+                webtest_runtime::CleanupCause::Runtime {
+                    failure,
+                    failure_class,
+                } => json!({"kind":"runtime", "failure":failure, "failure_class":failure_class}),
                 webtest_runtime::CleanupCause::Provider(error) => {
                     json!({"kind": "provider", "error": error})
                 }
@@ -694,6 +842,9 @@ fn run_failure_output_data(failure: &webtest_runtime::RunError) -> Value {
             "primary": run_failure_output_data(primary),
             "secondary": secondary.iter().map(run_failure_output_data).collect::<Vec<_>>(),
         }),
+        webtest_runtime::RunError::FixtureBudget(budget) => {
+            json!({"code": failure.code().short_code(), "failure_class":failure.failure_class(), "budget":budget})
+        }
         webtest_runtime::RunError::ExecutionIdentity(_)
         | webtest_runtime::RunError::Browser(_)
         | webtest_runtime::RunError::Provider(_)
@@ -790,6 +941,22 @@ pub async fn serve_with_configuration(
 ) -> Result<(), DapError> {
     let writer = ProtocolWriter::new(tokio::io::stdout());
     let state = DebugState::new_with_configuration(writer, browser, options, providers);
+    serve_state(state).await
+}
+
+pub async fn serve_with_workspace(
+    browser: Arc<dyn BrowserHost>,
+    options: RunnerOptions,
+    providers: ProviderRegistry,
+    loader: Arc<dyn WorkspaceLoader>,
+) -> Result<(), DapError> {
+    let state = DebugState::new_with_workspace(
+        ProtocolWriter::new(tokio::io::stdout()),
+        browser,
+        options,
+        providers,
+        Some(loader),
+    );
     serve_state(state).await
 }
 
@@ -1261,6 +1428,8 @@ fn debug_bytes_value(bytes: &[u8]) -> webtest_model::Value {
 
 fn operation_name(operation: &TestOperation) -> String {
     match operation {
+        TestOperation::AcquireFixture(call) => format!("use fixture {}", call.fixture),
+        TestOperation::Return(_) => "return helper value".into(),
         TestOperation::Provide(_) => "provide".into(),
         TestOperation::EvaluatePure(operation) => operation.result_binding.map_or_else(
             || "evaluate expression".into(),

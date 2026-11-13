@@ -145,7 +145,7 @@ async fn journal_exhaustion_cancels_active_jobs_before_slow_teardown_and_stops_a
             matches!(
                 r.event,
                 ExecutionEvent::StepPassed {
-                    test_id: TestId(1),
+                    test_id: Some(TestId(1)),
                     ..
                 }
             )
@@ -349,7 +349,7 @@ fn assert_source_and_operation_metadata(plan: &TestPlan, result: &webtest_runtim
             let step = plan
                 .tests
                 .iter()
-                .find(|test| test.id == *test_id)
+                .find(|test| Some(test.id) == *test_id)
                 .unwrap()
                 .steps()
                 .into_iter()

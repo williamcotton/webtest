@@ -18,6 +18,15 @@ pub struct PlanNode {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PlanNodeKind {
+    /// Compiler-generated lazy expression control; no public conditional syntax.
+    Conditional {
+        condition: crate::PlanExpr,
+        branches: Vec<PlanNode>,
+    },
+    Helper {
+        call: crate::HelperCall,
+        body: Box<PlanNode>,
+    },
     /// First successfully completed child wins; every loser is cancelled and joined.
     Race {
         children: Vec<PlanNode>,
@@ -68,6 +77,47 @@ pub const MAX_PARALLEL_BRANCHES: usize = 64;
 pub const MAX_CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 impl PlanNode {
+    pub fn conditional(
+        test: PlanDeclarationId,
+        origin: SyntaxOrigin,
+        revision: SourceRevision,
+        path: Vec<u32>,
+        condition: crate::PlanExpr,
+        branches: Vec<Self>,
+    ) -> Self {
+        let mut node = Self::sequence(test, origin, revision, path, branches);
+        let PlanNodeKind::Sequence { children } = node.kind else {
+            unreachable!()
+        };
+        node.kind = PlanNodeKind::Conditional {
+            condition,
+            branches: children,
+        };
+        node.assign_identity(test);
+        node
+    }
+    pub fn helper(
+        test: PlanDeclarationId,
+        origin: SyntaxOrigin,
+        revision: SourceRevision,
+        path: Vec<u32>,
+        call: crate::HelperCall,
+        body: Self,
+    ) -> Self {
+        let mut node = Self {
+            id: PlanNodeId([0; 32]),
+            path,
+            origin,
+            source_revision: revision,
+            required_capabilities: body.required_capabilities.clone(),
+            kind: PlanNodeKind::Helper {
+                call,
+                body: Box::new(body),
+            },
+        };
+        node.assign_identity(test);
+        node
+    }
     pub fn parallel(
         test: PlanDeclarationId,
         origin: SyntaxOrigin,
@@ -174,10 +224,13 @@ impl PlanNode {
         Self::sequence(test, origin, revision, path, vec![resource])
     }
 
-    fn rebase(&mut self, test: PlanDeclarationId, path: Vec<u32>) {
+    pub fn rebase(&mut self, test: PlanDeclarationId, path: Vec<u32>) {
         self.path = path;
         match &mut self.kind {
-            PlanNodeKind::Sequence { children }
+            PlanNodeKind::Conditional {
+                branches: children, ..
+            }
+            | PlanNodeKind::Sequence { children }
             | PlanNodeKind::Parallel { children, .. }
             | PlanNodeKind::Race { children, .. } => {
                 for (ordinal, child) in children.iter_mut().enumerate() {
@@ -188,7 +241,8 @@ impl PlanNode {
             }
             PlanNodeKind::Retry { child, .. }
             | PlanNodeKind::Timeout { child, .. }
-            | PlanNodeKind::ResourceScope { body: child, .. } => {
+            | PlanNodeKind::ResourceScope { body: child, .. }
+            | PlanNodeKind::Helper { body: child, .. } => {
                 let mut path = self.path.clone();
                 path.push(0);
                 child.rebase(test, path);
@@ -297,6 +351,8 @@ impl PlanNode {
 
     fn kind_identity(&self) -> &'static str {
         match &self.kind {
+            PlanNodeKind::Conditional { .. } => "conditional/v1",
+            PlanNodeKind::Helper { .. } => "helper/v1",
             PlanNodeKind::ResourceScope { .. } => "resource/browser-context/v1",
             PlanNodeKind::Parallel { .. } => "parallel/v1",
             PlanNodeKind::Race { .. } => "race/v2",
@@ -304,8 +360,10 @@ impl PlanNode {
             PlanNodeKind::Timeout { .. } => "timeout/v1",
             PlanNodeKind::Retry { .. } => "retry/v1",
             PlanNodeKind::Operation { step } => match &step.operation {
+                crate::TestOperation::AcquireFixture(_) => "fixture/acquire/v1",
                 crate::TestOperation::EvaluatePure(_) => "eval/v1",
                 crate::TestOperation::Provide(_) => "provide/v1",
+                crate::TestOperation::Return(_) => "return/v1",
                 crate::TestOperation::ServerProviderCall(_) => "provider/v1",
                 crate::TestOperation::Browser(_) => "browser/v1",
                 crate::TestOperation::Assertion(_) => "assert/v1",
@@ -326,11 +384,16 @@ impl PlanNode {
 
     pub fn steps(&self) -> Vec<&PlannedStep> {
         match &self.kind {
-            PlanNodeKind::ResourceScope { body, .. } => body.steps(),
+            PlanNodeKind::ResourceScope { body, .. } | PlanNodeKind::Helper { body, .. } => {
+                body.steps()
+            }
             PlanNodeKind::Retry { child, .. } | PlanNodeKind::Timeout { child, .. } => {
                 child.steps()
             }
-            PlanNodeKind::Sequence { children }
+            PlanNodeKind::Conditional {
+                branches: children, ..
+            }
+            | PlanNodeKind::Sequence { children }
             | PlanNodeKind::Parallel { children, .. }
             | PlanNodeKind::Race { children, .. } => {
                 children.iter().flat_map(Self::steps).collect()
@@ -341,11 +404,16 @@ impl PlanNode {
 
     pub fn steps_mut(&mut self) -> Vec<&mut PlannedStep> {
         match &mut self.kind {
-            PlanNodeKind::ResourceScope { body, .. } => body.steps_mut(),
+            PlanNodeKind::ResourceScope { body, .. } | PlanNodeKind::Helper { body, .. } => {
+                body.steps_mut()
+            }
             PlanNodeKind::Retry { child, .. } | PlanNodeKind::Timeout { child, .. } => {
                 child.steps_mut()
             }
-            PlanNodeKind::Sequence { children }
+            PlanNodeKind::Conditional {
+                branches: children, ..
+            }
+            | PlanNodeKind::Sequence { children }
             | PlanNodeKind::Parallel { children, .. }
             | PlanNodeKind::Race { children, .. } => {
                 children.iter_mut().flat_map(Self::steps_mut).collect()
@@ -358,8 +426,11 @@ impl PlanNode {
 fn operation_capabilities(operation: &crate::TestOperation) -> Vec<Capability> {
     use crate::{AssertionOperation, TestOperation};
     match operation {
-        TestOperation::EvaluatePure(_) | TestOperation::Provide(_) => vec![],
+        TestOperation::EvaluatePure(_) | TestOperation::Provide(_) | TestOperation::Return(_) => {
+            vec![]
+        }
         TestOperation::ServerProviderCall(_) => vec![Capability::Server],
+        TestOperation::AcquireFixture(call) => call.required_capabilities.clone(),
         TestOperation::Browser(_) => vec![Capability::Browser],
         TestOperation::Assertion(AssertionOperation::Value { .. }) => vec![Capability::Test],
         TestOperation::Assertion(_) => vec![Capability::Browser],
@@ -371,6 +442,8 @@ pub enum PlanTreeError {
     RootIsNotSequence,
     InvalidControlSetting,
     InvalidRaceResult,
+    InvalidHelperResult,
+    InvalidFixture,
     UnsafeRetry,
     InvalidPath,
     InvalidIdentity,
@@ -380,6 +453,8 @@ pub enum PlanTreeError {
     DuplicateStep,
     DuplicateTest,
     MissingSourceFile,
+    DuplicateSourceFile,
+    InvalidVariantIdentity,
     MissingResourceScope,
     ResourceAccessConflict,
     TooDeep,
@@ -392,7 +467,7 @@ impl std::fmt::Display for PlanTreeError {
 impl std::error::Error for PlanTreeError {}
 
 impl PlanNode {
-    fn validate(
+    pub(crate) fn validate(
         &self,
         test: PlanDeclarationId,
         revision: SourceRevision,
@@ -428,7 +503,24 @@ impl PlanNode {
                 return Err(PlanTreeError::MissingResourceScope);
             }
         }
+        if let PlanNodeKind::Conditional { branches, .. } = &self.kind
+            && branches.len() != 2
+        {
+            return Err(PlanTreeError::InvalidControlSetting);
+        }
         let capabilities = match &self.kind {
+            PlanNodeKind::Helper { call, body } => {
+                if body.origin != call.declaration
+                    || body.source_revision != call.declaration_revision
+                {
+                    return Err(PlanTreeError::OriginMismatch);
+                }
+                let mut child_path = path.to_vec();
+                child_path.push(0);
+                body.validate(test, call.declaration_revision, &child_path, steps)?;
+                body.required_capabilities.clone()
+            }
+
             PlanNodeKind::ResourceScope {
                 resource: ResourcePlan::BrowserContext,
                 body,
@@ -482,7 +574,10 @@ impl PlanNode {
                 child.validate(test, revision, &child_path, steps)?;
                 child.required_capabilities.clone()
             }
-            PlanNodeKind::Sequence { children }
+            PlanNodeKind::Conditional {
+                branches: children, ..
+            }
+            | PlanNodeKind::Sequence { children }
             | PlanNodeKind::Parallel { children, .. }
             | PlanNodeKind::Race { children, .. } => {
                 for (ordinal, child) in children.iter().enumerate() {
@@ -517,17 +612,38 @@ impl PlanNode {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResultFlow {
+    None,
+    Race,
+    Helper,
+}
+
 impl PlanNode {
     /// Result flow is lexical; nested concurrency cannot provide into its parent branch.
-    fn validate_results(
+    pub(crate) fn validate_results(
         &self,
-        allowed: bool,
+        allowed: ResultFlow,
         expected: Option<&webtest_model::Type>,
     ) -> Result<bool, PlanTreeError> {
         match &self.kind {
+            PlanNodeKind::Conditional { branches, .. } => {
+                for branch in branches {
+                    branch.validate_results(ResultFlow::None, None)?;
+                }
+                Ok(false)
+            }
             PlanNodeKind::Operation { step } => {
+                if let crate::TestOperation::Return(value) = &step.operation {
+                    if allowed != ResultFlow::Helper
+                        || expected.is_some_and(|ty| !ty.accepts(&value.result_type))
+                    {
+                        return Err(PlanTreeError::InvalidHelperResult);
+                    }
+                    return Ok(true);
+                }
                 if let crate::TestOperation::Provide(value) = &step.operation {
-                    if !allowed
+                    if allowed != ResultFlow::Race
                         || !value.result_type.is_transferable()
                         || expected.is_some_and(|ty| !ty.accepts(&value.result_type))
                     {
@@ -551,11 +667,26 @@ impl PlanNode {
             PlanNodeKind::Retry { child, .. }
             | PlanNodeKind::Timeout { child, .. }
             | PlanNodeKind::ResourceScope { body: child, .. } => {
-                child.validate_results(allowed, expected)
+                let returned = child.validate_results(allowed, expected)?;
+                if returned
+                    && allowed == ResultFlow::Helper
+                    && expected.is_some_and(|ty| !ty.is_transferable())
+                {
+                    return Err(PlanTreeError::InvalidHelperResult);
+                }
+                Ok(returned)
+            }
+            PlanNodeKind::Helper { call, body } => {
+                let returned =
+                    body.validate_results(ResultFlow::Helper, Some(&call.result_type))?;
+                if !returned && call.result_type != webtest_model::Type::Null {
+                    return Err(PlanTreeError::InvalidHelperResult);
+                }
+                Ok(false)
             }
             PlanNodeKind::Parallel { children, .. } => {
                 for child in children {
-                    child.validate_results(false, None)?;
+                    child.validate_results(ResultFlow::None, None)?;
                 }
                 Ok(false)
             }
@@ -567,8 +698,10 @@ impl PlanNode {
                     return Err(PlanTreeError::InvalidRaceResult);
                 }
                 for child in children {
-                    let provided =
-                        child.validate_results(true, result.as_ref().map(|binding| &binding.ty))?;
+                    let provided = child.validate_results(
+                        ResultFlow::Race,
+                        result.as_ref().map(|binding| &binding.ty),
+                    )?;
                     if result.is_some() && !provided {
                         return Err(PlanTreeError::InvalidRaceResult);
                     }
@@ -579,8 +712,63 @@ impl PlanNode {
     }
 }
 
+fn validate_authored_and_related(
+    tests: &[PlannedTest],
+    sources: &[crate::PlanSourceFile],
+) -> Result<(), PlanTreeError> {
+    let mut files = std::collections::BTreeSet::new();
+    for source in sources {
+        if !files.insert(source.file.get()) {
+            return Err(PlanTreeError::DuplicateSourceFile);
+        }
+    }
+    let mut declarations = std::collections::BTreeSet::new();
+    let mut variants = std::collections::BTreeSet::new();
+    for test in tests {
+        if !declarations.insert(test.test_declaration_id)
+            || !variants.insert(test.variant_id)
+            || test.variant_id != default_variant(test.test_declaration_id)
+        {
+            return Err(PlanTreeError::InvalidVariantIdentity);
+        }
+        for step in test.steps() {
+            for link in &step.origin_chain {
+                if !sources.iter().any(|source| {
+                    source.file == link.origin.file
+                        && source.revision == link.revision
+                        && source.path == link.path
+                }) {
+                    return Err(PlanTreeError::MissingSourceFile);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 impl crate::TestPlan {
     pub fn validate_tree(&self) -> Result<(), PlanTreeError> {
+        validate_authored_and_related(&self.tests, &self.source_files)?;
+        crate::fixtures::validate_references(&self.fixtures, &self.tests, &|file| {
+            self.source_files
+                .iter()
+                .find(|source| source.file == file)
+                .map(|source| source.revision)
+        })?;
+        if !self.source_files.is_empty()
+            && !self
+                .source_files
+                .iter()
+                .any(|source| source.file == self.file && source.revision == self.source_revision)
+        {
+            return Err(PlanTreeError::MissingSourceFile);
+        }
+
+        for test in &self.tests {
+            test.body
+                .validate_sources(&|file| self.source_revision_for(file))?;
+        }
+
         let mut steps = std::collections::BTreeSet::new();
         let mut tests = std::collections::BTreeSet::new();
         let mut declarations = std::collections::BTreeSet::new();
@@ -596,7 +784,7 @@ impl crate::TestPlan {
             }
             test.body
                 .validate(test.declaration_id, self.source_revision, &[], &mut steps)?;
-            test.body.validate_results(false, None)?;
+            test.body.validate_results(ResultFlow::None, None)?;
             if !test.body.required_resources().is_empty() {
                 return Err(PlanTreeError::MissingResourceScope);
             }
@@ -615,6 +803,23 @@ impl crate::TestPlan {
 
 impl crate::PlanEnvelope {
     pub fn validate_tree(&self) -> Result<(), PlanTreeError> {
+        validate_authored_and_related(&self.tests, &self.source_files)?;
+        crate::fixtures::validate_references(&self.fixtures, &self.tests, &|file| {
+            self.source_files
+                .iter()
+                .find(|source| source.file == file)
+                .map(|source| source.revision)
+        })?;
+
+        for test in &self.tests {
+            test.body.validate_sources(&|file| {
+                self.source_files
+                    .iter()
+                    .find(|source| source.file == file)
+                    .map(|source| source.revision)
+            })?;
+        }
+
         let mut steps = std::collections::BTreeSet::new();
         let mut tests = std::collections::BTreeSet::new();
         let mut declarations = std::collections::BTreeSet::new();
@@ -637,7 +842,7 @@ impl crate::PlanEnvelope {
             }
             test.body
                 .validate(test.declaration_id, source.revision, &[], &mut steps)?;
-            test.body.validate_results(false, None)?;
+            test.body.validate_results(ResultFlow::None, None)?;
             if !test.body.required_resources().is_empty() {
                 return Err(PlanTreeError::MissingResourceScope);
             }
@@ -652,6 +857,17 @@ impl crate::PlanEnvelope {
         }
         Ok(())
     }
+}
+
+pub fn default_variant(
+    declaration: webtest_model::TestDeclarationId,
+) -> webtest_model::TestVariantId {
+    webtest_model::TestVariantId(webtest_text::semantic_key(
+        &declaration.0,
+        "variant",
+        "default",
+        0,
+    ))
 }
 
 impl PlannedTest {
@@ -684,6 +900,8 @@ impl PlannedTest {
             body
         };
         Self {
+            test_declaration_id: webtest_model::TestDeclarationId(declaration_id.0),
+            variant_id: default_variant(webtest_model::TestDeclarationId(declaration_id.0)),
             id,
             declaration_id,
             name,
@@ -709,6 +927,73 @@ pub fn declaration_identity(
         ))
         .as_bytes(),
     )
+}
+
+impl PlanNode {
+    pub(crate) fn validate_sources(
+        &self,
+        revision: &impl Fn(webtest_text::FileId) -> Option<SourceRevision>,
+    ) -> Result<(), PlanTreeError> {
+        if revision(self.origin.file) != Some(self.source_revision) {
+            return Err(PlanTreeError::SourceRevisionMismatch);
+        }
+        let expressions = match &self.kind {
+            PlanNodeKind::Operation { step } => step.operation.expressions(),
+            PlanNodeKind::Helper { call, body } => {
+                body.validate_sources(revision)?;
+                call.arguments
+                    .iter()
+                    .map(|argument| &argument.value)
+                    .collect()
+            }
+            PlanNodeKind::Conditional {
+                condition,
+                branches,
+            } => {
+                for branch in branches {
+                    branch.validate_sources(revision)?;
+                }
+                vec![condition]
+            }
+            PlanNodeKind::Sequence { children }
+            | PlanNodeKind::Parallel { children, .. }
+            | PlanNodeKind::Race { children, .. } => {
+                for child in children {
+                    child.validate_sources(revision)?;
+                }
+                Vec::new()
+            }
+            PlanNodeKind::Retry { child, .. }
+            | PlanNodeKind::Timeout { child, .. }
+            | PlanNodeKind::ResourceScope { body: child, .. } => {
+                child.validate_sources(revision)?;
+                Vec::new()
+            }
+        };
+        let mut pending = expressions
+            .into_iter()
+            .map(|expression| (expression, 0))
+            .collect::<Vec<_>>();
+        while let Some((expression, depth)) = pending.pop() {
+            if depth > 256 {
+                return Err(PlanTreeError::TooDeep);
+            }
+            if let crate::PlanExpr::PureCall { metadata, .. } = expression
+                && (revision(metadata.declaration.file) != Some(metadata.declaration_revision)
+                    || revision(metadata.call.file) != Some(metadata.call_revision)
+                    || revision(metadata.body_origin.file) != Some(metadata.declaration_revision))
+            {
+                return Err(PlanTreeError::SourceRevisionMismatch);
+            }
+            pending.extend(
+                expression
+                    .children()
+                    .into_iter()
+                    .map(|child| (child, depth + 1)),
+            );
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -777,6 +1062,7 @@ mod control_tests {
             revision,
             vec![0, 0],
             PlannedStep {
+                origin_chain: Vec::new(),
                 id: StepId(0),
                 origin,
                 operation: TestOperation::ServerProviderCall(call),
@@ -819,6 +1105,7 @@ mod control_tests {
             revision,
             vec![0, ordinal],
             PlannedStep {
+                origin_chain: Vec::new(),
                 id: StepId(ordinal),
                 origin,
                 operation: if browser {
@@ -881,11 +1168,11 @@ mod control_tests {
             result_type: webtest_model::Type::Int,
         });
         assert_eq!(
-            child.validate_results(false, None),
+            child.validate_results(ResultFlow::None, None),
             Err(PlanTreeError::InvalidRaceResult)
         );
         let mut node = PlanNode::race(test, origin, revision, vec![0], vec![child]);
-        node.validate_results(false, None).unwrap();
+        node.validate_results(ResultFlow::None, None).unwrap();
         if let PlanNodeKind::Race { result, .. } = &mut node.kind {
             *result = Some(crate::RaceBinding {
                 id: webtest_model::BindingId(0),
@@ -894,18 +1181,18 @@ mod control_tests {
             });
         }
         assert_eq!(
-            node.validate_results(false, None),
+            node.validate_results(ResultFlow::None, None),
             Err(PlanTreeError::InvalidRaceResult)
         );
         if let PlanNodeKind::Race { result, .. } = &mut node.kind {
             result.as_mut().unwrap().ty = webtest_model::Type::Int;
         }
-        node.validate_results(false, None).unwrap();
+        node.validate_results(ResultFlow::None, None).unwrap();
         if let PlanNodeKind::Race { children, .. } = &mut node.kind {
             children.push(branch(test, origin, revision, 1, false));
         }
         assert_eq!(
-            node.validate_results(false, None),
+            node.validate_results(ResultFlow::None, None),
             Err(PlanTreeError::InvalidRaceResult)
         );
     }

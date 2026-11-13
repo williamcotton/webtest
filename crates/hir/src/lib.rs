@@ -4,20 +4,34 @@ use std::{collections::HashMap, time::Duration};
 
 use rowan::ast::AstNode;
 use serde::{Deserialize, Serialize};
-pub use webtest_model::{BinaryOperator, BindingId, StepId, TestId, UnaryOperator};
+pub use webtest_model::{
+    BinaryOperator, BindingId, FixtureId, FixtureLifetime, FunctionId, ModuleId, ParameterId,
+    StepId, SymbolId, TestDeclarationId, TestId, TestVariantId, UnaryOperator,
+};
 use webtest_syntax::{
     SyntaxKind,
     ast::{self, BrowserOperation, DomainStatement, FlowStatement},
 };
 use webtest_text::{FileId, SyntaxOrigin};
 
+mod declarations;
+mod visit;
+pub use declarations::*;
+pub use visit::{visit_expression, visit_statement_expressions};
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct HirFile {
+    pub module_id: ModuleId,
+    pub imports: Vec<HirImport>,
+    pub functions: Vec<HirFunction>,
+    pub fixtures: Vec<HirFixture>,
     pub tests: Vec<HirTest>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct HirTest {
+    pub declaration_id: TestDeclarationId,
+    pub variant_id: TestVariantId,
     pub id: TestId,
     pub name: String,
     pub body: Vec<HirStmt>,
@@ -233,6 +247,7 @@ pub struct HirExpr {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum HirExprKind {
+    FixtureUse(Box<HirExpr>),
     Literal(HirLiteral),
     Name(HirNameRef),
     List(Vec<HirExpr>),
@@ -276,6 +291,8 @@ pub enum HirNameRef {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct HirRecordField {
+    pub name_origin: SyntaxOrigin,
+    pub quoted: bool,
     pub name: String,
     pub value: HirExpr,
     pub origin: SyntaxOrigin,
@@ -283,6 +300,7 @@ pub struct HirRecordField {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct HirCallArgument {
+    pub name_origin: Option<SyntaxOrigin>,
     pub name: Option<String>,
     pub value: HirExpr,
     pub origin: SyntaxOrigin,
@@ -307,6 +325,7 @@ pub enum HirTypeKind {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HirTypeField {
+    pub name_origin: SyntaxOrigin,
     pub name: String,
     pub ty: HirType,
     pub optional: bool,
@@ -314,17 +333,49 @@ pub struct HirTypeField {
 }
 
 pub fn lower(file: FileId, parsed: &webtest_syntax::Parse) -> HirFile {
+    lower_with_source_identity(file, parsed, &format!("file:{}", file.get()))
+}
+
+pub fn lower_with_source_identity(
+    file: FileId,
+    parsed: &webtest_syntax::Parse,
+    source_identity: &str,
+) -> HirFile {
     let Some(root) = ast::Root::cast(parsed.syntax()) else {
         return HirFile::default();
     };
     let mut next_binding = 0;
-    HirFile {
+    let mut lowered = HirFile {
         tests: root
             .tests()
             .enumerate()
             .filter_map(|(index, test)| lower_test(file, index as u32, test, &mut next_binding))
             .collect(),
+        ..HirFile::default()
+    };
+    lowered.module_id = ModuleId(
+        *webtest_text::SourceRevision::of(&format!("webtest-module/v1/{source_identity}"))
+            .as_bytes(),
+    );
+    declarations::lower_declarations(file, root, &mut next_binding, &mut lowered);
+    let mut occurrences = HashMap::<String, u32>::new();
+    for test in &mut lowered.tests {
+        let ordinal = occurrences.entry(test.name.clone()).or_default();
+        test.declaration_id = TestDeclarationId(semantic_key(
+            &lowered.module_id.0,
+            "test",
+            &test.name,
+            *ordinal,
+        ));
+        test.variant_id = TestVariantId(semantic_key(
+            &test.declaration_id.0,
+            "variant",
+            "default",
+            0,
+        ));
+        *ordinal += 1;
     }
+    lowered
 }
 
 struct LowerContext {
@@ -351,6 +402,8 @@ fn lower_test(
         .collect();
     *next_binding = context.next_binding;
     Some(HirTest {
+        declaration_id: TestDeclarationId::default(),
+        variant_id: TestVariantId::default(),
         id: TestId(id),
         name,
         body,
@@ -782,8 +835,25 @@ fn url_expectation(
 }
 
 fn lower_expr(context: &LowerContext, expression: ast::Expr) -> Option<HirExpr> {
-    let expression_origin = origin(context.file, expression.syntax());
+    let expression_origin = if matches!(expression, ast::Expr::Use(_)) {
+        let mut tokens = expression
+            .syntax()
+            .descendants_with_tokens()
+            .filter_map(|element| element.into_token())
+            .filter(|token| !token.kind().is_trivia());
+        let first = tokens.next()?;
+        let last = tokens.last().unwrap_or_else(|| first.clone());
+        SyntaxOrigin::new(
+            context.file,
+            webtest_text::TextRange::new(first.text_range().start(), last.text_range().end()),
+        )
+    } else {
+        origin(context.file, expression.syntax())
+    };
     let kind = match expression {
+        ast::Expr::Use(use_expression) => {
+            HirExprKind::FixtureUse(Box::new(lower_expr(context, use_expression.call()?)?))
+        }
         ast::Expr::Literal(literal) => {
             let token = literal.token()?;
             HirExprKind::Literal(match token.kind() {
@@ -817,6 +887,11 @@ fn lower_expr(context: &LowerContext, expression: ast::Expr) -> Option<HirExpr> 
                 .fields()
                 .filter_map(|field| {
                     Some(HirRecordField {
+                        name_origin: SyntaxOrigin::new(
+                            context.file,
+                            field.name_token()?.text_range(),
+                        ),
+                        quoted: field.name_token()?.kind() == SyntaxKind::String,
                         name: field.name()?,
                         value: lower_expr(context, field.value()?)?,
                         origin: origin(context.file, field.syntax()),
@@ -825,11 +900,20 @@ fn lower_expr(context: &LowerContext, expression: ast::Expr) -> Option<HirExpr> 
                 .collect(),
         ),
         ast::Expr::Member(member) => {
-            let member_token = member.member()?;
+            let member_token = member.member();
             HirExprKind::Member {
                 receiver: Box::new(lower_expr(context, member.receiver()?)?),
-                member: member_token.text().into(),
-                member_origin: SyntaxOrigin::new(context.file, member_token.text_range()),
+                member: member_token
+                    .as_ref()
+                    .map(|token| token.text().to_owned())
+                    .unwrap_or_default(),
+                member_origin: SyntaxOrigin::new(
+                    context.file,
+                    member_token.map_or_else(
+                        || webtest_text::TextRange::empty(member.syntax().text_range().end()),
+                        |token| token.text_range(),
+                    ),
+                ),
             }
         }
         ast::Expr::Call(call) => HirExprKind::Call {
@@ -838,6 +922,9 @@ fn lower_expr(context: &LowerContext, expression: ast::Expr) -> Option<HirExpr> 
                 .arguments()
                 .filter_map(|argument| {
                     Some(HirCallArgument {
+                        name_origin: argument
+                            .name_token()
+                            .map(|token| SyntaxOrigin::new(context.file, token.text_range())),
                         name: argument.name(),
                         value: lower_expr(context, argument.value()?)?,
                         origin: origin(context.file, argument.syntax()),
@@ -902,6 +989,7 @@ fn lower_type(file: FileId, ty: ast::TypeExpr) -> Option<HirType> {
                 .fields()
                 .filter_map(|field| {
                     Some(HirTypeField {
+                        name_origin: SyntaxOrigin::new(file, field.name_token()?.text_range()),
                         name: field.name()?,
                         ty: lower_type(file, field.ty()?)?,
                         optional: field.optional(),
@@ -1081,4 +1169,9 @@ mod retry_tests {
             })
         ));
     }
+}
+
+/// Identity hashing is part of semantic lowering, never an editor text scan.
+pub fn semantic_key(parent: &[u8; 32], kind: &str, name: &str, ordinal: u32) -> [u8; 32] {
+    webtest_text::semantic_key(parent, kind, name, ordinal)
 }

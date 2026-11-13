@@ -40,6 +40,7 @@ pub(super) struct ExecutionScope {
     pub event: ScopeEvent,
     pub context: ScopeContext,
     pub resource_owner: ResourceOwner,
+    pub fixture_boundary: Option<ScopeContext>,
     ancestors: Vec<ExecutionScopeId>,
     cleanup_timeout: Option<std::time::Duration>,
 }
@@ -69,17 +70,100 @@ impl ExecutionScope {
 /// There is no shared "current scope" or mutable execution stack.
 pub(super) struct ScopeFactory {
     ids: ExecutionIds,
-    test_execution_id: TestExecutionId,
-    test_id: TestId,
+    test_execution_id: Option<TestExecutionId>,
+    test_id: Option<TestId>,
+    test_declaration_id: Option<webtest_model::TestDeclarationId>,
+    variant_id: Option<webtest_model::TestVariantId>,
+    fixture: Option<webtest_observation::FixtureExecutionContext>,
 }
 
 impl ScopeFactory {
-    pub fn new(ids: ExecutionIds, test_id: TestId) -> Self {
+    pub fn new(ids: ExecutionIds, test: &webtest_plan::PlannedTest) -> Self {
         Self {
-            test_execution_id: TestExecutionId(ids.next()),
+            test_execution_id: Some(TestExecutionId(ids.next())),
             ids,
-            test_id,
+            test_id: Some(test.id),
+            test_declaration_id: Some(test.test_declaration_id),
+            variant_id: Some(test.variant_id),
+            fixture: None,
         }
+    }
+
+    pub fn for_fixture(
+        ids: ExecutionIds,
+        fixture: webtest_observation::FixtureExecutionContext,
+    ) -> Self {
+        Self {
+            ids,
+            test_execution_id: None,
+            test_id: None,
+            test_declaration_id: None,
+            variant_id: None,
+            fixture: Some(fixture),
+        }
+    }
+    pub fn fixture_root(
+        &self,
+        node: &PlanNode,
+        owner: &ScopeContext,
+        cancellation: crate::CancellationToken,
+        name: &str,
+    ) -> ExecutionScope {
+        let mut root = self.create(node, None, owner.deadline, true);
+        root.context.cancellation = cancellation;
+        root.context.deadline_scope_id = owner.deadline_scope_id;
+        root.resource_owner.context = root.context.clone();
+        if let Some(frame) = root.debug_frames.last_mut() {
+            frame.display_name = Some(format!("fixture {name}"));
+            frame.kind = crate::DebugScopeKind::FixtureLifetime;
+        }
+        root
+    }
+    pub fn fixture_phase(
+        &self,
+        parent: &ExecutionScope,
+        node: &PlanNode,
+        phase: webtest_observation::FixturePhase,
+        deadline: tokio::time::Instant,
+    ) -> ExecutionScope {
+        let cleanup = phase == webtest_observation::FixturePhase::Teardown;
+        let mut child = self.create(node, Some(parent), Some(deadline), cleanup);
+        if cleanup {
+            child.context.cancellation = crate::CancellationToken::default();
+            if let Some(at) = parent.context.cancellation.cleanup_started_at() {
+                child.context.cancellation.start_cleanup_at(at);
+            }
+            child.context.deadline = Some(deadline);
+            child.context.deadline_scope_id = Some(child.id());
+            child.resource_owner.context = child.context.clone();
+        }
+        if let Some(fixture) = &mut child.event.execution_context.fixture {
+            fixture.phase = phase;
+        }
+        if cleanup {
+            child.resource_owner.event = child.event.clone();
+        }
+        if let Some(frame) = child.debug_frames.last_mut() {
+            frame.scope = child.event.clone();
+            frame.kind = match phase {
+                webtest_observation::FixturePhase::Lifetime => {
+                    crate::DebugScopeKind::FixtureLifetime
+                }
+                webtest_observation::FixturePhase::Setup => crate::DebugScopeKind::FixtureSetup,
+                webtest_observation::FixturePhase::Teardown => {
+                    crate::DebugScopeKind::FixtureTeardown
+                }
+            };
+            frame.display_name = Some(
+                match phase {
+                    webtest_observation::FixturePhase::Lifetime => "fixture lifetime",
+                    webtest_observation::FixturePhase::Setup => "fixture setup",
+                    webtest_observation::FixturePhase::Teardown => "fixture teardown",
+                }
+                .into(),
+            );
+        }
+        child
     }
 
     pub fn root(&self, node: &PlanNode, deadline: tokio::time::Instant) -> ExecutionScope {
@@ -126,6 +210,7 @@ impl ScopeFactory {
             max_attempts,
         });
         scope.event.execution_context.attempt_id = Some(AttemptId(self.ids.next()));
+        scope.fixture_boundary = Some(scope.context.clone());
         scope.resource_owner.event = scope.event.clone();
         if let Some(frame) = scope.debug_frames.last_mut() {
             frame.scope = scope.event.clone();
@@ -144,6 +229,11 @@ impl ScopeFactory {
         let scope_id = ExecutionScopeId(self.ids.next());
         let event = ScopeEvent {
             execution_context: ExecutionContext {
+                fixture: parent
+                    .and_then(|parent| parent.event.execution_context.fixture)
+                    .or(self.fixture),
+                test_declaration_id: self.test_declaration_id,
+                variant_id: self.variant_id,
                 test_execution_id: self.test_execution_id,
                 test_id: self.test_id,
                 task_path: node.path.clone(),
@@ -193,9 +283,16 @@ impl ScopeFactory {
         };
         let mut debug_frames = parent.map_or_else(Vec::new, |parent| parent.debug_frames.clone());
         debug_frames.push(crate::DebugScope {
+            display_name: match &node.kind {
+                PlanNodeKind::Helper { call, .. } => Some(format!("helper {}", call.name)),
+                _ => None,
+            },
             scope: event.clone(),
             kind: match node.kind {
-                PlanNodeKind::Sequence { .. } => crate::DebugScopeKind::Sequence,
+                PlanNodeKind::Helper { .. } => crate::DebugScopeKind::Helper,
+                PlanNodeKind::Conditional { .. } | PlanNodeKind::Sequence { .. } => {
+                    crate::DebugScopeKind::Sequence
+                }
                 PlanNodeKind::Parallel { .. } => crate::DebugScopeKind::Parallel,
                 PlanNodeKind::Race { .. } => crate::DebugScopeKind::Race,
                 PlanNodeKind::Retry { .. } => crate::DebugScopeKind::Retry,
@@ -212,6 +309,9 @@ impl ScopeFactory {
             debug_frames,
             cleanup_timeout,
             event,
+            fixture_boundary: parent
+                .and_then(|parent| parent.fixture_boundary.clone())
+                .or_else(|| (self.test_id.is_some() && parent.is_none()).then(|| context.clone())),
             context,
             resource_owner,
             ancestors,

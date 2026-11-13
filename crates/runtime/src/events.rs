@@ -161,7 +161,15 @@ pub(crate) struct EventBuffer {
     capacity: NonZeroUsize,
     subscribers: Vec<SubscriptionSender>,
     source_revision: Option<SourceRevision>,
+    source_revisions: std::collections::HashMap<webtest_text::FileId, SourceRevision>,
     tests: BTreeMap<TestId, SyntaxOrigin>,
+    test_identities: BTreeMap<
+        TestId,
+        (
+            webtest_model::TestDeclarationId,
+            webtest_model::TestVariantId,
+        ),
+    >,
     steps: BTreeMap<(TestId, StepId), SyntaxOrigin>,
 }
 
@@ -182,14 +190,19 @@ impl EventBuffer {
             capacity,
             subscribers,
             source_revision: None,
+            source_revisions: std::collections::HashMap::new(),
             tests: BTreeMap::new(),
+            test_identities: BTreeMap::new(),
             steps: BTreeMap::new(),
         }
     }
     pub(crate) fn for_plan(mut self, plan: &webtest_plan::TestPlan) -> Self {
         self.source_revision = Some(plan.source_revision);
+        self.source_revisions = plan.sources().into_iter().collect();
         for test in &plan.tests {
             self.tests.insert(test.id, test.origin);
+            self.test_identities
+                .insert(test.id, (test.test_declaration_id, test.variant_id));
             for step in test.steps() {
                 self.steps.insert((test.id, step.id), step.origin);
             }
@@ -208,6 +221,16 @@ impl EventBuffer {
                     .or_else(|| self.tests.get(&test))
                     .copied()
             });
+            if let Some(origin) = metadata.origin {
+                metadata.source_revision = self.source_revisions.get(&origin.file).copied();
+            }
+        }
+        if let Some((declaration, variant)) = event
+            .test_id()
+            .and_then(|test| self.test_identities.get(&test))
+        {
+            metadata.execution_context.test_declaration_id = Some(*declaration);
+            metadata.execution_context.variant_id = Some(*variant);
         }
         metadata
     }
@@ -309,8 +332,11 @@ mod tests {
         };
         let scope = |context: &ScopeContext| ScopeEvent {
             execution_context: webtest_observation::ExecutionContext {
-                test_execution_id: webtest_model::TestExecutionId(0),
-                test_id: TestId(0),
+                fixture: None,
+                test_declaration_id: None,
+                variant_id: None,
+                test_execution_id: Some(webtest_model::TestExecutionId(0)),
+                test_id: Some(TestId(0)),
                 task_path: vec![],
                 scope_id: context.scope_id,
                 parent_scope_id: None,

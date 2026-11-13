@@ -29,7 +29,8 @@ pub(crate) async fn run(cli: Cli) -> Result<ExitClass, AppError> {
             headed,
             reporter,
             jobs,
-        } => test::run_test(paths, chrome_path, headed, reporter, jobs).await,
+            variants,
+        } => test::run_test(paths, chrome_path, headed, reporter, jobs, variants).await,
         Command::Inspect {
             url,
             chrome_path,

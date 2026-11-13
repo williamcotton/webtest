@@ -13,6 +13,9 @@ use webtest_syntax::{AuthorFacingLanguage, author_facing_language};
 
 mod app_bridge;
 mod catalog;
+pub(crate) mod workspace;
+mod workspace_catalog;
+pub use workspace::{ProjectDeclaration, ProjectSemanticDescription};
 
 use catalog::{add_provider_constructs, core_constructs};
 
@@ -94,6 +97,7 @@ impl DescriptionLimits {
 #[derive(Clone, Debug, Serialize)]
 #[serde(untagged)]
 pub enum DescriptionResponse {
+    Project(ProjectSemanticDescription),
     Index(DescriptionIndex),
     Language(LanguageDescription),
     Grammar(GrammarDescription),
@@ -266,6 +270,8 @@ pub struct GuidanceDescription {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct SourceExample {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub inputs: BTreeMap<String, String>,
     pub name: String,
     pub source: String,
     pub source_kind: String,
@@ -372,6 +378,22 @@ struct CategorySpec {
 
 const CATEGORY_SPECS: &[CategorySpec] = &[
     CategorySpec {
+        index_key: "builtins",
+        query: "builtin",
+        aliases: &["builtins"],
+        prefixes: &["builtin"],
+        exact_children: &[],
+        summary: "Installed pure expression functions.",
+    },
+    CategorySpec {
+        index_key: "workspace",
+        query: "workspace",
+        aliases: &["modules", "fixtures", "helpers"],
+        prefixes: &["language", "project"],
+        exact_children: &["statement.use"],
+        summary: "Modules, reusable declarations, and project semantic discovery.",
+    },
+    CategorySpec {
         index_key: "controls",
         query: "control",
         aliases: &["controls"],
@@ -383,7 +405,7 @@ const CATEGORY_SPECS: &[CategorySpec] = &[
         index_key: "declarations",
         query: "declaration",
         aliases: &["declarations"],
-        prefixes: &["declaration"],
+        prefixes: &["declaration", "language"],
         exact_children: &[],
         summary: "Top-level WebTest declarations.",
     },
@@ -864,11 +886,25 @@ fn apply_limits(
     let oversized_examples = construct
         .examples
         .iter()
-        .filter(|example| example.source.len() > limits.max_example_bytes)
+        .filter(|example| {
+            example.source.len().saturating_add(
+                example
+                    .inputs
+                    .iter()
+                    .map(|(path, source)| path.len() + source.len())
+                    .sum::<usize>(),
+            ) > limits.max_example_bytes
+        })
         .count();
-    construct
-        .examples
-        .retain(|example| example.source.len() <= limits.max_example_bytes);
+    construct.examples.retain(|example| {
+        example.source.len().saturating_add(
+            example
+                .inputs
+                .iter()
+                .map(|(path, source)| path.len() + source.len())
+                .sum::<usize>(),
+        ) <= limits.max_example_bytes
+    });
     if oversized_examples > 0 {
         construct.truncation.push(Truncation {
             collection: "examples".into(),
@@ -1177,6 +1213,7 @@ mod tests {
                         | "block_fragment"
                         | "locator_fragment"
                         | "statement_fragment"
+                        | "workspace_sources"
                 )
             }) {
                 let source = wrap_example(example);
@@ -1190,7 +1227,18 @@ mod tests {
                     source
                 );
                 let mut database = AnalysisDatabase::default();
-                let file = database.open_file("example.webtest", source.clone());
+                let file = if example.source_kind == "workspace_sources" {
+                    database.configure_workspace(crate::WorkspaceConfiguration {
+                        root: "/reference".into(),
+                        ..Default::default()
+                    });
+                    for (path, source) in &example.inputs {
+                        database.open_file(format!("/reference/{path}"), source.clone());
+                    }
+                    database.open_file("/reference/example.webtest", source.clone())
+                } else {
+                    database.open_file("example.webtest", source.clone())
+                };
                 let diagnostics = database.diagnostics(file).expect("diagnostics");
                 assert!(
                     diagnostics
@@ -1284,6 +1332,13 @@ mod tests {
     fn public_reference_is_complete_unique_and_does_not_advertise_roadmap_constructs() {
         let expected = [
             "declaration.test",
+            "language.import",
+            "language.export",
+            "language.fn",
+            "language.fixture",
+            "statement.use",
+            "builtin.lower",
+            "project.metadata",
             "control.timeout",
             "control.parallel",
             "control.race",
@@ -2122,7 +2177,7 @@ mod tests {
 
     fn wrap_example(example: &SourceExample) -> String {
         match example.source_kind.as_str() {
-            "source_file" => example.source.clone(),
+            "source_file" | "workspace_sources" => example.source.clone(),
             "declaration_fragment" => example.source.clone(),
             "block_fragment" => format!("test \"example\" {{ {} }}", example.source),
             "locator_fragment" => format!(

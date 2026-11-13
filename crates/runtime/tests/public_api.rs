@@ -23,6 +23,8 @@ fn accepts_event_sink(_: Option<&dyn RunEventSink>) {}
 
 fn test_result(outcome: TestOutcome) -> TestResult {
     TestResult {
+        test_declaration_id: Default::default(),
+        variant_id: Default::default(),
         test_id: webtest_model::TestId(0),
         name: "test".into(),
         outcome,
@@ -35,6 +37,7 @@ fn test_result(outcome: TestOutcome) -> TestResult {
 fn failed_outcome() -> TestOutcome {
     TestOutcome::Failed(Box::new(StepFailure {
         step: PlannedStep {
+            origin_chain: Vec::new(),
             id: StepId(0),
             origin: SyntaxOrigin::new(FileId::new(7), TextRange::default()),
             operation: webtest_plan::TestOperation::EvaluatePure(
@@ -59,6 +62,7 @@ fn failed_outcome() -> TestOutcome {
 fn root_public_api_remains_importable_and_constructible() {
     let file = FileId::new(7);
     let step = PlannedStep {
+        origin_chain: Vec::new(),
         id: StepId(3),
         origin: SyntaxOrigin::new(file, TextRange::default()),
         operation: webtest_plan::TestOperation::EvaluatePure(webtest_plan::EvaluatePureOperation {
