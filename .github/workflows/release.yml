@@ -1,0 +1,122 @@
+name: Release
+on:
+  push:
+    tags: ['v[0-9]*']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  quality:
+    uses: ./.github/workflows/ci.yml
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: macos-15-intel, target: x86_64-apple-darwin}
+          - {os: macos-15, target: aarch64-apple-darwin}
+          - {os: ubuntu-22.04, target: x86_64-unknown-linux-gnu}
+          - {os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu}
+          - {os: windows-2022, target: x86_64-pc-windows-msvc}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - name: Build locked native product
+        run: cargo build --release --locked -p webtest
+        env:
+          WEBTEST_BUILD_COMMIT: ${{ github.sha }}
+          CARGO_INCREMENTAL: 0
+          CARGO_PROFILE_RELEASE_STRIP: debuginfo
+          RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/webtest
+      - name: Native archive and binary smoke
+        shell: bash
+        run: |
+          binary=target/release/webtest
+          if [[ "$RUNNER_OS" == Windows ]]; then binary="$binary.exe"; fi
+          "$binary" --version --json
+          python scripts/release/package.py --binary "$binary" --target '${{ matrix.target }}'
+          python scripts/release/smoke.py release/dist '${{ matrix.target }}'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.target }}
+          path: release/dist/*
+  editor:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with: {targets: wasm32-unknown-unknown}
+      - uses: actions/setup-node@v4
+        with: {node-version: 22}
+      - run: cargo install wasm-bindgen-cli --version "$(python3 -c 'import tomllib; print(next(p["version"] for p in tomllib.load(open("Cargo.lock","rb"))["package"] if p["name"] == "wasm-bindgen"))')" --locked
+      - run: npm ci && npm run build && npm test && npm pack --ignore-scripts
+        working-directory: editors/monaco
+      - run: npm ci && npm run smoke && npm run test:releases
+        working-directory: editors/vscode
+      - uses: actions/upload-artifact@v4
+        with:
+          name: editors
+          path: |
+            editors/monaco/*.tgz
+            editors/vscode/*.vsix
+  container:
+    needs: native
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-x86_64-unknown-linux-gnu
+          path: release/dist
+      - name: Assemble container context
+        run: |
+          cp release/dist/*.bin release/webtest.bin
+          docker build -t webtest:rehearsal -f release/Dockerfile release
+      - name: Non-root sandboxed Chrome smoke
+        run: |
+          test "$(docker inspect webtest:rehearsal --format '{{.Config.User}}')" = '10001:10001'
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          docker run --rm --cap-add=SYS_ADMIN -v "$PWD/release/container-smoke.webtest:/workspace/smoke.webtest:ro" webtest:rehearsal test /workspace/smoke.webtest
+      - run: docker save webtest:rehearsal -o release/container.tar
+      - uses: actions/upload-artifact@v4
+        with: {name: container, path: release/container.tar}
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [quality, native, editor, container]
+    environment: release
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: {path: release/dist, merge-multiple: true}
+      - name: Assemble and verify all artifacts
+        run: |
+          mv release/dist/container.tar /tmp/webtest-container.tar
+          python3 scripts/release/manifest.py release/dist
+          python3 scripts/release/package_managers.py release/dist
+          python3 scripts/release/manifest.py release/dist
+          python3 -c 'import json,os; assert "v"+json.load(open("release/dist/manifest.json"))["version"] == os.environ["GITHUB_REF_NAME"]'
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign authoritative manifest
+        run: cosign sign-blob --yes --bundle release/dist/manifest.sigstore.json release/dist/manifest.json
+      - uses: actions/attest-build-provenance@v2
+        with: {subject-path: 'release/dist/*'}
+      - name: Publish release
+        env: {GH_TOKEN: '${{ github.token }}'}
+        run: gh release create "$GITHUB_REF_NAME" release/dist/* release/install.sh release/install.ps1 --verify-tag --generate-notes
+      - name: Publish pinned CI container
+        env: {GH_TOKEN: '${{ github.token }}'}
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker load -i /tmp/webtest-container.tar
+          docker tag webtest:rehearsal "ghcr.io/williamcotton/webtest:${GITHUB_REF_NAME#v}"
+          docker push "ghcr.io/williamcotton/webtest:${GITHUB_REF_NAME#v}"
+          cosign sign --yes "ghcr.io/williamcotton/webtest:${GITHUB_REF_NAME#v}"

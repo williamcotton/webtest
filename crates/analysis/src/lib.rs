@@ -29,11 +29,11 @@ mod syntax_diagnostics;
 pub use database::{AnalysisCancellation, AnalysisDatabase, AnalysisError, AnalysisSnapshot};
 pub use description::{
     Availability, CategoryDescription, ConstraintDescription, ConstructDescription,
-    DescriptionDiagnostic, DescriptionIndex, DescriptionLimits, DescriptionProject,
-    DescriptionRequest, DescriptionResponse, GuidanceDescription, LanguageDescription,
-    ParameterDescription, ProjectDeclaration, ProjectSemanticDescription, Provenance,
-    ResolvedRuntimeConfiguration, SearchDescription, SearchResult, SourceExample, SyntaxElement,
-    SyntaxForm, describe,
+    DESCRIPTION_SCHEMA_VERSION, DescriptionDiagnostic, DescriptionIndex, DescriptionLimits,
+    DescriptionProject, DescriptionRequest, DescriptionResponse, GuidanceDescription,
+    LanguageDescription, ParameterDescription, ProjectDeclaration, ProjectSemanticDescription,
+    Provenance, ResolvedRuntimeConfiguration, SearchDescription, SearchResult, SourceExample,
+    SyntaxElement, SyntaxForm, describe,
 };
 pub use diagnostic::{Diagnostic, DiagnosticSeverity, DiagnosticSource};
 pub use facts::{

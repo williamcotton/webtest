@@ -1,6 +1,8 @@
 //! Stable DTO-oriented facade for browser/editor builds of the language core.
 
+mod session;
 mod workspace;
+pub use session::{EDITOR_API_VERSION, EditorSession, Position, WORKER_PROTOCOL_VERSION, WebRange};
 pub use workspace::{PortableWorkspace, WorkspaceInputs, WorkspaceQuery, WorkspaceSource};
 
 use serde::Serialize;
@@ -120,8 +122,7 @@ fn compile_with_database(source: &str, mut database: AnalysisDatabase) -> Portab
         .unwrap_or_default();
     PortableCompilation {
         diagnostics,
-        executable_on_wasm: required_host_capabilities.is_empty()
-            || required_host_capabilities == [Capability::Pure, Capability::Test],
+        executable_on_wasm: false,
         required_host_capabilities,
         plan,
     }

@@ -14,7 +14,7 @@ mod output;
 mod publication;
 pub use attachment::{Artifact, ArtifactKind, Attachment};
 pub use output::{CapturedOutput, OutputStream};
-pub use publication::{ObservationPublication, PublishedObservation};
+pub use publication::{OBSERVATION_IPC_VERSION, ObservationPublication, PublishedObservation};
 mod event_metadata;
 mod journal;
 pub use event_metadata::{EventContext, EventMetadata};

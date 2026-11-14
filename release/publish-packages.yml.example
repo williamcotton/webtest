@@ -1,0 +1,16 @@
+# Maintainer opt-in steps for the protected release job, after all release gates.
+# Configure npm trusted publishing (OIDC) and marketplace credentials first.
+- uses: actions/setup-node@v4
+  with:
+    node-version: 22
+    registry-url: https://registry.npmjs.org
+- run: npm publish release/dist/webtest-editor-*.tgz --access public --provenance
+- run: npm ci --prefix editors/vscode
+- name: Publish universal VSIX to Visual Studio Marketplace
+  env:
+    VSCE_PAT: ${{ secrets.VSCE_PAT }}
+  run: npm --prefix editors/vscode exec -- vsce publish --packagePath release/dist/webtest-vscode-*.vsix
+- name: Publish universal VSIX to Open VSX (Cursor-compatible registry)
+  env:
+    OVSX_PAT: ${{ secrets.OVSX_PAT }}
+  run: npx --yes ovsx@0.10.6 publish release/dist/webtest-vscode-*.vsix

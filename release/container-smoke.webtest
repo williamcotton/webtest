@@ -1,0 +1,6 @@
+test "release Chrome can run a browser test" {
+    browser {
+        open "data:text/html,<h1>Release browser passed</h1>"
+        expect text("Release browser passed").visible
+    }
+}

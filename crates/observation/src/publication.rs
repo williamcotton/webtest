@@ -1,4 +1,5 @@
 //! Portable completed observation batches. Native transport owns paths/authentication.
+pub const OBSERVATION_IPC_VERSION: u32 = 1;
 use crate::{ExecutionId, RuntimeObservation, RuntimeObservationKind};
 use webtest_model::{StepId, TestId};
 use webtest_text::{FileId, SourceRevision, TextRange, TextSize};

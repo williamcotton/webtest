@@ -17,10 +17,16 @@ for (const required of [
     "extension/package.json",
     "extension/out/extension.js",
     "extension/out/testing.js",
+    "extension/out/releases.js",
     "extension/language-configuration.json",
     "extension/LICENSE.txt",
 ]) {
     assert.ok(files.has(required), `${required} is missing from the VSIX`);
+}
+
+for (const name of files.keys()) {
+    assert.ok(!/(^|\/)(\.env(?:\.|$)|id_rsa|id_ed25519|target)(\/|$)/.test(name), `unexpected sensitive/build file: ${name}`);
+    assert.ok(!/\.(exe|dll|dylib|so|node|p12|pfx|key)$/.test(name), `unexpected native binary/key: ${name}`);
 }
 
 const manifest = JSON.parse(files.get("extension/package.json").toString("utf8"));
@@ -32,7 +38,7 @@ assert.ok(manifest.activationEvents.includes("onLanguage:webtest"));
 assert.ok(manifest.activationEvents.includes("onDebug"));
 assert.deepEqual(
     manifest.contributes.commands.map(({ command }) => command).sort(),
-    ["webtest.debugCurrentFile", "webtest.runCurrentFile"],
+    ["webtest.debugCurrentFile", "webtest.installServer", "webtest.runCurrentFile"],
     "only extension-owned commands should be registered; webtest.runFile belongs to LSP",
 );
 assert.ok(manifest.contributes.semanticTokenScopes[0].scopes.keyword.length > 0);
@@ -47,7 +53,7 @@ for (const marker of [
     'args: ["lsp"]',
     'const args = ["dap"]',
     'args.push("--project", program)',
-    'path.join(os.homedir(), ".cargo")',
+    "managedBinary",
     "sourceText",
 ]) {
     assert.ok(extension.includes(marker), `compiled extension is missing ${marker}`);

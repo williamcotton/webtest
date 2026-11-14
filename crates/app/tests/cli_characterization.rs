@@ -27,7 +27,7 @@ fn help_surface_is_byte_stable() {
     let cases: &[(&[&str], &str)] = &[
         (
             &["--help"],
-            "Statically analyzable web application tests\n\nUsage: webtest <COMMAND>\n\nCommands:\n  init      Create a minimal WebTest project, application schema, example, and agent skill\n  check     Parse and statically check WebTest files\n  fmt       Rewrite WebTest files using the canonical formatter\n  build     Analyze WebTest files and emit a versioned execution plan\n  test      Execute WebTest files in Chrome\n  trace     Validate a trace and serve a local read-only viewer\n  inspect   Inspect one page, starting the configured app for project-relative URLs\n  describe  Describe the installed language and project-visible provider surface\n  browser   Install and inspect managed Chrome for Testing versions\n  lsp       Run the language server over stdio\n  dap       Run the debug adapter protocol server over stdio\n  help      Print this message or the help of the given subcommand(s)\n\nOptions:\n  -h, --help     Print help\n  -V, --version  Print version\n",
+            "Statically analyzable web application tests\n\nUsage: webtest <COMMAND>\n\nCommands:\n  version   Report product, build, and protocol compatibility versions\n  init      Create a minimal WebTest project, application schema, example, and agent skill\n  check     Parse and statically check WebTest files\n  fmt       Rewrite WebTest files using the canonical formatter\n  build     Analyze WebTest files and emit a versioned execution plan\n  test      Execute WebTest files in Chrome\n  trace     Validate a trace and serve a local read-only viewer\n  inspect   Inspect one page, starting the configured app for project-relative URLs\n  describe  Describe the installed language and project-visible provider surface\n  browser   Install and inspect managed Chrome for Testing versions\n  lsp       Run the language server over stdio\n  dap       Run the debug adapter protocol server over stdio\n  help      Print this message or the help of the given subcommand(s)\n\nOptions:\n  -h, --help     Print help\n  -V, --version  Print version\n",
         ),
         (
             &["init", "--help"],
@@ -269,5 +269,28 @@ fn build_is_deterministic_and_description_json_remains_machine_clean() {
         let value: serde_json::Value =
             serde_json::from_slice(&output.stdout).expect("description JSON");
         assert!(value.is_object());
+    }
+}
+
+#[test]
+fn machine_version_reports_canonical_compatibility_and_target() {
+    for arguments in [["--version", "--json"], ["version", "--json"]] {
+        let output = run(Path::new(env!("CARGO_MANIFEST_DIR")), &arguments);
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["webtest"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(value["plan_format"], webtest_plan::PLAN_FORMAT_VERSION);
+        assert_eq!(value["trace_format"], webtest_trace::TRACE_FORMAT_VERSION);
+        assert_eq!(
+            value["diagnostic_schema"],
+            webtest_feedback::DIAGNOSTIC_SCHEMA_VERSION
+        );
+        assert_eq!(
+            value["worker_protocol"],
+            webtest_wasm::WORKER_PROTOCOL_VERSION
+        );
+        assert!(!value["target"].as_str().unwrap().is_empty());
+        assert!(!value["build_commit"].as_str().unwrap().is_empty());
     }
 }

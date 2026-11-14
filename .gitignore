@@ -10,3 +10,11 @@ editors/vscode/*.vsix
 .DS_Store
 **/obj
 *.dump
+editors/monaco/dist/
+editors/monaco/*.tgz
+editors/monaco/LICENSE
+editors/monaco/THIRD_PARTY_NOTICES
+release/dist/
+**/__pycache__/
+editors/monaco/test/bundled-index.js
+editors/monaco/test/bundled-worker.js

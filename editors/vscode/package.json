@@ -22,7 +22,8 @@
     "onLanguage:webtest",
     "onCommand:webtest.runCurrentFile",
     "onCommand:webtest.debugCurrentFile",
-    "onDebug"
+    "onDebug",
+    "onCommand:webtest.installServer"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -48,6 +49,10 @@
         "command": "webtest.debugCurrentFile",
         "title": "WebTest: Debug Current File",
         "icon": "$(debug-alt)"
+      },
+      {
+        "command": "webtest.installServer",
+        "title": "WebTest: Install/Update Server"
       }
     ],
     "menus": {
@@ -182,7 +187,7 @@
           "type": "string",
           "default": "webtest",
           "scope": "resource",
-          "description": "Path to the WebTest executable. When unset, the extension checks target/debug/webtest in the open workspace, Cargo's bin directory, then PATH."
+          "description": "Executable override. Otherwise checks workspace target/debug/webtest, PATH, then the verified extension-managed release. Activation never downloads binaries."
         },
         "webtest.chromePath": {
           "type": "string",
@@ -201,17 +206,29 @@
     "smoke": "npm run package && node ./scripts/package-smoke.mjs",
     "smoke:cursor": "npm run smoke && node ./scripts/cursor-smoke.mjs",
     "smoke:activation": "npm run compile && node ./test/run.mjs",
-    "test:testing": "npm run compile && node --test test/testing-api.cjs"
+    "test:testing": "npm run compile && node --test test/testing-api.cjs",
+    "test:releases": "npm run compile && node --test test/releases.cjs"
   },
   "dependencies": {
+    "sigstore": "4.1.1",
     "vscode-languageclient": "^10.0.0"
   },
   "devDependencies": {
+    "@sigstore/rekor-types": "^4.0.0",
+    "@types/make-fetch-happen": "^10.0.4",
     "@types/node": "^22.0.0",
     "@types/vscode": "^1.96.0",
     "@vscode/test-electron": "^3.1.0",
     "@vscode/vsce": "^3.9.2",
     "typescript": "^5.7.0",
     "yauzl": "^3.2.1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/williamcotton/webtest"
+  },
+  "homepage": "https://github.com/williamcotton/webtest#readme",
+  "bugs": {
+    "url": "https://github.com/williamcotton/webtest/issues"
   }
 }

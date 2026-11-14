@@ -28,6 +28,9 @@ pub struct WorkspaceInputs {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkspaceQuery {
+    CompileVariant {
+        variant: webtest_model::TestVariantId,
+    },
     ProjectDescription {
         limit: usize,
     },
@@ -216,6 +219,9 @@ impl PortableWorkspace {
         }
         Ok(self.database.workspace_revision())
     }
+    pub fn revision(&self) -> u64 {
+        self.database.workspace_revision()
+    }
     pub fn snapshot(&self) -> AnalysisSnapshot {
         self.database.snapshot()
     }
@@ -233,6 +239,28 @@ fn query(snapshot: &mut AnalysisSnapshot, request: WorkspaceQuery) -> Result<Val
             .ok_or_else(|| format!("unknown workspace source `{path}`"))
     };
     let result = match request {
+        WorkspaceQuery::CompileVariant { variant } => {
+            let discovery = snapshot.discover_tests(10_000).map_err(|e| e.to_string())?;
+            if discovery.truncated {
+                return Err("test discovery exceeded the limit".into());
+            }
+            let module = discovery
+                .modules
+                .iter()
+                .find(|module| {
+                    module.tests.iter().any(|test| {
+                        test.variants
+                            .iter()
+                            .any(|item| item.id == variant && item.runnable)
+                    })
+                })
+                .ok_or("unknown or non-runnable test variant")?;
+            let plan = snapshot
+                .test_plan(module.file)
+                .map_err(|e| e.to_string())?
+                .select_variants(&BTreeSet::from([variant]));
+            json!({"required_host_capabilities":plan.required_host_capabilities,"plan":plan,"executable_on_wasm":false})
+        }
         WorkspaceQuery::ProjectDescription { limit } => encoded(
             snapshot
                 .project_description(limit)

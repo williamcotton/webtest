@@ -17,6 +17,11 @@ pub(crate) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
+    /// Report product, build, and protocol compatibility versions.
+    Version {
+        #[arg(long)]
+        json: bool,
+    },
     /// Create a minimal WebTest project, application schema, example, and agent skill.
     Init {
         /// Directory to initialize.

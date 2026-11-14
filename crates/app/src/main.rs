@@ -1,6 +1,7 @@
 mod chrome;
 mod cli;
 mod commands;
+mod compatibility;
 mod diagnostic_output;
 mod error;
 mod init;
@@ -34,7 +35,16 @@ async fn main() -> ExitCode {
         .try_init()
         .ok();
 
-    let cli = match Cli::try_parse() {
+    let args = std::env::args_os().collect::<Vec<_>>();
+    let args = if args.len() == 3
+        && args[1..].contains(&"--version".into())
+        && args[1..].contains(&"--json".into())
+    {
+        vec![args[0].clone(), "version".into(), "--json".into()]
+    } else {
+        args
+    };
+    let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
         Err(error) => {
             let code = if error.use_stderr() { 2 } else { 0 };

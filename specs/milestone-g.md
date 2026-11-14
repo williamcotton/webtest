@@ -6,6 +6,67 @@ This specification expands Milestone G in [`future-functionality.md`](./future-f
 
 Milestone G makes the same Rust language intelligence available in Monaco/browser hosts and turns all native/editor components into reproducible release artifacts. It does not fork language semantics for the web.
 
+### Implementation status (2026-11-13)
+
+The repository now contains an implementation of the portable editor and release
+preparation slices. **Milestone G is not yet accepted as complete.** Publishing and
+tier-1 clean-environment release rehearsals require external evidence; workflow
+configuration alone does not satisfy the acceptance criteria below.
+
+Implemented source surfaces:
+
+- `crates/wasm/src/session.rs`: API/worker version 1, typed envelopes/errors,
+  workspace/document lifecycle, transactional UTF-16 edits, revisions, schema
+  invalidation, range projections, variant compilation and capability rejection.
+- `editors/monaco`: ESM package, worker/client cancellation and bounded scheduling,
+  diagnostics/test notifications, declarations, optional Monaco providers,
+  self-hosted CSP integration, npm install/type/bundle checks and exact native/WASM
+  DTO parity. Executing a synchronous WASM query is not preemptible; queued
+  cancellation and stale-result suppression are explicit.
+- `webtest --version --json` and `webtest version --json`: canonical compatibility
+  versions, native target and source commit, composed from authoritative constants.
+- `scripts/release`, `release`, `.github/workflows/release.yml`: deterministic
+  native archives/raw binaries, compatibility manifests, checksums, SBOM/license
+  inventory, signed manifest/provenance pipeline, installers, reviewed package
+  manager projections, and a non-root Chrome container build/smoke gate.
+- `editors/vscode/src/releases.ts`: explicit confirmed server installation using
+  exact release-workflow Sigstore identity, compatibility/size/checksum checks,
+  raw-binary installation, immutable previous versions and atomic activation.
+
+Locally verified: 14 Rust facade tests; exact native/real-WASM DTO corpus; worker
+lifecycle/cancellation/error tests; packed ESM installation, TypeScript and esbuild
+checks; direct and bundled real-Chrome Monaco integration under CSP; VSIX content
+checks and live VS Code activation/run/debug; deterministic archive tests and a
+locally packaged macOS archive smoke; workspace Clippy. The first unconstrained
+workspace test run hit a CDP Target.createTarget timeout; the isolated rerun passed.
+The full Rust workspace suite passed with `cargo test --workspace -- --test-threads=1`;
+`cargo clippy --workspace --all-targets -- -D warnings` and the release workspace
+benchmark also passed. Bridge projection/reference/Node conformance passed. Ruby conformance exposed an
+existing immediate-cancellation startup race: dispatch now acknowledges that the
+child entered its rescue/ensure boundary before reading a cancel frame. The
+conformance rerun verifies that release prerequisite.
+The real browser fixture passed for both direct ESM and esbuild-bundled clients.
+These are local implementation checks, not published-release acceptance.
+
+Outstanding acceptance evidence and distribution work:
+
+- Execute the release workflow on all five tier-1 targets and install each signed
+  candidate in clean environments. The release workflow and platform runners have
+  not been exercised from this local change.
+- Verify the real signed-manifest install/upgrade path and end-to-end rollback on
+  every supported extension host. Local verification currently covers rejection,
+  integrity, package activation, LSP and DAP; it does not substitute for a signed
+  release rehearsal. Previous binaries can be selected with `webtest.serverPath`.
+- Build/run/publish the official Linux container, including host sandbox policy and
+  mounted artifact ownership. Its release smoke retains Chrome sandboxing and
+  explicitly grants SYS_ADMIN in CI; no default `--no-sandbox` is introduced.
+- Configure protected release/tag policy and npm/marketplace credentials/trusted
+  publishing; publish npm/VSIX artifacts and submit Homebrew/WinGet projections.
+  `release/publish-packages.yml.example` documents the optional protected steps.
+- Complete signature/provenance/SBOM and installer/package-manager validation on
+  clean target systems. Shell/PowerShell installers require cosign. Package-manager
+  projections are generated for review and are not claims of registry acceptance.
+
 ## 1. Outcome
 
 Users can:

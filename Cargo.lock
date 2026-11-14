@@ -2360,6 +2360,7 @@ dependencies = [
  "webtest-syntax",
  "webtest-text",
  "webtest-trace",
+ "webtest-wasm",
 ]
 
 [[package]]

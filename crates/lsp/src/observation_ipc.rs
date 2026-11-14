@@ -19,7 +19,7 @@ use tower_lsp_server::Client;
 use webtest_observation::{ObservationPublication, RuntimeObservationKind};
 use webtest_text::SourceRevision;
 
-const PROTOCOL: u32 = 1;
+const PROTOCOL: u32 = webtest_observation::OBSERVATION_IPC_VERSION;
 const MAX_FRAME: usize = 8 * 1024 * 1024;
 const DEADLINE: Duration = Duration::from_secs(2);
 

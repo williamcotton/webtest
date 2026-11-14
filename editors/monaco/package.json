@@ -1,0 +1,51 @@
+{
+  "name": "@webtest/editor",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "MIT OR Apache-2.0",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./monaco": {
+      "types": "./dist/monaco.d.ts",
+      "import": "./dist/monaco.js"
+    },
+    "./worker": "./dist/worker.js",
+    "./wasm": "./dist/webtest_bg.wasm"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test test/*.test.mjs",
+    "test:browser": "node test/browser.mjs",
+    "prepack": "npm run build"
+  },
+  "peerDependencies": {
+    "monaco-editor": ">=0.52.0 <1"
+  },
+  "peerDependenciesMeta": {
+    "monaco-editor": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "esbuild": "0.27.0",
+    "monaco-editor": "0.57.0",
+    "typescript": "5.9.3"
+  },
+  "webtestCompatibility": {
+    "wasm_editor_api": 1,
+    "worker_protocol": 1,
+    "plan_format": 10
+  },
+  "overrides": {
+    "dompurify": "3.4.17"
+  }
+}

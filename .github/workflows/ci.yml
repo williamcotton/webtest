@@ -3,6 +3,7 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_call:
 
 jobs:
   quality-suite:
@@ -81,3 +82,23 @@ jobs:
         working-directory: editors/vscode
         env:
           WEBTEST_CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
+
+      - name: Build portable editor package
+        run: |
+          cargo install wasm-bindgen-cli --version "$(python3 -c 'import tomllib; print(next(p["version"] for p in tomllib.load(open("Cargo.lock","rb"))["package"] if p["name"] == "wasm-bindgen"))')" --locked
+          npm --prefix editors/monaco ci
+          npm --prefix editors/monaco run build
+
+      - name: Native/WASM DTO parity and worker lifecycle
+        run: npm --prefix editors/monaco test
+
+      - name: Real worker and Monaco browser integration
+        run: npm --prefix editors/monaco run test:browser
+        env:
+          WEBTEST_CHROME_PATH: ${{ steps.setup-chrome.outputs.chrome-path }}
+
+      - name: Release package and installer validation
+        run: |
+          python3 scripts/release/test_package.py
+          npm --prefix editors/vscode run test:releases
+          sh -n release/install.sh

@@ -14,7 +14,7 @@ Or build it in place for extension development:
 cargo build
 ```
 
-The extension discovers `target/debug/webtest` in an open workspace and Cargo-installed binaries in `CARGO_HOME/bin` or `~/.cargo/bin`. Otherwise, put `webtest` on `PATH` or configure `webtest.serverPath` with an absolute executable path. Debug sessions select configuration from the nearest `webtest.toml` above the test file, rather than assuming the editor workspace is the project root.
+The extension discovers `target/debug/webtest` in an open workspace, then `webtest` on `PATH`, then a verified managed installation. Configure `webtest.serverPath` for an explicit executable override. Debug sessions select configuration from the nearest `webtest.toml` above the test file, rather than assuming the editor workspace is the project root.
 
 Package, install, and verify the current extension version in Cursor with:
 
@@ -34,3 +34,20 @@ The Testing view discovers a workspace → module → test → default variant t
 Workspace language services include import-path and auto-import completion, typed helper/fixture/provider completion and signatures, hover, definitions, references, rename, symbols, folding, selection ranges, code actions, inlay hints, and semantic tokens. Pure and statement helper bodies and fixture setup/teardown have source breakpoints and task frames. Debug restart retains the captured dependency sources.
 
 Incremental edits validate UTF-16 boundaries and document versions. Invalid edits request a full buffer resynchronization through `webtest/resyncRequired`. Configuration/schema and source-file changes refresh explicit project inputs while preserving unsaved buffers, including newly added imports. Multiple workspace folders are rejected explicitly. Static project metadata is also available through `webtest describe project.declarations` and `webtest/describeProject`; it never runs the application.
+
+## Verified release installation
+
+Run **WebTest: Install/Update Server**, enter an exact release version, and confirm
+the download. The extension verifies the Sigstore bundle against the exact
+`williamcotton/webtest` release workflow tag identity and GitHub OIDC issuer, then
+checks platform, protocol compatibility, size and SHA-256 before activating a raw
+binary in global extension storage. It never extracts downloaded archives or
+silently downloads on activation. Reload after installation. Existing immutable
+version directories remain available for rollback; select a previous executable
+with `webtest.serverPath` if needed.
+
+Resolution order: explicit `webtest.serverPath`, workspace `target/debug/webtest`,
+PATH, verified managed release. Unsupported platforms receive source-build/manual
+installation guidance. A missing server leaves the Install/Update command usable.
+No telemetry or document upload is added. Release documentation and support:
+https://github.com/williamcotton/webtest/tree/main/release

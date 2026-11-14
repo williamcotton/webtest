@@ -18,6 +18,14 @@ use crate::{
 
 pub(crate) async fn run(cli: Cli) -> Result<ExitClass, AppError> {
     match cli.command {
+        Command::Version { json } => {
+            if json {
+                println!("{}", crate::compatibility::manifest());
+            } else {
+                println!("webtest {}", env!("CARGO_PKG_VERSION"));
+            }
+            Ok(ExitClass::Success)
+        }
         Command::Init { path } => init::run(&path),
         Command::Check { paths, reporter } => check::run_check(paths, reporter),
         Command::Fmt { paths, check } => format::run_format(paths, check),

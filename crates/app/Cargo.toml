@@ -42,6 +42,7 @@ webtest-runtime.workspace = true
 webtest-syntax.workspace = true
 webtest-text.workspace = true
 webtest-trace.workspace = true
+webtest-wasm = { path = "../wasm" }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

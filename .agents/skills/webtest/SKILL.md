@@ -234,3 +234,13 @@ Restart joins cleanup before rerunning the same source snapshot. Disconnect also
 awaits cleanup. Debug pause time counts toward deadlines. Exception filters include
 assertion, provider, infrastructure, and internal failures. Inspect
 `webtest describe runtime.configuration` for the current debugger contract.
+
+### Portable browser editors
+
+The browser package under `editors/monaco` hosts the same Rust workspace queries
+in a dedicated WASM worker. Use its explicit source/configuration/offline-schema
+inputs for browser authoring; Monaco providers only map those shared DTOs. Public
+web positions are UTF-16 and updates require increasing host versions. Compiled
+plans retain canonical byte origins and required native capabilities. The portable
+package cannot execute plans or replace native `webtest inspect`/test/DAP. See the
+package README and `specs/milestone-g.md` for API, build and release acceptance.

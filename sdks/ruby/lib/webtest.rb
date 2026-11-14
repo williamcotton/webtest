@@ -129,9 +129,13 @@ module WebTest
         return
       end
       gate = Queue.new
+      ready = Queue.new
       thread = Thread.new do
         deadline = nil
         begin
+          # A cancel may arrive immediately after dispatch returns. Acknowledge
+          # entry into the rescue/ensure boundary before admitting that frame.
+          ready << true
           gate.pop
           deadline = Thread.new do
             sleep(deadline_ms / 1000.0)
@@ -170,6 +174,7 @@ module WebTest
         @in_flight[id] = thread
       end
       gate << true
+      ready.pop
     end
 
     def with_defaults(schema, value)

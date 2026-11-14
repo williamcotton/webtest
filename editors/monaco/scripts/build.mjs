@@ -1,0 +1,18 @@
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, cpSync, readdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+const root = fileURLToPath(new URL('../../../', import.meta.url));
+const here = fileURLToPath(new URL('../', import.meta.url));
+const run = (cmd, args) => execFileSync(cmd, args, { cwd: root, stdio: 'inherit' });
+const lock = readFileSync(root + 'Cargo.lock', 'utf8');
+const version = lock.match(/name = "wasm-bindgen"\nversion = "([^"]+)"/)[1];
+const installed = execFileSync('wasm-bindgen', ['--version'], { encoding: 'utf8' }).trim();
+if (installed !== `wasm-bindgen ${version}`) throw new Error(`Install cargo install wasm-bindgen-cli --version ${version} --locked`);
+run('cargo', ['build', '--locked', '--release', '-p', 'webtest-wasm', '--target', 'wasm32-unknown-unknown']);
+rmSync(here + 'dist', { recursive: true, force: true });
+mkdirSync(here + 'dist', { recursive: true });
+run('wasm-bindgen', [root + 'target/wasm32-unknown-unknown/release/webtest_wasm.wasm', '--target', 'web', '--out-name', 'webtest', '--out-dir', here + 'dist']);
+for (const file of readdirSync(here + 'src')) cpSync(here + 'src/' + file, here + 'dist/' + file);
+cpSync(root + 'LICENSE', here + 'LICENSE');
+const metadata = JSON.parse(execFileSync('cargo', ['metadata', '--locked', '--format-version', '1'], { cwd: root, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 }));
+writeFileSync(here + 'THIRD_PARTY_NOTICES', metadata.packages.map(p => `${p.name} ${p.version}: ${p.license ?? 'see upstream license'} ${p.repository ?? ''}`).sort().join('\n') + '\n');

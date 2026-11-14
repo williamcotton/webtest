@@ -1,6 +1,5 @@
 import * as vscode from "vscode";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import {
     LanguageClient,
@@ -8,12 +7,24 @@ import {
     ServerOptions,
 } from "vscode-languageclient/node";
 
+import { installRelease, managedBinary } from "./releases";
 import { registerTesting } from "./testing";
 
 let client: LanguageClient | undefined;
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
-    const serverPath = await resolveServerPath();
+    context.subscriptions.push(vscode.commands.registerCommand("webtest.installServer", async () => {
+        const version = await vscode.window.showInputBox({ prompt: "Exact WebTest release version (x.y.z)", value: "0.1.0", validateInput: value => /^\d+\.\d+\.\d+$/.test(value) ? undefined : "Use an exact x.y.z version" });
+        if (!version) return;
+        const consent = await vscode.window.showInformationMessage(`Download and verify WebTest ${version} from williamcotton/webtest into extension storage?`, { modal: true }, "Install");
+        if (consent !== "Install") return;
+        try {
+            await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: "Installing verified WebTest server" }, () => installRelease(context.globalStorageUri.fsPath, version));
+            const action = await vscode.window.showInformationMessage("WebTest installed. Reload to use it. Previous installations remain available in extension storage.", "Reload");
+            if (action) await vscode.commands.executeCommand("workbench.action.reloadWindow");
+        } catch (error) { void vscode.window.showErrorMessage(`WebTest installation failed: ${String(error)}`); }
+    }));
+    const serverPath = await resolveServerPath(context.globalStorageUri.fsPath);
 
     const debugProvider: vscode.DebugConfigurationProvider = {
         provideDebugConfigurations: () => [defaultDebugConfiguration()],
@@ -163,7 +174,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             `Could not start the WebTest language server at ${serverPath}. ` +
                 "Build webtest or configure webtest.serverPath.",
         );
-        throw error;
+        return;
     }
 }
 
@@ -182,7 +193,7 @@ export async function deactivate(): Promise<void> {
     await client?.stop();
 }
 
-async function resolveServerPath(): Promise<string> {
+async function resolveServerPath(storage: string): Promise<string> {
     const configuration = vscode.workspace.getConfiguration("webtest");
     const inspected = configuration.inspect<string>("serverPath");
     const configured =
@@ -201,17 +212,12 @@ async function resolveServerPath(): Promise<string> {
         }
     }
 
-    const cargoHome = process.env.CARGO_HOME?.trim();
-    const cargoCandidate = path.join(
-        cargoHome ? path.resolve(cargoHome) : path.join(os.homedir(), ".cargo"),
-        "bin",
-        executable,
-    );
-    if (await isExecutable(cargoCandidate)) {
-        return cargoCandidate;
+    for (const directory of (process.env.PATH ?? "").split(path.delimiter)) {
+        if (!directory) continue;
+        const candidate = path.join(directory, executable);
+        if (await isExecutable(candidate)) return candidate;
     }
-
-    return "webtest";
+    return (await managedBinary(storage)) ?? "webtest";
 }
 
 function resolveDebugProgram(session: vscode.DebugSession): string | undefined {
