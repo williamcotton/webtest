@@ -7,6 +7,8 @@ use webtest_text::{SourceRevision, SyntaxOrigin};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<webtest_model::ActorId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_declaration_id: Option<webtest_model::TestDeclarationId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub variant_id: Option<webtest_model::TestVariantId>,
@@ -30,6 +32,8 @@ pub struct ExecutionContext {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScopeOutcome {
+    Skipped,
+    Inconclusive,
     Passed,
     Failed,
     Aborted,

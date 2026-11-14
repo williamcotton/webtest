@@ -175,6 +175,26 @@ impl Indexer<'_> {
         };
         let (name, origin, full, exported, parameters, result, documentation, lifetime) =
             match callable {
+                Callable::Guard(value) => (
+                    &value.name,
+                    value.name_origin,
+                    value.origin,
+                    value.exported,
+                    &value.parameters,
+                    &value.result_type,
+                    &value.documentation,
+                    None,
+                ),
+                Callable::Pattern(value) => (
+                    &value.name,
+                    value.name_origin,
+                    value.origin,
+                    value.exported,
+                    &value.parameters,
+                    &value.result_type,
+                    &value.documentation,
+                    None,
+                ),
                 Callable::Function(value) => (
                     &value.name,
                     value.name_origin,
@@ -199,7 +219,15 @@ impl Indexer<'_> {
         let ty = crate::compiler::declared_type(result).0;
         let label = format!(
             "{} {}({}) -> {}",
-            if lifetime.is_some() { "fixture" } else { "fn" },
+            if matches!(callable, Callable::Guard(_)) {
+                "guard"
+            } else if matches!(callable, Callable::Pattern(_)) {
+                "pattern"
+            } else if lifetime.is_some() {
+                "fixture"
+            } else {
+                "fn"
+            },
             name,
             parameters
                 .iter()
@@ -215,7 +243,11 @@ impl Indexer<'_> {
         self.add(
             id,
             name,
-            if lifetime.is_some() {
+            if matches!(callable, Callable::Guard(_)) {
+                SymbolKind::Guard
+            } else if matches!(callable, Callable::Pattern(_)) {
+                SymbolKind::Pattern
+            } else if lifetime.is_some() {
                 SymbolKind::Fixture
             } else {
                 SymbolKind::Function
@@ -377,6 +409,7 @@ impl Indexer<'_> {
     ) -> ValueInfo {
         self.db.unwind_if_revision_cancelled();
         match &expression.kind {
+            HirExprKind::PatternRecord { record, .. } => self.expression(record, scope, owner),
             HirExprKind::Name(HirNameRef::Binding { id, .. }) => {
                 if let Some(symbol) = self.locals.get(id).copied() {
                     self.reference(
@@ -539,6 +572,8 @@ impl Indexer<'_> {
                         return ValueInfo::unknown();
                     };
                     let (parameters, result) = match callable {
+                        Callable::Guard(value) => (&value.parameters, &value.result_type),
+                        Callable::Pattern(value) => (&value.parameters, &value.result_type),
                         Callable::Function(value) => (&value.parameters, &value.result_type),
                         Callable::Fixture(value) => (&value.parameters, &value.result_type),
                     };
@@ -695,6 +730,75 @@ impl Indexer<'_> {
             HirExprKind::Missing => ValueInfo::unknown(),
         }
     }
+    fn event_arms(
+        &mut self,
+        arms: &[webtest_hir::HirEventArm],
+        scope: SymbolId,
+        domain: Capability,
+        returns: Option<&Shape>,
+    ) {
+        for arm in arms {
+            if let HirExprKind::Call { callee, .. } = &arm.source.kind {
+                webtest_hir::visit_expression(callee, &mut |expression| {
+                    if matches!(
+                        expression.kind,
+                        HirExprKind::Name(HirNameRef::Binding { .. })
+                    ) {
+                        self.expression(expression, scope, scope);
+                    }
+                });
+            }
+            let nested = self.key(scope, "event alternative", "");
+            self.scope(Some(scope), nested);
+            let locals = self.locals.clone();
+            let values = self.values.clone();
+            if let Some(binding) = &arm.binding {
+                let id = self.key(nested, "event", &binding.name);
+                let ty = crate::compiler::reactive::event_source(&arm.source)
+                    .and_then(|n| webtest_model::EventSource::from_name(&n))
+                    .map(|s| s.payload_type())
+                    .unwrap_or(Type::Unknown);
+                self.add(
+                    id,
+                    &binding.name,
+                    SymbolKind::Binding,
+                    SymbolOrigin {
+                        name: Some(binding.name_origin),
+                        full: Some(arm.origin),
+                        container: Some(nested),
+                    },
+                    SymbolInfo {
+                        ty: Some(ty.clone()),
+                        documentation: String::new(),
+                        read_only: true,
+                    },
+                );
+                self.locals.insert(binding.id, id);
+                let value = self.external(&ty, id);
+                self.values.insert(binding.id, value);
+                if let Some(s) = self.output.scopes.get_mut(&nested) {
+                    s.names.insert(binding.name.clone(), id);
+                }
+                self.reference(
+                    id,
+                    id,
+                    binding.name_origin,
+                    nested,
+                    ReferenceRole {
+                        declaration: true,
+                        quoted: false,
+                        scope_sensitive: true,
+                    },
+                );
+            }
+            if let Some(filter) = &arm.filter {
+                self.expression(filter, nested, nested);
+            }
+            self.statements(&arm.statements, nested, domain, returns);
+            self.locals = locals;
+            self.values = values;
+        }
+    }
     fn statements(
         &mut self,
         statements: &[HirStmt],
@@ -703,7 +807,109 @@ impl Indexer<'_> {
         returns: Option<&Shape>,
     ) {
         for statement in statements {
+            if let HirStmt::BrowserOperation(operation) = statement
+                && let Some(locator) = operation.locator()
+                && let webtest_hir::HirLocatorKind::Dynamic { value, name, .. } = &locator.kind
+            {
+                self.expression(value, scope, scope);
+                if let Some(name) = name {
+                    self.expression(name, scope, scope);
+                }
+            }
             match statement {
+                HirStmt::GuardScope(guard) => {
+                    self.expression(&guard.activations, scope, scope);
+                    let nested = self.key(scope, "with guards", "");
+                    self.scope(Some(scope), nested);
+                    let locals = self.locals.clone();
+                    let values = self.values.clone();
+                    self.statements(&guard.statements, nested, domain, returns);
+                    self.locals = locals;
+                    self.values = values;
+                }
+                HirStmt::Select(select) => {
+                    self.expression(&select.actor, scope, scope);
+                    if let Some(cursor) = &select.cursor {
+                        self.expression(cursor, scope, scope);
+                    }
+                    self.event_arms(&select.arms, scope, domain, returns);
+                    for timeout in &select.timeouts {
+                        let nested = self.key(scope, "select timeout", "");
+                        self.scope(Some(scope), nested);
+                        let locals = self.locals.clone();
+                        let values = self.values.clone();
+                        self.statements(timeout, nested, domain, returns);
+                        self.locals = locals;
+                        self.values = values;
+                    }
+                }
+                HirStmt::Actor(actor) => {
+                    let binding = &actor.binding;
+                    let id = self.key(scope, "actor", &binding.name);
+                    self.add(
+                        id,
+                        &binding.name,
+                        SymbolKind::Binding,
+                        SymbolOrigin {
+                            name: Some(binding.name_origin),
+                            full: Some(actor.origin),
+                            container: Some(scope),
+                        },
+                        SymbolInfo {
+                            ty: Some(Type::BrowserActor),
+                            documentation: String::new(),
+                            read_only: true,
+                        },
+                    );
+                    if let Some(names) = self.output.scopes.get_mut(&scope) {
+                        names.names.insert(binding.name.clone(), id);
+                    }
+                    self.locals.insert(binding.id, id);
+                    let mut value = ValueInfo::unknown();
+                    value.ty = Type::BrowserActor;
+                    self.values.insert(binding.id, value);
+                    self.reference(
+                        id,
+                        id,
+                        binding.name_origin,
+                        scope,
+                        ReferenceRole {
+                            declaration: true,
+                            quoted: false,
+                            scope_sensitive: true,
+                        },
+                    );
+                }
+                HirStmt::ActorBlock(block) => {
+                    self.expression(&block.actor, scope, scope);
+                    let nested = self.key(scope, "actor body", "");
+                    self.scope(Some(scope), nested);
+                    let locals = self.locals.clone();
+                    let values = self.values.clone();
+                    self.statements(&block.statements, nested, Capability::Browser, returns);
+                    self.locals = locals;
+                    self.values = values;
+                }
+                HirStmt::Check(block) => {
+                    let nested = self.key(scope, "check", "");
+                    self.scope(Some(scope), nested);
+                    let locals = self.locals.clone();
+                    let values = self.values.clone();
+                    self.statements(&block.statements, nested, domain, returns);
+                    self.locals = locals;
+                    self.values = values;
+                }
+                HirStmt::Verdict(verdict) => {
+                    if let Some(message) = &verdict.message {
+                        self.expression(message, scope, scope);
+                    }
+                }
+                HirStmt::Assume(assume) => {
+                    self.expression(&assume.condition, scope, scope);
+                    if let Some(message) = &assume.verdict.message {
+                        self.expression(message, scope, scope);
+                    }
+                }
                 HirStmt::Let(binding) => {
                     let id = self.key(scope, "binding", &binding.name);
                     let mut value = self.expression(&binding.value, scope, id);
@@ -883,6 +1089,50 @@ pub(crate) fn symbols(db: &dyn Db, file: SourceInput) -> Arc<SymbolIndex> {
             read_only: false,
         },
     );
+    for pattern in &module.hir.guards {
+        let id = SymbolId(pattern.id.0);
+        index.callable(module.id, id);
+        if let Some(symbol) = index.output.symbols.get_mut(&id) {
+            symbol.kind = SymbolKind::Guard;
+        }
+        index.globals.insert(pattern.name.clone(), (id, id));
+        if let Some(scope) = index.output.scopes.get_mut(&root) {
+            scope.names.insert(pattern.name.clone(), id);
+        }
+        index.reference(
+            id,
+            id,
+            pattern.name_origin,
+            root,
+            ReferenceRole {
+                declaration: true,
+                quoted: false,
+                scope_sensitive: true,
+            },
+        );
+    }
+    for pattern in &module.hir.patterns {
+        let id = SymbolId(pattern.id.0);
+        index.callable(module.id, id);
+        if let Some(symbol) = index.output.symbols.get_mut(&id) {
+            symbol.kind = SymbolKind::Pattern;
+        }
+        index.globals.insert(pattern.name.clone(), (id, id));
+        if let Some(scope) = index.output.scopes.get_mut(&root) {
+            scope.names.insert(pattern.name.clone(), id);
+        }
+        index.reference(
+            id,
+            id,
+            pattern.name_origin,
+            root,
+            ReferenceRole {
+                declaration: true,
+                quoted: false,
+                scope_sensitive: true,
+            },
+        );
+    }
     for function in &module.hir.functions {
         let id = SymbolId(function.id.0);
         index.callable(module.id, id);
@@ -1089,6 +1339,52 @@ pub(crate) fn symbols(db: &dyn Db, file: SourceInput) -> Arc<SymbolIndex> {
         index.statements(&fixture.setup, id, Capability::Pure, Some(&result.shape));
         index.statements(&fixture.teardown, id, Capability::Pure, None);
     }
+    for pattern in &module.hir.patterns {
+        let id = SymbolId(pattern.id.0);
+        index.locals.clear();
+        index.values.clear();
+        for parameter in &pattern.parameters {
+            let symbol = SymbolId(parameter.symbol_id.0);
+            let value = index.annotation(&parameter.annotation, symbol, false);
+            index.locals.insert(parameter.id, symbol);
+            index.values.insert(parameter.id, value);
+            index.reference(
+                symbol,
+                symbol,
+                parameter.name_origin,
+                id,
+                ReferenceRole {
+                    declaration: true,
+                    quoted: false,
+                    scope_sensitive: true,
+                },
+            );
+        }
+        index.expression(&pattern.matcher, id, id);
+    }
+    for guard in &module.hir.guards {
+        let id = SymbolId(guard.id.0);
+        index.locals.clear();
+        index.values.clear();
+        for parameter in &guard.parameters {
+            let symbol = SymbolId(parameter.symbol_id.0);
+            let value = index.annotation(&parameter.annotation, symbol, false);
+            index.locals.insert(parameter.id, symbol);
+            index.values.insert(parameter.id, value);
+            index.reference(
+                symbol,
+                symbol,
+                parameter.name_origin,
+                id,
+                ReferenceRole {
+                    declaration: true,
+                    quoted: false,
+                    scope_sensitive: true,
+                },
+            );
+        }
+        index.event_arms(&guard.clauses, id, Capability::Pure, None);
+    }
     for test in &module.hir.tests {
         let id = SymbolId(test.declaration_id.0);
         index.scope(Some(root), id);
@@ -1109,6 +1405,54 @@ pub(crate) fn symbols(db: &dyn Db, file: SourceInput) -> Arc<SymbolIndex> {
                 read_only: true,
             },
         );
+        if let (Some(binding), Some(cases)) = (&test.case_binding, &test.cases)
+            && let Some(first) = cases.first()
+        {
+            let symbol = index.key(id, "case binding", &binding.name);
+            let value = index.expression(&first.value, id, symbol);
+            index.add(
+                symbol,
+                &binding.name,
+                SymbolKind::Binding,
+                SymbolOrigin {
+                    name: Some(binding.name_origin),
+                    full: Some(first.origin),
+                    container: Some(id),
+                },
+                SymbolInfo {
+                    ty: Some(value.ty.clone()),
+                    documentation: String::new(),
+                    read_only: true,
+                },
+            );
+            index.locals.insert(binding.id, symbol);
+            index.values.insert(binding.id, value);
+            if let Some(scope) = index.output.scopes.get_mut(&id) {
+                scope.names.insert(binding.name.clone(), symbol);
+            }
+            index.reference(
+                symbol,
+                symbol,
+                binding.name_origin,
+                id,
+                ReferenceRole {
+                    declaration: true,
+                    quoted: false,
+                    scope_sensitive: true,
+                },
+            );
+            if let Some(shape) = index
+                .values
+                .get(&binding.id)
+                .map(|value| value.shape.clone())
+            {
+                for case in cases.iter().skip(1) {
+                    let owner = index.key(id, "case", &case.label);
+                    let value = index.expression(&case.value, id, owner);
+                    index.unify(&shape, &value.shape);
+                }
+            }
+        }
         index.statements(&test.body, id, Capability::Pure, None);
     }
     index.output.references.sort_by_key(|reference| {

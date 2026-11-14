@@ -84,6 +84,20 @@ impl PreparedWorkspaceRun {
                 };
                 let (outcome, message, location, related_locations, artifacts) =
                     match result.outcome {
+                        TestOutcome::Verdict { kind, message } => (
+                            match kind {
+                                webtest_model::VerdictKind::Pass => TestOutcomeKind::Passed,
+                                webtest_model::VerdictKind::Fail => TestOutcomeKind::Failed,
+                                webtest_model::VerdictKind::Skipped => TestOutcomeKind::Skipped,
+                                webtest_model::VerdictKind::Inconclusive => {
+                                    TestOutcomeKind::Inconclusive
+                                }
+                            },
+                            Some(message),
+                            None,
+                            Vec::new(),
+                            Vec::new(),
+                        ),
                         TestOutcome::Passed => {
                             (TestOutcomeKind::Passed, None, None, Vec::new(), Vec::new())
                         }

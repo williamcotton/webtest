@@ -1,5 +1,8 @@
 //! Protocol-neutral semantic identities, operators, types, values, and capabilities.
 
+mod reactive;
+pub use reactive::{EventSource, ReactiveLimits};
+
 use std::{collections::BTreeMap, fmt, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -63,7 +66,11 @@ semantic_identity!(
     ParameterId,
     SymbolId,
     TestDeclarationId,
-    TestVariantId
+    TestVariantId,
+    PatternId,
+    ActorId,
+    GuardId,
+    AlternativeId
 );
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -168,6 +175,8 @@ pub struct RecordField {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum Type {
+    BrowserActor,
+    EventCursor,
     Unknown,
     Null,
     Bool,
@@ -194,7 +203,7 @@ pub enum Type {
 impl Type {
     pub fn is_transferable(&self) -> bool {
         match self {
-            Self::Unknown => false,
+            Self::BrowserActor | Self::EventCursor | Self::Unknown => false,
             Self::Null
             | Self::Bool
             | Self::Int
@@ -311,6 +320,8 @@ impl Type {
 impl fmt::Display for Type {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::BrowserActor => formatter.write_str("BrowserActor"),
+            Self::EventCursor => formatter.write_str("EventCursor"),
             Self::Unknown => formatter.write_str("unknown"),
             Self::Null => formatter.write_str("Null"),
             Self::Bool => formatter.write_str("Bool"),
@@ -919,4 +930,60 @@ mod tests {
         assert!(format!("{:?}", fields["response"]).contains("[redacted]"));
         assert!(format!("{:?}", fields["process"]).contains("[redacted]"));
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MismatchReason {
+    MissingField,
+    UnexpectedField,
+    ExpectedAbsent,
+    WrongType,
+    WrongLiteral,
+    WrongLength,
+    NoContainedItem,
+    RegexMismatch,
+    OutOfRange,
+    NoAlternative,
+    NegationMatched,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatternMismatch {
+    pub path: String,
+    pub reason: MismatchReason,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MatchReport {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alternatives: Vec<PatternAlternative>,
+    pub mismatches: Vec<PatternMismatch>,
+    pub truncated: bool,
+}
+
+/// Semantic test decisions are independent from infrastructure and cleanup errors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerdictKind {
+    Pass,
+    Fail,
+    Skipped,
+    Inconclusive,
+}
+
+impl VerdictKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+            Self::Skipped => "skipped",
+            Self::Inconclusive => "inconclusive",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatternAlternative {
+    pub index: usize,
+    pub mismatches: Vec<PatternMismatch>,
+    pub truncated: bool,
 }

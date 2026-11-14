@@ -23,7 +23,7 @@ class PackageTests(unittest.TestCase):
                 for kind,extension in [('binary','.exe' if target.endswith('msvc') else '.bin'),('archive','.zip' if target.endswith('msvc') else '.tar.gz')]:
                     name=f'webtest-0.1.0-{target}{extension}';data=name.encode();(root/name).write_bytes(data)
                     artifacts.append({'name':name,'kind':kind,'target':target,'sha256':hashlib.sha256(data).hexdigest(),'bytes':len(data)})
-                (root/(target+'.json')).write_text(json.dumps({'schema':1,'version':'0.1.0','compatibility':{'target':target,'plan_format':10},'artifacts':artifacts}))
+                (root/(target+'.json')).write_text(json.dumps({'schema':1,'version':'0.1.0','compatibility':{'target':target,'plan_format':11},'artifacts':artifacts}))
             subprocess.check_call(['python3',str(pathlib.Path(__file__).with_name('manifest.py')),d])
             subprocess.check_call(['python3',str(pathlib.Path(__file__).with_name('package_managers.py')),d])
             self.assertIn('on_arm',(root/'webtest.rb').read_text())

@@ -652,6 +652,18 @@ mod tests {
         assert!(WEBTEST_SKILL.contains("webtest describe statement.provide"));
         assert!(WEBTEST_SKILL.contains("webtest describe control.retry"));
         for query in [
+            "language.cases",
+            "language.pattern",
+            "language.actor",
+            "builtin.checkpoint",
+            "control.select",
+            "language.guard",
+            "control.check",
+            "statement.inconclusive",
+        ] {
+            assert!(WEBTEST_SKILL.contains(&format!("webtest describe {query}")));
+        }
+        for query in [
             "language.import",
             "language.fn",
             "language.fixture",

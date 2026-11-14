@@ -37,7 +37,7 @@ pub fn author_facing_language() -> AuthorFacingLanguage {
             ("fixture_declaration", "[export] fixture <Identifier>(<typed_parameters>?) -> <Type> [scope (test | file | worker | suite)] [shareable] { setup [server | browser] <flow_block> [teardown [server | browser] <flow_block>] }"),
             ("typed_parameters", "<Identifier>: <Type> (, <Identifier>: <Type>)*"),
             ("fixture_use", "use <Identifier>(<argument_list>?)"),
-            ("test_declaration", "test <StringLiteral> <flow_block>"),
+            ("test_declaration", "test <StringLiteral> [cases [case <StringLiteral> <record>, ...] as <Identifier>] <flow_block>"),
             ("flow_block", "{ <flow_statement>* }"),
             (
                 "flow_statement",

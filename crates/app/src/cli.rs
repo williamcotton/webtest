@@ -62,6 +62,9 @@ pub(crate) enum Command {
         /// Run only these stable executable variant IDs (repeat for multiple tests).
         #[arg(long = "variant")]
         variants: Vec<webtest_model::TestVariantId>,
+        /// Run all variants of these authored test declarations.
+        #[arg(long = "test-id")]
+        declarations: Vec<webtest_model::TestDeclarationId>,
         #[arg(long, value_enum, default_value_t = TestReporter::Human)]
         reporter: TestReporter,
     },

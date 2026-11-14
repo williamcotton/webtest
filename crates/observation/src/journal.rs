@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, num::NonZeroUsize, time::Duration};
 
 use crate::{ExecutionEvent, ExecutionId};
 
-pub const EVENT_JOURNAL_SCHEMA_VERSION: u32 = 10;
+pub const EVENT_JOURNAL_SCHEMA_VERSION: u32 = 11;
 
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
@@ -153,7 +153,7 @@ impl ReplayJournal {
     /// Select a known archive schema explicitly. Live replay defaults to the
     /// current schema; older archives retain their original envelopes unchanged.
     pub fn for_schema(capacity: NonZeroUsize, schema_version: u32) -> Result<Self, ReplayError> {
-        if !matches!(schema_version, 8 | 9 | EVENT_JOURNAL_SCHEMA_VERSION) {
+        if !matches!(schema_version, 8 | 9 | 10 | EVENT_JOURNAL_SCHEMA_VERSION) {
             return Err(ReplayError::UnsupportedSchema {
                 found: schema_version,
             });

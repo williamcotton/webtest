@@ -86,7 +86,7 @@ fn concurrent_file_traces_preserve_sources_failures_and_unique_nonoverwriting_pa
     let first = run(directory.path(), "json", "5");
     assert_eq!(first.status.code(), Some(1));
     let first = report(&first);
-    assert_eq!(first["schema_version"], 14);
+    assert_eq!(first["schema_version"], 15);
     assert_eq!(first["traces"].as_array().unwrap().len(), 2);
     let captured = trace(&first, 0);
     let mapping = &captured.manifest().sources[0];

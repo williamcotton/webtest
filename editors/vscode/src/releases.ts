@@ -34,7 +34,7 @@ export function parseManifest(bytes: Buffer, version: string): Manifest {
     const manifest = JSON.parse(bytes.toString('utf8')) as Manifest;
     if (!/^\d+\.\d+\.\d+$/.test(version) || manifest.schema !== 1 || manifest.version !== version || !Array.isArray(manifest.artifacts) || manifest.artifacts.length > 32) throw new Error('Unsupported release manifest');
     const c = manifest.compatibility;
-    if (!c || c.plan_format !== 10 || c.event_schema !== 14 || c.worker_protocol !== 1 || c.wasm_editor_api !== 1 || !Array.isArray(c.app_bridge_protocol) || !c.app_bridge_protocol.includes(1)) throw new Error('Release is incompatible with this extension');
+    if (!c || c.plan_format !== 11 || c.event_schema !== 15 || c.worker_protocol !== 1 || c.wasm_editor_api !== 1 || !Array.isArray(c.app_bridge_protocol) || !c.app_bridge_protocol.includes(1)) throw new Error('Release is incompatible with this extension');
     const names = new Set<string>();
     for (const artifact of manifest.artifacts) {
         if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,180}$/.test(artifact.name) || names.has(artifact.name) || !/^[a-f0-9]{64}$/.test(artifact.sha256) || !Number.isSafeInteger(artifact.bytes) || artifact.bytes <= 0 || artifact.bytes > 256 * 1024 * 1024) throw new Error('Invalid release artifact');

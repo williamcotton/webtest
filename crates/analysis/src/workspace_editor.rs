@@ -22,7 +22,8 @@ pub(crate) fn context_domain(
         .filter(|node| contains(node, offset))
         .filter_map(|node| {
             let domain = match node.kind() {
-                K::BrowserBlock => Some(webtest_model::Capability::Browser),
+                K::GuardDecl => Some(webtest_model::Capability::Pure),
+                K::ActorBlock | K::BrowserBlock => Some(webtest_model::Capability::Browser),
                 K::ServerBlock => Some(webtest_model::Capability::Server),
                 K::FunctionDecl | K::FixtureSetup | K::FixtureTeardown => node
                     .children_with_tokens()
@@ -60,6 +61,24 @@ pub(crate) fn signature(
     parsed: &Parse,
     offset: TextSize,
 ) -> Option<Signature> {
+    if let Some((source, _range)) = event_at(parsed, offset) {
+        return Some(Signature {
+            symbol: None,
+            capability: Some(webtest_model::Capability::Browser),
+            lifetime: None,
+            label: format!("{}(event: {})", source.name(), source.payload_type()),
+            documentation: format!("Normalized actor event. See event.{}", source.name()),
+            parameters: vec![SignatureParameter {
+                name: "event".into(),
+                ty: Some(source.payload_type()),
+                optional: false,
+                default: None,
+                label: format!("event: {}", source.payload_type()),
+                documentation: String::new(),
+            }],
+            active_parameter: 0,
+        });
+    }
     let call = call(parsed, offset)?;
     let ast::Expr::Name(callee) = call.callee()? else {
         return None;
@@ -173,6 +192,18 @@ pub(crate) fn documentation(
     file: SourceInput,
     offset: TextSize,
 ) -> Option<DocumentationFact> {
+    let parsed = crate::incremental::parsed(db, file);
+    if let Some((source, range)) = event_at(&parsed, offset) {
+        return Some(DocumentationFact {
+            range,
+            contents: format!(
+                "{}(event: {})\nBrowser capability; bounded actor journal. See event.{}.",
+                source.name(),
+                source.payload_type(),
+                source.name()
+            ),
+        });
+    }
     let index = semantic_index::symbols(db, file);
     let reference = index
         .references
@@ -216,6 +247,23 @@ fn collect_visible(
         }
         let inside = range.start() <= offset && offset <= range.end();
         match statement {
+            HirStmt::Actor(actor) if range.end() <= offset => {
+                visible.insert(actor.binding.name.clone(), actor.binding.name_origin);
+            }
+            HirStmt::Select(select) => {
+                if inside {
+                    for arm in &select.arms {
+                        if arm.origin.range.start() <= offset && offset <= arm.origin.range.end() {
+                            if let Some(binding) = &arm.binding {
+                                visible.insert(binding.name.clone(), binding.name_origin);
+                            }
+                            collect_visible(&arm.statements, offset, visible);
+                        }
+                    }
+                } else if let Some(binding) = &select.binding {
+                    visible.insert(binding.name.clone(), binding.name_origin);
+                }
+            }
             HirStmt::Let(binding) if range.end() <= offset => {
                 visible.insert(binding.name.clone(), binding.name_origin);
             }
@@ -258,7 +306,9 @@ fn symbol_completion(symbol: &crate::Symbol, label: &str) -> Completion {
         ),
         documentation: symbol.documentation.clone(),
         kind: match symbol.kind {
-            SymbolKind::Function => CompletionKind::Function,
+            SymbolKind::Pattern | SymbolKind::Guard | SymbolKind::Function => {
+                CompletionKind::Function
+            }
             SymbolKind::Fixture => CompletionKind::Fixture,
             SymbolKind::Parameter => CompletionKind::Parameter,
             SymbolKind::ProviderNamespace => CompletionKind::Namespace,
@@ -277,6 +327,9 @@ pub(crate) fn completions(
 ) -> Vec<Completion> {
     use webtest_syntax::SyntaxKind as K;
     let syntax = parsed.syntax();
+    if let Some(items) = event_completions(parsed, offset) {
+        return items;
+    }
     let graph = crate::workspace::module_graph(db, file);
     let Some(module) = graph.modules.get(&graph.root) else {
         return Vec::new();
@@ -411,6 +464,9 @@ pub(crate) fn completions(
         .iter()
         .filter(|test| test.origin.range.contains(offset))
     {
+        if let Some(binding) = &test.case_binding {
+            visible.insert(binding.name.clone(), binding.name_origin);
+        }
         collect_visible(&test.body, offset, &mut visible);
     }
     for function in module
@@ -436,6 +492,28 @@ pub(crate) fn completions(
         collect_visible(&fixture.setup, offset, &mut visible);
         collect_visible(&fixture.teardown, offset, &mut visible);
     }
+    for pattern in &module.hir.patterns {
+        if pattern.origin.range.contains(offset) {
+            for parameter in &pattern.parameters {
+                visible.insert(parameter.name.clone(), parameter.name_origin);
+            }
+        }
+    }
+    for guard in &module.hir.guards {
+        if guard.origin.range.contains(offset) {
+            for parameter in &guard.parameters {
+                visible.insert(parameter.name.clone(), parameter.name_origin);
+            }
+            for clause in &guard.clauses {
+                if clause.origin.range.contains(offset) {
+                    if let Some(binding) = &clause.binding {
+                        visible.insert(binding.name.clone(), binding.name_origin);
+                    }
+                    collect_visible(&clause.statements, offset, &mut visible);
+                }
+            }
+        }
+    }
     for (name, origin) in visible {
         if let Some(symbol) = index.symbols.values().find(|symbol| {
             symbol
@@ -454,6 +532,20 @@ pub(crate) fn completions(
         .functions
         .iter()
         .map(|function| (&function.name, webtest_model::SymbolId(function.id.0)))
+        .chain(
+            module
+                .hir
+                .patterns
+                .iter()
+                .map(|pattern| (&pattern.name, webtest_model::SymbolId(pattern.id.0))),
+        )
+        .chain(
+            module
+                .hir
+                .guards
+                .iter()
+                .map(|guard| (&guard.name, webtest_model::SymbolId(guard.id.0))),
+        )
         .chain(
             module
                 .hir
@@ -555,7 +647,9 @@ pub(crate) fn completions(
         })
     });
     if top_level {
-        for keyword in ["test", "import", "export", "fn", "fixture"] {
+        for keyword in [
+            "test", "import", "export", "fn", "fixture", "pattern", "guard",
+        ] {
             candidates.insert(
                 keyword.into(),
                 Completion {
@@ -576,7 +670,24 @@ pub(crate) fn completions(
     {
         let browser = domain == Some(webtest_model::Capability::Browser);
         let server = domain == Some(webtest_model::Capability::Server);
-        let mut keywords = vec!["let", "timeout", "parallel", "race", "retry", "expect"];
+        let mut keywords = vec![
+            "let",
+            "timeout",
+            "parallel",
+            "race",
+            "retry",
+            "expect",
+            "check",
+            "pass",
+            "fail",
+            "skip",
+            "inconclusive",
+            "assume",
+            "actor",
+            "with guards",
+            "select",
+            "checkpoint",
+        ];
         if !browser && !server {
             keywords.extend(["server", "browser"]);
         }
@@ -762,6 +873,22 @@ pub(crate) fn auto_imports(
                     CompletionKind::Function,
                 )
             })
+            .chain(hir.patterns.iter().map(|pattern| {
+                (
+                    &pattern.name,
+                    pattern.exported,
+                    webtest_model::SymbolId(pattern.id.0),
+                    CompletionKind::Function,
+                )
+            }))
+            .chain(hir.guards.iter().map(|guard| {
+                (
+                    &guard.name,
+                    guard.exported,
+                    webtest_model::SymbolId(guard.id.0),
+                    CompletionKind::Function,
+                )
+            }))
             .chain(hir.fixtures.iter().map(|fixture| {
                 (
                     &fixture.name,
@@ -1021,6 +1148,170 @@ mod refinement_tests {
             db.completions(file, (source.find("http.").unwrap() as u32 + 5).into())
                 .unwrap()
                 .is_empty()
+        );
+    }
+}
+
+fn event_path(expression: ast::Expr) -> Option<Vec<String>> {
+    match expression {
+        ast::Expr::Name(name) => Some(vec![name.name()?.text().into()]),
+        ast::Expr::Member(member) => {
+            let mut path = event_path(member.receiver()?)?;
+            if let Some(name) = member.member() {
+                path.push(name.text().into());
+            }
+            Some(path)
+        }
+        _ => None,
+    }
+}
+fn event_name(
+    arm: &ast::EventArm,
+) -> Option<(webtest_model::EventSource, webtest_text::TextRange)> {
+    let source = arm.source()?;
+    let ast::Expr::Call(call) = source else {
+        return None;
+    };
+    let callee = call.callee()?;
+    let range = callee.syntax().text_range();
+    let mut parts = event_path(callee)?;
+    if arm
+        .syntax()
+        .ancestors()
+        .any(|n| n.kind() == webtest_syntax::SyntaxKind::GuardDecl)
+        && !parts.is_empty()
+    {
+        parts.remove(0);
+    }
+    Some((
+        webtest_model::EventSource::from_name(&parts.join("."))?,
+        range,
+    ))
+}
+fn event_at(
+    parsed: &Parse,
+    offset: TextSize,
+) -> Option<(webtest_model::EventSource, webtest_text::TextRange)> {
+    parsed
+        .syntax()
+        .descendants()
+        .filter_map(ast::EventArm::cast)
+        .filter(|arm| arm.source().is_some_and(|s| contains(s.syntax(), offset)))
+        .find_map(|arm| event_name(&arm))
+}
+fn event_completions(parsed: &Parse, offset: TextSize) -> Option<Vec<Completion>> {
+    let arm = parsed
+        .syntax()
+        .descendants()
+        .filter_map(ast::EventArm::cast)
+        .find(|arm| {
+            contains(arm.syntax(), offset)
+                && arm.source().is_none_or(|s| contains(s.syntax(), offset))
+        })?;
+    let mut prefix = Vec::new();
+    if let Some(source) = arm.source() {
+        let callee = if let ast::Expr::Call(call) = source {
+            let callee = call.callee()?;
+            if !contains(callee.syntax(), offset) {
+                return None;
+            }
+            callee
+        } else {
+            source
+        };
+        if let ast::Expr::Member(member) = callee {
+            prefix = event_path(member.receiver()?).unwrap_or_default();
+        }
+    }
+    if arm
+        .syntax()
+        .ancestors()
+        .any(|n| n.kind() == webtest_syntax::SyntaxKind::GuardDecl)
+        && !prefix.is_empty()
+    {
+        prefix.remove(0);
+    }
+    let prefix = if prefix.is_empty() {
+        String::new()
+    } else {
+        format!("{}.", prefix.join("."))
+    };
+    Some(
+        webtest_model::EventSource::ALL
+            .into_iter()
+            .filter_map(|source| {
+                let insert = source.name().strip_prefix(&prefix)?;
+                Some(Completion {
+                    label: source.name().into(),
+                    insert_text: insert.into(),
+                    kind: CompletionKind::Function,
+                    detail: format!("event: {}", source.payload_type()),
+                    ..Default::default()
+                })
+            })
+            .collect(),
+    )
+}
+
+#[cfg(test)]
+mod reactive_tests {
+    use crate::{AnalysisDatabase, WorkspaceConfiguration};
+    use webtest_text::TextSize;
+    fn at(text: &str, needle: &str) -> TextSize {
+        (text.find(needle).unwrap() as u32).into()
+    }
+    #[test]
+    fn imported_guards_patterns_and_actor_helpers_keep_shared_navigation_and_event_services() {
+        let mut db = AnalysisDatabase::default();
+        db.configure_workspace(WorkspaceConfiguration {
+            root: "/h".into(),
+            ..Default::default()
+        });
+        let support = "export pattern Named(name: String) = subset {name: name}\nexport guard clean(actor: BrowserActor) {when actor.console.error(e) {fail e.message}}\nexport fn visit(actor: BrowserActor, target: String) -> Null browser {actor {open target}}";
+        let library = db.open_file("/h/support.webtest", support);
+        let source = "import {Named, clean, visit} from \"./support\"\ntest \"H\" cases [case \"a\" {name: \"Ada\"}] as input {actor alice browser with guards [clean(alice)] {visit(alice, \"http://example.test\") expect input matches Named(input.name)} select alice within 1s {when network.response(e) if e.status == 200 {pass} timeout {skip \"offline\"}}}";
+        let file = db.open_file("/h/test.webtest", source);
+        assert!(
+            db.diagnostics(file).unwrap().is_empty(),
+            "{:?}",
+            db.diagnostics(file).unwrap()
+        );
+        db.test_plan(file).unwrap().validate_tree().unwrap();
+        let definition = db
+            .definition(file, at(source, "clean(alice)"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(definition.target.origin.file, library);
+        let renamed = db
+            .rename(library, at(support, "clean(actor"), "quiet")
+            .unwrap();
+        assert_eq!(renamed.documents.len(), 2);
+        let renamed = db
+            .rename(library, at(support, "actor: BrowserActor"), "participant")
+            .unwrap();
+        assert!(renamed.documents[0].edits.len() >= 2);
+        let signature = db
+            .signature_help(file, at(source, "response(e") + TextSize::from(10))
+            .unwrap()
+            .unwrap();
+        assert!(signature.label.contains("network.response"));
+        assert!(signature.label.contains("status"));
+        let hover = db
+            .documentation_at(file, at(source, "network.response") + TextSize::from(9))
+            .unwrap()
+            .unwrap();
+        assert!(hover.contents.contains("event.network.response"));
+        db.set_file_text(
+            file,
+            "test \"completion\" {actor alice browser select alice within 1s {when network.}}",
+        );
+        let edited = db.source(file).unwrap();
+        let completion = db
+            .completions(file, at(&edited, "network.") + TextSize::from(8))
+            .unwrap();
+        assert!(
+            completion.iter().any(|c| c.label == "network.response"),
+            "{completion:?}"
         );
     }
 }

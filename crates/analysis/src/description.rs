@@ -52,6 +52,8 @@ pub struct ResolvedRuntimeConfiguration {
     pub provider_call_timeout_ms: u64,
     pub cleanup_timeout_ms: u64,
     pub journal_max_events: usize,
+    #[serde(default)]
+    pub reactive: webtest_model::ReactiveLimits,
     pub trace_mode: String,
     pub trace_sources: bool,
     pub trace_attachments: bool,
@@ -377,6 +379,22 @@ struct CategorySpec {
 }
 
 const CATEGORY_SPECS: &[CategorySpec] = &[
+    CategorySpec {
+        index_key: "patterns",
+        query: "pattern",
+        aliases: &["patterns", "matchers"],
+        prefixes: &["pattern"],
+        exact_children: &["language.pattern"],
+        summary: "Typed reusable structural matchers.",
+    },
+    CategorySpec {
+        index_key: "events",
+        query: "event",
+        aliases: &["events", "event_sources"],
+        prefixes: &["event"],
+        exact_children: &[],
+        summary: "Normalized actor event sources.",
+    },
     CategorySpec {
         index_key: "builtins",
         query: "builtin",
@@ -1332,6 +1350,46 @@ mod tests {
     fn public_reference_is_complete_unique_and_does_not_advertise_roadmap_constructs() {
         let expected = [
             "declaration.test",
+            "language.cases",
+            "language.pattern",
+            "language.actor",
+            "scope.actor",
+            "builtin.checkpoint",
+            "control.select",
+            "language.guard",
+            "control.guards",
+            "type.BrowserActor",
+            "type.EventCursor",
+            "event.console.message",
+            "event.console.error",
+            "event.network.request",
+            "event.network.response",
+            "event.websocket.received",
+            "event.websocket.sent",
+            "event.websocket.received_json",
+            "event.websocket.sent_json",
+            "event.navigation",
+            "pattern.any",
+            "pattern.literal",
+            "pattern.type",
+            "pattern.subset",
+            "pattern.exact",
+            "pattern.list",
+            "pattern.each",
+            "pattern.contains",
+            "pattern.optional",
+            "pattern.absent",
+            "pattern.regex",
+            "pattern.range",
+            "pattern.one_of",
+            "pattern.all_of",
+            "pattern.not",
+            "control.check",
+            "statement.pass",
+            "statement.fail",
+            "statement.skip",
+            "statement.inconclusive",
+            "statement.assume",
             "language.import",
             "language.export",
             "language.fn",
@@ -1414,9 +1472,10 @@ mod tests {
             assert!(!construct.syntax_forms.is_empty(), "{}", construct.id);
             assert_eq!(construct.provenance.content_trust, "installed");
         }
-        assert!(core.keys().all(|id| {
-            !id.contains("pattern") && !id.contains("module") && !id.contains("trace")
-        }));
+        assert!(
+            core.keys()
+                .all(|id| { !id.contains("module") && !id.contains("trace") })
+        );
         let serialized =
             serde_json::to_string(&core.values().collect::<Vec<_>>()).expect("reference JSON");
         for false_claim in [
@@ -2060,6 +2119,7 @@ mod tests {
             provider_call_timeout_ms: 60_000,
             cleanup_timeout_ms: 5_000,
             journal_max_events: 1234,
+            reactive: Default::default(),
             trace_mode: "off".into(),
             trace_sources: false,
             trace_attachments: true,

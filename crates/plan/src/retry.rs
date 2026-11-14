@@ -73,6 +73,8 @@ impl TestOperation {
     /// the fingerprinted schema, never from the runtime failure's retryable bit.
     pub fn is_retry_safe(&self) -> bool {
         match self {
+            Self::Reactive(_) => true,
+            Self::Verdict { .. } => true,
             Self::AcquireFixture(call) => call.retry_safe,
             Self::EvaluatePure(_) | Self::Provide(_) | Self::Return(_) | Self::Assertion(_) => true,
             Self::ServerProviderCall(call) => call.retry_safe,
@@ -99,6 +101,7 @@ impl PlanNode {
             PlanNodeKind::Conditional {
                 branches: children, ..
             }
+            | PlanNodeKind::Semantic { children, .. }
             | PlanNodeKind::Sequence { children }
             | PlanNodeKind::Parallel { children, .. }
             | PlanNodeKind::Race { children, .. } => children

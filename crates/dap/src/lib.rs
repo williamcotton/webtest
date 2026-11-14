@@ -665,6 +665,11 @@ impl DebugState {
             .await;
         for test in &result.tests {
             let (category, status, data) = match &test.outcome {
+                TestOutcome::Verdict { kind, message } => (
+                    "console",
+                    format!("{}: {}", kind.as_str(), message),
+                    json!({"verdict":kind,"message":message}),
+                ),
                 TestOutcome::Passed => ("stdout", "ok".to_owned(), Value::Null),
                 TestOutcome::Failed(failure) => {
                     let hints = (!failure.repair_hints.is_empty())
@@ -767,6 +772,7 @@ impl DebugState {
 fn branch_output_data(branches: &[webtest_runtime::BranchResult]) -> Value {
     Value::Array(branches.iter().map(|branch| {
         let (outcome, data) = match &branch.outcome {
+            TestOutcome::Verdict{kind,message}=>(kind.as_str(),json!({"verdict":kind,"message":message})),
             TestOutcome::Passed => ("passed", Value::Null),
             TestOutcome::Failed(failure) => ("failed", failure_output_data(failure)),
             TestOutcome::TimedOut { timeout, active_step } => ("timed_out", json!({"timeout_ms": timeout.as_millis(), "active_step_id": active_step.map(|id| id.0)})),
@@ -861,6 +867,9 @@ fn aborted_failure_output_data(
 ) -> Value {
     let mut data = run_failure_output_data(failure);
     let prior = match prior {
+        Some(webtest_runtime::PriorTestOutcome::Verdict { kind, message }) => {
+            json!({"kind":"verdict","verdict":kind,"message":message})
+        }
         Some(webtest_runtime::PriorTestOutcome::Failed(failure)) => json!({
             "kind": "failed",
             "failure": failure_output_data(failure),
@@ -1428,6 +1437,15 @@ fn debug_bytes_value(bytes: &[u8]) -> webtest_model::Value {
 
 fn operation_name(operation: &TestOperation) -> String {
     match operation {
+        TestOperation::Reactive(webtest_plan::semantics::ReactiveOperation::Checkpoint {
+            name,
+            ..
+        }) => format!("checkpoint {name}"),
+        TestOperation::Reactive(webtest_plan::semantics::ReactiveOperation::Failure {
+            reason,
+            ..
+        }) => format!("event {reason:?}"),
+        TestOperation::Verdict { verdict, .. } => format!("verdict {}", verdict.as_str()),
         TestOperation::AcquireFixture(call) => format!("use fixture {}", call.fixture),
         TestOperation::Return(_) => "return helper value".into(),
         TestOperation::Provide(_) => "provide".into(),
@@ -1506,6 +1524,9 @@ fn expression_name(expression: &webtest_plan::PlanExpr) -> String {
 
 fn locator_name(locator: &webtest_plan::Locator) -> String {
     match locator {
+        webtest_plan::Locator::Dynamic { template, .. } => {
+            format!("{} <value>", locator_name(template))
+        }
         webtest_plan::Locator::Id(value) => format!("id({value:?})"),
         webtest_plan::Locator::Role {
             role,

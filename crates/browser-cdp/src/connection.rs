@@ -23,6 +23,7 @@ const CORRELATION_SWEEP: Duration = Duration::from_millis(10);
 
 #[derive(Clone)]
 pub(crate) struct CdpConnection {
+    reactive: Arc<std::sync::Mutex<crate::reactive::Captures>>,
     sender: mpsc::Sender<OutgoingCommand>,
     command_timeout: Duration,
     in_flight: Arc<AtomicUsize>,
@@ -91,6 +92,8 @@ impl CdpConnection {
         let (events, _) = broadcast::channel(256);
         let actor_events = events.clone();
 
+        let reactive = Arc::new(std::sync::Mutex::new(crate::reactive::Captures::default()));
+        let ingress = reactive.clone();
         let task = tokio::spawn(async move {
             let mut next_id = 1u64;
             let mut pending = HashMap::<u64, PendingCommand>::new();
@@ -170,6 +173,7 @@ impl CdpConnection {
                                 errors.push(entry);
                             }
                             if let (Some(method), Some(params)) = (message.method, message.params) {
+                                ingress.lock().unwrap_or_else(|e|e.into_inner()).observe(message.session_id.as_deref(),&method,&params);
                                 let _ = actor_events.send(CdpEvent {
                                     session_id: message.session_id,
                                     method,
@@ -226,6 +230,10 @@ impl CdpConnection {
                     }
                 }
             };
+            ingress
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .close(terminal.clone());
             let _ = actor_events.send(CdpEvent {
                 session_id: None,
                 method: String::new(),
@@ -239,6 +247,7 @@ impl CdpConnection {
         });
 
         Ok(Self {
+            reactive,
             sender,
             command_timeout,
             in_flight,
@@ -248,7 +257,28 @@ impl CdpConnection {
         })
     }
 
+    pub(crate) fn reactive_start(
+        &self,
+        session: String,
+        observer: Arc<dyn webtest_browser::reactive::ReactiveObserver>,
+        sources: &[webtest_model::EventSource],
+    ) {
+        self.reactive
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(session, observer, sources);
+    }
+    pub(crate) fn reactive_stop(&self, session: &str) {
+        self.reactive
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(session);
+    }
     pub(crate) async fn shutdown(&self) {
+        self.reactive
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .close(BrowserError::BrowserDisconnected);
         let task = self
             .task
             .0

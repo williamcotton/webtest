@@ -253,6 +253,8 @@ impl HumanTestProgress {
                     ..
                 } => {
                     let status = match outcome {
+                        TestOutcomeKind::Skipped => "SKIPPED",
+                        TestOutcomeKind::Inconclusive => "INCONCLUSIVE",
                         TestOutcomeKind::Passed => "ok",
                         TestOutcomeKind::Failed => "FAILED",
                         TestOutcomeKind::TimedOut => "TIMED OUT",
@@ -284,6 +286,7 @@ impl HumanTestProgress {
                 | ExecutionEvent::ProviderCallFailed { .. }
                 | ExecutionEvent::StepFailed { .. }
                 | ExecutionEvent::TestTimedOut { .. }
+                | ExecutionEvent::Semantic { .. }
                 | ExecutionEvent::CleanupFailed { .. } => {}
             }
             Ok(())

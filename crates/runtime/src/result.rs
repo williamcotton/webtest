@@ -46,6 +46,10 @@ pub struct BranchResult {
 
 #[derive(Clone, Debug)]
 pub enum TestOutcome {
+    Verdict {
+        kind: webtest_model::VerdictKind,
+        message: String,
+    },
     Passed,
     Failed(Box<StepFailure>),
     TimedOut {
@@ -67,6 +71,10 @@ pub enum TestOutcome {
 
 #[derive(Clone, Debug)]
 pub enum PriorTestOutcome {
+    Verdict {
+        kind: webtest_model::VerdictKind,
+        message: String,
+    },
     Failed(Box<StepFailure>),
     TimedOut {
         timeout: Duration,
@@ -80,6 +88,12 @@ pub enum PriorTestOutcome {
 impl TestOutcome {
     pub(crate) const fn finished_kind(&self) -> TestOutcomeKind {
         match self {
+            Self::Verdict { kind, .. } => match kind {
+                webtest_model::VerdictKind::Pass => TestOutcomeKind::Passed,
+                webtest_model::VerdictKind::Fail => TestOutcomeKind::Failed,
+                webtest_model::VerdictKind::Skipped => TestOutcomeKind::Skipped,
+                webtest_model::VerdictKind::Inconclusive => TestOutcomeKind::Inconclusive,
+            },
             Self::Passed => TestOutcomeKind::Passed,
             Self::Failed(_) => TestOutcomeKind::Failed,
             Self::TimedOut { .. } => TestOutcomeKind::TimedOut,
@@ -98,6 +112,11 @@ impl TestOutcome {
 
     pub(crate) fn failure_class(&self) -> Option<FailureClass> {
         match self {
+            Self::Verdict { kind, .. } => matches!(
+                kind,
+                webtest_model::VerdictKind::Fail | webtest_model::VerdictKind::Inconclusive
+            )
+            .then_some(FailureClass::Test),
             Self::Passed | Self::Cancelled { .. } => None,
             Self::Failed(_) | Self::TimedOut { .. } => Some(FailureClass::Test),
             Self::Skipped { failure_class, .. } => *failure_class,
@@ -183,6 +202,13 @@ impl RunResult {
         let mut counts = [0; 6];
         for result in &self.tests {
             let index = match result.outcome {
+                TestOutcome::Verdict { kind, .. } => match kind {
+                    webtest_model::VerdictKind::Pass => 0,
+                    webtest_model::VerdictKind::Fail | webtest_model::VerdictKind::Inconclusive => {
+                        1
+                    }
+                    webtest_model::VerdictKind::Skipped => 4,
+                },
                 TestOutcome::Passed => 0,
                 TestOutcome::Failed(_) => 1,
                 TestOutcome::TimedOut { .. } => 2,

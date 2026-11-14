@@ -38,7 +38,7 @@ pub(super) async fn execute_browser(
         BrowserOperation::Click { locator } => page
             .perform(
                 &Action::Click {
-                    locator: browser_locator(locator),
+                    locator: resolve_locator(locator, environment)?,
                 },
                 bounded_timeout(options.action_timeout, remaining),
             )
@@ -48,7 +48,7 @@ pub(super) async fn execute_browser(
             let value = string_value(evaluate(value, environment)?)?;
             page.perform(
                 &Action::Fill {
-                    locator: browser_locator(locator),
+                    locator: resolve_locator(locator, environment)?,
                     value,
                 },
                 bounded_timeout(options.action_timeout, remaining),
@@ -60,7 +60,7 @@ pub(super) async fn execute_browser(
             let value = string_value(evaluate(value, environment)?)?;
             page.perform(
                 &Action::Type {
-                    locator: browser_locator(locator),
+                    locator: resolve_locator(locator, environment)?,
                     value,
                 },
                 bounded_timeout(options.action_timeout, remaining),
@@ -72,7 +72,7 @@ pub(super) async fn execute_browser(
             let key = string_value(evaluate(key, environment)?)?;
             page.perform(
                 &Action::Press {
-                    locator: browser_locator(locator),
+                    locator: resolve_locator(locator, environment)?,
                     key,
                 },
                 bounded_timeout(options.action_timeout, remaining),
@@ -83,7 +83,7 @@ pub(super) async fn execute_browser(
         BrowserOperation::Check { locator, checked } => page
             .perform(
                 &Action::Check {
-                    locator: browser_locator(locator),
+                    locator: resolve_locator(locator, environment)?,
                     checked: *checked,
                 },
                 bounded_timeout(options.action_timeout, remaining),
@@ -94,7 +94,7 @@ pub(super) async fn execute_browser(
             let option = string_value(evaluate(option, environment)?)?;
             page.perform(
                 &Action::Select {
-                    locator: browser_locator(locator),
+                    locator: resolve_locator(locator, environment)?,
                     option,
                 },
                 bounded_timeout(options.action_timeout, remaining),
@@ -105,7 +105,7 @@ pub(super) async fn execute_browser(
         BrowserOperation::Hover { locator } => page
             .perform(
                 &Action::Hover {
-                    locator: browser_locator(locator),
+                    locator: resolve_locator(locator, environment)?,
                 },
                 bounded_timeout(options.action_timeout, remaining),
             )
@@ -117,7 +117,7 @@ pub(super) async fn execute_browser(
             timeout,
         } => page
             .wait_for_locator(
-                &browser_locator(locator),
+                &resolve_locator(locator, environment)?,
                 browser_state(*state),
                 bounded_timeout(timeout.unwrap_or(options.assertion_timeout), remaining),
             )
@@ -142,6 +142,7 @@ pub(crate) fn bounded_timeout(timeout: Duration, remaining: Duration) -> Duratio
 
 pub(crate) fn browser_locator(locator: &Locator) -> BrowserLocator {
     match locator {
+        Locator::Dynamic { template, .. } => browser_locator(template),
         Locator::Id(value) => BrowserLocator::Id(value.clone()),
         Locator::Role { role, name } => BrowserLocator::Role {
             role: role.clone(),
@@ -180,7 +181,11 @@ pub(crate) fn step_browser_locator(step: &PlannedStep) -> Option<BrowserLocator>
         | TestOperation::Browser(BrowserOperation::Hover { locator })
         | TestOperation::Browser(BrowserOperation::WaitForLocator { locator, .. })
         | TestOperation::Assertion(AssertionOperation::Locator { locator, .. }) => {
-            Some(browser_locator(locator))
+            if matches!(locator, Locator::Dynamic { .. }) {
+                None
+            } else {
+                Some(browser_locator(locator))
+            }
         }
         _ => None,
     }
@@ -192,3 +197,37 @@ fn resolve_url(base_url: Option<&str>, value: &str) -> Result<String, StepError>
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) fn resolve_locator(
+    locator: &Locator,
+    environment: &HashMap<BindingId, Value>,
+) -> Result<BrowserLocator, StepError> {
+    let Locator::Dynamic {
+        template,
+        value,
+        name,
+    } = locator
+    else {
+        return Ok(browser_locator(locator));
+    };
+    let value = string_value(evaluate(value, environment)?)?;
+    let name = name
+        .as_ref()
+        .map(|name| string_value(evaluate(name, environment)?))
+        .transpose()?;
+    Ok(match template.as_ref() {
+        Locator::Id(_) => BrowserLocator::Id(value),
+        Locator::Role { .. } => BrowserLocator::Role { role: value, name },
+        Locator::Label(_) => BrowserLocator::Label(value),
+        Locator::Text(_) => BrowserLocator::Text(value),
+        Locator::Placeholder(_) => BrowserLocator::Placeholder(value),
+        Locator::TestId(_) => BrowserLocator::TestId(value),
+        Locator::Css(_) => BrowserLocator::Css(value),
+        Locator::XPath(_) => BrowserLocator::XPath(value),
+        Locator::Dynamic { .. } => {
+            return Err(StepError::Internal(
+                "nested dynamic locator template".into(),
+            ));
+        }
+    })
+}

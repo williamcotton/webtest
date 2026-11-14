@@ -159,6 +159,37 @@ pub enum SyntaxKind {
     FixtureSetup,
     FixtureTeardown,
     UseExpr,
+    CasesKw,
+    CaseKw,
+    CaseList,
+    CaseDecl,
+    PatternKw,
+    SubsetKw,
+    ExactKw,
+    PatternDecl,
+    PatternRecordExpr,
+    PassKw,
+    FailKw,
+    SkipKw,
+    InconclusiveKw,
+    AssumeKw,
+    ElseKw,
+    CheckBlock,
+    VerdictStmt,
+    AssumeStmt,
+    ActorKw,
+    ActorDecl,
+    ActorBlock,
+    SinceKw,
+    WhenKw,
+    IfKw,
+    ReactiveSelect,
+    EventArm,
+    SelectTimeout,
+    GuardKw,
+    GuardsKw,
+    GuardDecl,
+    GuardScope,
     Eof,
 }
 
@@ -170,7 +201,24 @@ impl SyntaxKind {
     pub const fn is_keyword(self) -> bool {
         matches!(
             self,
-            Self::TestKw
+            Self::ActorKw
+                | Self::GuardKw
+                | Self::GuardsKw
+                | Self::WhenKw
+                | Self::IfKw
+                | Self::SinceKw
+                | Self::PassKw
+                | Self::FailKw
+                | Self::SkipKw
+                | Self::InconclusiveKw
+                | Self::AssumeKw
+                | Self::ElseKw
+                | Self::PatternKw
+                | Self::SubsetKw
+                | Self::ExactKw
+                | Self::CasesKw
+                | Self::CaseKw
+                | Self::TestKw
                 | Self::ImportKw
                 | Self::ExportKw
                 | Self::FromKw
@@ -427,7 +475,39 @@ impl Language for WebtestLanguage {
             153 => SyntaxKind::FixtureSetup,
             154 => SyntaxKind::FixtureTeardown,
             155 => SyntaxKind::UseExpr,
-            156 => SyntaxKind::Eof,
+            156 => SyntaxKind::CasesKw,
+            157 => SyntaxKind::CaseKw,
+            158 => SyntaxKind::CaseList,
+            159 => SyntaxKind::CaseDecl,
+            160 => SyntaxKind::PatternKw,
+            161 => SyntaxKind::SubsetKw,
+            162 => SyntaxKind::ExactKw,
+            163 => SyntaxKind::PatternDecl,
+            164 => SyntaxKind::PatternRecordExpr,
+            165 => SyntaxKind::PassKw,
+            166 => SyntaxKind::FailKw,
+            167 => SyntaxKind::SkipKw,
+            168 => SyntaxKind::InconclusiveKw,
+            169 => SyntaxKind::AssumeKw,
+            170 => SyntaxKind::ElseKw,
+            171 => SyntaxKind::CheckBlock,
+            172 => SyntaxKind::VerdictStmt,
+            173 => SyntaxKind::AssumeStmt,
+            174 => SyntaxKind::ActorKw,
+            175 => SyntaxKind::ActorDecl,
+            176 => SyntaxKind::ActorBlock,
+            177 => SyntaxKind::SinceKw,
+            178 => SyntaxKind::WhenKw,
+            179 => SyntaxKind::IfKw,
+            180 => SyntaxKind::ReactiveSelect,
+            181 => SyntaxKind::EventArm,
+            182 => SyntaxKind::SelectTimeout,
+            183 => SyntaxKind::GuardKw,
+            184 => SyntaxKind::GuardsKw,
+            185 => SyntaxKind::GuardDecl,
+            186 => SyntaxKind::GuardScope,
+            187 => SyntaxKind::Eof,
+
             _ => SyntaxKind::Error,
         }
     }

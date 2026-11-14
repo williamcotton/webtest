@@ -33,6 +33,7 @@ struct FakeSession {
 }
 
 struct FakePage {
+    observer: Option<Arc<dyn webtest_browser::reactive::ReactiveObserver>>,
     result: Mutex<Result<(), BrowserError>>,
 }
 
@@ -86,6 +87,7 @@ impl BrowserHost for FakeHost {
 impl BrowserSession for FakeSession {
     async fn new_page(&mut self) -> Result<Box<dyn Page>, BrowserError> {
         Ok(Box::new(FakePage {
+            observer: None,
             result: Mutex::new(self.result.clone()),
         }))
     }
@@ -93,7 +95,21 @@ impl BrowserSession for FakeSession {
 
 #[async_trait]
 impl Page for FakePage {
+    async fn start_reactive(
+        &mut self,
+        observer: Arc<dyn webtest_browser::reactive::ReactiveObserver>,
+        _: &[webtest_model::EventSource],
+    ) -> Result<(), BrowserError> {
+        self.observer = Some(observer);
+        Ok(())
+    }
+    async fn reactive_barrier(&mut self) -> Result<(), BrowserError> {
+        Ok(())
+    }
     async fn open(&mut self, _url: &str) -> Result<(), BrowserError> {
+        if let Some(observer) = &self.observer {
+            observer.observe(webtest_browser::reactive::BrowserEvent{source:webtest_model::EventSource::ConsoleMessage,payload:webtest_model::value_from_json(serde_json::json!({"level":"error","message":if _url.ends_with("/first"){"first"}else if _url.ends_with("/second"){"second"}else{"boom"},"url":{"value":"","path":"","query":"","host":"","scheme":""},"line":0,"column":0,"timestamp":0.0})),captured_bytes:100,truncated:false});
+        }
         Ok(())
     }
 
@@ -476,4 +492,339 @@ async fn statement_helpers_keep_isolated_bindings_and_cross_file_scope_revisions
         .unwrap()
         .revision = SourceRevision::of("changed");
     assert!(stale.validate_tree().is_err());
+}
+
+#[tokio::test]
+async fn cases_patterns_checks_and_semantic_verdicts_use_the_shared_runtime() {
+    let mut db = webtest_analysis::AnalysisDatabase::default();
+    let source = r#"pattern User(email: String) = subset {id: range(1,99), email: email, password: absent}
+    test "cases" cases [case "one" {id: 1}, case "two" {id: 2}] as input { expect {id: input.id, email: "a"} matches User("a") }
+    test "check" { check {expect 1 == 2 fail "second" expect "abc" matches regex("^z$")} expect true }
+    test "skip" { assume false else skip "not applicable" fail "unreachable" }
+    test "undecided" { inconclusive "external precondition" }
+    test "early success" { pass fail "unreachable" }"#;
+    let file = db.open_file("h.webtest", source);
+    assert!(
+        db.diagnostics(file).unwrap().is_empty(),
+        "{:?}",
+        db.diagnostics(file).unwrap()
+    );
+    let plan = db.test_plan(file).unwrap();
+    plan.validate_tree().unwrap();
+    let host = FakeHost {
+        result: Ok(()),
+        starts: Arc::new(AtomicUsize::new(0)),
+    };
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .run(&plan, &host)
+        .await;
+    assert_eq!(result.tests.len(), 6);
+    assert_eq!(result.passed(), 3);
+    assert_eq!(result.failed(), 2);
+    assert_eq!(result.skipped(), 1);
+    assert_eq!(host.starts.load(Ordering::Relaxed), 0);
+    let TestOutcome::Failed(failure) = &result.tests[2].outcome else {
+        panic!("check result: {:?}", result.tests[2].outcome);
+    };
+    let StepError::Assertion(assertion) = &failure.error else {
+        panic!("check aggregate");
+    };
+    let webtest_observation::ValueDiff::Check {
+        failures, total, ..
+    } = &assertion.diff
+    else {
+        panic!("typed aggregate diff");
+    };
+    assert_eq!(*total, 3);
+    assert_eq!(failures.len(), 3);
+    assert!(matches!(
+        result.tests[3].outcome,
+        TestOutcome::Verdict {
+            kind: webtest_model::VerdictKind::Skipped,
+            ..
+        }
+    ));
+    assert!(matches!(
+        result.tests[4].outcome,
+        TestOutcome::Verdict {
+            kind: webtest_model::VerdictKind::Inconclusive,
+            ..
+        }
+    ));
+    assert!(matches!(
+        result.tests[5].outcome,
+        TestOutcome::Verdict {
+            kind: webtest_model::VerdictKind::Pass,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn explicit_actors_have_separate_owned_pages_and_static_exclusive_access() {
+    let mut db = webtest_analysis::AnalysisDatabase::default();
+    let file = db.open_file(
+        "actors.webtest",
+        r#"test "actors" {
+        actor alice browser
+        actor bob browser
+        parallel { alice {open "http://alice.test"} bob {open "http://bob.test"} }
+        alice {expect true}
+    }"#,
+    );
+    assert!(
+        db.diagnostics(file).unwrap().is_empty(),
+        "{:?}",
+        db.diagnostics(file).unwrap()
+    );
+    let plan = db.test_plan(file).unwrap();
+    plan.validate_tree().unwrap();
+    let host = FakeHost {
+        result: Ok(()),
+        starts: Arc::new(AtomicUsize::new(0)),
+    };
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .run(&plan, &host)
+        .await;
+    assert_eq!(result.passed(), 1, "{:?}", result.tests);
+    assert_eq!(host.starts.load(Ordering::Relaxed), 2);
+    db.set_file_text(file,r#"test "conflict" {actor alice browser parallel {alice {expect true} alice {expect true}}}"#);
+    assert!(
+        db.diagnostics(file)
+            .unwrap()
+            .iter()
+            .any(|d| d.code == "semantic.concurrent_resource_conflict")
+    );
+}
+
+#[tokio::test]
+async fn checkpoints_replay_synchronous_stimulus_events_without_running_other_alternatives() {
+    let mut db = webtest_analysis::AnalysisDatabase::default();
+    let file=db.open_file("select.webtest",r#"test "replay" {
+        actor alice browser
+        let mark = checkpoint(alice)
+        alice {open "http://example.test"}
+        let result = select alice since mark within 10ms {
+            when console.error(e) if e.message == "boom" {provide e.message}
+            when console.message(e) {fail "second alternative must not execute"}
+            timeout {fail "event was lost"}
+        }
+        expect result == "boom"
+    }
+    test "timeout" {actor alice browser select alice within 1ms {when console.error(e) {fail e.message} timeout {skip "no event"}}}
+    test "timeout failure" {actor alice browser select alice within 1ms {when console.error(e) {fail e.message}}}
+    test "unmatched evidence" {actor alice browser let mark = checkpoint(alice) alice {open "http://example.test"} select alice since mark within 1ms {when console.error(e) if false {fail e.message} timeout {skip "unmatched"}}}
+    "#);
+    assert!(
+        db.diagnostics(file).unwrap().is_empty(),
+        "{:?}",
+        db.diagnostics(file).unwrap()
+    );
+    let plan = db.test_plan(file).unwrap();
+    plan.validate_tree().unwrap();
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .with_options(crate::RunnerOptions {
+            reactive: webtest_model::ReactiveLimits {
+                max_unmatched_evidence: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .run(
+            &plan,
+            &FakeHost {
+                result: Ok(()),
+                starts: Arc::new(AtomicUsize::new(0)),
+            },
+        )
+        .await;
+    assert_eq!(result.passed(), 1, "{:?}", result.tests);
+    assert_eq!(result.skipped(), 2);
+    assert_eq!(result.failed(), 1);
+    assert!(result.events.iter().any(|event| matches!(event, webtest_observation::ExecutionEvent::Semantic {event:webtest_observation::SemanticEvent::SelectionObserved {unmatched:1,unmatched_sequences,truncated:true,..},..} if unmatched_sequences.is_empty())));
+    assert!(
+        matches!(&result.tests[2].outcome,TestOutcome::Failed(failure) if failure.error.code()==webtest_observation::RuntimeFailureCode::SelectionTimeout)
+    );
+}
+
+#[tokio::test]
+async fn guards_observe_body_final_poll_and_end_with_their_lexical_scope() {
+    let mut db = webtest_analysis::AnalysisDatabase::default();
+    let file=db.open_file("guards.webtest",r#"
+        guard clean(actor: BrowserActor) {when actor.console.error(e) {fail e.message}}
+        guard undecided(actor: BrowserActor) {when actor.console.error(e) {inconclusive e.message}}
+        test "guard catches final poll" {actor alice browser with guards [clean(alice)] {alice {open "http://example.test"}} fail "unreachable"}
+        test "guard ends" {actor alice browser with guards [clean(alice)] {expect true} alice {open "http://example.test"} expect true}
+        test "guard verdict" {actor alice browser with guards [undecided(alice)] {alice {open "http://example.test"}}}
+    "#);
+    assert!(
+        db.diagnostics(file).unwrap().is_empty(),
+        "{:?}",
+        db.diagnostics(file).unwrap()
+    );
+    let plan = db.test_plan(file).unwrap();
+    plan.validate_tree().unwrap();
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .run(
+            &plan,
+            &FakeHost {
+                result: Ok(()),
+                starts: Arc::new(AtomicUsize::new(0)),
+            },
+        )
+        .await;
+    assert_eq!(result.passed(), 1, "{:?}", result.tests);
+    assert_eq!(result.failed(), 2);
+    assert!(
+        matches!(&result.tests[0].outcome,TestOutcome::Failed(failure) if failure.error.to_string()=="boom")
+    );
+    assert!(matches!(
+        &result.tests[2].outcome,
+        TestOutcome::Verdict {
+            kind: webtest_model::VerdictKind::Inconclusive,
+            ..
+        }
+    ));
+    db.set_file_text(file,r#"guard bad(actor: BrowserActor){when actor.console.error(e){server {http.get("http://example.test")} fail e.message}}"#);
+    assert!(
+        db.diagnostics(file)
+            .unwrap()
+            .iter()
+            .any(|d| d.code == "semantic.guard_effect_not_allowed")
+    );
+}
+
+#[tokio::test]
+async fn guard_order_follows_event_ingress_before_clause_poll_order() {
+    let mut db = webtest_analysis::AnalysisDatabase::default();
+    let file=db.open_file("guard-order.webtest",r#"
+        guard ordered(actor: BrowserActor){
+            when actor.console.message(e) if e.message == "second" {fail "wrong: later event"}
+            when actor.console.message(e) if e.message == "first" {fail "correct: first event"}
+        }
+        test "ordered" {actor alice browser with guards [ordered(alice)] {alice {open "http://example.test/first" open "http://example.test/second"}}}
+    "#);
+    assert!(
+        db.diagnostics(file).unwrap().is_empty(),
+        "{:?}",
+        db.diagnostics(file).unwrap()
+    );
+    let plan = db.test_plan(file).unwrap();
+    plan.validate_tree().unwrap();
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .run(
+            &plan,
+            &FakeHost {
+                result: Ok(()),
+                starts: Arc::new(AtomicUsize::new(0)),
+            },
+        )
+        .await;
+    assert!(
+        matches!(&result.tests[0].outcome,TestOutcome::Failed(failure) if failure.error.to_string()=="correct: first event")
+    );
+    assert_eq!(
+        result
+            .events
+            .iter()
+            .filter(|e| matches!(
+                e,
+                webtest_observation::ExecutionEvent::Semantic {
+                    event: webtest_observation::SemanticEvent::GuardTriggered { .. },
+                    ..
+                }
+            ))
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn concurrent_verdicts_terminate_variants_and_bound_races_allow_bottom_branches() {
+    use webtest_model::VerdictKind;
+    for (operation, expected) in [
+        ("pass", Some(VerdictKind::Pass)),
+        ("skip \"reason\"", Some(VerdictKind::Skipped)),
+        ("inconclusive \"reason\"", Some(VerdictKind::Inconclusive)),
+        ("fail \"reason\"", None),
+    ] {
+        for construct in ["parallel", "race"] {
+            let source = format!(
+                "test \"terminal\" {{{construct} {{server {{{operation}}} server {{expect true}}}} fail \"unreachable\"}}"
+            );
+            let mut db = webtest_analysis::AnalysisDatabase::default();
+            let file = db.open_file("verdict.webtest", source);
+            assert!(
+                db.diagnostics(file).unwrap().is_empty(),
+                "{:?}",
+                db.diagnostics(file)
+            );
+            let plan = db.test_plan(file).unwrap();
+            plan.validate_tree().unwrap();
+            let host = FakeHost {
+                result: Ok(()),
+                starts: Arc::new(AtomicUsize::new(0)),
+            };
+            let result = Runner::new(Arc::new(ObservationStore::default()))
+                .run(&plan, &host)
+                .await;
+            match expected {
+                Some(expected) => assert!(
+                    matches!(result.tests[0].outcome, TestOutcome::Verdict {kind,..} if kind == expected),
+                    "{construct} {operation}: {:?}",
+                    result.tests[0].outcome
+                ),
+                None => assert!(
+                    matches!(&result.tests[0].outcome,TestOutcome::Failed(failure) if matches!(&failure.error, StepError::Assertion(assertion) if assertion.matcher==webtest_plan::ValueMatcher::ExplicitFail))
+                ),
+            }
+        }
+    }
+    let mut db = webtest_analysis::AnalysisDatabase::default();
+    let file = db.open_file(
+        "bottom.webtest",
+        r#"fn stop() -> Int {pass}
+        test "bound" {let value = race {server {pass} server {provide 42}} fail "unreachable"}
+        test "helper" {let value = stop() fail "unreachable"}
+        test "soft" {check {parallel {server {fail "soft"} server {expect 1 == 2}}}}
+    "#,
+    );
+    assert!(
+        db.diagnostics(file).unwrap().is_empty(),
+        "{:?}",
+        db.diagnostics(file)
+    );
+    let plan = db.test_plan(file).unwrap();
+    plan.validate_tree().unwrap();
+    let host = FakeHost {
+        result: Ok(()),
+        starts: Arc::new(AtomicUsize::new(0)),
+    };
+    let result = Runner::new(Arc::new(ObservationStore::default()))
+        .run(&plan, &host)
+        .await;
+    assert!(matches!(
+        result.tests[0].outcome,
+        TestOutcome::Verdict {
+            kind: VerdictKind::Pass,
+            ..
+        }
+    ));
+    assert!(matches!(
+        result.tests[1].outcome,
+        TestOutcome::Verdict {
+            kind: VerdictKind::Pass,
+            ..
+        }
+    ));
+    let TestOutcome::Failed(failure) = &result.tests[2].outcome else {
+        panic!("soft check")
+    };
+    let StepError::Assertion(assertion) = &failure.error else {
+        panic!("check assertion")
+    };
+    assert!(matches!(
+        assertion.diff,
+        webtest_observation::ValueDiff::Check { total: 2, .. }
+    ));
 }

@@ -104,7 +104,9 @@ pub(crate) fn tokens(db: &dyn Db, file: SourceInput) -> Vec<SemanticToken> {
                         SemanticTokenKind::Namespace
                     }
                     SymbolKind::RecordField => SemanticTokenKind::Property,
-                    SymbolKind::Type => SemanticTokenKind::Type,
+                    SymbolKind::Guard | SymbolKind::Pattern | SymbolKind::Type => {
+                        SemanticTokenKind::Type
+                    }
                     SymbolKind::Binding | SymbolKind::Import => SemanticTokenKind::Variable,
                     SymbolKind::Test => return None,
                 };

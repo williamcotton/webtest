@@ -59,6 +59,16 @@ pub(crate) fn describe(db: &dyn Db, revision: u64, limit: usize) -> ProjectSeman
             .iter()
             .map(|function| (SymbolId(function.id.0), function.exported, "helper"))
             .chain(
+                hir.guards
+                    .iter()
+                    .map(|guard| (SymbolId(guard.id.0), guard.exported, "guard")),
+            )
+            .chain(
+                hir.patterns
+                    .iter()
+                    .map(|pattern| (SymbolId(pattern.id.0), pattern.exported, "pattern")),
+            )
+            .chain(
                 hir.fixtures
                     .iter()
                     .map(|fixture| (SymbolId(fixture.id.0), fixture.exported, "fixture")),
@@ -118,7 +128,7 @@ pub(crate) fn describe(db: &dyn Db, revision: u64, limit: usize) -> ProjectSeman
                     required_capabilities: capabilities,
                     lifetime: None,
                     shareable: false,
-                    default_variant: Some(test.variant_id),
+                    default_variant: test.cases.is_none().then_some(test.variant_id),
                 });
             }
         }

@@ -210,6 +210,18 @@ impl TestExecutionState {
             })
     }
 
+    pub(super) fn accept_event_metadata(&mut self, value: &Value, query: &[String]) {
+        crate::redaction::collect_sensitive_values(
+            value,
+            &self.redacted_fields,
+            false,
+            &mut self.secrets,
+        );
+        crate::redaction::collect_event_url_secrets(value, query, &mut self.secrets);
+        self.secrets
+            .sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        self.secrets.dedup();
+    }
     pub(super) fn redaction(&self) -> (&[String], &[String]) {
         (&self.redacted_fields, &self.secrets)
     }

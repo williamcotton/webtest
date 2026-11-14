@@ -35,12 +35,15 @@ impl TreeExecution<'_, '_> {
             .collect();
         let first = self.branch.completed_branches.len();
         let mut transfers = std::collections::BTreeMap::new();
-        let winner = scheduler::schedule(
+        let check_depth = self.branch.check_depth;
+        let decision = scheduler::schedule(
             &parent.context,
             policy,
             children,
             |completion| match &completion.result.outcome {
                 TestOutcome::Passed => scheduler::Completion::Passed,
+                TestOutcome::Verdict { .. } => scheduler::Completion::Verdict,
+                TestOutcome::Failed(failure) if check_depth==0&&matches!(&failure.error,crate::StepError::Assertion(assertion) if assertion.matcher==webtest_plan::ValueMatcher::ExplicitFail)=>scheduler::Completion::Verdict,
                 outcome => outcome.failure_class().map_or(
                     scheduler::Completion::Cancelled,
                     scheduler::Completion::Failed,
@@ -73,7 +76,7 @@ impl TreeExecution<'_, '_> {
                 .task_path
                 .cmp(&b.scope.execution_context.task_path)
         });
-        if let Some(winner) = winner {
+        if let Some(winner) = decision.winner {
             if let Some(binding) = binding {
                 let Some(transfer) = transfers.remove(&winner) else {
                     return TestBodyOutcome::Provisional(ProvisionalTestOutcome::Aborted {
@@ -91,6 +94,29 @@ impl TreeExecution<'_, '_> {
             results[winner].race_winner = true;
             observations.recovered = true;
             return TestBodyOutcome::Provisional(ProvisionalTestOutcome::Passed);
+        }
+        if let Some(ordinal) = decision.verdict
+            && !results.iter().any(|child| {
+                child
+                    .outcome
+                    .failure_class()
+                    .is_some_and(|class| class != FailureClass::Test)
+            })
+        {
+            let selected = &results[ordinal].outcome;
+            if policy == scheduler::SiblingPolicy::FirstSuccess
+                || !results.iter().any(|child| {
+                    matches!(
+                        child.outcome,
+                        TestOutcome::Failed(_) | TestOutcome::TimedOut { .. }
+                    )
+                })
+            {
+                observations.recovered = policy == scheduler::SiblingPolicy::FirstSuccess;
+                return TestBodyOutcome::Provisional(ProvisionalTestOutcome::Finalized(Box::new(
+                    selected.clone(),
+                )));
+            }
         }
         let mut summary = &TestOutcome::Passed;
         for child in results {
@@ -112,6 +138,7 @@ fn severity(outcome: &TestOutcome) -> u8 {
     match outcome.failure_class() {
         Some(FailureClass::Internal) => 4,
         Some(FailureClass::Infrastructure) => 3,
+        _ if matches!(outcome, TestOutcome::Verdict { .. }) => 2,
         Some(FailureClass::Test) => 2,
         None if matches!(outcome, TestOutcome::Passed) => 0,
         None => 1,

@@ -76,6 +76,9 @@ impl Compiler<'_> {
         types: &mut HashMap<BindingId, Type>,
         chain: &[webtest_text::SourceLocation],
     ) -> PlanExpr {
+        if matches!(expression, PlanExpr::Pattern(_) | PlanExpr::Type(_)) {
+            return expression;
+        }
         let binding = self.temporary_binding(ty.clone(), types);
         nodes.push(self.pure_operation(
             declaration,
@@ -342,6 +345,7 @@ fn expression_type(expression: &PlanExpr, types: &HashMap<BindingId, Type>) -> T
         PlanExpr::PureCall { metadata, .. } => metadata.result_type.clone(),
         PlanExpr::Binding(id) => types.get(id).cloned().unwrap_or(Type::Unknown),
         PlanExpr::Literal(value) => literal_type(value),
+        PlanExpr::Pattern(_) => Type::Unknown,
         PlanExpr::Lower { .. } => Type::String,
         PlanExpr::Decode { target, .. } | PlanExpr::Type(target) => target.clone(),
         PlanExpr::List(values) => Type::List(Box::new(

@@ -332,6 +332,7 @@ mod tests {
         };
         let scope = |context: &ScopeContext| ScopeEvent {
             execution_context: webtest_observation::ExecutionContext {
+                actor: None,
                 fixture: None,
                 test_declaration_id: None,
                 variant_id: None,

@@ -626,6 +626,7 @@ mod tests {
         let pending = PendingFailure {
             metadata: webtest_observation::EventMetadata {
                 execution_context: webtest_observation::EventContext {
+                    actor: None,
                     test_id: Some(TestId(3)),
                     ..Default::default()
                 },

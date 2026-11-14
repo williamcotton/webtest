@@ -187,6 +187,16 @@ pub(crate) fn candidates(
 }
 
 fn exports(hir: &HirFile, name: &str) -> Option<(SymbolId, bool, SyntaxOrigin)> {
+    if let Some(guard) = hir.guards.iter().find(|g| g.name == name) {
+        return Some((SymbolId(guard.id.0), guard.exported, guard.name_origin));
+    }
+    if let Some(pattern) = hir.patterns.iter().find(|p| p.name == name) {
+        return Some((
+            SymbolId(pattern.id.0),
+            pattern.exported,
+            pattern.name_origin,
+        ));
+    }
     hir.functions
         .iter()
         .find(|function| function.name == name)
@@ -250,9 +260,19 @@ pub(crate) fn resolved_module(db: &dyn Db, input: SourceInput) -> Arc<ResolvedMo
         .iter()
         .map(|function| (&function.name, function.name_origin))
         .chain(
+            hir.guards
+                .iter()
+                .map(|guard| (&guard.name, guard.name_origin)),
+        )
+        .chain(
             hir.fixtures
                 .iter()
                 .map(|fixture| (&fixture.name, fixture.name_origin)),
+        )
+        .chain(
+            hir.patterns
+                .iter()
+                .map(|pattern| (&pattern.name, pattern.name_origin)),
         )
     {
         if let Some(previous) = local_names.insert(name.clone(), origin) {

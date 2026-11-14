@@ -3,6 +3,7 @@ use crate::{AssertionOperation, BrowserOperation, PlanExpr, TestOperation};
 impl PlanExpr {
     pub fn children(&self) -> Vec<&Self> {
         match self {
+            Self::Pattern(matcher) => matcher.expressions(),
             Self::PureCall {
                 arguments, body, ..
             } => arguments
@@ -24,6 +25,7 @@ impl PlanExpr {
     }
     pub fn children_mut(&mut self) -> Vec<&mut Self> {
         match self {
+            Self::Pattern(matcher) => matcher.expressions_mut(),
             Self::PureCall {
                 arguments, body, ..
             } => arguments
@@ -47,6 +49,8 @@ impl PlanExpr {
 impl TestOperation {
     pub fn expressions(&self) -> Vec<&PlanExpr> {
         match self {
+            Self::Reactive(_) => Vec::new(),
+            Self::Verdict { message, .. } => message.iter().collect(),
             Self::AcquireFixture(call) => call
                 .arguments
                 .iter()
@@ -59,26 +63,33 @@ impl TestOperation {
                 actual, expected, ..
             }) => std::iter::once(actual).chain(expected.iter()).collect(),
             Self::Assertion(AssertionOperation::Url { url, .. }) => vec![url],
-            Self::Assertion(AssertionOperation::Locator { .. }) => Vec::new(),
+            Self::Assertion(AssertionOperation::Locator { locator, .. }) => locator.expressions(),
             Self::Browser(value) => match value {
                 BrowserOperation::Navigate { url } | BrowserOperation::WaitForUrl { url, .. } => {
                     vec![url]
                 }
-                BrowserOperation::Fill { value, .. } | BrowserOperation::Type { value, .. } => {
-                    vec![value]
+                BrowserOperation::Fill { value, locator }
+                | BrowserOperation::Type { value, locator } => std::iter::once(value)
+                    .chain(locator.expressions())
+                    .collect(),
+                BrowserOperation::Press { key, locator } => {
+                    std::iter::once(key).chain(locator.expressions()).collect()
                 }
-                BrowserOperation::Press { key, .. } => vec![key],
-                BrowserOperation::Select { option, .. } => vec![option],
-                BrowserOperation::Evaluate { .. }
-                | BrowserOperation::Click { .. }
-                | BrowserOperation::Check { .. }
-                | BrowserOperation::Hover { .. }
-                | BrowserOperation::WaitForLocator { .. } => Vec::new(),
+                BrowserOperation::Select { option, locator } => std::iter::once(option)
+                    .chain(locator.expressions())
+                    .collect(),
+                BrowserOperation::Evaluate { .. } => Vec::new(),
+                BrowserOperation::Click { locator }
+                | BrowserOperation::Check { locator, .. }
+                | BrowserOperation::Hover { locator }
+                | BrowserOperation::WaitForLocator { locator, .. } => locator.expressions(),
             },
         }
     }
     pub fn expressions_mut(&mut self) -> Vec<&mut PlanExpr> {
         match self {
+            Self::Reactive(_) => Vec::new(),
+            Self::Verdict { message, .. } => message.iter_mut().collect(),
             Self::AcquireFixture(call) => call
                 .arguments
                 .iter_mut()
@@ -88,30 +99,61 @@ impl TestOperation {
             Self::Provide(value) | Self::Return(value) => vec![&mut value.expression],
             Self::ServerProviderCall(value) => value.arguments.values_mut().collect(),
             Self::Assertion(AssertionOperation::Value {
-                actual,
-                matcher: crate::ValueMatcher::Matches,
-                ..
-            }) => vec![actual],
-            Self::Assertion(AssertionOperation::Value {
                 actual, expected, ..
             }) => std::iter::once(actual).chain(expected.iter_mut()).collect(),
             Self::Assertion(AssertionOperation::Url { url, .. }) => vec![url],
-            Self::Assertion(AssertionOperation::Locator { .. }) => Vec::new(),
+            Self::Assertion(AssertionOperation::Locator { locator, .. }) => {
+                locator.expressions_mut()
+            }
             Self::Browser(value) => match value {
                 BrowserOperation::Navigate { url } | BrowserOperation::WaitForUrl { url, .. } => {
                     vec![url]
                 }
-                BrowserOperation::Fill { value, .. } | BrowserOperation::Type { value, .. } => {
-                    vec![value]
-                }
-                BrowserOperation::Press { key, .. } => vec![key],
-                BrowserOperation::Select { option, .. } => vec![option],
-                BrowserOperation::Evaluate { .. }
-                | BrowserOperation::Click { .. }
-                | BrowserOperation::Check { .. }
-                | BrowserOperation::Hover { .. }
-                | BrowserOperation::WaitForLocator { .. } => Vec::new(),
+                BrowserOperation::Fill { value, locator }
+                | BrowserOperation::Type { value, locator } => std::iter::once(value)
+                    .chain(locator.expressions_mut())
+                    .collect(),
+                BrowserOperation::Press { key, locator } => std::iter::once(key)
+                    .chain(locator.expressions_mut())
+                    .collect(),
+                BrowserOperation::Select { option, locator } => std::iter::once(option)
+                    .chain(locator.expressions_mut())
+                    .collect(),
+                BrowserOperation::Evaluate { .. } => Vec::new(),
+                BrowserOperation::Click { locator }
+                | BrowserOperation::Check { locator, .. }
+                | BrowserOperation::Hover { locator }
+                | BrowserOperation::WaitForLocator { locator, .. } => locator.expressions_mut(),
             },
+        }
+    }
+}
+
+impl crate::Locator {
+    pub fn expressions(&self) -> Vec<&PlanExpr> {
+        match self {
+            Self::Dynamic {
+                template,
+                value,
+                name,
+            } => std::iter::once(value.as_ref())
+                .chain(name.iter().map(|v| v.as_ref()))
+                .chain(template.expressions())
+                .collect(),
+            _ => vec![],
+        }
+    }
+    pub fn expressions_mut(&mut self) -> Vec<&mut PlanExpr> {
+        match self {
+            Self::Dynamic {
+                template,
+                value,
+                name,
+            } => std::iter::once(value.as_mut())
+                .chain(name.iter_mut().map(|v| v.as_mut()))
+                .chain(template.expressions_mut())
+                .collect(),
+            _ => vec![],
         }
     }
 }

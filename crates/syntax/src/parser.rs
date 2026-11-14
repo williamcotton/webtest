@@ -66,6 +66,14 @@ impl<'a> Parser<'a> {
                 SyntaxKind::Eof => break,
                 SyntaxKind::TestKw => self.test_decl(),
                 SyntaxKind::ImportKw => self.import_decl(),
+                SyntaxKind::GuardKw => self.guard_decl(),
+                SyntaxKind::ExportKw if self.nth_non_trivia(1) == SyntaxKind::GuardKw => {
+                    self.guard_decl()
+                }
+                SyntaxKind::PatternKw => self.pattern_decl(),
+                SyntaxKind::ExportKw if self.nth_non_trivia(1) == SyntaxKind::PatternKw => {
+                    self.pattern_decl()
+                }
                 SyntaxKind::ExportKw | SyntaxKind::FnKw | SyntaxKind::FixtureKw => {
                     self.reusable_decl()
                 }
@@ -79,6 +87,52 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn guard_decl(&mut self) {
+        self.start(SyntaxKind::GuardDecl);
+        if self.current() == SyntaxKind::ExportKw {
+            self.bump();
+            self.eat_trivia();
+        }
+        self.bump();
+        self.declaration_name();
+        self.parameters();
+        if self.expect(
+            SyntaxKind::LBrace,
+            "syntax.expected_lbrace",
+            "expected guard clauses",
+        ) {
+            loop {
+                self.eat_trivia();
+                match self.current() {
+                    SyntaxKind::RBrace => {
+                        self.bump();
+                        break;
+                    }
+                    SyntaxKind::Eof => {
+                        self.error_here("syntax.expected_rbrace", "expected guard closing brace");
+                        break;
+                    }
+                    SyntaxKind::WhenKw => {
+                        self.start(SyntaxKind::EventArm);
+                        self.bump();
+                        self.require_expression("expected actor event source(binding)");
+                        self.eat_trivia();
+                        if self.current() == SyntaxKind::IfKw {
+                            self.bump();
+                            self.require_expression("expected pure guard filter");
+                        }
+                        self.braced_block(SyntaxKind::Block, BlockDomain::Test);
+                        self.finish();
+                    }
+                    _ => {
+                        self.error_here("syntax.expected_guard_clause", "expected when clause");
+                        self.bump();
+                    }
+                }
+            }
+        }
+        self.finish();
+    }
     fn declaration_name(&mut self) {
         self.eat_trivia();
         if self.name_token(self.current()) {
@@ -336,6 +390,30 @@ impl<'a> Parser<'a> {
         self.finish();
     }
 
+    fn pattern_decl(&mut self) {
+        self.start(SyntaxKind::PatternDecl);
+        if self.current() == SyntaxKind::ExportKw {
+            self.bump();
+        }
+        self.expect(
+            SyntaxKind::PatternKw,
+            "syntax.expected_pattern",
+            "expected pattern declaration",
+        );
+        self.declaration_name();
+        self.eat_trivia();
+        if self.current() == SyntaxKind::LParen {
+            self.parameters();
+        }
+        self.expect(
+            SyntaxKind::Equal,
+            "syntax.expected_pattern_equal",
+            "expected `=` before pattern body",
+        );
+        self.require_expression("expected pattern body");
+        self.finish();
+    }
+
     fn test_decl(&mut self) {
         self.start(SyntaxKind::TestDecl);
         self.bump();
@@ -344,7 +422,63 @@ impl<'a> Parser<'a> {
             "syntax.expected_test_name",
             "expected test name string after `test`",
         );
+        self.eat_trivia();
+        if self.current() == SyntaxKind::CasesKw {
+            self.test_cases();
+        }
         self.braced_block(SyntaxKind::Block, BlockDomain::Test);
+        self.finish();
+    }
+    fn test_cases(&mut self) {
+        self.start(SyntaxKind::CaseList);
+        self.bump();
+        self.expect(
+            SyntaxKind::LBracket,
+            "syntax.expected_cases_open",
+            "expected `[` after cases",
+        );
+        loop {
+            self.eat_trivia();
+            if matches!(
+                self.current(),
+                SyntaxKind::RBracket | SyntaxKind::Eof | SyntaxKind::AsKw | SyntaxKind::TestKw
+            ) {
+                break;
+            }
+            if self.current() != SyntaxKind::CaseKw {
+                self.unexpected("syntax.expected_case", "expected labeled `case`");
+                continue;
+            }
+            self.start(SyntaxKind::CaseDecl);
+            self.bump();
+            self.expect(
+                SyntaxKind::String,
+                "syntax.expected_case_label",
+                "expected case label string",
+            );
+            self.eat_trivia();
+            if self.current() == SyntaxKind::LBrace {
+                self.record_expression();
+            } else {
+                self.error_here("syntax.expected_case_record", "expected case record");
+            }
+            self.finish();
+            self.eat_trivia();
+            if self.current() == SyntaxKind::Comma {
+                self.bump();
+            }
+        }
+        self.expect(
+            SyntaxKind::RBracket,
+            "syntax.expected_cases_close",
+            "expected `]` after cases",
+        );
+        self.expect(
+            SyntaxKind::AsKw,
+            "syntax.expected_case_binding",
+            "expected `as` and case binding",
+        );
+        self.declaration_name();
         self.finish();
     }
 
@@ -388,6 +522,83 @@ impl<'a> Parser<'a> {
 
     fn statement(&mut self, domain: BlockDomain) {
         match (domain, self.current()) {
+            (_, SyntaxKind::WithKw) if self.nth_non_trivia(1) == SyntaxKind::GuardsKw => {
+                self.start(SyntaxKind::GuardScope);
+                self.bump();
+                self.eat_trivia();
+                self.bump();
+                self.require_expression("expected guard activation list");
+                self.braced_block(SyntaxKind::Block, domain);
+                self.finish();
+            }
+            (_, SyntaxKind::SelectKw) if self.nth_non_trivia(1) == SyntaxKind::Ident => {
+                self.reactive_select(domain)
+            }
+            (_, SyntaxKind::ActorKw) if self.nth_non_trivia(1) == SyntaxKind::LBrace => {
+                self.start(SyntaxKind::ActorBlock);
+                self.bump();
+                self.braced_block(SyntaxKind::Block, BlockDomain::Browser);
+                self.finish();
+            }
+            (_, SyntaxKind::ActorKw) => {
+                self.start(SyntaxKind::ActorDecl);
+                self.bump();
+                self.eat_trivia();
+                self.expect(
+                    SyntaxKind::Ident,
+                    "syntax.expected_actor_name",
+                    "expected actor name",
+                );
+                self.eat_trivia();
+                self.expect(
+                    SyntaxKind::BrowserKw,
+                    "syntax.expected_actor_browser",
+                    "actor requires browser",
+                );
+                self.finish();
+            }
+            (_, SyntaxKind::Ident) if self.nth_non_trivia(1) == SyntaxKind::LBrace => {
+                self.start(SyntaxKind::ActorBlock);
+                self.bump();
+                self.braced_block(SyntaxKind::Block, BlockDomain::Browser);
+                self.finish();
+            }
+            (_, SyntaxKind::CheckKw) if self.nth_non_trivia(1) == SyntaxKind::LBrace => {
+                self.start(SyntaxKind::CheckBlock);
+                self.bump();
+                self.braced_block(SyntaxKind::Block, domain);
+                self.finish();
+            }
+            (
+                _,
+                SyntaxKind::PassKw
+                | SyntaxKind::FailKw
+                | SyntaxKind::SkipKw
+                | SyntaxKind::InconclusiveKw,
+            ) => self.verdict_statement(),
+            (_, SyntaxKind::AssumeKw) => {
+                self.start(SyntaxKind::AssumeStmt);
+                self.bump();
+                self.require_expression("expected Boolean assumption");
+                self.expect(
+                    SyntaxKind::ElseKw,
+                    "syntax.expected_assume_else",
+                    "expected else skip/inconclusive",
+                );
+                self.eat_trivia();
+                if matches!(
+                    self.current(),
+                    SyntaxKind::SkipKw | SyntaxKind::InconclusiveKw
+                ) {
+                    self.verdict_statement();
+                } else {
+                    self.error_here(
+                        "syntax.invalid_assume_verdict",
+                        "assume requires else skip or inconclusive",
+                    );
+                }
+                self.finish();
+            }
             (_, SyntaxKind::ParallelKw | SyntaxKind::RaceKw)
                 if matches!(self.nth_non_trivia(1), SyntaxKind::LBrace | SyntaxKind::Eof) =>
             {
@@ -489,6 +700,15 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn verdict_statement(&mut self) {
+        self.start(SyntaxKind::VerdictStmt);
+        let kind = self.current();
+        self.bump();
+        if kind != SyntaxKind::PassKw {
+            self.require_expression("expected verdict message String");
+        }
+        self.finish();
+    }
     fn retry_statement(&mut self, domain: BlockDomain) {
         self.start(SyntaxKind::RetryStmt);
         self.bump();
@@ -582,7 +802,9 @@ impl<'a> Parser<'a> {
             "expected `=` in binding",
         );
         self.eat_trivia();
-        if self.current() == SyntaxKind::RaceKw
+        if self.current() == SyntaxKind::SelectKw && self.nth_non_trivia(1) == SyntaxKind::Ident {
+            self.reactive_select(domain);
+        } else if self.current() == SyntaxKind::RaceKw
             && matches!(self.nth_non_trivia(1), SyntaxKind::LBrace | SyntaxKind::Eof)
         {
             self.statement(domain);
@@ -592,6 +814,81 @@ impl<'a> Parser<'a> {
         self.finish();
     }
 
+    fn reactive_select(&mut self, domain: BlockDomain) {
+        self.start(SyntaxKind::ReactiveSelect);
+        self.bump();
+        self.eat_trivia();
+        self.expect(
+            SyntaxKind::Ident,
+            "syntax.expected_select_actor",
+            "expected select actor",
+        );
+        self.eat_trivia();
+        if self.current() == SyntaxKind::SinceKw {
+            self.bump();
+            self.eat_trivia();
+            self.expect(
+                SyntaxKind::Ident,
+                "syntax.expected_cursor",
+                "expected event cursor",
+            );
+        }
+        self.expect(
+            SyntaxKind::WithinKw,
+            "syntax.expected_select_within",
+            "select requires within duration",
+        );
+        self.expect(
+            SyntaxKind::Duration,
+            "syntax.expected_select_duration",
+            "expected finite select duration",
+        );
+        if self.expect(
+            SyntaxKind::LBrace,
+            "syntax.expected_lbrace",
+            "expected select alternatives",
+        ) {
+            loop {
+                self.eat_trivia();
+                match self.current() {
+                    SyntaxKind::RBrace => {
+                        self.bump();
+                        break;
+                    }
+                    SyntaxKind::Eof => {
+                        self.error_here("syntax.expected_rbrace", "expected select closing brace");
+                        break;
+                    }
+                    SyntaxKind::WhenKw => {
+                        self.start(SyntaxKind::EventArm);
+                        self.bump();
+                        self.require_expression("expected event source(binding)");
+                        self.eat_trivia();
+                        if self.current() == SyntaxKind::IfKw {
+                            self.bump();
+                            self.require_expression("expected pure event predicate");
+                        }
+                        self.braced_block(SyntaxKind::Block, domain);
+                        self.finish();
+                    }
+                    SyntaxKind::TimeoutKw => {
+                        self.start(SyntaxKind::SelectTimeout);
+                        self.bump();
+                        self.braced_block(SyntaxKind::Block, domain);
+                        self.finish();
+                    }
+                    _ => {
+                        self.error_here(
+                            "syntax.expected_select_arm",
+                            "expected when or timeout alternative",
+                        );
+                        self.bump();
+                    }
+                }
+            }
+        }
+        self.finish();
+    }
     fn expression_statement(&mut self) {
         self.start(SyntaxKind::ExprStmt);
         self.require_expression("expected expression");
@@ -763,11 +1060,17 @@ impl<'a> Parser<'a> {
             "syntax.expected_lparen",
             "expected `(` after locator name",
         );
-        self.expect(
-            SyntaxKind::String,
-            "syntax.expected_locator_string",
-            "expected string in locator",
-        );
+        self.eat_trivia();
+        if self.current() == SyntaxKind::String
+            && matches!(
+                self.nth_non_trivia(1),
+                SyntaxKind::RParen | SyntaxKind::Comma
+            )
+        {
+            self.bump();
+        } else {
+            self.require_expression("expected String expression in locator");
+        }
         self.eat_trivia();
         if node_kind == SyntaxKind::RoleLocator && self.current() == SyntaxKind::Comma {
             self.bump();
@@ -781,11 +1084,13 @@ impl<'a> Parser<'a> {
                 "syntax.expected_colon",
                 "expected `:` after `name`",
             );
-            self.expect(
-                SyntaxKind::String,
-                "syntax.expected_role_name_value",
-                "expected role name string",
-            );
+            self.eat_trivia();
+            if self.current() == SyntaxKind::String && self.nth_non_trivia(1) == SyntaxKind::RParen
+            {
+                self.bump();
+            } else {
+                self.require_expression("expected String expression for role name");
+            }
         }
         self.expect(
             SyntaxKind::RParen,
@@ -809,6 +1114,20 @@ impl<'a> Parser<'a> {
         self.eat_trivia();
         let checkpoint = self.builder.checkpoint();
         match self.current() {
+            SyntaxKind::SubsetKw | SyntaxKind::ExactKw => {
+                self.start(SyntaxKind::PatternRecordExpr);
+                self.bump();
+                self.eat_trivia();
+                if self.current() == SyntaxKind::LBrace {
+                    self.record_expression();
+                } else {
+                    self.error_here(
+                        "syntax.expected_pattern_record",
+                        "expected record after subset/exact",
+                    );
+                }
+                self.finish();
+            }
             SyntaxKind::UseKw => {
                 self.start(SyntaxKind::UseExpr);
                 self.bump();
@@ -1092,7 +1411,9 @@ impl<'a> Parser<'a> {
     fn expression_start(&self, kind: SyntaxKind) -> bool {
         matches!(
             kind,
-            SyntaxKind::UseKw
+            SyntaxKind::SubsetKw
+                | SyntaxKind::ExactKw
+                | SyntaxKind::UseKw
                 | SyntaxKind::String
                 | SyntaxKind::Int
                 | SyntaxKind::Float

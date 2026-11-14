@@ -46,3 +46,6 @@ webtest-wasm = { path = "../wasm" }
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+[dev-dependencies]
+tokio-tungstenite.workspace = true

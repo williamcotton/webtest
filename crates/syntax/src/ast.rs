@@ -26,6 +26,15 @@ macro_rules! ast_node {
 }
 
 ast_node!(Root, Root);
+ast_node!(GuardDecl, GuardDecl);
+ast_node!(GuardScope, GuardScope);
+ast_node!(ReactiveSelect, ReactiveSelect);
+ast_node!(EventArm, EventArm);
+ast_node!(SelectTimeout, SelectTimeout);
+ast_node!(ActorDecl, ActorDecl);
+ast_node!(ActorBlock, ActorBlock);
+ast_node!(PatternDecl, PatternDecl);
+ast_node!(PatternRecordExpr, PatternRecordExpr);
 ast_node!(ImportDecl, ImportDecl);
 ast_node!(ImportBinding, ImportBinding);
 ast_node!(FunctionDecl, FunctionDecl);
@@ -37,6 +46,11 @@ ast_node!(FixtureTeardown, FixtureTeardown);
 ast_node!(UseExpr, UseExpr);
 
 ast_node!(TestDecl, TestDecl);
+ast_node!(CheckBlock, CheckBlock);
+ast_node!(VerdictStmt, VerdictStmt);
+ast_node!(AssumeStmt, AssumeStmt);
+ast_node!(CaseList, CaseList);
+ast_node!(CaseDecl, CaseDecl);
 ast_node!(Block, Block);
 ast_node!(ServerBlock, ServerBlock);
 ast_node!(BrowserBlock, BrowserBlock);
@@ -156,7 +170,30 @@ impl Root {
     }
 }
 
+impl CaseDecl {
+    pub fn label(&self) -> Option<StringToken> {
+        direct_string(&self.syntax)
+    }
+    pub fn value(&self) -> Option<Expr> {
+        self.syntax.children().find_map(Expr::cast)
+    }
+}
+impl CaseList {
+    pub fn cases(&self) -> impl Iterator<Item = CaseDecl> + '_ {
+        self.syntax.children().filter_map(CaseDecl::cast)
+    }
+    pub fn binding(&self) -> Option<SyntaxToken> {
+        self.syntax
+            .children_with_tokens()
+            .filter_map(|c| c.into_token())
+            .find(|t| t.kind() == SyntaxKind::Ident || t.kind() == SyntaxKind::CaseKw)
+    }
+}
 impl TestDecl {
+    pub fn cases(&self) -> Option<CaseList> {
+        self.syntax.children().find_map(CaseList::cast)
+    }
+
     pub fn name(&self) -> Option<StringToken> {
         direct_string(&self.syntax)
     }
@@ -473,6 +510,13 @@ pub enum BrowserOperation {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum FlowStatement {
+    GuardScope(GuardScope),
+    Select(ReactiveSelect),
+    Actor(ActorDecl),
+    ActorBlock(ActorBlock),
+    Check(CheckBlock),
+    Verdict(VerdictStmt),
+    Assume(AssumeStmt),
     Timeout(TimeoutStmt),
     Retry(RetryStmt),
     Parallel(ParallelStmt),
@@ -488,6 +532,13 @@ pub enum FlowStatement {
 impl FlowStatement {
     fn cast(node: SyntaxNode) -> Option<Self> {
         match node.kind() {
+            SyntaxKind::GuardScope => GuardScope::cast(node).map(Self::GuardScope),
+            SyntaxKind::ReactiveSelect => ReactiveSelect::cast(node).map(Self::Select),
+            SyntaxKind::ActorDecl => ActorDecl::cast(node).map(Self::Actor),
+            SyntaxKind::ActorBlock => ActorBlock::cast(node).map(Self::ActorBlock),
+            SyntaxKind::CheckBlock => CheckBlock::cast(node).map(Self::Check),
+            SyntaxKind::VerdictStmt => VerdictStmt::cast(node).map(Self::Verdict),
+            SyntaxKind::AssumeStmt => AssumeStmt::cast(node).map(Self::Assume),
             SyntaxKind::TimeoutStmt => TimeoutStmt::cast(node).map(Self::Timeout),
             SyntaxKind::RetryStmt => RetryStmt::cast(node).map(Self::Retry),
             SyntaxKind::ParallelStmt => ParallelStmt::cast(node).map(Self::Parallel),
@@ -505,6 +556,13 @@ impl FlowStatement {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum DomainStatement {
+    GuardScope(GuardScope),
+    Select(ReactiveSelect),
+    Actor(ActorDecl),
+    ActorBlock(ActorBlock),
+    Check(CheckBlock),
+    Verdict(VerdictStmt),
+    Assume(AssumeStmt),
     Timeout(TimeoutStmt),
     Retry(RetryStmt),
     Parallel(ParallelStmt),
@@ -519,6 +577,13 @@ pub enum DomainStatement {
 impl DomainStatement {
     fn cast(node: SyntaxNode) -> Option<Self> {
         match node.kind() {
+            SyntaxKind::GuardScope => GuardScope::cast(node).map(Self::GuardScope),
+            SyntaxKind::ReactiveSelect => ReactiveSelect::cast(node).map(Self::Select),
+            SyntaxKind::ActorDecl => ActorDecl::cast(node).map(Self::Actor),
+            SyntaxKind::ActorBlock => ActorBlock::cast(node).map(Self::ActorBlock),
+            SyntaxKind::CheckBlock => CheckBlock::cast(node).map(Self::Check),
+            SyntaxKind::VerdictStmt => VerdictStmt::cast(node).map(Self::Verdict),
+            SyntaxKind::AssumeStmt => AssumeStmt::cast(node).map(Self::Assume),
             SyntaxKind::TimeoutStmt => TimeoutStmt::cast(node).map(Self::Timeout),
             SyntaxKind::RetryStmt => RetryStmt::cast(node).map(Self::Retry),
             SyntaxKind::ParallelStmt => ParallelStmt::cast(node).map(Self::Parallel),
@@ -534,6 +599,7 @@ impl DomainStatement {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Expr {
+    PatternRecord(PatternRecordExpr),
     Use(UseExpr),
     Literal(LiteralExpr),
     Name(NameExpr),
@@ -549,6 +615,7 @@ pub enum Expr {
 impl Expr {
     pub fn cast(node: SyntaxNode) -> Option<Self> {
         match node.kind() {
+            SyntaxKind::PatternRecordExpr => PatternRecordExpr::cast(node).map(Self::PatternRecord),
             SyntaxKind::UseExpr => UseExpr::cast(node).map(Self::Use),
             SyntaxKind::LiteralExpr => LiteralExpr::cast(node).map(Self::Literal),
             SyntaxKind::NameExpr => NameExpr::cast(node).map(Self::Name),
@@ -565,6 +632,7 @@ impl Expr {
 
     pub fn syntax(&self) -> &SyntaxNode {
         match self {
+            Self::PatternRecord(value) => value.syntax(),
             Self::Use(value) => value.syntax(),
             Self::Literal(value) => value.syntax(),
             Self::Name(value) => value.syntax(),
@@ -818,6 +886,29 @@ pub enum Locator {
 }
 
 impl Locator {
+    pub fn syntax(&self) -> &SyntaxNode {
+        match self {
+            Self::Id(v) => v.syntax(),
+            Self::Role(v) => v.syntax(),
+            Self::Label(v) => v.syntax(),
+            Self::Text(v) => v.syntax(),
+            Self::Placeholder(v) => v.syntax(),
+            Self::TestId(v) => v.syntax(),
+            Self::Css(v) => v.syntax(),
+            Self::XPath(v) => v.syntax(),
+        }
+    }
+    pub fn arguments(&self) -> Vec<LocatorArgument> {
+        self.syntax()
+            .children_with_tokens()
+            .filter_map(|c| match c {
+                rowan::NodeOrToken::Node(node) => Expr::cast(node).map(LocatorArgument::Expression),
+                rowan::NodeOrToken::Token(token) => {
+                    StringToken::cast(token).map(LocatorArgument::String)
+                }
+            })
+            .collect()
+    }
     fn cast(node: SyntaxNode) -> Option<Self> {
         match node.kind() {
             SyntaxKind::IdLocator => IdLocator::cast(node).map(Self::Id),
@@ -940,7 +1031,12 @@ fn reusable_name(node: &SyntaxNode) -> Option<SyntaxToken> {
         .children_with_tokens()
         .filter_map(|element| element.into_token())
         .filter(|token| !token.kind().is_trivia());
-    tokens.find(|token| matches!(token.kind(), SyntaxKind::FnKw | SyntaxKind::FixtureKw))?;
+    tokens.find(|token| {
+        matches!(
+            token.kind(),
+            SyntaxKind::FnKw | SyntaxKind::FixtureKw | SyntaxKind::PatternKw | SyntaxKind::GuardKw
+        )
+    })?;
     tokens.next()
 }
 fn declaration_documentation(node: &SyntaxNode) -> String {
@@ -1002,6 +1098,8 @@ macro_rules! reusable_accessors {
         }
     };
 }
+reusable_accessors!(PatternDecl);
+reusable_accessors!(GuardDecl);
 reusable_accessors!(FunctionDecl);
 reusable_accessors!(FixtureDecl);
 impl Parameter {
@@ -1113,4 +1211,175 @@ impl UseExpr {
 pub enum DeclaredCapability {
     Server,
     Browser,
+}
+
+impl Root {
+    pub fn patterns(&self) -> impl Iterator<Item = PatternDecl> + '_ {
+        self.syntax.children().filter_map(PatternDecl::cast)
+    }
+}
+impl PatternDecl {
+    pub fn expression(&self) -> Option<Expr> {
+        self.syntax.children().find_map(Expr::cast)
+    }
+}
+impl PatternRecordExpr {
+    pub fn exact(&self) -> bool {
+        self.syntax
+            .children_with_tokens()
+            .filter_map(|c| c.into_token())
+            .any(|t| t.kind() == SyntaxKind::ExactKw)
+    }
+    pub fn record(&self) -> Option<RecordExpr> {
+        self.syntax.children().find_map(RecordExpr::cast)
+    }
+}
+
+impl CheckBlock {
+    pub fn body(&self) -> Option<Block> {
+        self.syntax.children().find_map(Block::cast)
+    }
+    pub fn flow_statements(&self) -> impl Iterator<Item = FlowStatement> {
+        self.body().into_iter().flat_map(|body| {
+            body.syntax
+                .children()
+                .filter_map(FlowStatement::cast)
+                .collect::<Vec<_>>()
+        })
+    }
+    pub fn domain_statements(&self) -> impl Iterator<Item = DomainStatement> {
+        self.body().into_iter().flat_map(|body| {
+            body.syntax
+                .children()
+                .filter_map(DomainStatement::cast)
+                .collect::<Vec<_>>()
+        })
+    }
+}
+impl VerdictStmt {
+    pub fn keyword(&self) -> Option<SyntaxToken> {
+        first_meaningful_token(&self.syntax)
+    }
+    pub fn message(&self) -> Option<Expr> {
+        self.syntax.children().find_map(Expr::cast)
+    }
+}
+impl AssumeStmt {
+    pub fn condition(&self) -> Option<Expr> {
+        self.syntax.children().find_map(Expr::cast)
+    }
+    pub fn verdict(&self) -> Option<VerdictStmt> {
+        self.syntax.children().find_map(VerdictStmt::cast)
+    }
+}
+
+impl ActorDecl {
+    pub fn name(&self) -> Option<SyntaxToken> {
+        self.syntax
+            .children_with_tokens()
+            .filter_map(|c| c.into_token())
+            .find(|t| t.kind() == SyntaxKind::Ident)
+    }
+}
+impl ActorBlock {
+    pub fn name(&self) -> Option<SyntaxToken> {
+        self.syntax
+            .children_with_tokens()
+            .filter_map(|c| c.into_token())
+            .find(|t| crate::is_binding_name_kind(t.kind()))
+    }
+    pub fn body(&self) -> Option<Block> {
+        self.syntax.children().find_map(Block::cast)
+    }
+    pub fn statements(&self) -> impl Iterator<Item = DomainStatement> {
+        self.body().into_iter().flat_map(|body| {
+            body.syntax
+                .children()
+                .filter_map(DomainStatement::cast)
+                .collect::<Vec<_>>()
+        })
+    }
+}
+
+impl ReactiveSelect {
+    pub fn actor(&self) -> Option<SyntaxToken> {
+        self.syntax
+            .children_with_tokens()
+            .filter_map(|c| c.into_token())
+            .find(|t| t.kind() == SyntaxKind::Ident)
+    }
+    pub fn cursor(&self) -> Option<SyntaxToken> {
+        let mut tokens = self
+            .syntax
+            .children_with_tokens()
+            .filter_map(|c| c.into_token());
+        tokens.find(|t| t.kind() == SyntaxKind::SinceKw)?;
+        tokens.find(|t| t.kind() == SyntaxKind::Ident)
+    }
+    pub fn duration(&self) -> Option<DurationToken> {
+        self.syntax
+            .children_with_tokens()
+            .filter_map(|c| c.into_token())
+            .find_map(DurationToken::cast)
+    }
+    pub fn arms(&self) -> impl Iterator<Item = EventArm> + '_ {
+        self.syntax.children().filter_map(EventArm::cast)
+    }
+    pub fn timeouts(&self) -> impl Iterator<Item = SelectTimeout> + '_ {
+        self.syntax.children().filter_map(SelectTimeout::cast)
+    }
+}
+impl EventArm {
+    pub fn source(&self) -> Option<Expr> {
+        self.syntax.children().find_map(Expr::cast)
+    }
+    pub fn filter(&self) -> Option<Expr> {
+        self.syntax.children().filter_map(Expr::cast).nth(1)
+    }
+    pub fn body(&self) -> Option<Block> {
+        self.syntax.children().find_map(Block::cast)
+    }
+}
+impl SelectTimeout {
+    pub fn body(&self) -> Option<Block> {
+        self.syntax.children().find_map(Block::cast)
+    }
+}
+impl Block {
+    pub fn flow_statements(&self) -> impl Iterator<Item = FlowStatement> + '_ {
+        self.syntax.children().filter_map(FlowStatement::cast)
+    }
+    pub fn domain_statements(&self) -> impl Iterator<Item = DomainStatement> + '_ {
+        self.syntax.children().filter_map(DomainStatement::cast)
+    }
+}
+impl LetStmt {
+    pub fn selection(&self) -> Option<ReactiveSelect> {
+        self.syntax.children().find_map(ReactiveSelect::cast)
+    }
+}
+
+impl Root {
+    pub fn guards(&self) -> impl Iterator<Item = GuardDecl> + '_ {
+        self.syntax.children().filter_map(GuardDecl::cast)
+    }
+}
+impl GuardDecl {
+    pub fn clauses(&self) -> impl Iterator<Item = EventArm> + '_ {
+        self.syntax.children().filter_map(EventArm::cast)
+    }
+}
+impl GuardScope {
+    pub fn activations(&self) -> Option<Expr> {
+        self.syntax.children().find_map(Expr::cast)
+    }
+    pub fn body(&self) -> Option<Block> {
+        self.syntax.children().find_map(Block::cast)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum LocatorArgument {
+    String(StringToken),
+    Expression(Expr),
 }

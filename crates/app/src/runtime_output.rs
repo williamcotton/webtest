@@ -94,6 +94,9 @@ pub(crate) fn aborted_test_failure_report(
 ) -> FailureReport {
     let mut report = run_failure_report(error);
     let prior = match prior_outcome.map(|prior| *prior) {
+        Some(PriorTestOutcome::Verdict { kind, message }) => {
+            serde_json::json!({"kind":"verdict","verdict":kind,"message":message})
+        }
         Some(PriorTestOutcome::Failed(failure)) => serde_json::json!({
             "kind": "failed",
             "failure": step_failure_report(*failure, source),
@@ -467,6 +470,22 @@ pub(crate) fn event_reports<'a>(
                 event.attachment = Some(attachment.clone());
                 event
             }
+            ExecutionEvent::Semantic {
+                execution_id,
+                scope,
+                event: semantic,
+            } => {
+                let mut event = event_report(
+                    path,
+                    semantic.kind(),
+                    Some(*execution_id),
+                    scope.execution_context.test_id.map(|t| t.0),
+                    None,
+                );
+                event.scope = Some(scope.clone());
+                event.semantic = Some(semantic.clone());
+                event
+            }
             ExecutionEvent::Attempt {
                 execution_id,
                 scope,
@@ -741,7 +760,8 @@ pub(crate) fn event_reports<'a>(
                 event.outcome = Some(test_outcome_name(*outcome).into());
                 event.failure_class = *failure_class;
                 event.exit_class = Some(match outcome {
-                    TestOutcomeKind::Passed => ExitClass::Success,
+                    TestOutcomeKind::Skipped | TestOutcomeKind::Passed => ExitClass::Success,
+                    TestOutcomeKind::Inconclusive => ExitClass::TestFailure,
                     TestOutcomeKind::Failed
                     | TestOutcomeKind::TimedOut
                     | TestOutcomeKind::Cancelled => ExitClass::TestFailure,
@@ -841,6 +861,7 @@ fn event_report(
         event_sequence: None,
         timestamp: None,
         attempt: None,
+        semantic: None,
         resource_lifecycle: None,
         wait: None,
         scope: None,
@@ -871,6 +892,8 @@ fn event_report(
 
 const fn test_outcome_name(outcome: TestOutcomeKind) -> &'static str {
     match outcome {
+        TestOutcomeKind::Skipped => "skipped",
+        TestOutcomeKind::Inconclusive => "inconclusive",
         TestOutcomeKind::Passed => "passed",
         TestOutcomeKind::Failed => "failed",
         TestOutcomeKind::TimedOut => "timed_out",
@@ -923,6 +946,7 @@ mod tests {
         };
         let metadata = EventMetadata {
             execution_context: EventContext {
+                actor: None,
                 fixture: None,
                 test_declaration_id: None,
                 variant_id: None,
@@ -978,6 +1002,7 @@ mod tests {
         };
         let scope = ScopeEvent {
             execution_context: ExecutionContext {
+                actor: None,
                 fixture: None,
                 test_declaration_id: None,
                 variant_id: None,
@@ -1054,6 +1079,7 @@ mod tests {
         };
         let metadata = EventMetadata {
             execution_context: EventContext {
+                actor: None,
                 fixture: None,
                 test_declaration_id: None,
                 variant_id: None,

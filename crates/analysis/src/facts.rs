@@ -90,6 +90,8 @@ mod tests {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SymbolKind {
+    Guard,
+    Pattern,
     Module,
     Import,
     Test,

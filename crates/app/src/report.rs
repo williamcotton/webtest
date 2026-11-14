@@ -12,7 +12,7 @@ use webtest_project::Project;
 
 use crate::{error::AppError, project_context::normalized_path};
 
-pub(crate) const REPORT_SCHEMA_VERSION: u32 = 14;
+pub(crate) const REPORT_SCHEMA_VERSION: u32 = 15;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -129,6 +129,8 @@ pub struct DiagnosticReport {
 #[derive(Clone, Debug, Serialize)]
 pub struct TestReport {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub case_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub test_declaration_id: Option<webtest_model::TestDeclarationId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub variant_id: Option<webtest_model::TestVariantId>,
@@ -203,6 +205,7 @@ fn write_junit_branches(output: &mut dyn Write, test: &TestReport) -> io::Result
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TestReportOutcome {
+    Inconclusive,
     Passed,
     Failed,
     TimedOut,
@@ -214,6 +217,7 @@ pub enum TestReportOutcome {
 impl TestReportOutcome {
     const fn status(self) -> &'static str {
         match self {
+            Self::Inconclusive => "INCONCLUSIVE",
             Self::Passed => "ok",
             Self::Failed => "FAILED",
             Self::TimedOut => "TIMED OUT",
@@ -296,6 +300,7 @@ pub struct SummaryReport {
     pub files: usize,
     pub diagnostics: usize,
     pub tests: usize,
+    pub inconclusive: usize,
     pub passed: usize,
     pub failed: usize,
     pub timed_out: usize,
@@ -333,6 +338,8 @@ pub struct EventReport {
     pub timestamp: Option<webtest_observation::EventTime>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attempt: Option<webtest_observation::AttemptEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub semantic: Option<webtest_observation::SemanticEvent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_lifecycle: Option<webtest_observation::ResourceEvent>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -413,12 +420,14 @@ impl CommandReport {
         self.summary.tests = self.files.iter().map(|file| file.tests.len()).sum();
         self.summary.passed = 0;
         self.summary.failed = 0;
+        self.summary.inconclusive = 0;
         self.summary.timed_out = 0;
         self.summary.cancelled = 0;
         self.summary.skipped = 0;
         self.summary.aborted = 0;
         for test in self.files.iter().flat_map(|file| &file.tests) {
             match test.outcome {
+                TestReportOutcome::Inconclusive => self.summary.inconclusive += 1,
                 TestReportOutcome::Passed => self.summary.passed += 1,
                 TestReportOutcome::Failed => self.summary.failed += 1,
                 TestReportOutcome::TimedOut => self.summary.timed_out += 1,
@@ -771,7 +780,7 @@ impl CommandReport {
         let tests = self.summary.tests + static_cases + file_execution_errors + self.trace_errors();
         let failures = self.summary.failed + self.summary.timed_out + static_cases;
         let errors = self.summary.aborted + file_execution_errors + self.trace_errors();
-        let skipped = self.summary.cancelled + self.summary.skipped;
+        let skipped = self.summary.cancelled + self.summary.skipped + self.summary.inconclusive;
         writeln!(output, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>")?;
         writeln!(
             output,
@@ -812,6 +821,14 @@ impl CommandReport {
             for test in &file.tests {
                 let seconds = test.duration_nanos as f64 / 1_000_000_000.0;
                 match test.outcome {
+                    TestReportOutcome::Inconclusive => {
+                        writeln!(
+                            output,
+                            "    <testcase name=\"{}\" time=\"{seconds:.9}\"><properties><property name=\"webtest.verdict\" value=\"inconclusive\" /></properties><skipped type=\"webtest.inconclusive\" message=\"{}\" /></testcase>",
+                            xml(&test.name),
+                            xml(test.reason.as_deref().unwrap_or("inconclusive"))
+                        )?;
+                    }
                     TestReportOutcome::Passed => {
                         if test.branches.is_empty() {
                             writeln!(
@@ -839,7 +856,8 @@ impl CommandReport {
                         let (fallback_code, fallback_message) = match test.outcome {
                             TestReportOutcome::TimedOut => ("test_timeout", "test timed out"),
                             TestReportOutcome::Failed => ("test_failure", "test failed"),
-                            TestReportOutcome::Passed
+                            TestReportOutcome::Inconclusive
+                            | TestReportOutcome::Passed
                             | TestReportOutcome::Cancelled
                             | TestReportOutcome::Skipped
                             | TestReportOutcome::Aborted => {
@@ -1021,6 +1039,7 @@ mod tests {
             duration_nanos: 12,
             diagnostics: Vec::new(),
             tests: vec![TestReport {
+                case_label: None,
                 test_declaration_id: None,
                 variant_id: None,
                 branches: Vec::new(),
@@ -1108,6 +1127,7 @@ mod tests {
             diagnostics: Vec::new(),
             tests: vec![
                 TestReport {
+                    case_label: None,
                     test_declaration_id: None,
                     variant_id: None,
                     branches: Vec::new(),
@@ -1121,6 +1141,7 @@ mod tests {
                     failure: None,
                 },
                 TestReport {
+                    case_label: None,
                     test_declaration_id: None,
                     variant_id: None,
                     branches: Vec::new(),
@@ -1240,6 +1261,7 @@ mod tests {
             duration_nanos: 250_000_000,
             diagnostics: Vec::new(),
             tests: vec![TestReport {
+                case_label: None,
                 test_declaration_id: None,
                 variant_id: None,
                 branches: Vec::new(),
@@ -1345,7 +1367,7 @@ mod tests {
         assert_eq!(value["exit_class"], "test_failure");
         assert_eq!(
             String::from_utf8(json).expect("UTF-8 JSON"),
-            include_str!("../tests/fixtures/report-v14.json")
+            include_str!("../tests/fixtures/report-v15.json")
         );
 
         let mut events = Vec::new();
@@ -1357,7 +1379,7 @@ mod tests {
             let value: serde_json::Value = serde_json::from_str(line).expect("json line");
             assert_eq!(value["schema_version"], REPORT_SCHEMA_VERSION);
         }
-        assert_eq!(events, include_str!("../tests/fixtures/report-v14.jsonl"));
+        assert_eq!(events, include_str!("../tests/fixtures/report-v15.jsonl"));
     }
 
     #[test]
@@ -1384,11 +1406,11 @@ mod tests {
             ),
             (
                 Reporter::Json,
-                include_str!("../tests/fixtures/cancellation-v14.json"),
+                include_str!("../tests/fixtures/cancellation-v15.json"),
             ),
             (
                 Reporter::Events,
-                include_str!("../tests/fixtures/cancellation-v14.jsonl"),
+                include_str!("../tests/fixtures/cancellation-v15.jsonl"),
             ),
             (
                 Reporter::Junit,
@@ -1510,6 +1532,7 @@ mod tests {
             .take()
             .expect("execution error");
         report.files[0].tests = vec![TestReport {
+            case_label: None,
             test_declaration_id: None,
             variant_id: None,
             branches: Vec::new(),

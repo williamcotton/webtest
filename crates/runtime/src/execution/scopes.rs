@@ -181,7 +181,12 @@ impl ScopeFactory {
             deadline,
             matches!(
                 node.kind,
-                PlanNodeKind::Timeout { .. } | PlanNodeKind::ResourceScope { .. }
+                PlanNodeKind::Timeout { .. }
+                    | PlanNodeKind::ResourceScope { .. }
+                    | PlanNodeKind::Semantic {
+                        operation: webtest_plan::semantics::SemanticOperation::Guards { .. },
+                        ..
+                    }
             ),
         )
     }
@@ -229,6 +234,14 @@ impl ScopeFactory {
         let scope_id = ExecutionScopeId(self.ids.next());
         let event = ScopeEvent {
             execution_context: ExecutionContext {
+                actor: match &node.kind {
+                    PlanNodeKind::Semantic {
+                        operation:
+                            webtest_plan::semantics::SemanticOperation::ActorAccess { actor, .. },
+                        ..
+                    } => Some(*actor),
+                    _ => parent.and_then(|parent| parent.event.execution_context.actor),
+                },
                 fixture: parent
                     .and_then(|parent| parent.event.execution_context.fixture)
                     .or(self.fixture),
@@ -284,15 +297,17 @@ impl ScopeFactory {
         let mut debug_frames = parent.map_or_else(Vec::new, |parent| parent.debug_frames.clone());
         debug_frames.push(crate::DebugScope {
             display_name: match &node.kind {
+                PlanNodeKind::Semantic{operation:webtest_plan::semantics::SemanticOperation::ActorAccess{actor,name}|webtest_plan::semantics::SemanticOperation::ActorScope{actor,name,..},..}=>Some(format!("actor {name} ({actor})")),
+                PlanNodeKind::Semantic { operation, .. } => Some(operation.identity().into()),
                 PlanNodeKind::Helper { call, .. } => Some(format!("helper {}", call.name)),
                 _ => None,
             },
             scope: event.clone(),
             kind: match node.kind {
                 PlanNodeKind::Helper { .. } => crate::DebugScopeKind::Helper,
-                PlanNodeKind::Conditional { .. } | PlanNodeKind::Sequence { .. } => {
-                    crate::DebugScopeKind::Sequence
-                }
+                PlanNodeKind::Semantic { .. }
+                | PlanNodeKind::Conditional { .. }
+                | PlanNodeKind::Sequence { .. } => crate::DebugScopeKind::Sequence,
                 PlanNodeKind::Parallel { .. } => crate::DebugScopeKind::Parallel,
                 PlanNodeKind::Race { .. } => crate::DebugScopeKind::Race,
                 PlanNodeKind::Retry { .. } => crate::DebugScopeKind::Retry,

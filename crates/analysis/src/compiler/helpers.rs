@@ -17,6 +17,10 @@ impl Compiler<'_> {
             self.declared_names.clear();
             for parameter in &function.parameters {
                 let ty = self.lower_type(&parameter.annotation);
+                if ty == Type::BrowserActor {
+                    self.actors
+                        .insert(parameter.id, webtest_model::ActorId(parameter.symbol_id.0));
+                }
                 self.bindings.insert(
                     parameter.id,
                     BindingState {
@@ -40,7 +44,7 @@ impl Compiler<'_> {
                 }
                 self.provide_is_return = true;
                 self.provide_types = Some(Vec::new());
-                let _body = self.compile_sequence(
+                let body = self.compile_sequence(
                     webtest_model::PlanDeclarationId(function.id.0),
                     function.origin,
                     &function.body,
@@ -48,7 +52,7 @@ impl Compiler<'_> {
                     Vec::new(),
                 );
                 let returned = self.provide_types.take().unwrap_or_default();
-                if returned.is_empty() && expected != Type::Null {
+                if returned.is_empty() && !body.terminates_variant() && expected != Type::Null {
                     self.error(
                         function.name_origin.range,
                         "semantic.missing_helper_result",
@@ -64,6 +68,8 @@ impl Compiler<'_> {
             self.validating_declaration = false;
         }
         self.bindings.clear();
+        self.actors.clear();
+        self.cursors.clear();
         self.names.clear();
         self.declared_names.clear();
         self.next_step = 0;
@@ -374,6 +380,7 @@ impl Compiler<'_> {
         }
         let mut children = Vec::new();
         let mut call_arguments = Vec::new();
+        let mut actor_arguments = HashMap::new();
         let mut supplied = HashSet::new();
         let mut positional = 0;
         for argument in arguments {
@@ -401,6 +408,12 @@ impl Compiler<'_> {
                 );
             }
             let expected = self.lower_type(&parameter.annotation);
+            if expected == Type::BrowserActor {
+                if let Some(actor) = self.actor_reference(&argument.value) {
+                    actor_arguments.insert(parameter.id, actor);
+                }
+                continue;
+            }
             let value = self.infer_expr(&argument.value, domain, Some(&expected));
             self.expect_type(argument.value.origin.range, &expected, &value.ty);
             let temporary = webtest_model::BindingId(self.next_temporary);
@@ -437,6 +450,8 @@ impl Compiler<'_> {
             }
         }
         let result_type = self.lower_type(&function.result_type);
+        let outer_actors = std::mem::replace(&mut self.actors, actor_arguments);
+        let outer_cursors = std::mem::take(&mut self.cursors);
         let outer_bindings = std::mem::take(&mut self.bindings);
         let outer_names = std::mem::take(&mut self.names);
         let outer_declared = std::mem::take(&mut self.declared_names);
@@ -481,7 +496,7 @@ impl Compiler<'_> {
             body_path,
         );
         let returned = self.provide_types.take().unwrap_or_default();
-        if returned.is_empty() && result_type != Type::Null {
+        if returned.is_empty() && !body.terminates_variant() && result_type != Type::Null {
             self.error(
                 function.name_origin.range,
                 "semantic.missing_helper_result",
@@ -495,6 +510,8 @@ impl Compiler<'_> {
         self.module = old_module;
         self.revision = old_revision;
         self.bindings = outer_bindings;
+        self.actors = outer_actors;
+        self.cursors = outer_cursors;
         self.names = outer_names;
         self.declared_names = outer_declared;
         self.concurrent_captures = captures;

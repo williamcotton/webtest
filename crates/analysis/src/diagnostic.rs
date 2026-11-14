@@ -103,6 +103,8 @@ pub(crate) fn type_reference_name(ty: &Type) -> &'static str {
         Type::TempDirectory => "TempDirectory",
         Type::Locator => "Locator",
         Type::BrowserPage => "BrowserPage",
+        Type::BrowserActor => "BrowserActor",
+        Type::EventCursor => "EventCursor",
     }
 }
 

@@ -1,0 +1,18 @@
+pattern Named(expected: String) = subset {name: expected, password: absent}
+
+fn label(value: String) -> String = value
+
+test "case rows" cases [
+    case "Ada" {name: label("Ada")},
+    case "Grace" {name: label("Grace")}
+] as input {
+    check {
+        expect input matches Named(input.name)
+        expect input.name matches regex("^[A-Z][a-z]+$")
+        expect [1, 2, 3] matches each(range(1, 3))
+    }
+}
+
+test "precondition" {
+    assume false else skip "example is intentionally not applicable"
+}

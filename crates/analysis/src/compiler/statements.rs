@@ -38,6 +38,237 @@ impl Compiler<'_> {
             let mut child_path = path.clone();
             child_path.push(ordinal as u32);
             let node = match statement {
+                HirStmt::GuardScope(guard) => self.compile_guards(test, guard, domain, child_path),
+                HirStmt::Let(binding) if matches!(&binding.value.kind,HirExprKind::Call{callee,..} if matches!(&callee.kind,HirExprKind::Name(HirNameRef::Unresolved(name)) if name=="checkpoint")) =>
+                {
+                    self.record_capability(Capability::Browser);
+                    let HirExprKind::Call { arguments, .. } = &binding.value.kind else {
+                        unreachable!()
+                    };
+                    let actor = if arguments.len() == 1 {
+                        self.actor_reference(&arguments[0].value)
+                    } else {
+                        self.error(
+                            binding.value.origin.range,
+                            "semantic.checkpoint_arguments",
+                            "checkpoint requires exactly one actor".into(),
+                        );
+                        None
+                    }
+                    .unwrap_or_default();
+                    if self.names.contains_key(&binding.name) {
+                        self.error(
+                            binding.name_origin.range,
+                            "semantic.duplicate_binding",
+                            "binding already exists".into(),
+                        );
+                    }
+                    self.cursors.insert(binding.id, (actor, self.retry_depth));
+                    self.names.insert(binding.name.clone(), binding.name_origin);
+                    self.bindings.insert(
+                        binding.id,
+                        BindingState {
+                            name: binding.name.clone(),
+                            ty: Type::EventCursor,
+                            domain: Capability::Browser,
+                            provider_operation: None,
+                        },
+                    );
+                    self.type_fact(
+                        binding.name_origin.range,
+                        Type::EventCursor,
+                        Capability::Browser,
+                    );
+                    let mut steps = Vec::new();
+                    self.push_step(
+                        &mut steps,
+                        binding.value.origin,
+                        TestOperation::Reactive(
+                            webtest_plan::semantics::ReactiveOperation::Checkpoint {
+                                actor,
+                                binding: binding.id,
+                                name: binding.name.clone(),
+                            },
+                        ),
+                    );
+                    let mut node = webtest_plan::PlanNode::operation(
+                        test,
+                        self.revision,
+                        vec![],
+                        steps.remove(0),
+                    );
+                    node.rebase(test, child_path);
+                    node
+                }
+                HirStmt::Select(select) => self.compile_selection(test, select, domain, child_path),
+                HirStmt::Actor(actor) => {
+                    self.record_capability(Capability::Browser);
+                    let saved = self.bindings.clone();
+                    let names = self.names.clone();
+                    let actors = self.actors.clone();
+                    if self.names.contains_key(&actor.binding.name) {
+                        self.error(
+                            actor.binding.name_origin.range,
+                            "semantic.duplicate_binding",
+                            "actor name already declared".into(),
+                        );
+                    }
+                    let id = webtest_model::ActorId(webtest_hir::semantic_key(
+                        &test.0,
+                        "actor",
+                        &format!("{}:{:?}", actor.binding.name, child_path),
+                        0,
+                    ));
+                    self.actors.insert(actor.binding.id, id);
+                    self.names
+                        .insert(actor.binding.name.clone(), actor.binding.name_origin);
+                    self.bindings.insert(
+                        actor.binding.id,
+                        BindingState {
+                            name: actor.binding.name.clone(),
+                            ty: Type::BrowserActor,
+                            domain: Capability::Browser,
+                            provider_operation: None,
+                        },
+                    );
+                    self.type_fact(
+                        actor.binding.name_origin.range,
+                        Type::BrowserActor,
+                        Capability::Browser,
+                    );
+                    let body = self.compile_sequence(
+                        test,
+                        origin,
+                        &statements[ordinal + 1..],
+                        domain,
+                        vec![],
+                    );
+                    let sources = body.event_sources(id);
+                    self.bindings = saved;
+                    self.names = names;
+                    self.actors = actors;
+                    let mut node = webtest_plan::PlanNode::semantic(
+                        test,
+                        actor.origin,
+                        self.revision,
+                        vec![],
+                        webtest_plan::semantics::SemanticOperation::ActorScope {
+                            actor: id,
+                            name: actor.binding.name.clone(),
+                            sources,
+                        },
+                        vec![body],
+                    );
+                    node.rebase(test, child_path);
+                    children.push(node);
+                    break;
+                }
+                HirStmt::ActorBlock(block) => {
+                    let id = match &block.actor.kind {
+                        HirExprKind::Name(HirNameRef::Binding { id: binding, .. }) => {
+                            self.actors.get(binding).copied()
+                        }
+                        _ => None,
+                    };
+                    let Some(id) = id else {
+                        self.error(
+                            block.actor.origin.range,
+                            "semantic.expected_actor",
+                            "expected an actor declared in this lexical scope".into(),
+                        );
+                        continue;
+                    };
+                    self.type_fact(
+                        block.actor.origin.range,
+                        Type::BrowserActor,
+                        Capability::Browser,
+                    );
+                    let saved = self.bindings.clone();
+                    let names = self.names.clone();
+                    let body = self.compile_sequence(
+                        test,
+                        block.origin,
+                        &block.statements,
+                        Capability::Browser,
+                        vec![],
+                    );
+                    self.bindings = saved;
+                    self.names = names;
+                    let mut node = webtest_plan::PlanNode::semantic(
+                        test,
+                        block.origin,
+                        self.revision,
+                        vec![],
+                        webtest_plan::semantics::SemanticOperation::ActorAccess {
+                            actor: id,
+                            name: match &block.actor.kind {
+                                HirExprKind::Name(HirNameRef::Binding { id: binding, .. }) => self
+                                    .bindings
+                                    .get(binding)
+                                    .map(|b| b.name.clone())
+                                    .unwrap_or_default(),
+                                _ => String::new(),
+                            },
+                        },
+                        vec![body],
+                    );
+                    node.rebase(test, child_path);
+                    node
+                }
+
+                HirStmt::Check(block) => {
+                    let saved = self.bindings.clone();
+                    let names = self.names.clone();
+                    let body = self.compile_sequence(
+                        test,
+                        block.origin,
+                        &block.statements,
+                        domain,
+                        Vec::new(),
+                    );
+                    self.bindings = saved;
+                    self.names = names;
+                    let webtest_plan::PlanNodeKind::Sequence { children } = body.kind else {
+                        unreachable!()
+                    };
+                    let mut node = webtest_plan::PlanNode::semantic(
+                        test,
+                        block.origin,
+                        self.revision,
+                        Vec::new(),
+                        webtest_plan::semantics::SemanticOperation::Check {
+                            continuation:
+                                webtest_plan::semantics::CheckContinuation::AssertionsOnly,
+                        },
+                        children,
+                    );
+                    node.rebase(test, child_path);
+                    node
+                }
+                HirStmt::Assume(assume) => {
+                    let condition = self.infer_expr(&assume.condition, domain, Some(&Type::Bool));
+                    self.expect_type(assume.condition.origin.range, &Type::Bool, &condition.ty);
+                    let mut steps = Vec::new();
+                    self.compile_verdict(&assume.verdict, domain, &mut steps);
+                    let children = steps
+                        .into_iter()
+                        .map(|step| {
+                            webtest_plan::PlanNode::operation(test, self.revision, Vec::new(), step)
+                        })
+                        .collect();
+                    let mut node = webtest_plan::PlanNode::semantic(
+                        test,
+                        assume.origin,
+                        self.revision,
+                        Vec::new(),
+                        webtest_plan::semantics::SemanticOperation::Assume {
+                            condition: condition.expression,
+                        },
+                        children,
+                    );
+                    node.rebase(test, child_path);
+                    node
+                }
                 HirStmt::Parallel(block) => self.compile_concurrent(
                     test,
                     ConcurrentInput {
@@ -297,6 +528,10 @@ impl Compiler<'_> {
             self.bindings = bindings.clone();
             self.names = names.clone();
             let origin = match branch {
+                HirStmt::Select(select) => select.origin,
+                HirStmt::GuardScope(guard) => guard.origin,
+                HirStmt::ActorBlock(block) => block.origin,
+                HirStmt::Check(block) => block.origin,
                 HirStmt::Server(block) => block.origin,
                 HirStmt::Browser(block) => block.origin,
                 HirStmt::Timeout(block) => block.origin,
@@ -325,11 +560,16 @@ impl Compiler<'_> {
                 domain,
                 child_path,
             );
-            if !child.required_resources().is_empty() && domain == Capability::Browser {
+            if child
+                .required_resources()
+                .iter()
+                .any(|usage| usage.resource == webtest_plan::ResourceReference::BrowserContext)
+                && domain == Capability::Browser
+            {
                 self.error(origin.range, "semantic.concurrent_resource_conflict", "concurrent browser operations require a lexical browser block in a flow domain; the enclosing browser context is exclusive".into());
             }
             let provides = self.provide_types.take().unwrap_or_default();
-            if block.binding.is_some() && provides.is_empty() {
+            if block.binding.is_some() && provides.is_empty() && !child.terminates_variant() {
                 self.error(
                     origin.range,
                     "semantic.missing_race_result",
@@ -427,7 +667,17 @@ impl Compiler<'_> {
         steps: &mut Vec<PlannedStep>,
     ) {
         match statement {
-            HirStmt::Timeout(_) | HirStmt::Retry(_) | HirStmt::Parallel(_) | HirStmt::Race(_) => {
+            HirStmt::Verdict(verdict) => self.compile_verdict(verdict, domain, steps),
+            HirStmt::GuardScope(_)
+            | HirStmt::Select(_)
+            | HirStmt::Actor(_)
+            | HirStmt::ActorBlock(_)
+            | HirStmt::Check(_)
+            | HirStmt::Assume(_)
+            | HirStmt::Timeout(_)
+            | HirStmt::Retry(_)
+            | HirStmt::Parallel(_)
+            | HirStmt::Race(_) => {
                 unreachable!("control nodes compile through the execution tree")
             }
             HirStmt::Server(block) => {
@@ -712,19 +962,12 @@ impl Compiler<'_> {
         {
             if *operator == BinaryOperator::Matches {
                 let actual = self.infer_expr(left, domain, None);
-                let pattern = self.pattern_type(right);
-                if actual.ty != Type::Json && !matches!(actual.ty, Type::Record(_)) {
-                    self.error(
-                        left.origin.range,
-                        "semantic.invalid_matcher",
-                        format!("`matches` requires Json or a record, got {}", actual.ty),
-                    );
-                }
+                let pattern = self.compile_matcher(right, domain, false, 0);
                 (
                     ValueMatcher::Matches,
                     actual.expression,
-                    Some(PlanExpr::Type(pattern.clone())),
-                    pattern,
+                    Some(PlanExpr::Pattern(Box::new(pattern))),
+                    actual.ty,
                 )
             } else {
                 let left = self.infer_expr(left, domain, None);
@@ -775,6 +1018,34 @@ impl Compiler<'_> {
             .and_then(|binding| binding.provider_operation.clone())
     }
 
+    fn compile_verdict(
+        &mut self,
+        verdict: &webtest_hir::HirVerdict,
+        domain: Capability,
+        steps: &mut Vec<PlannedStep>,
+    ) {
+        if self.in_fixture_teardown {
+            self.error(
+                verdict.origin.range,
+                "semantic.verdict_in_teardown",
+                "terminating verdicts are not allowed during fixture teardown".into(),
+            );
+        }
+        let message = verdict.message.as_ref().map(|expr| {
+            let value = self.infer_expr(expr, domain, Some(&Type::String));
+            self.expect_type(expr.origin.range, &Type::String, &value.ty);
+            value.expression
+        });
+        self.record_capability(Capability::Test);
+        self.push_step(
+            steps,
+            verdict.origin,
+            TestOperation::Verdict {
+                verdict: verdict.kind,
+                message,
+            },
+        );
+    }
     pub(super) fn push_step(
         &mut self,
         steps: &mut Vec<PlannedStep>,
@@ -806,6 +1077,35 @@ pub(super) fn collect_binding_names(statement: &HirStmt, names: &mut HashSet<Str
                 collect_binding_names(statement, names);
             }
         }
+        HirStmt::Check(block) => {
+            for statement in &block.statements {
+                collect_binding_names(statement, names);
+            }
+        }
+        HirStmt::GuardScope(guard) => {
+            for stmt in &guard.statements {
+                collect_binding_names(stmt, names);
+            }
+        }
+        HirStmt::Select(select) => {
+            if let Some(binding) = &select.binding {
+                names.insert(binding.name.clone());
+            }
+            for arm in &select.arms {
+                for stmt in &arm.statements {
+                    collect_binding_names(stmt, names);
+                }
+            }
+        }
+        HirStmt::Actor(actor) => {
+            names.insert(actor.binding.name.clone());
+        }
+        HirStmt::ActorBlock(block) => {
+            for s in &block.statements {
+                collect_binding_names(s, names);
+            }
+        }
+        HirStmt::Verdict(_) | HirStmt::Assume(_) => (),
         HirStmt::Retry(block) => {
             for statement in &block.statements {
                 collect_binding_names(statement, names);

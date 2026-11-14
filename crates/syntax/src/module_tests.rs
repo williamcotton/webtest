@@ -81,3 +81,43 @@ fn declarations_recover_from_invalid_and_half_typed_input_without_losing_text() 
     );
     assert_eq!(ast::Root::cast(parsed.syntax()).unwrap().tests().count(), 1);
 }
+
+#[test]
+fn case_and_pattern_syntax_is_lossless_and_recovers_partial_sources() {
+    for source in [
+        "test \"é\" cases [case \"one\" {value: 1},case \"two\" {value: 2}] as case { expect case.value > 0 }",
+        "export pattern User(email: String) = subset {email: email, id: Int, password: absent}",
+        "pattern Point = exact {x: range(0,10),y: one_of(1,2)}",
+    ] {
+        let parsed = crate::parse(source);
+        assert!(
+            parsed.errors().is_empty(),
+            "{source}: {:?}",
+            parsed.errors()
+        );
+        assert_eq!(parsed.syntax().text().to_string(), source);
+    }
+    for source in [
+        "test \"x\" cases [case",
+        "test \"x\" cases [case {}] as",
+        "pattern A = subset {",
+        "export pattern A(x:",
+    ] {
+        let parsed = crate::parse(source);
+        assert!(!parsed.errors().is_empty());
+        assert_eq!(parsed.syntax().text().to_string(), source);
+    }
+}
+
+#[test]
+fn reactive_constructs_preserve_unicode_and_recover_half_typed_input() {
+    for source in [
+        "guard clean(actor: BrowserActor){when actor.console.error(e){fail e.message}} test \"é😀\" cases [case \"日本語\" {name: \"Ada\"}] as input {actor alice browser let mark=checkpoint(alice) select alice since mark within 1s {when network.response(r) if r.status==200 {pass} timeout {skip \"offline\"}}}",
+        "guard clean(actor: BrowserActor){when actor.",
+        "test \"partial\" {actor alice browser select alice since mark within",
+        "test \"partial\" {with guards [clean(",
+    ] {
+        let parsed = crate::parse(source);
+        assert_eq!(parsed.syntax().text().to_string(), source);
+    }
+}

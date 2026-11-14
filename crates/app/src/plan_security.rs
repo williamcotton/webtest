@@ -157,9 +157,10 @@ impl Policy<'_> {
                     }
                     Ok(Provenance::default())
                 }
-                TestOperation::Browser(_) | TestOperation::Assertion(_) => {
-                    Ok(Provenance::default())
-                }
+                TestOperation::Reactive(_)
+                | TestOperation::Verdict { .. }
+                | TestOperation::Browser(_)
+                | TestOperation::Assertion(_) => Ok(Provenance::default()),
             },
             PlanNodeKind::Helper { call, body } => {
                 let mut locals = call
@@ -190,7 +191,7 @@ impl Policy<'_> {
                 }
                 Ok(Provenance::default())
             }
-            PlanNodeKind::Sequence { children } => {
+            PlanNodeKind::Semantic { children, .. } | PlanNodeKind::Sequence { children } => {
                 let mut result = Provenance::default();
                 for child in children {
                     result = result.merge(self.node(child, bindings)?);

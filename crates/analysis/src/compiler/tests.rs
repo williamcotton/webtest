@@ -1041,3 +1041,72 @@ fn race_infers_numeric_and_nullable_compatible_types_in_either_branch_order() {
         plan.validate_tree().unwrap();
     }
 }
+
+#[test]
+fn cases_expand_pure_helpers_with_stable_label_identity_and_one_schema() {
+    let source = r#"fn two(value: Int) -> Int = value * 2
+    test "rows" cases [case "α" {value: two(1)}, case "β" {value: 4}] as input { expect input.value > 0 }"#;
+    let (diagnostics, plan) = analyze(source);
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    assert_eq!(plan.tests.len(), 2);
+    assert_ne!(plan.tests[0].id, plan.tests[1].id);
+    plan.validate_tree().unwrap();
+    let (diagnostics, reordered) = analyze(&source.replace(
+        "case \"α\" {value: two(1)}, case \"β\" {value: 4}",
+        "case \"β\" {value: 999}, case \"α\" {value: two(1)}",
+    ));
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    assert_eq!(plan.tests[0].variant_id, reordered.tests[1].variant_id);
+    assert_eq!(plan.tests[1].variant_id, reordered.tests[0].variant_id);
+    for (source, code) in [
+        (
+            r#"test "x" cases [case "a" {v: 1}, case "a" {v: 2}] as input {}"#,
+            "semantic.duplicate_case_label",
+        ),
+        (
+            r#"test "x" cases [case "a" {v: 1}, case "b" {v: "bad"}] as input {}"#,
+            "semantic.case_type_mismatch",
+        ),
+        (r#"test "x" cases [] as input {}"#, "semantic.invalid_cases"),
+        (
+            r#"test "x" cases [case "a" {v: http.get("/")}] as input {}"#,
+            "semantic.effectful_expression",
+        ),
+    ] {
+        let (diagnostics, _) = analyze(source);
+        assert!(
+            diagnostics.iter().any(|d| d.code == code),
+            "{source}: {diagnostics:?}"
+        );
+    }
+}
+#[test]
+fn pattern_algebra_is_typed_bounded_and_serializable() {
+    let source = r#"pattern Id = all_of(Int, range(1, 99))
+    pattern User(email: String) = subset {id: Id, email: email, roles: each(String), password: absent, alias: optional(String)}
+    test "matches" { expect {id: 7, email: "a", roles: ["user"]} matches User("a") expect "abc" matches regex("^[a-z]+$") let ok = 2 matches one_of(1,2) expect ok }"#;
+    let (diagnostics, plan) = analyze(source);
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    plan.validate_tree().unwrap();
+    let encoded = serde_json::to_value(&plan).unwrap();
+    assert!(encoded.to_string().contains("reference"));
+    let source = r#"pattern Loop = Loop test "x" { expect 1 matches Loop }"#;
+    assert!(
+        analyze(source)
+            .0
+            .iter()
+            .any(|d| d.code == "semantic.recursive_pattern")
+    );
+    assert!(
+        analyze(r#"pattern Bad = regex("[") test "x" {}"#)
+            .0
+            .iter()
+            .any(|d| d.code == "semantic.invalid_regex")
+    );
+    assert!(
+        analyze(r#"test "x" { expect 1 matches absent }"#)
+            .0
+            .iter()
+            .any(|d| d.code == "semantic.invalid_pattern_position")
+    );
+}

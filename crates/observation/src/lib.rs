@@ -20,6 +20,8 @@ mod journal;
 pub use event_metadata::{EventContext, EventMetadata};
 mod resource;
 mod scope;
+mod semantic;
+pub use semantic::SemanticEvent;
 mod wait;
 pub use journal::{
     EVENT_JOURNAL_SCHEMA_VERSION, EventIdentity, EventJournal, EventSequence, EventTime,
@@ -95,6 +97,11 @@ pub enum RuntimeFailureCode {
     TestTimeout,
     JsonDecodeFailed,
     ResponseDecodeFailed,
+    SelectionTimeout,
+    EventOverflow,
+    EventCursorExpired,
+    PatternLimitExceeded,
+
     DivisionByZero,
     IntegerOverflow,
     InternalError,
@@ -161,6 +168,11 @@ impl RuntimeFailureCode {
             Self::TestTimeout => "test_timeout",
             Self::JsonDecodeFailed => "json_decode_failed",
             Self::ResponseDecodeFailed => "response_decode_failed",
+            Self::SelectionTimeout => "selection_timeout",
+            Self::EventOverflow => "event_overflow",
+            Self::EventCursorExpired => "event_cursor_expired",
+            Self::PatternLimitExceeded => "pattern_limit_exceeded",
+
             Self::DivisionByZero => "division_by_zero",
             Self::IntegerOverflow => "integer_overflow",
             Self::InternalError => "internal_error",
@@ -227,6 +239,11 @@ impl RuntimeFailureCode {
             Self::TestTimeout => "runtime.test_timeout",
             Self::JsonDecodeFailed => "runtime.json_decode_failed",
             Self::ResponseDecodeFailed => "runtime.response_decode_failed",
+            Self::SelectionTimeout => "runtime.selection_timeout",
+            Self::EventOverflow => "runtime.event_overflow",
+            Self::EventCursorExpired => "runtime.event_cursor_expired",
+            Self::PatternLimitExceeded => "runtime.pattern_limit_exceeded",
+
             Self::DivisionByZero => "runtime.division_by_zero",
             Self::IntegerOverflow => "runtime.integer_overflow",
             Self::InternalError => "runtime.internal_error",
@@ -293,6 +310,11 @@ impl RuntimeFailureCode {
             "test_timeout" => Some(Self::TestTimeout),
             "json_decode_failed" => Some(Self::JsonDecodeFailed),
             "response_decode_failed" => Some(Self::ResponseDecodeFailed),
+            "selection_timeout" => Some(Self::SelectionTimeout),
+            "event_overflow" => Some(Self::EventOverflow),
+            "event_cursor_expired" => Some(Self::EventCursorExpired),
+            "pattern_limit_exceeded" => Some(Self::PatternLimitExceeded),
+
             "division_by_zero" => Some(Self::DivisionByZero),
             "integer_overflow" => Some(Self::IntegerOverflow),
             "internal_error" => Some(Self::InternalError),
@@ -324,6 +346,10 @@ impl RuntimeFailureCode {
             Self::AssertionFailed
             | Self::JsonDecodeFailed
             | Self::ResponseDecodeFailed
+            | Self::SelectionTimeout
+            | Self::EventOverflow
+            | Self::EventCursorExpired
+            | Self::PatternLimitExceeded
             | Self::DivisionByZero
             | Self::IntegerOverflow => &["assertion.value"],
             _ => &[],
@@ -424,6 +450,14 @@ impl<'de> serde::Deserialize<'de> for RuntimeFailureCode {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ValueDiff {
+    Check {
+        failures: Vec<CheckAssertion>,
+        total: usize,
+        truncated: bool,
+    },
+    Pattern {
+        report: webtest_model::MatchReport,
+    },
     Scalar {
         expected: Option<String>,
         actual: String,
@@ -461,6 +495,8 @@ pub enum SkipReason {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TestOutcomeKind {
+    Skipped,
+    Inconclusive,
     Passed,
     Failed,
     TimedOut,
@@ -744,6 +780,11 @@ impl RuntimeFailure {
     deny_unknown_fields
 )]
 pub enum ExecutionEvent {
+    Semantic {
+        execution_id: ExecutionId,
+        scope: ScopeEvent,
+        event: SemanticEvent,
+    },
     FixtureAcquired {
         execution_id: ExecutionId,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -908,7 +949,8 @@ pub enum ExecutionEvent {
 impl ExecutionEvent {
     pub const fn execution_id(&self) -> ExecutionId {
         match self {
-            Self::FixtureAcquired { execution_id, .. }
+            Self::Semantic { execution_id, .. }
+            | Self::FixtureAcquired { execution_id, .. }
             | Self::OutputCaptured { execution_id, .. }
             | Self::CancellationRequested { execution_id, .. }
             | Self::ScopeAborted { execution_id, .. }
@@ -940,7 +982,8 @@ impl ExecutionEvent {
             Self::ProviderCallFailed { code, .. } | Self::CleanupFailed { code, .. } => Some(*code),
             Self::StepFailed { failure, .. } => Some(failure.code()),
             Self::TestTimedOut { .. } => Some(RuntimeFailureCode::TestTimeout),
-            Self::FixtureAcquired { .. }
+            Self::Semantic { .. }
+            | Self::FixtureAcquired { .. }
             | Self::OutputCaptured { .. }
             | Self::CancellationRequested { .. }
             | Self::AttachmentCreated { .. }
@@ -2091,4 +2134,11 @@ mod failure_code_tests {
         assert_eq!(RuntimeFailureCode::from(&alternate), C::AppProviderFailure);
         assert!(RuntimeFailureCode::from_short_code("another_dynamic_code").is_none());
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CheckAssertion {
+    pub origin: SyntaxOrigin,
+    pub source_revision: SourceRevision,
+    pub failure: Box<RuntimeFailure>,
 }

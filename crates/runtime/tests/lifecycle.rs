@@ -409,6 +409,8 @@ fn test_capabilities(
                 capabilities.insert(Capability::Test);
             }
             TestOperation::EvaluatePure(_)
+            | TestOperation::Reactive(_)
+            | TestOperation::Verdict { .. }
             | TestOperation::Provide(_)
             | TestOperation::Return(_) => {}
         }
@@ -850,7 +852,8 @@ fn event_names(events: &[ExecutionEvent]) -> Vec<&'static str> {
         .filter(|event| {
             !matches!(
                 event,
-                ExecutionEvent::FixtureAcquired { .. }
+                ExecutionEvent::Semantic { .. }
+                    | ExecutionEvent::FixtureAcquired { .. }
                     | ExecutionEvent::OutputCaptured { .. }
                     | ExecutionEvent::CancellationRequested { .. }
                     | ExecutionEvent::ScopeAborted { .. }
@@ -862,7 +865,8 @@ fn event_names(events: &[ExecutionEvent]) -> Vec<&'static str> {
             )
         })
         .map(|event| match event {
-            ExecutionEvent::FixtureAcquired { .. }
+            ExecutionEvent::Semantic { .. }
+            | ExecutionEvent::FixtureAcquired { .. }
             | ExecutionEvent::OutputCaptured { .. }
             | ExecutionEvent::CancellationRequested { .. }
             | ExecutionEvent::ScopeAborted { .. }

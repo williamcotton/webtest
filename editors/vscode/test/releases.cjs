@@ -4,7 +4,7 @@ const { createHash } = require('node:crypto');
 const { platformTarget, parseManifest, verifyBinary, managedBinary } = require('../out/releases');
 const data = Buffer.from('binary');
 const artifact = { name: 'webtest-0.1.0-aarch64-apple-darwin.bin', target: 'aarch64-apple-darwin', kind: 'binary', bytes: data.length, sha256: createHash('sha256').update(data).digest('hex') };
-const manifest = () => ({ schema: 1, version: '0.1.0', compatibility: { plan_format: 10, event_schema: 14, worker_protocol: 1, wasm_editor_api: 1, app_bridge_protocol: [1] }, artifacts: [{ ...artifact }] });
+const manifest = () => ({ schema: 1, version: '0.1.0', compatibility: { plan_format: 11, event_schema: 15, worker_protocol: 1, wasm_editor_api: 1, app_bridge_protocol: [1] }, artifacts: [{ ...artifact }] });
 test('tier 1 platform mapping and unsupported platform errors', () => {
     assert.equal(platformTarget('darwin','arm64'), 'aarch64-apple-darwin');
     assert.equal(platformTarget('linux','x64'), 'x86_64-unknown-linux-gnu');

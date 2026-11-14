@@ -1231,7 +1231,12 @@ Acceptance: multi-file projects remain responsive, provider schemas invalidate c
 
 Acceptance: native, Cursor/VS Code, and Monaco experiences agree on syntax, static description, formatting, structured diagnostics/repair hints, semantic tokens, test identities, and compiled plans; live browser inspection remains an explicit native capability.
 
+The locally implemented portable editor/release-preparation scope is complete.
+External platform release acceptance and publication have moved to Milestone J.
+
 ### [Milestone H — Test Modeling and Reactive Workflows](./milestone-h.md)
+
+Implementation complete (2026-11-14); acceptance evidence is recorded in the milestone specification.
 
 - statically expanded, explicitly labeled test cases with stable independently runnable/debuggable `TestVariantId`s;
 - reusable typed pattern declarations with a deterministic serializable matcher algebra and path-aware structured diffs;
@@ -1243,6 +1248,17 @@ Acceptance: native, Cursor/VS Code, and Monaco experiences agree on syntax, stat
 - end-to-end plan, runtime event, trace, reporter, editor, DAP, C.5 description, and native/WASM static support for all Milestone H concepts.
 
 Acceptance: WebTest can model independently reportable test data, reusable acceptable-value structures, multiple isolated browser participants, accumulated assertions, explicit semantic outcomes, persistent scoped invariants, and bounded asynchronous browser-event behavior while preserving deterministic plans, lost-event prevention, structured ownership/cancellation, source mapping, redaction, and one shared Rust semantic implementation. Existing `race` behavior remains unchanged and no raw CDP events, arbitrary callbacks, or detached tasks enter the language.
+
+
+### [Milestone J — Release acceptance and publication](./milestone-j.md)
+
+Finish the external release work deferred from G: five-platform clean installs,
+signed manifest/provenance/SBOM validation, server upgrade/rollback, container
+sandbox/artifact ownership, protected publishing, npm/VSIX/registry releases and
+Homebrew/WinGet submissions. Validate the final H/I compatibility versions.
+
+Acceptance: all required platform/package/container rehearsals pass and verified
+artifacts are published with exact compatibility and source-provenance evidence.
 
 ---
 

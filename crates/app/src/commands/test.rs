@@ -33,6 +33,7 @@ pub(crate) async fn run_test(
     reporter: TestReporter,
     jobs: JobLimit,
     variants: Vec<webtest_model::TestVariantId>,
+    declarations: Vec<webtest_model::TestDeclarationId>,
 ) -> Result<ExitClass, AppError> {
     let project = project(&paths)?;
     let mut report = base_report("test", &project);
@@ -86,6 +87,21 @@ pub(crate) async fn run_test(
             .iter()
             .any(|diagnostic| diagnostic.severity == "error");
         prepared.push((file, analyzed, started.elapsed(), has_static_errors));
+    }
+    let mut variants = variants;
+    for declaration in declarations {
+        let found = prepared
+            .iter()
+            .flat_map(|(_, analyzed, _, _)| &analyzed.plan.tests)
+            .filter(|test| test.test_declaration_id == declaration)
+            .map(|test| test.variant_id)
+            .collect::<Vec<_>>();
+        if found.is_empty() {
+            return Err(AppError::usage(format!(
+                "unknown test declaration `{declaration}`"
+            )));
+        }
+        variants.extend(found);
     }
     if !variants.is_empty() {
         let selected = variants
@@ -500,6 +516,8 @@ fn run_error_exit_class(error: &RunError) -> ExitClass {
 fn cancellation_reason_name(reason: webtest_runtime::CancellationReason) -> &'static str {
     match reason {
         webtest_runtime::CancellationReason::UserCancelled => "user_cancelled",
+        webtest_runtime::CancellationReason::Verdict => "verdict",
+        webtest_runtime::CancellationReason::GuardFailed => "guard_failed",
         webtest_runtime::CancellationReason::ParentFailed => "parent_failed",
         webtest_runtime::CancellationReason::RaceLost => "race_lost",
         webtest_runtime::CancellationReason::Timeout => "timeout",
@@ -566,6 +584,27 @@ fn test_report(
     let test_declaration_id = test.test_declaration_id;
     let variant_id = test.variant_id;
     let (outcome, failure_class, reason, timeout_nanos, failure, exit_class) = match test.outcome {
+        TestOutcome::Verdict { kind, message } => {
+            use webtest_model::VerdictKind as V;
+            let failed = matches!(kind, V::Fail | V::Inconclusive);
+            (
+                match kind {
+                    V::Pass => TestReportOutcome::Passed,
+                    V::Fail => TestReportOutcome::Failed,
+                    V::Skipped => TestReportOutcome::Skipped,
+                    V::Inconclusive => TestReportOutcome::Inconclusive,
+                },
+                failed.then_some(FailureClass::Test),
+                Some(message),
+                None,
+                None,
+                if failed {
+                    ExitClass::TestFailure
+                } else {
+                    ExitClass::Success
+                },
+            )
+        }
         TestOutcome::Passed => (
             TestReportOutcome::Passed,
             None,
@@ -675,6 +714,11 @@ fn test_report(
         }
     };
     TestReport {
+        case_label: plan
+            .tests
+            .iter()
+            .find(|planned| planned.id == test_id)
+            .and_then(|planned| planned.case_label.clone()),
         test_declaration_id: Some(test_declaration_id),
         variant_id: Some(variant_id),
         branches: test

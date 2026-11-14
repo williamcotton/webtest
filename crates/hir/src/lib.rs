@@ -24,12 +24,23 @@ pub struct HirFile {
     pub module_id: ModuleId,
     pub imports: Vec<HirImport>,
     pub functions: Vec<HirFunction>,
+    pub patterns: Vec<HirPattern>,
+    pub guards: Vec<HirGuard>,
     pub fixtures: Vec<HirFixture>,
     pub tests: Vec<HirTest>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct HirCase {
+    pub label: String,
+    pub value: HirExpr,
+    pub origin: SyntaxOrigin,
+    pub label_origin: SyntaxOrigin,
+}
+#[derive(Clone, Debug, PartialEq)]
 pub struct HirTest {
+    pub cases: Option<Vec<HirCase>>,
+    pub case_binding: Option<HirResultBinding>,
     pub declaration_id: TestDeclarationId,
     pub variant_id: TestVariantId,
     pub id: TestId,
@@ -40,6 +51,13 @@ pub struct HirTest {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum HirStmt {
+    GuardScope(HirGuardScope),
+    Select(HirSelect),
+    Actor(HirActor),
+    ActorBlock(HirActorBlock),
+    Check(HirCheck),
+    Verdict(HirVerdict),
+    Assume(HirAssume),
     Timeout(HirTimeout),
     Retry(HirRetry),
     Parallel(HirParallel),
@@ -53,6 +71,52 @@ pub enum HirStmt {
     BrowserOperation(HirBrowserOp),
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct HirSelect {
+    pub actor: HirExpr,
+    pub cursor: Option<HirExpr>,
+    pub duration: Option<Duration>,
+    pub arms: Vec<HirEventArm>,
+    pub timeouts: Vec<Vec<HirStmt>>,
+    pub binding: Option<HirResultBinding>,
+    pub origin: SyntaxOrigin,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct HirEventArm {
+    pub source: HirExpr,
+    pub binding: Option<HirResultBinding>,
+    pub filter: Option<HirExpr>,
+    pub statements: Vec<HirStmt>,
+    pub origin: SyntaxOrigin,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct HirActor {
+    pub binding: HirResultBinding,
+    pub origin: SyntaxOrigin,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct HirActorBlock {
+    pub actor: HirExpr,
+    pub statements: Vec<HirStmt>,
+    pub origin: SyntaxOrigin,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct HirCheck {
+    pub statements: Vec<HirStmt>,
+    pub origin: SyntaxOrigin,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct HirVerdict {
+    pub kind: webtest_model::VerdictKind,
+    pub message: Option<HirExpr>,
+    pub origin: SyntaxOrigin,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct HirAssume {
+    pub condition: HirExpr,
+    pub verdict: HirVerdict,
+    pub origin: SyntaxOrigin,
+}
 #[derive(Clone, Debug, PartialEq)]
 pub struct HirRace {
     pub branches: Vec<HirStmt>,
@@ -202,8 +266,16 @@ pub struct HirLocator {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum HirLocatorKind {
+    Dynamic {
+        template: Box<HirLocatorKind>,
+        value: Box<HirExpr>,
+        name: Option<Box<HirExpr>>,
+    },
     Id(String),
-    Role { role: String, name: Option<String> },
+    Role {
+        role: String,
+        name: Option<String>,
+    },
     Label(String),
     Text(String),
     Placeholder(String),
@@ -247,6 +319,10 @@ pub struct HirExpr {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum HirExprKind {
+    PatternRecord {
+        exact: bool,
+        record: Box<HirExpr>,
+    },
     FixtureUse(Box<HirExpr>),
     Literal(HirLiteral),
     Name(HirNameRef),
@@ -396,12 +472,39 @@ fn lower_test(
         bindings: HashMap::new(),
         next_binding: *next_binding,
     };
+    let cases = test.cases().map(|cases| {
+        cases
+            .cases()
+            .filter_map(|case| {
+                let label = case.label()?;
+                Some(HirCase {
+                    label: label.value()?,
+                    value: lower_expr(&context, case.value()?)?,
+                    origin: origin(file, case.syntax()),
+                    label_origin: SyntaxOrigin::new(file, label.syntax().text_range()),
+                })
+            })
+            .collect()
+    });
+    let case_binding = test.cases().and_then(|cases| cases.binding()).map(|name| {
+        let id = BindingId(context.next_binding);
+        context.next_binding += 1;
+        context.bindings.insert(name.text().into(), id);
+        HirResultBinding {
+            id,
+            name: name.text().into(),
+            annotation: None,
+            name_origin: SyntaxOrigin::new(file, name.text_range()),
+        }
+    });
     let body = test
         .statements()
         .filter_map(|statement| lower_flow_statement(&mut context, statement))
         .collect();
     *next_binding = context.next_binding;
     Some(HirTest {
+        cases,
+        case_binding,
         declaration_id: TestDeclarationId::default(),
         variant_id: TestVariantId::default(),
         id: TestId(id),
@@ -413,6 +516,21 @@ fn lower_test(
 
 fn lower_flow_statement(context: &mut LowerContext, statement: FlowStatement) -> Option<HirStmt> {
     match statement {
+        FlowStatement::GuardScope(guard) => Some(HirStmt::GuardScope(HirGuardScope {
+            activations: lower_expr(context, guard.activations()?)?,
+            statements: lower_event_body(context, guard.body()?, true),
+            origin: origin(context.file, guard.syntax()),
+        })),
+        FlowStatement::Select(select) => {
+            lower_select(context, select, true, None).map(HirStmt::Select)
+        }
+        FlowStatement::Actor(actor) => lower_actor(context, actor).map(HirStmt::Actor),
+        FlowStatement::ActorBlock(block) => {
+            lower_actor_block(context, block).map(HirStmt::ActorBlock)
+        }
+        FlowStatement::Check(block) => Some(HirStmt::Check(lower_check(context, block, true))),
+        FlowStatement::Verdict(stmt) => lower_verdict(context, stmt).map(HirStmt::Verdict),
+        FlowStatement::Assume(stmt) => lower_assume(context, stmt).map(HirStmt::Assume),
         FlowStatement::Race(statement) => {
             lower_race(context, statement, true, None).map(HirStmt::Race)
         }
@@ -450,7 +568,9 @@ fn lower_flow_statement(context: &mut LowerContext, statement: FlowStatement) ->
             }))
         }
         FlowStatement::Let(statement) => {
-            if let Some(race) = statement.race() {
+            if let Some(select) = statement.selection() {
+                lower_select(context, select, true, Some(statement)).map(HirStmt::Select)
+            } else if let Some(race) = statement.race() {
                 lower_race(context, race, true, Some(statement)).map(HirStmt::Race)
             } else {
                 lower_let(context, statement).map(HirStmt::Let)
@@ -470,6 +590,21 @@ fn lower_domain_statement(
     statement: DomainStatement,
 ) -> Option<HirStmt> {
     match statement {
+        DomainStatement::GuardScope(guard) => Some(HirStmt::GuardScope(HirGuardScope {
+            activations: lower_expr(context, guard.activations()?)?,
+            statements: lower_event_body(context, guard.body()?, false),
+            origin: origin(context.file, guard.syntax()),
+        })),
+        DomainStatement::Select(select) => {
+            lower_select(context, select, false, None).map(HirStmt::Select)
+        }
+        DomainStatement::Actor(actor) => lower_actor(context, actor).map(HirStmt::Actor),
+        DomainStatement::ActorBlock(block) => {
+            lower_actor_block(context, block).map(HirStmt::ActorBlock)
+        }
+        DomainStatement::Check(block) => Some(HirStmt::Check(lower_check(context, block, false))),
+        DomainStatement::Verdict(stmt) => lower_verdict(context, stmt).map(HirStmt::Verdict),
+        DomainStatement::Assume(stmt) => lower_assume(context, stmt).map(HirStmt::Assume),
         DomainStatement::Race(statement) => {
             lower_race(context, statement, false, None).map(HirStmt::Race)
         }
@@ -487,7 +622,9 @@ fn lower_domain_statement(
             lower_timeout(context, statement, false).map(HirStmt::Timeout)
         }
         DomainStatement::Let(statement) => {
-            if let Some(race) = statement.race() {
+            if let Some(select) = statement.selection() {
+                lower_select(context, select, false, Some(statement)).map(HirStmt::Select)
+            } else if let Some(race) = statement.race() {
                 lower_race(context, race, false, Some(statement)).map(HirStmt::Race)
             } else {
                 lower_let(context, statement).map(HirStmt::Let)
@@ -707,7 +844,7 @@ fn lower_browser_operation(
             origin: origin(context.file, statement.syntax()),
         }),
         BrowserOperation::Click(statement) => HirBrowserOp::Click(locator_action(
-            context.file,
+            context,
             statement.syntax(),
             statement.locator()?,
         )?),
@@ -730,12 +867,12 @@ fn lower_browser_operation(
             statement.value_expression()?,
         )?),
         BrowserOperation::Check(statement) => HirBrowserOp::Check(locator_action(
-            context.file,
+            context,
             statement.syntax(),
             statement.locator()?,
         )?),
         BrowserOperation::Uncheck(statement) => HirBrowserOp::Uncheck(locator_action(
-            context.file,
+            context,
             statement.syntax(),
             statement.locator()?,
         )?),
@@ -746,12 +883,12 @@ fn lower_browser_operation(
             statement.value_expression()?,
         )?),
         BrowserOperation::Hover(statement) => HirBrowserOp::Hover(locator_action(
-            context.file,
+            context,
             statement.syntax(),
             statement.locator()?,
         )?),
         BrowserOperation::WaitLocator(statement) => HirBrowserOp::WaitLocator(locator_expectation(
-            context.file,
+            context,
             statement.syntax(),
             statement.locator()?,
             statement.state()?,
@@ -759,7 +896,7 @@ fn lower_browser_operation(
         )?),
         BrowserOperation::ExpectLocator(statement) => {
             HirBrowserOp::ExpectLocator(locator_expectation(
-                context.file,
+                context,
                 statement.syntax(),
                 statement.locator()?,
                 statement.state()?,
@@ -783,13 +920,13 @@ fn lower_browser_operation(
 }
 
 fn locator_action(
-    file: FileId,
+    context: &LowerContext,
     syntax: &webtest_syntax::SyntaxNode,
     locator: ast::Locator,
 ) -> Option<HirLocatorAction> {
     Some(HirLocatorAction {
-        locator: lower_locator(file, locator)?,
-        origin: origin(file, syntax),
+        locator: lower_locator(context, locator)?,
+        origin: origin(context.file, syntax),
     })
 }
 
@@ -800,24 +937,24 @@ fn value_action(
     value: ast::Expr,
 ) -> Option<HirValueAction> {
     Some(HirValueAction {
-        locator: lower_locator(context.file, locator)?,
+        locator: lower_locator(context, locator)?,
         value: lower_expr(context, value)?,
         origin: origin(context.file, syntax),
     })
 }
 
 fn locator_expectation(
-    file: FileId,
+    context: &LowerContext,
     syntax: &webtest_syntax::SyntaxNode,
     locator: ast::Locator,
     state: ast::LocatorState,
     timeout: Option<Duration>,
 ) -> Option<HirLocatorExpectation> {
     Some(HirLocatorExpectation {
-        locator: lower_locator(file, locator)?,
+        locator: lower_locator(context, locator)?,
         state: state.into(),
         timeout,
-        origin: origin(file, syntax),
+        origin: origin(context.file, syntax),
     })
 }
 
@@ -851,6 +988,10 @@ fn lower_expr(context: &LowerContext, expression: ast::Expr) -> Option<HirExpr> 
         origin(context.file, expression.syntax())
     };
     let kind = match expression {
+        ast::Expr::PatternRecord(pattern) => HirExprKind::PatternRecord {
+            exact: pattern.exact(),
+            record: Box::new(lower_expr(context, ast::Expr::Record(pattern.record()?))?),
+        },
         ast::Expr::Use(use_expression) => {
             HirExprKind::FixtureUse(Box::new(lower_expr(context, use_expression.call()?)?))
         }
@@ -1012,48 +1153,51 @@ fn lower_string(file: FileId, token: ast::StringToken) -> Option<HirString> {
     })
 }
 
-fn lower_locator(file: FileId, locator: ast::Locator) -> Option<HirLocator> {
-    let (kind, range) = match locator {
-        ast::Locator::Id(locator) => (
-            HirLocatorKind::Id(locator.value()?.value()?),
-            locator.syntax().text_range(),
-        ),
-        ast::Locator::Role(locator) => (
-            HirLocatorKind::Role {
-                role: locator.role()?.value()?,
-                name: locator.name().and_then(|name| name.value()),
-            },
-            locator.syntax().text_range(),
-        ),
-        ast::Locator::Label(locator) => (
-            HirLocatorKind::Label(locator.value()?.value()?),
-            locator.syntax().text_range(),
-        ),
-        ast::Locator::Text(locator) => (
-            HirLocatorKind::Text(locator.value()?.value()?),
-            locator.syntax().text_range(),
-        ),
-        ast::Locator::Placeholder(locator) => (
-            HirLocatorKind::Placeholder(locator.value()?.value()?),
-            locator.syntax().text_range(),
-        ),
-        ast::Locator::TestId(locator) => (
-            HirLocatorKind::TestId(locator.value()?.value()?),
-            locator.syntax().text_range(),
-        ),
-        ast::Locator::Css(locator) => (
-            HirLocatorKind::Css(locator.value()?.value()?),
-            locator.syntax().text_range(),
-        ),
-        ast::Locator::XPath(locator) => (
-            HirLocatorKind::XPath(locator.value()?.value()?),
-            locator.syntax().text_range(),
-        ),
+fn lower_locator(context: &LowerContext, locator: ast::Locator) -> Option<HirLocator> {
+    let origin = origin(context.file, locator.syntax());
+    let arguments = locator.arguments();
+    let lower = |arg: &ast::LocatorArgument| match arg {
+        ast::LocatorArgument::String(token) => Some(HirExpr {
+            kind: HirExprKind::Literal(HirLiteral::String(token.value()?)),
+            origin: SyntaxOrigin::new(context.file, token.syntax().text_range()),
+        }),
+        ast::LocatorArgument::Expression(expr) => lower_expr(context, expr.clone()),
     };
-    Some(HirLocator {
-        kind,
-        origin: SyntaxOrigin::new(file, range),
-    })
+    let value = lower(arguments.first()?)?;
+    let name = arguments.get(1).and_then(lower);
+    let literal = |value: &HirExpr| {
+        if let HirExprKind::Literal(HirLiteral::String(value)) = &value.kind {
+            Some(value.clone())
+        } else {
+            None
+        }
+    };
+    let text = literal(&value);
+    let name_text = name.as_ref().and_then(literal);
+    let static_value = text.clone().unwrap_or_default();
+    let kind = match locator {
+        ast::Locator::Id(_) => HirLocatorKind::Id(static_value),
+        ast::Locator::Role(_) => HirLocatorKind::Role {
+            role: static_value,
+            name: name_text,
+        },
+        ast::Locator::Label(_) => HirLocatorKind::Label(static_value),
+        ast::Locator::Text(_) => HirLocatorKind::Text(static_value),
+        ast::Locator::Placeholder(_) => HirLocatorKind::Placeholder(static_value),
+        ast::Locator::TestId(_) => HirLocatorKind::TestId(static_value),
+        ast::Locator::Css(_) => HirLocatorKind::Css(static_value),
+        ast::Locator::XPath(_) => HirLocatorKind::XPath(static_value),
+    };
+    let kind = if text.is_none() || name.as_ref().is_some_and(|n| literal(n).is_none()) {
+        HirLocatorKind::Dynamic {
+            template: Box::new(kind),
+            value: Box::new(value),
+            name: name.map(Box::new),
+        }
+    } else {
+        kind
+    };
+    Some(HirLocator { kind, origin })
 }
 
 fn origin(file: FileId, syntax: &webtest_syntax::SyntaxNode) -> SyntaxOrigin {
@@ -1174,4 +1318,207 @@ mod retry_tests {
 /// Identity hashing is part of semantic lowering, never an editor text scan.
 pub fn semantic_key(parent: &[u8; 32], kind: &str, name: &str, ordinal: u32) -> [u8; 32] {
     webtest_text::semantic_key(parent, kind, name, ordinal)
+}
+
+fn lower_check(context: &mut LowerContext, block: ast::CheckBlock, flow: bool) -> HirCheck {
+    let bindings = context.bindings.clone();
+    let statements = if flow {
+        block
+            .flow_statements()
+            .filter_map(|s| lower_flow_statement(context, s))
+            .collect()
+    } else {
+        block
+            .domain_statements()
+            .filter_map(|s| lower_domain_statement(context, s))
+            .collect()
+    };
+    context.bindings = bindings;
+    HirCheck {
+        statements,
+        origin: origin(context.file, block.syntax()),
+    }
+}
+fn lower_verdict(context: &LowerContext, stmt: ast::VerdictStmt) -> Option<HirVerdict> {
+    let kind = match stmt.keyword()?.kind() {
+        SyntaxKind::PassKw => webtest_model::VerdictKind::Pass,
+        SyntaxKind::FailKw => webtest_model::VerdictKind::Fail,
+        SyntaxKind::SkipKw => webtest_model::VerdictKind::Skipped,
+        SyntaxKind::InconclusiveKw => webtest_model::VerdictKind::Inconclusive,
+        _ => return None,
+    };
+    Some(HirVerdict {
+        kind,
+        message: stmt.message().and_then(|e| lower_expr(context, e)),
+        origin: origin(context.file, stmt.syntax()),
+    })
+}
+fn lower_assume(context: &LowerContext, stmt: ast::AssumeStmt) -> Option<HirAssume> {
+    Some(HirAssume {
+        condition: lower_expr(context, stmt.condition()?)?,
+        verdict: lower_verdict(context, stmt.verdict()?)?,
+        origin: origin(context.file, stmt.syntax()),
+    })
+}
+
+fn lower_actor(context: &mut LowerContext, actor: ast::ActorDecl) -> Option<HirActor> {
+    let name = actor.name()?;
+    let id = BindingId(context.next_binding);
+    context.next_binding += 1;
+    context.bindings.entry(name.text().into()).or_insert(id);
+    Some(HirActor {
+        binding: HirResultBinding {
+            id,
+            name: name.text().into(),
+            annotation: None,
+            name_origin: SyntaxOrigin::new(context.file, name.text_range()),
+        },
+        origin: origin(context.file, actor.syntax()),
+    })
+}
+fn lower_actor_block(context: &mut LowerContext, block: ast::ActorBlock) -> Option<HirActorBlock> {
+    let name = block.name()?;
+    let actor = HirExpr {
+        kind: HirExprKind::Name(
+            context
+                .bindings
+                .get(name.text())
+                .copied()
+                .map(|id| HirNameRef::Binding {
+                    id,
+                    name: name.text().into(),
+                })
+                .unwrap_or_else(|| HirNameRef::Unresolved(name.text().into())),
+        ),
+        origin: SyntaxOrigin::new(context.file, name.text_range()),
+    };
+    let bindings = context.bindings.clone();
+    let statements = block
+        .statements()
+        .filter_map(|s| lower_domain_statement(context, s))
+        .collect();
+    context.bindings = bindings;
+    Some(HirActorBlock {
+        actor,
+        statements,
+        origin: origin(context.file, block.syntax()),
+    })
+}
+
+fn token_reference(context: &LowerContext, token: webtest_syntax::SyntaxToken) -> HirExpr {
+    HirExpr {
+        kind: HirExprKind::Name(
+            context
+                .bindings
+                .get(token.text())
+                .copied()
+                .map(|id| HirNameRef::Binding {
+                    id,
+                    name: token.text().into(),
+                })
+                .unwrap_or_else(|| HirNameRef::Unresolved(token.text().into())),
+        ),
+        origin: SyntaxOrigin::new(context.file, token.text_range()),
+    }
+}
+fn lower_select(
+    context: &mut LowerContext,
+    select: ast::ReactiveSelect,
+    flow: bool,
+    binding: Option<ast::LetStmt>,
+) -> Option<HirSelect> {
+    let actor = token_reference(context, select.actor()?);
+    let cursor = select.cursor().map(|c| token_reference(context, c));
+    let mut arms = Vec::new();
+    for arm in select.arms() {
+        arms.push(lower_event_arm(context, arm, flow)?);
+    }
+    let mut timeouts = Vec::new();
+    for timeout in select.timeouts() {
+        let saved = context.bindings.clone();
+        timeouts.push(lower_event_body(context, timeout.body()?, flow));
+        context.bindings = saved;
+    }
+    let binding = binding.and_then(|b| {
+        let name = b.name()?;
+        let id = BindingId(context.next_binding);
+        context.next_binding += 1;
+        context.bindings.entry(name.text().into()).or_insert(id);
+        Some(HirResultBinding {
+            id,
+            name: name.text().into(),
+            annotation: b.annotation().and_then(|a| lower_type(context.file, a)),
+            name_origin: SyntaxOrigin::new(context.file, name.text_range()),
+        })
+    });
+    Some(HirSelect {
+        actor,
+        cursor,
+        duration: select.duration().and_then(|d| d.value()),
+        arms,
+        timeouts,
+        binding,
+        origin: origin(context.file, select.syntax()),
+    })
+}
+fn lower_event_body(context: &mut LowerContext, body: ast::Block, flow: bool) -> Vec<HirStmt> {
+    if flow {
+        body.flow_statements()
+            .filter_map(|s| lower_flow_statement(context, s))
+            .collect()
+    } else {
+        body.domain_statements()
+            .filter_map(|s| lower_domain_statement(context, s))
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HirGuardScope {
+    pub activations: HirExpr,
+    pub statements: Vec<HirStmt>,
+    pub origin: SyntaxOrigin,
+}
+
+fn lower_event_arm(
+    context: &mut LowerContext,
+    arm: ast::EventArm,
+    flow: bool,
+) -> Option<HirEventArm> {
+    let source = lower_expr(context, arm.source()?)?;
+    let saved = context.bindings.clone();
+    let event = if let HirExprKind::Call { arguments, .. } = &source.kind {
+        if arguments.len() == 1 {
+            if let HirExprKind::Name(reference) = &arguments[0].value.kind {
+                let name = match reference {
+                    HirNameRef::Binding { name, .. } | HirNameRef::Unresolved(name) => name.clone(),
+                };
+                let id = BindingId(context.next_binding);
+                context.next_binding += 1;
+                context.bindings.insert(name.clone(), id);
+                Some(HirResultBinding {
+                    id,
+                    name,
+                    annotation: None,
+                    name_origin: arguments[0].value.origin,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let filter = arm.filter().and_then(|e| lower_expr(context, e));
+    let statements = lower_event_body(context, arm.body()?, flow);
+    context.bindings = saved;
+    Some(HirEventArm {
+        source,
+        binding: event,
+        filter,
+        statements,
+        origin: origin(context.file, arm.syntax()),
+    })
 }

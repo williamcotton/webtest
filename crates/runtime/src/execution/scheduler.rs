@@ -1,144 +1,203 @@
-//! Structured sibling scheduling. Futures own branch-local execution state; this
-//! driver only observes completion and signals sibling cancellation. It never
-//! drops unfinished siblings when a branch fails.
+//! Structured sibling scheduling. Every cancellation is joined through owned cleanup.
 use crate::ScopeContext;
 use futures::{StreamExt, stream::FuturesUnordered};
 use std::future::Future;
 use webtest_feedback::FailureClass;
 use webtest_host::{Cancellation, CancellationReason};
-
-/// A bounded, coalescing primary-failure notification. This is a runtime service,
-/// not a container for mutable branch state. Ancestor schedulers can observe the
-/// same failure before nested scopes finish tearing down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PrimarySignal {
+    Failure(FailureClass),
+    Verdict { order: u64 },
+}
 #[derive(Clone)]
-pub(crate) struct FailureSignal(tokio::sync::watch::Sender<Option<FailureClass>>);
+pub(crate) struct FailureSignal(tokio::sync::watch::Sender<Option<PrimarySignal>>);
 impl FailureSignal {
-    pub fn channel() -> (Self, tokio::sync::watch::Receiver<Option<FailureClass>>) {
+    pub fn channel() -> (Self, tokio::sync::watch::Receiver<Option<PrimarySignal>>) {
         let (sender, receiver) = tokio::sync::watch::channel(None);
         (Self(sender), receiver)
     }
     pub fn report(&self, class: FailureClass) {
         if matches!(class, FailureClass::Infrastructure | FailureClass::Internal) {
             self.0.send_if_modified(|value| {
-                if value.is_some() {
+                if matches!(value, Some(PrimarySignal::Failure(_))) {
                     false
                 } else {
-                    *value = Some(class);
+                    *value = Some(PrimarySignal::Failure(class));
                     true
                 }
             });
         }
     }
+    pub fn report_verdict(&self, order: u64) {
+        self.0.send_if_modified(|value| match value {
+            None => {
+                *value = Some(PrimarySignal::Verdict { order });
+                true
+            }
+            Some(PrimarySignal::Verdict { order: old }) if order < *old => {
+                *old = order;
+                true
+            }
+            _ => false,
+        });
+    }
 }
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SiblingPolicy {
     All,
     FirstSuccess,
 }
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Completion {
     Passed,
+    Verdict,
     Failed(FailureClass),
     Cancelled,
 }
-
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct SiblingDecision {
+    pub winner: Option<usize>,
+    pub verdict: Option<usize>,
+}
 pub(super) async fn schedule<F, T>(
     parent: &ScopeContext,
     policy: SiblingPolicy,
     children: Vec<(
         ScopeContext,
-        tokio::sync::watch::Receiver<Option<FailureClass>>,
+        tokio::sync::watch::Receiver<Option<PrimarySignal>>,
         F,
     )>,
     classify: impl Fn(&T) -> Completion,
     mut on_completion: impl FnMut(usize, T),
     mut on_cancellation: impl FnMut(usize, Cancellation),
-) -> Option<usize>
+) -> SiblingDecision
 where
     F: Future<Output = T>,
 {
-    let contexts: Vec<_> = children
+    let contexts = children
         .iter()
         .map(|(context, _, _)| context.clone())
-        .collect();
-    let failures: Vec<_> = children
+        .collect::<Vec<_>>();
+    let signals = children
         .iter()
         .map(|(_, receiver, _)| receiver.clone())
-        .collect();
+        .collect::<Vec<_>>();
     let mut notices = FuturesUnordered::new();
     let mut pending = FuturesUnordered::new();
     for (ordinal, (_, mut receiver, future)) in children.into_iter().enumerate() {
         notices.push(async move {
-            let class = receiver
-                .wait_for(Option::is_some)
-                .await
-                .ok()
-                .and_then(|value| *value);
-            (ordinal, class)
+            let _ = receiver.wait_for(Option::is_some).await;
         });
         pending.push(async move { (ordinal, future.await) });
     }
     let mut completed = vec![false; contexts.len()];
     let mut winner = None;
+    let mut terminal: Option<(u64, usize)> = None;
     let mut unhealthy = false;
     while !pending.is_empty() {
-        tokio::select! {
-            biased;
-            Some((ordinal, class)) = notices.next(), if !notices.is_empty() => {
-                if class.is_some() {
+        let completed_child = tokio::select! {biased;Some(())=notices.next(),if !notices.is_empty()=>None,Some(value)=pending.next()=>Some(value)};
+        if let Some((ordinal, _)) = &completed_child {
+            completed[*ordinal] = true;
+        }
+        for (ordinal, receiver) in signals.iter().enumerate() {
+            match *receiver.borrow() {
+                Some(PrimarySignal::Failure(_)) => {
                     unhealthy = true;
                     winner = None;
-                    cancel_siblings(parent, &contexts, &completed, ordinal, CancellationReason::ParentFailed, &mut on_cancellation);
+                    cancel_siblings(
+                        parent,
+                        &contexts,
+                        &completed,
+                        ordinal,
+                        CancellationReason::ParentFailed,
+                        &mut on_cancellation,
+                    );
                 }
-            }
-            Some((ordinal, outcome)) = pending.next() => {
-                // This future includes teardown and terminal publication. Do not
-                // target it with a request while processing same-poll notices.
-                completed[ordinal] = true;
-                // Polling child futures can publish a failure after select has
-                // polled notices but before it returns a completed sibling.
-                // Observe those reports before awarding a race winner.
-                for (failed, receiver) in failures.iter().enumerate() {
-                    if receiver.borrow().is_some() {
-                        unhealthy = true;
-                        winner = None;
-                        cancel_siblings(parent, &contexts, &completed, failed, CancellationReason::ParentFailed, &mut on_cancellation);
+                Some(PrimarySignal::Verdict { order }) => {
+                    if terminal.is_none_or(|prior| (order, ordinal) < prior) {
+                        terminal = Some((order, ordinal));
                     }
-                }
-                // Also catches infrastructure failures discovered during cleanup.
-                let completion = classify(&outcome);
-                if matches!(completion, Completion::Failed(FailureClass::Infrastructure | FailureClass::Internal)) {
-                    unhealthy = true;
                     winner = None;
-                    cancel_siblings(parent, &contexts, &completed, ordinal, CancellationReason::ParentFailed, &mut on_cancellation);
-                } else if policy == SiblingPolicy::FirstSuccess
-                    && completion == Completion::Passed
-                    && winner.is_none()
-                    && !unhealthy
-                    && parent.cancellation.cause().is_none()
-                {
-                    winner = Some(ordinal);
-                    cancel_siblings(parent, &contexts, &completed, ordinal, CancellationReason::RaceLost, &mut on_cancellation);
                 }
-                on_completion(ordinal, outcome);
+                None => (),
             }
         }
+        if let Some((_, ordinal)) = terminal {
+            cancel_siblings(
+                parent,
+                &contexts,
+                &completed,
+                ordinal,
+                CancellationReason::Verdict,
+                &mut on_cancellation,
+            );
+        }
+        if let Some((ordinal, outcome)) = completed_child {
+            let completion = classify(&outcome);
+            if matches!(
+                completion,
+                Completion::Failed(FailureClass::Infrastructure | FailureClass::Internal)
+            ) {
+                unhealthy = true;
+                winner = None;
+                cancel_siblings(
+                    parent,
+                    &contexts,
+                    &completed,
+                    ordinal,
+                    CancellationReason::ParentFailed,
+                    &mut on_cancellation,
+                );
+            } else if completion == Completion::Verdict {
+                if terminal.is_none() {
+                    terminal = Some((u64::MAX, ordinal));
+                }
+                winner = None;
+                if let Some((_, selected)) = terminal {
+                    cancel_siblings(
+                        parent,
+                        &contexts,
+                        &completed,
+                        selected,
+                        CancellationReason::Verdict,
+                        &mut on_cancellation,
+                    );
+                }
+            } else if policy == SiblingPolicy::FirstSuccess
+                && completion == Completion::Passed
+                && winner.is_none()
+                && terminal.is_none()
+                && !unhealthy
+                && parent.cancellation.cause().is_none()
+            {
+                winner = Some(ordinal);
+                cancel_siblings(
+                    parent,
+                    &contexts,
+                    &completed,
+                    ordinal,
+                    CancellationReason::RaceLost,
+                    &mut on_cancellation,
+                );
+            }
+            on_completion(ordinal, outcome);
+        }
     }
-    winner.filter(|_| parent.cancellation.cause().is_none())
+    SiblingDecision {
+        winner: winner.filter(|_| parent.cancellation.cause().is_none()),
+        verdict: terminal.map(|(_, ordinal)| ordinal),
+    }
 }
-
 fn cancel_siblings(
     parent: &ScopeContext,
     contexts: &[ScopeContext],
     completed: &[bool],
-    failed: usize,
+    selected: usize,
     reason: CancellationReason,
     on_cancellation: &mut impl FnMut(usize, Cancellation),
 ) {
     for (ordinal, context) in contexts.iter().enumerate() {
-        if ordinal != failed && !completed[ordinal] {
+        if ordinal != selected && !completed[ordinal] {
             context.cancellation.cancel_observed(
                 Cancellation {
                     reason,
@@ -149,7 +208,6 @@ fn cancel_siblings(
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,6 +228,46 @@ mod tests {
     }
 
     type Task = std::pin::Pin<Box<dyn Future<Output = Completion> + Send>>;
+
+    #[tokio::test(start_paused = true)]
+    async fn verdict_cancels_siblings_before_its_teardown_and_joins_every_child() {
+        let parent = parent();
+        let terminal = parent.child(ExecutionScopeId(1), None);
+        let sibling = parent.child(ExecutionScopeId(2), None);
+        let (signal, receiver) = FailureSignal::channel();
+        let (_, other) = FailureSignal::channel();
+        let terminal_task: Task = Box::pin(async move {
+            signal.report_verdict(7);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            Completion::Verdict
+        });
+        let watched = sibling.clone();
+        let sibling_task: Task = Box::pin(async move {
+            let cause = watched.cancellation.cancelled().await;
+            assert_eq!(cause.reason, CancellationReason::Verdict);
+            Completion::Cancelled
+        });
+        let started = tokio::time::Instant::now();
+        let mut finished = Vec::new();
+        let decision = schedule(
+            &parent,
+            SiblingPolicy::FirstSuccess,
+            vec![
+                (terminal, receiver, terminal_task),
+                (sibling, other, sibling_task),
+            ],
+            |value| *value,
+            |ordinal, _| finished.push((ordinal, started.elapsed())),
+            |_, _| {},
+        )
+        .await;
+        assert_eq!(decision.verdict, Some(0));
+        assert_eq!(decision.winner, None);
+        assert_eq!(
+            finished,
+            vec![(1, Duration::ZERO), (0, Duration::from_secs(1))]
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn race_observes_primary_failure_published_in_the_same_poll_as_a_success() {
@@ -197,7 +295,8 @@ mod tests {
             |ordinal, outcome| completed.push((ordinal, outcome)),
             |_, _| panic!("the other sibling has already finished"),
         )
-        .await;
+        .await
+        .winner;
         assert_eq!(winner, None);
         assert!(successful.cancellation.cause().is_none());
         assert_eq!(completed.len(), 2);
@@ -223,7 +322,8 @@ mod tests {
             |ordinal, outcome| results.push((ordinal, outcome)),
             |_, _| {},
         )
-        .await;
+        .await
+        .winner;
         assert_eq!(winner, Some(results[0].0));
         assert_eq!(results.len(), 2);
     }
@@ -255,7 +355,8 @@ mod tests {
                 |_, _| completed += 1,
                 |_, _| {},
             )
-            .await;
+            .await
+            .winner;
             assert_eq!(winner, None);
             assert_eq!(completed, 1);
             assert_eq!(child.cancellation.cause().unwrap().reason, reason);

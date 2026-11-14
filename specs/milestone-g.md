@@ -9,9 +9,9 @@ Milestone G makes the same Rust language intelligence available in Monaco/browse
 ### Implementation status (2026-11-13)
 
 The repository now contains an implementation of the portable editor and release
-preparation slices. **Milestone G is not yet accepted as complete.** Publishing and
-tier-1 clean-environment release rehearsals require external evidence; workflow
-configuration alone does not satisfy the acceptance criteria below.
+preparation slices. **Milestone G is complete within its revised local-delivery scope.** Publishing
+and clean-environment release acceptance are deferred to Milestone J. Workflow
+configuration is not evidence of those external outcomes.
 
 Implemented source surfaces:
 
@@ -48,24 +48,12 @@ conformance rerun verifies that release prerequisite.
 The real browser fixture passed for both direct ESM and esbuild-bundled clients.
 These are local implementation checks, not published-release acceptance.
 
-Outstanding acceptance evidence and distribution work:
-
-- Execute the release workflow on all five tier-1 targets and install each signed
-  candidate in clean environments. The release workflow and platform runners have
-  not been exercised from this local change.
-- Verify the real signed-manifest install/upgrade path and end-to-end rollback on
-  every supported extension host. Local verification currently covers rejection,
-  integrity, package activation, LSP and DAP; it does not substitute for a signed
-  release rehearsal. Previous binaries can be selected with `webtest.serverPath`.
-- Build/run/publish the official Linux container, including host sandbox policy and
-  mounted artifact ownership. Its release smoke retains Chrome sandboxing and
-  explicitly grants SYS_ADMIN in CI; no default `--no-sandbox` is introduced.
-- Configure protected release/tag policy and npm/marketplace credentials/trusted
-  publishing; publish npm/VSIX artifacts and submit Homebrew/WinGet projections.
-  `release/publish-packages.yml.example` documents the optional protected steps.
-- Complete signature/provenance/SBOM and installer/package-manager validation on
-  clean target systems. Shell/PowerShell installers require cosign. Package-manager
-  projections are generated for review and are not claims of registry acceptance.
+The remaining external release acceptance and publication work has moved to
+[Milestone J — Release Acceptance and Publication](./milestone-j.md), by the
+2026-11-13 scope decision. Milestone G is complete for the locally implemented
+portable editor, compatibility, installer and release-preparation surfaces above.
+The original distribution requirements below remain design context; externally
+published artifacts and platform/container release acceptance belong to J.
 
 ## 1. Outcome
 

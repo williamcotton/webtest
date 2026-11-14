@@ -342,11 +342,22 @@ impl DebugState {
                     }
                     .into()
                 };
+                let name = scope
+                    .scope
+                    .execution_context
+                    .actor
+                    .map_or(name.clone(), |actor| format!("{name} [actor {actor}]"));
                 let mut values = if index == 0 {
                     bindings.take().unwrap_or_default()
                 } else {
                     BTreeMap::new()
                 };
+                if let Some(actor) = scope.scope.execution_context.actor {
+                    values.insert(
+                        "$actor".into(),
+                        webtest_model::Value::String(actor.to_string()),
+                    );
+                }
                 // Ancestor frames expose their own metadata, never a child's lexical locals.
                 values.insert(
                     "$scope".into(),
@@ -751,6 +762,43 @@ mod tests {
             .resume(&request("continue", id), command)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn concrete_case_variant_debugging_preserves_the_authored_case_binding() {
+        let source = "test \"rows\" cases [case \"one\" {value: 1}, case \"two\" {value: 2}] as input {\n expect input.value > 0\n}";
+        let state = state(source);
+        let mut database = AnalysisDatabase::default();
+        let file = database.open_file("/debug.webtest", source);
+        let variants = database.test_plan(file).unwrap();
+        let selected = variants.tests[1].variant_id;
+        let program = LoadedProgram::from_database(
+            PathBuf::from("/debug.webtest"),
+            database,
+            file,
+            &[selected],
+        )
+        .unwrap();
+        assert_eq!(program.plan.tests.len(), 1);
+        assert_eq!(program.plan.tests[0].case_label.as_deref(), Some("two"));
+        *lock(&state.program) = Some(program);
+        lock(&state.breakpoints).insert(PathBuf::from("/debug.webtest"), HashSet::from([2]));
+        let running = run(&state);
+        parked(&state, 1).await;
+        {
+            let tasks = lock(&state.tasks);
+            let snapshot = tasks
+                .tasks
+                .values()
+                .find_map(|task| task.snapshot.as_ref())
+                .unwrap();
+            assert_eq!(snapshot.frames[0].location.line, 2);
+        }
+        resume(&state, ResumeCommand::Continue).await;
+        let result = running.await.unwrap();
+        assert_eq!(result.tests.len(), 1);
+        assert_eq!(result.tests[0].variant_id, selected);
+        assert_eq!(result.passed(), 1);
     }
 
     #[tokio::test]

@@ -8,6 +8,8 @@ use crate::{RunnerOptions, StepError, assertions::execute_assertion, evaluation:
 use super::{browser::execute_browser, provider::execute_provider, state::TestExecutionState};
 
 pub(super) enum StepCompletion {
+    Checkpoint(webtest_model::BindingId, super::actors::Cursor),
+    Verdict(webtest_model::VerdictKind, String),
     Completed,
     ProviderOutput(Vec<webtest_observation::CapturedOutput>),
     Provided(webtest_model::Value),
@@ -27,6 +29,50 @@ pub(super) async fn execute_step(
         page.set_operation_context(Some(context.clone()));
     }
     match &step.operation {
+        TestOperation::Reactive(operation) => match operation {
+            webtest_plan::semantics::ReactiveOperation::Checkpoint { .. } => Err(
+                StepError::Internal("checkpoint dispatch bypassed actor ownership".into()),
+            ),
+            webtest_plan::semantics::ReactiveOperation::Failure { reason, actor } => {
+                use webtest_plan::semantics::EventFailureKind::*;
+                let kind = match reason {
+                    SelectionTimeout => crate::EvaluationFailureKind::SelectionTimeout,
+                    Overflow => crate::EvaluationFailureKind::EventOverflow,
+                    CursorExpired => crate::EvaluationFailureKind::EventCursorExpired,
+                    SourceClosed => {
+                        return Err(StepError::Browser(
+                            webtest_browser::BrowserError::BrowserDisconnected,
+                        ));
+                    }
+                };
+                Err(StepError::Evaluation(crate::EvaluationFailure {
+                    kind,
+                    message: format!("actor {actor}: {reason:?}"),
+                }))
+            }
+        },
+        TestOperation::Verdict { verdict, message } => {
+            let message = message
+                .as_ref()
+                .map(|expr| evaluate(expr, state.environment()))
+                .transpose()?
+                .map(crate::evaluation::string_value)
+                .transpose()?
+                .unwrap_or_default();
+            if *verdict == webtest_model::VerdictKind::Fail {
+                return Err(StepError::Assertion(Box::new(crate::AssertionFailure {
+                    matcher: webtest_plan::ValueMatcher::ExplicitFail,
+                    expected: None,
+                    actual: webtest_model::Value::String(message.clone()),
+                    message: message.clone(),
+                    diff: webtest_observation::ValueDiff::Scalar {
+                        expected: None,
+                        actual: message,
+                    },
+                })));
+            }
+            Ok(StepCompletion::Verdict(*verdict, message))
+        }
         TestOperation::AcquireFixture(_) => Err(StepError::Internal(
             "fixture acquisition must be dispatched by its owned execution scope".into(),
         )),

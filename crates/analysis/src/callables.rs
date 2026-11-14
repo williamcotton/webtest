@@ -32,6 +32,8 @@ pub struct DeclarationSignature {
 
 #[derive(Clone, Copy)]
 pub(crate) enum Callable<'a> {
+    Guard(&'a webtest_hir::HirGuard),
+    Pattern(&'a webtest_hir::HirPattern),
     Function(&'a webtest_hir::HirFunction),
     Fixture(&'a webtest_hir::HirFixture),
 }
@@ -42,6 +44,22 @@ pub(crate) fn find(module: &crate::Module, id: SymbolId) -> Option<Callable<'_>>
         .iter()
         .find(|function| function.id.0 == id.0)
         .map(Callable::Function)
+        .or_else(|| {
+            module
+                .hir
+                .guards
+                .iter()
+                .find(|g| g.id.0 == id.0)
+                .map(Callable::Guard)
+        })
+        .or_else(|| {
+            module
+                .hir
+                .patterns
+                .iter()
+                .find(|p| p.id.0 == id.0)
+                .map(Callable::Pattern)
+        })
         .or_else(|| {
             module
                 .hir
@@ -69,10 +87,26 @@ fn resolve_in_module(module: &crate::Module, name: &str) -> Option<(ModuleId, Sy
         .or_else(|| {
             module
                 .hir
+                .guards
+                .iter()
+                .find(|g| g.name == name)
+                .map(|g| (module.id, SymbolId(g.id.0)))
+        })
+        .or_else(|| {
+            module
+                .hir
                 .fixtures
                 .iter()
                 .find(|fixture| fixture.name == name)
                 .map(|fixture| (module.id, SymbolId(fixture.id.0)))
+        })
+        .or_else(|| {
+            module
+                .hir
+                .patterns
+                .iter()
+                .find(|p| p.name == name)
+                .map(|p| (module.id, SymbolId(p.id.0)))
         })
         .or_else(|| {
             module
@@ -135,6 +169,30 @@ fn basic(db: &dyn Db, file: SourceInput, id: SymbolId) -> Option<DeclarationSign
             Some(fixture.lifetime),
             fixture.shareable,
             &fixture.documentation,
+        )
+    } else if let Some(guard) = hir.guards.iter().find(|g| g.id.0 == id.0) {
+        (
+            &guard.name,
+            guard.name_origin,
+            &guard.parameters,
+            &guard.result_type,
+            Capability::Browser,
+            false,
+            None,
+            false,
+            &guard.documentation,
+        )
+    } else if let Some(pattern) = hir.patterns.iter().find(|p| p.id.0 == id.0) {
+        (
+            &pattern.name,
+            pattern.name_origin,
+            &pattern.parameters,
+            &pattern.result_type,
+            Capability::Pure,
+            false,
+            None,
+            false,
+            &pattern.documentation,
         )
     } else {
         return None;
@@ -296,6 +354,19 @@ pub(crate) fn signature(
         }
     }
     match callable {
+        Callable::Guard(guard) => {
+            for clause in &guard.clauses {
+                if let Some(filter) = &clause.filter {
+                    webtest_hir::visit_expression(filter, &mut |expression| roots.push(expression));
+                }
+                statements(&clause.statements, &mut roots, &mut capabilities);
+            }
+        }
+        Callable::Pattern(pattern) => {
+            webtest_hir::visit_expression(&pattern.matcher, &mut |expression| {
+                roots.push(expression)
+            });
+        }
         Callable::Function(function) => {
             if let Some(expression) = &function.expression {
                 webtest_hir::visit_expression(expression, &mut |expression| roots.push(expression));

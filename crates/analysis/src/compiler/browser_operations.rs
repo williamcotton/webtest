@@ -58,7 +58,7 @@ impl Compiler<'_> {
             ),
             HirBrowserOp::Click(action) => (
                 BrowserOperation::Click {
-                    locator: locator_from_hir(&action.locator.kind),
+                    locator: self.compile_locator(&action.locator.kind, domain),
                 },
                 action.locator.origin,
                 None,
@@ -67,7 +67,7 @@ impl Compiler<'_> {
                 let value = self.browser_string_value(action, domain);
                 (
                     BrowserOperation::Fill {
-                        locator: locator_from_hir(&action.locator.kind),
+                        locator: self.compile_locator(&action.locator.kind, domain),
                         value,
                     },
                     action.locator.origin,
@@ -78,7 +78,7 @@ impl Compiler<'_> {
                 let value = self.browser_string_value(action, domain);
                 (
                     BrowserOperation::Type {
-                        locator: locator_from_hir(&action.locator.kind),
+                        locator: self.compile_locator(&action.locator.kind, domain),
                         value,
                     },
                     action.locator.origin,
@@ -98,7 +98,7 @@ impl Compiler<'_> {
                 }
                 (
                     BrowserOperation::Press {
-                        locator: locator_from_hir(&action.locator.kind),
+                        locator: self.compile_locator(&action.locator.kind, domain),
                         key: value,
                     },
                     action.locator.origin,
@@ -107,7 +107,7 @@ impl Compiler<'_> {
             }
             HirBrowserOp::Check(action) | HirBrowserOp::Uncheck(action) => (
                 BrowserOperation::Check {
-                    locator: locator_from_hir(&action.locator.kind),
+                    locator: self.compile_locator(&action.locator.kind, domain),
                     checked: matches!(operation, HirBrowserOp::Check(_)),
                 },
                 action.locator.origin,
@@ -117,7 +117,7 @@ impl Compiler<'_> {
                 let value = self.browser_string_value(action, domain);
                 (
                     BrowserOperation::Select {
-                        locator: locator_from_hir(&action.locator.kind),
+                        locator: self.compile_locator(&action.locator.kind, domain),
                         option: value,
                     },
                     action.locator.origin,
@@ -126,14 +126,14 @@ impl Compiler<'_> {
             }
             HirBrowserOp::Hover(action) => (
                 BrowserOperation::Hover {
-                    locator: locator_from_hir(&action.locator.kind),
+                    locator: self.compile_locator(&action.locator.kind, domain),
                 },
                 action.locator.origin,
                 None,
             ),
             HirBrowserOp::WaitLocator(wait) => (
                 BrowserOperation::WaitForLocator {
-                    locator: locator_from_hir(&wait.locator.kind),
+                    locator: self.compile_locator(&wait.locator.kind, domain),
                     state: locator_state_from_hir(wait.state),
                     timeout: wait.timeout,
                 },
@@ -150,13 +150,13 @@ impl Compiler<'_> {
             ),
             HirBrowserOp::ExpectLocator(expectation) => {
                 let assertion = AssertionOperation::Locator {
-                    locator: locator_from_hir(&expectation.locator.kind),
+                    locator: self.compile_locator(&expectation.locator.kind, domain),
                     state: locator_state_from_hir(expectation.state),
                     timeout: expectation.timeout,
                 };
                 (
                     BrowserOperation::Hover {
-                        locator: locator_from_hir(&expectation.locator.kind),
+                        locator: self.compile_locator(&expectation.locator.kind, domain),
                     },
                     expectation.locator.origin,
                     Some(assertion),
@@ -193,6 +193,7 @@ impl Compiler<'_> {
 
 fn locator_from_hir(locator: &HirLocatorKind) -> Locator {
     match locator {
+        HirLocatorKind::Dynamic { template, .. } => locator_from_hir(template),
         HirLocatorKind::Id(value) => Locator::Id(value.clone()),
         HirLocatorKind::Role { role, name } => Locator::Role {
             role: role.clone(),
@@ -269,6 +270,38 @@ fn valid_key_chord(value: &str) -> bool {
         }
     }
     main == 1
+}
+
+impl Compiler<'_> {
+    fn compile_locator(&mut self, locator: &HirLocatorKind, domain: Capability) -> Locator {
+        if let HirLocatorKind::Dynamic {
+            template,
+            value,
+            name,
+        } = locator
+        {
+            let value = self.infer_expr(value, domain, Some(&Type::String));
+            self.expect_type(value_origin(locator), &Type::String, &value.ty);
+            let name = name.as_ref().map(|name| {
+                let result = self.infer_expr(name, domain, Some(&Type::String));
+                self.expect_type(name.origin.range, &Type::String, &result.ty);
+                Box::new(result.expression)
+            });
+            Locator::Dynamic {
+                template: Box::new(locator_from_hir(template)),
+                value: Box::new(value.expression),
+                name,
+            }
+        } else {
+            locator_from_hir(locator)
+        }
+    }
+}
+fn value_origin(locator: &HirLocatorKind) -> webtest_text::TextRange {
+    let HirLocatorKind::Dynamic { value, .. } = locator else {
+        unreachable!()
+    };
+    value.origin.range
 }
 
 #[cfg(test)]

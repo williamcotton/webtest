@@ -9,6 +9,7 @@ use webtest_model::{BindingId, Capability};
 #[serde(rename_all = "snake_case")]
 pub enum ResourceReference {
     BrowserContext,
+    Actor(webtest_model::ActorId),
     Binding(BindingId),
 }
 
@@ -70,6 +71,20 @@ impl PlanNode {
     pub fn required_resources(&self) -> Vec<ResourceUse> {
         let resources = match &self.kind {
             PlanNodeKind::Operation { step }
+                if matches!(&step.operation, crate::TestOperation::Reactive(_)) =>
+            {
+                if let crate::TestOperation::Reactive(
+                    crate::semantics::ReactiveOperation::Checkpoint { actor, .. },
+                ) = &step.operation
+                {
+                    return vec![ResourceUse {
+                        resource: ResourceReference::Actor(*actor),
+                        access: ResourceAccess::Shared,
+                    }];
+                }
+                return vec![];
+            }
+            PlanNodeKind::Operation { step }
                 if matches!(step.operation, crate::TestOperation::AcquireFixture(_)) =>
             {
                 return Vec::new();
@@ -82,6 +97,34 @@ impl PlanNode {
                     }];
                 }
                 return Vec::new();
+            }
+            PlanNodeKind::Semantic {
+                operation,
+                children,
+            } => {
+                let mut resources = merged(children.iter().flat_map(Self::required_resources));
+                match operation {
+                    crate::semantics::SemanticOperation::ActorScope { actor, .. } => {
+                        resources.remove(&ResourceReference::Actor(*actor));
+                    }
+                    crate::semantics::SemanticOperation::ActorAccess { actor, .. } => {
+                        resources.remove(&ResourceReference::BrowserContext);
+                        resources
+                            .insert(ResourceReference::Actor(*actor), ResourceAccess::Exclusive);
+                    }
+                    crate::semantics::SemanticOperation::Select { actor, .. } => {
+                        resources.insert(ResourceReference::Actor(*actor), ResourceAccess::Shared);
+                    }
+                    crate::semantics::SemanticOperation::Guards { clauses, .. } => {
+                        for clause in clauses {
+                            resources
+                                .entry(ResourceReference::Actor(clause.actor))
+                                .or_insert(ResourceAccess::Shared);
+                        }
+                    }
+                    _ => (),
+                }
+                resources
             }
             PlanNodeKind::Conditional {
                 branches: children, ..

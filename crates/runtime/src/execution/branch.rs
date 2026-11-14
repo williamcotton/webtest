@@ -8,7 +8,12 @@ use webtest_observation::CleanupFailure;
 /// structure together, and native handles/resource ownership are never cloned.
 pub(super) struct BranchState {
     pub bindings: TestExecutionState,
+    pub check_depth: usize,
+    pub ingress: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub page: Option<Box<dyn Page>>,
+    pub actors: std::collections::HashMap<webtest_model::ActorId, super::actors::ActorHandle>,
+    pub cursors: std::collections::HashMap<webtest_model::BindingId, super::actors::Cursor>,
+    pub current_actor: Option<webtest_model::ActorId>,
     pub session: Option<super::resource::OwnedBrowserSession>,
     pub session_owner: Option<webtest_observation::ScopeEvent>,
     pub provided: Option<webtest_model::Value>,
@@ -25,11 +30,16 @@ pub(super) struct BranchState {
 impl BranchState {
     pub fn new(options: &RunnerOptions) -> Self {
         Self {
+            check_depth: 0,
+            ingress: Default::default(),
             bindings: TestExecutionState::new(
                 options.redacted_json_fields.clone(),
                 options.project_root.clone(),
             ),
             page: None,
+            actors: Default::default(),
+            current_actor: None,
+            cursors: Default::default(),
             session: None,
             session_owner: None,
             active_step: None,
@@ -46,8 +56,13 @@ impl BranchState {
 
     pub fn fork(&self) -> Self {
         Self {
+            check_depth: self.check_depth,
+            ingress: self.ingress.clone(),
             bindings: self.bindings.transferable_snapshot(),
             page: None,
+            actors: self.actors.clone(),
+            current_actor: None,
+            cursors: self.cursors.clone(),
             session: None,
             session_owner: None,
             active_step: None,

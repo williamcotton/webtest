@@ -101,7 +101,7 @@ fn symbol_kind(kind: webtest_analysis::SymbolKind) -> SymbolKind {
         K::Parameter | K::Binding => SymbolKind::VARIABLE,
         K::RecordField => SymbolKind::PROPERTY,
         K::ProviderNamespace => SymbolKind::NAMESPACE,
-        K::Type => SymbolKind::STRUCT,
+        K::Guard | K::Pattern | K::Type => SymbolKind::STRUCT,
     }
 }
 #[allow(deprecated)]

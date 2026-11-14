@@ -3,9 +3,12 @@
 mod browser_operations;
 mod expressions;
 mod fixtures;
+mod guards;
 mod helpers;
+mod patterns;
 mod provider_calls;
 mod pure_scopes;
+pub(crate) mod reactive;
 mod statements;
 mod type_system;
 
@@ -117,6 +120,9 @@ struct Compiler<'a> {
     diagnostics: Vec<Diagnostic>,
     type_facts: Vec<TypeFact>,
     bindings: HashMap<BindingId, BindingState>,
+    cursors: HashMap<BindingId, (webtest_model::ActorId, usize)>,
+    actors: HashMap<BindingId, webtest_model::ActorId>,
+    pattern_arguments: HashMap<BindingId, PlanExpr>,
     names: HashMap<String, SyntaxOrigin>,
     declared_names: HashSet<String>,
     required: BTreeSet<Capability>,
@@ -170,6 +176,9 @@ impl<'a> Compiler<'a> {
             diagnostics,
             type_facts: Vec::new(),
             bindings: HashMap::new(),
+            cursors: HashMap::new(),
+            actors: HashMap::new(),
+            pattern_arguments: HashMap::new(),
             names: HashMap::new(),
             declared_names: HashSet::new(),
             required: BTreeSet::new(),
@@ -190,16 +199,43 @@ impl<'a> Compiler<'a> {
     fn compile(mut self, hir: &'a HirFile, source_identity: &str) -> CompileResult {
         self.local_hir = Some(hir);
         self.validate_expression_helpers(hir);
+        self.validate_patterns(hir);
+        self.validate_guards(hir);
         let fixtures = self.compile_fixture_declarations(hir);
         for definition in &fixtures {
             self.referenced_fixtures
                 .insert(definition.id, definition.clone());
         }
         let mut occurrences = HashMap::<String, u32>::new();
-        let tests = hir
-            .tests
-            .iter()
-            .map(|test| {
+        let mut tests = Vec::new();
+        for test in &hir.tests {
+            let occurrence = occurrences.entry(test.name.clone()).or_default();
+            let base = webtest_plan::declaration_identity(source_identity, &test.name, *occurrence);
+            *occurrence += 1;
+            let mut labels = HashSet::new();
+            let rows: Vec<_> = match &test.cases {
+                Some(cases) => {
+                    if cases.is_empty() || cases.len() > 1024 {
+                        self.error(
+                            test.origin.range,
+                            "semantic.invalid_cases",
+                            "cases require 1 to 1024 rows".into(),
+                        );
+                    }
+                    cases.iter().take(1024).map(Some).collect()
+                }
+                None => vec![None],
+            };
+            let mut schema: Option<Type> = None;
+            for row in rows {
+                if tests.len() >= 10_000 {
+                    self.error(
+                        test.origin.range,
+                        "semantic.variant_limit",
+                        "file variant limit of 10000 exceeded".into(),
+                    );
+                    break;
+                }
                 self.bindings.clear();
                 self.names.clear();
                 self.declared_names.clear();
@@ -207,39 +243,139 @@ impl<'a> Compiler<'a> {
                 for statement in &test.body {
                     statements::collect_binding_names(statement, &mut self.declared_names);
                 }
-                let occurrence = occurrences.entry(test.name.clone()).or_default();
-                let declaration_id =
-                    webtest_plan::declaration_identity(source_identity, &test.name, *occurrence);
-                *occurrence += 1;
-                let body = self.compile_sequence(
+                let key = row.map_or("default", |r| r.label.as_str());
+                let variant_id = webtest_model::TestVariantId(webtest_text::semantic_key(
+                    &test.declaration_id.0,
+                    "variant",
+                    key,
+                    0,
+                ));
+                let declaration_id = if row.is_some() {
+                    webtest_model::PlanDeclarationId(webtest_text::semantic_key(
+                        &base.0, "case", key, 0,
+                    ))
+                } else {
+                    base
+                };
+                let mut initial = Vec::new();
+                if let Some(row) = row {
+                    if row.label.is_empty() || !labels.insert(row.label.clone()) {
+                        self.error(
+                            row.label_origin.range,
+                            "semantic.duplicate_case_label",
+                            "case labels must be nonempty and unique".into(),
+                        );
+                    }
+                    let value = self.infer_expr(&row.value, Capability::Pure, None);
+                    if let Some(expected) = &schema {
+                        if !expected.accepts(&value.ty) || !value.ty.accepts(expected) {
+                            self.error(row.value.origin.range,"semantic.case_type_mismatch",format!("case `{}` is incompatible with the case schema: expected {}, found {}",row.label,expected,value.ty));
+                        }
+                    } else {
+                        schema = Some(value.ty.clone());
+                    }
+                    let constant =
+                        webtest_plan::evaluation::evaluate(&value.expression, &HashMap::new());
+                    let constant = match constant {
+                        Ok(value) if webtest_plan::evaluation::runtime_transferable(&value) => {
+                            value
+                        }
+                        _ => {
+                            self.error(
+                                row.value.origin.range,
+                                "semantic.nonconstant_case",
+                                "case values must be deterministic transferable pure constants"
+                                    .into(),
+                            );
+                            webtest_model::Value::Null
+                        }
+                    };
+                    if let Some(binding) = &test.case_binding {
+                        self.names.insert(binding.name.clone(), binding.name_origin);
+                        self.declared_names.insert(binding.name.clone());
+                        self.bindings.insert(
+                            binding.id,
+                            BindingState {
+                                name: binding.name.clone(),
+                                ty: value.ty.clone(),
+                                domain: Capability::Pure,
+                                provider_operation: None,
+                            },
+                        );
+                        self.type_fact(
+                            binding.name_origin.range,
+                            value.ty.clone(),
+                            Capability::Pure,
+                        );
+                        self.push_step(
+                            &mut initial,
+                            row.origin,
+                            webtest_plan::TestOperation::EvaluatePure(
+                                webtest_plan::EvaluatePureOperation {
+                                    expression: PlanExpr::Literal(constant),
+                                    result_binding: Some(binding.id),
+                                    result_name: Some(binding.name.clone()),
+                                    result_type: value.ty,
+                                },
+                            ),
+                        );
+                    }
+                }
+                let mut body = self.compile_sequence(
                     declaration_id,
                     test.origin,
                     &test.body,
                     Capability::Pure,
                     Vec::new(),
                 );
-                let body =
-                    if body.required_resources().iter().any(|usage| {
-                        usage.resource == webtest_plan::ResourceReference::BrowserContext
-                    }) {
-                        body.with_browser_resource(declaration_id)
-                    } else {
-                        body
-                    };
-                webtest_plan::PlannedTest {
+                if !initial.is_empty() {
+                    body.rebase(declaration_id, vec![1]);
+                    let mut children = initial
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, s)| {
+                            webtest_plan::PlanNode::operation(
+                                declaration_id,
+                                self.revision,
+                                vec![i as u32],
+                                s,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    children.push(body);
+                    body = webtest_plan::PlanNode::sequence(
+                        declaration_id,
+                        test.origin,
+                        self.revision,
+                        Vec::new(),
+                        children,
+                    );
+                }
+                if body
+                    .required_resources()
+                    .iter()
+                    .any(|usage| usage.resource == webtest_plan::ResourceReference::BrowserContext)
+                {
+                    body = body.with_browser_resource(declaration_id);
+                }
+                tests.push(webtest_plan::PlannedTest {
+                    case_label: row.map(|r| r.label.clone()),
                     test_declaration_id: test.declaration_id,
-                    variant_id: test.variant_id,
-                    id: test.id,
+                    variant_id,
+                    id: webtest_model::TestId(tests.len() as u32),
                     declaration_id,
-                    name: test.name.clone(),
+                    name: row.map_or_else(
+                        || test.name.clone(),
+                        |r| format!("{} [{}]", test.name, r.label),
+                    ),
                     required_host_capabilities: std::mem::take(&mut self.test_required)
                         .into_iter()
                         .collect(),
                     body,
                     origin: test.origin,
-                }
-            })
-            .collect();
+                });
+            }
+        }
         for definition in &fixtures {
             self.referenced_fixtures
                 .entry(definition.id)

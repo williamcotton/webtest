@@ -85,6 +85,16 @@ pub fn render_html(trace: &VerifiedTrace, max_bytes: usize) -> Result<String, Re
     for source in &trace.manifest.sources {
         sources.insert((source.execution_id, source.file_id.get()), source);
     }
+    let mut actors = BTreeMap::new();
+    for record in &trace.records {
+        if let ExecutionEvent::Semantic {
+            event: webtest_observation::SemanticEvent::ActorOpened { actor, name },
+            ..
+        } = &record.event
+        {
+            actors.insert((record.identity.execution_id, *actor), name.clone());
+        }
+    }
     for record in &trace.records {
         executions
             .entry(record.identity.execution_id)
@@ -109,6 +119,24 @@ pub fn render_html(trace: &VerifiedTrace, max_bytes: usize) -> Result<String, Re
             let sequence = record.identity.event_sequence.0;
             let context = &record.metadata.execution_context;
             out.add(format_args!("<tr id=\"event-{execution}-{sequence}\" class=\"{}\"><td>{:.3} s · #{sequence}<meter min=\"0\" max=\"{maximum}\" value=\"{}\" aria-label=\"Elapsed time\"></meter></td><td>", if record.event.failure_code().is_some() { "failure" } else { "fact" }, record.timestamp.elapsed.as_secs_f64(), record.timestamp.elapsed.as_secs_f64()))?;
+            let actor = context.actor.or_else(|| {
+                if let ExecutionEvent::Semantic { event, .. } = &record.event {
+                    event.actor()
+                } else {
+                    None
+                }
+            });
+            if let Some(actor) = actor {
+                out.add(format_args!(
+                    "actor {} <code>{actor}</code><br>",
+                    Escape(
+                        actors
+                            .get(&(execution, actor))
+                            .map(String::as_str)
+                            .unwrap_or("(name not recorded)")
+                    )
+                ))?;
+            }
             if let Some(test) = context.test_id {
                 out.add(format_args!("test {}<br>", test.0))?;
             }
@@ -177,8 +205,21 @@ pub fn render_html(trace: &VerifiedTrace, max_bytes: usize) -> Result<String, Re
         } else {
             out.add(format_args!("root"))?;
         }
+        if let Some(actor) = context.actor {
+            out.add(format_args!(
+                "</td><td>actor {} <code>{actor}</code><br>",
+                Escape(
+                    actors
+                        .get(&(*execution, actor))
+                        .map(String::as_str)
+                        .unwrap_or("(name not recorded)")
+                )
+            ))?;
+        } else {
+            out.add(format_args!("</td><td>"))?;
+        }
         out.add(format_args!(
-            "</td><td>{:?}</td><td>",
+            "{:?}</td><td>",
             context.task_path.as_deref().unwrap_or_default()
         ))?;
         if let Some(attempt) = context.attempt_id {
@@ -267,6 +308,9 @@ fn label(record: &RecordedEvent) -> String {
             event.kind(),
             event.outcome.map(|o| format!("{o:?}")).unwrap_or_default()
         ),
+        ExecutionEvent::Semantic { event, .. } => {
+            serde_json::to_string(event).unwrap_or_else(|_| event.kind().into())
+        }
         ExecutionEvent::Attempt { event, scope, .. } => format!(
             "Attempt {}/{} · {}",
             event.ordinal,

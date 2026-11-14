@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+webtest-model.workspace = true
 globset.workspace = true
 serde.workspace = true
 thiserror.workspace = true

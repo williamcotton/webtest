@@ -52,6 +52,45 @@ impl CdpPage {
 
 #[async_trait]
 impl Page for CdpPage {
+    async fn start_reactive(
+        &mut self,
+        observer: std::sync::Arc<dyn webtest_browser::reactive::ReactiveObserver>,
+        sources: &[webtest_model::EventSource],
+    ) -> Result<(), BrowserError> {
+        self.connection
+            .reactive_start(self.session_id.clone(), observer, sources);
+        if sources.iter().any(|s| {
+            matches!(
+                s,
+                webtest_model::EventSource::NetworkRequest
+                    | webtest_model::EventSource::NetworkResponse
+                    | webtest_model::EventSource::WebsocketReceived
+                    | webtest_model::EventSource::WebsocketSent
+                    | webtest_model::EventSource::WebsocketReceivedJson
+                    | webtest_model::EventSource::WebsocketSentJson
+            )
+        }) {
+            self.connection
+                .command(
+                    "Network.enable",
+                    Some(serde_json::json!({"maxTotalBufferSize":0,"maxResourceBufferSize":0})),
+                    Some(&self.session_id),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+    async fn reactive_barrier(&mut self) -> Result<(), BrowserError> {
+        self.connection
+            .command(
+                "Runtime.evaluate",
+                Some(serde_json::json!({"expression":"void 0","returnByValue":true})),
+                Some(&self.session_id),
+            )
+            .await
+            .map(|_| ())
+    }
+
     fn set_operation_context(
         &mut self,
         context: Option<std::sync::Arc<dyn webtest_host::OperationContext>>,
@@ -195,5 +234,11 @@ where
         biased;
         result = &mut future => Ok(result),
         _ = tokio::time::sleep_until(deadline) => Err(()),
+    }
+}
+
+impl Drop for CdpPage {
+    fn drop(&mut self) {
+        self.connection.reactive_stop(&self.session_id);
     }
 }

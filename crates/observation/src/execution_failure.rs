@@ -83,6 +83,10 @@ impl ExecutionFailure {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PriorScopeOutcome {
+    Verdict {
+        verdict: webtest_model::VerdictKind,
+        message: String,
+    },
     Failed {
         step_id: StepId,
         origin: webtest_text::SyntaxOrigin,

@@ -9,6 +9,8 @@ pub use webtest_model::ExecutionScopeId;
 pub enum CancellationReason {
     UserCancelled,
     ParentFailed,
+    GuardFailed,
+    Verdict,
     RaceLost,
     Timeout,
     DebugDisconnect,

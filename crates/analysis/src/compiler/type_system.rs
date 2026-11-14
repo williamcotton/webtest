@@ -2,7 +2,7 @@
 
 use super::{Compiler, TypedExpr};
 use crate::diagnostic::type_reference_name;
-use webtest_hir::{HirExpr, HirExprKind, HirNameRef, HirType, HirTypeKind};
+use webtest_hir::{HirType, HirTypeKind};
 use webtest_model::{BinaryOperator, Capability, RecordField, Type, Value};
 use webtest_plan::{PlanExpr, ValueMatcher};
 use webtest_text::TextRange;
@@ -97,48 +97,6 @@ impl Compiler<'_> {
                 Type::Bool
             }
             BinaryOperator::Matches => Type::Bool,
-        }
-    }
-
-    pub(super) fn pattern_type(&mut self, expression: &HirExpr) -> Type {
-        match &expression.kind {
-            HirExprKind::Name(HirNameRef::Unresolved(name)) => {
-                named_type(name).unwrap_or_else(|| {
-                    self.error(
-                        expression.origin.range,
-                        "semantic.unknown_type",
-                        format!("unknown type `{name}` in match pattern"),
-                    );
-                    Type::Unknown
-                })
-            }
-            HirExprKind::Record(fields) => Type::Record(
-                fields
-                    .iter()
-                    .map(|field| {
-                        (
-                            field.name.clone(),
-                            RecordField {
-                                ty: self.pattern_type(&field.value),
-                                optional: false,
-                                documentation: String::new(),
-                                secret: false,
-                            },
-                        )
-                    })
-                    .collect(),
-            ),
-            HirExprKind::List(items) if items.len() == 1 => {
-                Type::List(Box::new(self.pattern_type(&items[0])))
-            }
-            _ => {
-                self.error(
-                    expression.origin.range,
-                    "semantic.invalid_type_pattern",
-                    "expected a type name, record shape, or one-element list shape".into(),
-                );
-                Type::Unknown
-            }
         }
     }
 
@@ -248,6 +206,8 @@ pub(super) fn named_types() -> &'static [(&'static str, Type)] {
         ("TempDirectory", Type::TempDirectory),
         ("Locator", Type::Locator),
         ("BrowserPage", Type::BrowserPage),
+        ("BrowserActor", Type::BrowserActor),
+        ("EventCursor", Type::EventCursor),
     ]
 }
 fn named_type(name: &str) -> Option<Type> {

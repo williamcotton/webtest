@@ -43,7 +43,7 @@
   "webtestCompatibility": {
     "wasm_editor_api": 1,
     "worker_protocol": 1,
-    "plan_format": 10
+    "plan_format": 11
   },
   "overrides": {
     "dompurify": "3.4.17"

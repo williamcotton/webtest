@@ -12,6 +12,8 @@ use webtest_text::{SourceRevision, SyntaxOrigin};
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<webtest_model::ActorId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fixture: Option<crate::FixtureExecutionContext>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub test_declaration_id: Option<webtest_model::TestDeclarationId>,
@@ -49,6 +51,7 @@ impl From<&ScopeEvent> for EventMetadata {
         let context = &scope.execution_context;
         Self {
             execution_context: EventContext {
+                actor: context.actor,
                 fixture: context.fixture,
                 test_declaration_id: context.test_declaration_id,
                 variant_id: context.variant_id,
@@ -73,6 +76,7 @@ impl ExecutionEvent {
             Self::Scope { event, .. } => Some(event),
             Self::CancellationRequested { scope, .. }
             | Self::ScopeAborted { scope, .. }
+            | Self::Semantic { scope, .. }
             | Self::Attempt { scope, .. }
             | Self::Wait { scope, .. } => Some(scope),
             Self::Resource { scope, .. } => scope.as_ref(),
@@ -85,6 +89,7 @@ impl ExecutionEvent {
             Self::Scope { event, .. } => event.execution_context.test_id,
             Self::CancellationRequested { scope, .. }
             | Self::ScopeAborted { scope, .. }
+            | Self::Semantic { scope, .. }
             | Self::Attempt { scope, .. }
             | Self::Wait { scope, .. } => scope.execution_context.test_id,
             Self::Resource { scope, .. } => match scope {
@@ -130,6 +135,7 @@ impl ExecutionEvent {
             .map(EventMetadata::from)
             .unwrap_or_else(|| EventMetadata {
                 execution_context: EventContext {
+                    actor: None,
                     test_id: self.test_id(),
                     ..Default::default()
                 },
@@ -158,6 +164,7 @@ impl EventMetadata {
                     && self.source_revision.is_some()))
             && (scoped
                 || (context.parent_scope_id.is_none()
+                    && context.actor.is_none()
                     && context.operation_execution_id.is_none()
                     && context.attempt_id.is_none()))
             && (self.origin.is_none() || self.source_revision.is_some())
@@ -178,6 +185,7 @@ mod tests {
     fn scope() -> ScopeEvent {
         ScopeEvent {
             execution_context: ExecutionContext {
+                actor: None,
                 fixture: None,
                 test_declaration_id: None,
                 variant_id: None,

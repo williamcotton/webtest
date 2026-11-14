@@ -5,6 +5,7 @@ mod discovery;
 mod host;
 mod page;
 mod process;
+mod reactive;
 mod session;
 mod wire;
 

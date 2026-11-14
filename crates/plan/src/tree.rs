@@ -18,6 +18,10 @@ pub struct PlanNode {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PlanNodeKind {
+    Semantic {
+        operation: crate::semantics::SemanticOperation,
+        children: Vec<PlanNode>,
+    },
     /// Compiler-generated lazy expression control; no public conditional syntax.
     Conditional {
         condition: crate::PlanExpr,
@@ -77,6 +81,34 @@ pub const MAX_PARALLEL_BRANCHES: usize = 64;
 pub const MAX_CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 impl PlanNode {
+    pub fn semantic(
+        test: PlanDeclarationId,
+        origin: SyntaxOrigin,
+        revision: SourceRevision,
+        path: Vec<u32>,
+        operation: crate::semantics::SemanticOperation,
+        children: Vec<Self>,
+    ) -> Self {
+        let mut node = Self::sequence(test, origin, revision, path, children);
+        let PlanNodeKind::Sequence { children } = node.kind else {
+            unreachable!()
+        };
+        if matches!(
+            operation,
+            crate::semantics::SemanticOperation::ActorScope { .. }
+                | crate::semantics::SemanticOperation::ActorAccess { .. }
+        ) {
+            node.required_capabilities.push(Capability::Browser);
+            node.required_capabilities.sort();
+            node.required_capabilities.dedup();
+        }
+        node.kind = PlanNodeKind::Semantic {
+            operation,
+            children,
+        };
+        node.assign_identity(test);
+        node
+    }
     pub fn conditional(
         test: PlanDeclarationId,
         origin: SyntaxOrigin,
@@ -230,6 +262,7 @@ impl PlanNode {
             PlanNodeKind::Conditional {
                 branches: children, ..
             }
+            | PlanNodeKind::Semantic { children, .. }
             | PlanNodeKind::Sequence { children }
             | PlanNodeKind::Parallel { children, .. }
             | PlanNodeKind::Race { children, .. } => {
@@ -356,10 +389,13 @@ impl PlanNode {
             PlanNodeKind::ResourceScope { .. } => "resource/browser-context/v1",
             PlanNodeKind::Parallel { .. } => "parallel/v1",
             PlanNodeKind::Race { .. } => "race/v2",
+            PlanNodeKind::Semantic { operation, .. } => operation.identity(),
             PlanNodeKind::Sequence { .. } => "sequence/v1",
             PlanNodeKind::Timeout { .. } => "timeout/v1",
             PlanNodeKind::Retry { .. } => "retry/v1",
             PlanNodeKind::Operation { step } => match &step.operation {
+                crate::TestOperation::Reactive(_) => "reactive/v1",
+                crate::TestOperation::Verdict { .. } => "verdict/v1",
                 crate::TestOperation::AcquireFixture(_) => "fixture/acquire/v1",
                 crate::TestOperation::EvaluatePure(_) => "eval/v1",
                 crate::TestOperation::Provide(_) => "provide/v1",
@@ -393,6 +429,7 @@ impl PlanNode {
             PlanNodeKind::Conditional {
                 branches: children, ..
             }
+            | PlanNodeKind::Semantic { children, .. }
             | PlanNodeKind::Sequence { children }
             | PlanNodeKind::Parallel { children, .. }
             | PlanNodeKind::Race { children, .. } => {
@@ -413,6 +450,7 @@ impl PlanNode {
             PlanNodeKind::Conditional {
                 branches: children, ..
             }
+            | PlanNodeKind::Semantic { children, .. }
             | PlanNodeKind::Sequence { children }
             | PlanNodeKind::Parallel { children, .. }
             | PlanNodeKind::Race { children, .. } => {
@@ -426,6 +464,8 @@ impl PlanNode {
 fn operation_capabilities(operation: &crate::TestOperation) -> Vec<Capability> {
     use crate::{AssertionOperation, TestOperation};
     match operation {
+        TestOperation::Reactive(_) => vec![Capability::Browser],
+        TestOperation::Verdict { .. } => vec![Capability::Test],
         TestOperation::EvaluatePure(_) | TestOperation::Provide(_) | TestOperation::Return(_) => {
             vec![]
         }
@@ -483,6 +523,14 @@ impl PlanNode {
         if self.source_revision != revision {
             return Err(PlanTreeError::SourceRevisionMismatch);
         }
+        if let PlanNodeKind::Semantic {
+            operation,
+            children,
+        } = &self.kind
+            && !operation.validate(children)
+        {
+            return Err(PlanTreeError::InvalidControlSetting);
+        }
         if self.id != self.derived_identity(test) {
             return Err(PlanTreeError::InvalidIdentity);
         }
@@ -496,10 +544,12 @@ impl PlanNode {
             if !crate::conflicting_resource_accesses(&accesses).is_empty() {
                 return Err(PlanTreeError::ResourceAccessConflict);
             }
-            if children
-                .iter()
-                .any(|child| !child.required_resources().is_empty())
-            {
+            if children.iter().any(|child| {
+                child
+                    .required_resources()
+                    .iter()
+                    .any(|usage| !matches!(usage.resource, crate::ResourceReference::Actor(_)))
+            }) {
                 return Err(PlanTreeError::MissingResourceScope);
             }
         }
@@ -577,15 +627,35 @@ impl PlanNode {
             PlanNodeKind::Conditional {
                 branches: children, ..
             }
+            | PlanNodeKind::Semantic { children, .. }
             | PlanNodeKind::Sequence { children }
             | PlanNodeKind::Parallel { children, .. }
             | PlanNodeKind::Race { children, .. } => {
                 for (ordinal, child) in children.iter().enumerate() {
-                    if child.origin.file != self.origin.file {
+                    if child.origin.file != self.origin.file
+                        && !matches!(
+                            &self.kind,
+                            PlanNodeKind::Semantic {
+                                operation: crate::semantics::SemanticOperation::Guards { .. },
+                                ..
+                            }
+                        )
+                    {
                         return Err(PlanTreeError::OriginMismatch);
                     }
                     let mut child_path = path.to_vec();
                     child_path.push(ordinal as u32);
+                    let revision = if matches!(
+                        &self.kind,
+                        PlanNodeKind::Semantic {
+                            operation: crate::semantics::SemanticOperation::Guards { .. },
+                            ..
+                        }
+                    ) {
+                        child.source_revision
+                    } else {
+                        revision
+                    };
                     child.validate(test, revision, &child_path, steps)?;
                 }
                 children
@@ -605,6 +675,19 @@ impl PlanNode {
                 operation_capabilities(&step.operation)
             }
         };
+        let mut capabilities = capabilities;
+        if matches!(
+            &self.kind,
+            PlanNodeKind::Semantic {
+                operation: crate::semantics::SemanticOperation::ActorScope { .. }
+                    | crate::semantics::SemanticOperation::ActorAccess { .. },
+                ..
+            }
+        ) {
+            capabilities.push(Capability::Browser);
+            capabilities.sort();
+            capabilities.dedup();
+        }
         if self.required_capabilities != capabilities {
             return Err(PlanTreeError::CapabilityMismatch);
         }
@@ -654,7 +737,16 @@ impl PlanNode {
                     Ok(false)
                 }
             }
-            PlanNodeKind::Sequence { children } => {
+            PlanNodeKind::Semantic {
+                operation: crate::semantics::SemanticOperation::Select { result, .. },
+                children,
+            } => {
+                for child in children {
+                    child.validate_results(ResultFlow::Race, result.as_ref().map(|r| &r.ty))?;
+                }
+                Ok(false)
+            }
+            PlanNodeKind::Semantic { children, .. } | PlanNodeKind::Sequence { children } => {
                 let mut provided = false;
                 for child in children {
                     if provided {
@@ -679,7 +771,10 @@ impl PlanNode {
             PlanNodeKind::Helper { call, body } => {
                 let returned =
                     body.validate_results(ResultFlow::Helper, Some(&call.result_type))?;
-                if !returned && call.result_type != webtest_model::Type::Null {
+                if !returned
+                    && !body.terminates_variant()
+                    && call.result_type != webtest_model::Type::Null
+                {
                     return Err(PlanTreeError::InvalidHelperResult);
                 }
                 Ok(false)
@@ -702,7 +797,7 @@ impl PlanNode {
                         ResultFlow::Race,
                         result.as_ref().map(|binding| &binding.ty),
                     )?;
-                    if result.is_some() && !provided {
+                    if result.is_some() && !provided && !child.terminates_variant() {
                         return Err(PlanTreeError::InvalidRaceResult);
                     }
                 }
@@ -722,12 +817,18 @@ fn validate_authored_and_related(
             return Err(PlanTreeError::DuplicateSourceFile);
         }
     }
-    let mut declarations = std::collections::BTreeSet::new();
+    let mut declarations = std::collections::BTreeMap::new();
     let mut variants = std::collections::BTreeSet::new();
     for test in tests {
-        if !declarations.insert(test.test_declaration_id)
+        let mode = test.case_label.is_some();
+        let previous = declarations.insert(test.test_declaration_id, (mode, test.origin));
+        if previous.is_some_and(|(old, origin)| !mode || old != mode || origin != test.origin)
             || !variants.insert(test.variant_id)
-            || test.variant_id != default_variant(test.test_declaration_id)
+            || test.variant_id
+                != labeled_variant(
+                    test.test_declaration_id,
+                    test.case_label.as_deref().unwrap_or("default"),
+                )
         {
             return Err(PlanTreeError::InvalidVariantIdentity);
         }
@@ -859,6 +960,18 @@ impl crate::PlanEnvelope {
     }
 }
 
+pub fn labeled_variant(
+    declaration: webtest_model::TestDeclarationId,
+    label: &str,
+) -> webtest_model::TestVariantId {
+    webtest_model::TestVariantId(webtest_text::semantic_key(
+        &declaration.0,
+        "variant",
+        label,
+        0,
+    ))
+}
+
 pub fn default_variant(
     declaration: webtest_model::TestDeclarationId,
 ) -> webtest_model::TestVariantId {
@@ -900,6 +1013,7 @@ impl PlannedTest {
             body
         };
         Self {
+            case_label: None,
             test_declaration_id: webtest_model::TestDeclarationId(declaration_id.0),
             variant_id: default_variant(webtest_model::TestDeclarationId(declaration_id.0)),
             id,
@@ -955,6 +1069,15 @@ impl PlanNode {
                 }
                 vec![condition]
             }
+            PlanNodeKind::Semantic {
+                operation,
+                children,
+            } => {
+                for child in children {
+                    child.validate_sources(revision)?;
+                }
+                operation.expressions()
+            }
             PlanNodeKind::Sequence { children }
             | PlanNodeKind::Parallel { children, .. }
             | PlanNodeKind::Race { children, .. } => {
@@ -975,6 +1098,11 @@ impl PlanNode {
             .map(|expression| (expression, 0))
             .collect::<Vec<_>>();
         while let Some((expression, depth)) = pending.pop() {
+            if let crate::PlanExpr::Pattern(matcher) = expression
+                && !matcher.validate()
+            {
+                return Err(PlanTreeError::InvalidControlSetting);
+            }
             if depth > 256 {
                 return Err(PlanTreeError::TooDeep);
             }

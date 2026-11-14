@@ -24,8 +24,46 @@ pub(crate) fn redact_step_error(
             let actual = error.actual.redacted_with_secrets(fields, secrets);
             StepError::Assertion(Box::new(AssertionFailure {
                 matcher: error.matcher,
-                message: assertion_message(error.matcher, &actual, expected.as_ref()),
-                diff: value_diff(error.matcher, &actual, expected.as_ref()),
+                message: if matches!(
+                    error.matcher,
+                    webtest_plan::ValueMatcher::ExplicitFail | webtest_plan::ValueMatcher::Check
+                ) {
+                    redact_text(error.message, secrets)
+                } else {
+                    assertion_message(error.matcher, &actual, expected.as_ref())
+                },
+                diff: match error.diff {
+                    webtest_observation::ValueDiff::Check {
+                        mut failures,
+                        total,
+                        truncated,
+                    } => {
+                        for failure in &mut failures {
+                            *failure.failure = redact_runtime_failure(
+                                *failure.failure.clone(),
+                                secrets,
+                                query_parameters,
+                            );
+                        }
+                        webtest_observation::ValueDiff::Check {
+                            failures,
+                            total,
+                            truncated,
+                        }
+                    }
+                    webtest_observation::ValueDiff::Pattern { mut report } => {
+                        for mismatch in report.mismatches.iter_mut().chain(
+                            report
+                                .alternatives
+                                .iter_mut()
+                                .flat_map(|alternative| alternative.mismatches.iter_mut()),
+                        ) {
+                            mismatch.path = redact_text(mismatch.path.clone(), secrets);
+                        }
+                        webtest_observation::ValueDiff::Pattern { report }
+                    }
+                    _ => value_diff(error.matcher, &actual, expected.as_ref()),
+                },
                 expected,
                 actual,
             }))
@@ -433,7 +471,7 @@ pub(crate) fn bounded_value_summary(value: &Value) -> String {
     summary
 }
 
-fn collect_sensitive_values(
+pub(crate) fn collect_sensitive_values(
     value: &Value,
     redacted_fields: &[String],
     sensitive: bool,
@@ -576,6 +614,30 @@ fn redact_runtime_failure(
         E::Assertion { message, diff } => E::Assertion {
             message: redact_text(message, secrets),
             diff: match diff {
+                D::Check {
+                    mut failures,
+                    total,
+                    truncated,
+                } => {
+                    for failure in &mut failures {
+                        *failure.failure = redact_runtime_failure(
+                            *failure.failure.clone(),
+                            secrets,
+                            query_parameters,
+                        );
+                    }
+                    D::Check {
+                        failures,
+                        total,
+                        truncated,
+                    }
+                }
+                D::Pattern { mut report } => {
+                    for mismatch in &mut report.mismatches {
+                        mismatch.path = redact_text(mismatch.path.clone(), secrets);
+                    }
+                    D::Pattern { report }
+                }
                 D::Scalar { expected, actual } => D::Scalar {
                     expected: expected.map(|v| redact_text(v, secrets)),
                     actual: redact_text(actual, secrets),
@@ -628,6 +690,119 @@ fn redact_runtime_failure(
             message: redact_text(message, secrets),
         },
         error @ E::TestTimeout { .. } => error,
+    }
+}
+
+pub(crate) fn reactive_payload(
+    value: &Value,
+    fields: &[String],
+    secrets: &[String],
+    query: &[String],
+) -> Value {
+    fn urls(value: &mut Value, secrets: &[String], query: &[String]) {
+        match value {
+            Value::Record(fields) => {
+                let is_url = fields.contains_key("scheme")
+                    && fields.contains_key("host")
+                    && fields.contains_key("path");
+                if is_url && let Some(Value::String(value)) = fields.get_mut("value") {
+                    *value = redact_url(value.clone(), secrets, query);
+                    if let Ok(parsed) = url::Url::parse(value) {
+                        fields.insert(
+                            "query".into(),
+                            Value::String(parsed.query().unwrap_or("").into()),
+                        );
+                    }
+                }
+                for child in fields.values_mut() {
+                    urls(child, secrets, query);
+                }
+            }
+            Value::List(items) => {
+                for child in items {
+                    urls(child, secrets, query)
+                }
+            }
+            Value::String(text) => {
+                let mut rendered = String::new();
+                for part in text.split_inclusive(char::is_whitespace) {
+                    let bare = part.trim_end_matches(char::is_whitespace);
+                    let start = ["https://", "http://", "wss://", "ws://"]
+                        .iter()
+                        .filter_map(|scheme| bare.find(scheme))
+                        .min();
+                    if let Some(start) = start {
+                        let end = bare
+                            .trim_end_matches(['\"', '\'', ')', ']', '}', ',', ';'])
+                            .len();
+                        if end > start {
+                            rendered.push_str(&part[..start]);
+                            rendered.push_str(&redact_url(part[start..end].into(), secrets, query));
+                            rendered.push_str(&part[end..]);
+                        } else {
+                            rendered.push_str(part)
+                        }
+                    } else {
+                        rendered.push_str(part)
+                    }
+                }
+                *text = rendered;
+            }
+            _ => (),
+        }
+    }
+    let mut value = debugger_value(value, fields, secrets);
+    urls(&mut value, secrets, query);
+    value
+}
+
+pub(crate) fn collect_event_url_secrets(
+    value: &Value,
+    query: &[String],
+    secrets: &mut Vec<String>,
+) {
+    match value {
+        Value::String(text) => {
+            for part in text.split_whitespace() {
+                let start = ["https://", "http://", "wss://", "ws://"]
+                    .iter()
+                    .filter_map(|scheme| part.find(scheme))
+                    .min();
+                if let Some(start) = start
+                    && let Ok(url) = url::Url::parse(
+                        part[start..].trim_end_matches(['"', '\'', ')', ']', '}', ',', ';']),
+                    )
+                {
+                    for raw in url.query().unwrap_or_default().split('&') {
+                        let mut pairs = url::form_urlencoded::parse(raw.as_bytes());
+                        let Some((name, value)) = pairs.next() else {
+                            continue;
+                        };
+                        if !value.is_empty()
+                            && query.iter().any(|field| field.eq_ignore_ascii_case(&name))
+                        {
+                            secrets.push(value.into_owned());
+                            if let Some((_, encoded)) = raw.split_once('=')
+                                && !encoded.is_empty()
+                            {
+                                secrets.push(encoded.into());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Value::Record(fields) => {
+            for value in fields.values() {
+                collect_event_url_secrets(value, query, secrets)
+            }
+        }
+        Value::List(values) => {
+            for value in values {
+                collect_event_url_secrets(value, query, secrets)
+            }
+        }
+        _ => (),
     }
 }
 

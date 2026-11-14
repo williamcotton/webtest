@@ -20,6 +20,15 @@ impl Compiler<'_> {
             db.unwind_if_revision_cancelled();
         }
         let result = match &expression.kind {
+            HirExprKind::PatternRecord { .. } => {
+                self.error(
+                    expression.origin.range,
+                    "semantic.pattern_not_value",
+                    "pattern forms are only legal in pattern declarations and matches operands"
+                        .into(),
+                );
+                super::type_system::unknown_expr()
+            }
             HirExprKind::Literal(literal) => match literal {
                 HirLiteral::String(value) => {
                     super::type_system::typed(Value::String(value.clone()), Type::String)
@@ -39,6 +48,9 @@ impl Compiler<'_> {
             },
             HirExprKind::Name(HirNameRef::Binding { id, name }) => {
                 if let Some(binding) = self.bindings.get(id).cloned() {
+                    if matches!(binding.ty, Type::BrowserActor | Type::EventCursor) {
+                        self.error(expression.origin.range,"semantic.resource_value","actors and event cursors may only be used by their explicit language operations".into());
+                    }
                     if self.retry_captures.contains(id) {
                         self.error(expression.origin.range, "semantic.non_transferable_retry_capture", format!("binding `{name}` has non-transferable type {} and cannot be captured by a fresh retry attempt", binding.ty));
                     }
@@ -274,6 +286,18 @@ impl Compiler<'_> {
                 right,
             } => {
                 let left = self.infer_expr(left, domain, None);
+                if *operator == webtest_model::BinaryOperator::Matches {
+                    let matcher = self.compile_matcher(right, domain, false, 0);
+                    return TypedExpr {
+                        ty: Type::Bool,
+                        capability: Capability::Pure,
+                        expression: PlanExpr::Binary {
+                            operator: *operator,
+                            left: Box::new(left.expression),
+                            right: Box::new(PlanExpr::Pattern(Box::new(matcher))),
+                        },
+                    };
+                }
                 let right = self.infer_expr(right, domain, Some(&left.ty));
                 let ty =
                     self.validate_binary(*operator, &left.ty, &right.ty, expression.origin.range);

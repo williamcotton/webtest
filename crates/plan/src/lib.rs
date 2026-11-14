@@ -1,5 +1,9 @@
 //! Runtime-facing, syntax-independent, serializable test plans.
 
+pub mod evaluation;
+pub mod pattern;
+pub mod semantics;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     time::Duration,
@@ -30,8 +34,8 @@ pub use tree::{
 mod compatibility;
 pub use compatibility::{PlanCompatibilityError, PlanExecutionInputs};
 
-pub const PLAN_FORMAT_VERSION: u32 = 10;
-pub const RUNTIME_SEMANTICS_VERSION: u32 = 7;
+pub const PLAN_FORMAT_VERSION: u32 = 11;
+pub const RUNTIME_SEMANTICS_VERSION: u32 = 8;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PlanEnvelope {
@@ -220,6 +224,8 @@ impl TestPlan {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PlannedTest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub case_label: Option<String>,
     pub test_declaration_id: webtest_model::TestDeclarationId,
     pub variant_id: webtest_model::TestVariantId,
     pub id: TestId,
@@ -301,6 +307,11 @@ pub struct PlannedStep {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "operation", rename_all = "snake_case")]
 pub enum TestOperation {
+    Reactive(semantics::ReactiveOperation),
+    Verdict {
+        verdict: webtest_model::VerdictKind,
+        message: Option<PlanExpr>,
+    },
     AcquireFixture(FixtureAcquire),
     Return(ProvideOperation),
     Provide(ProvideOperation),
@@ -351,6 +362,7 @@ pub struct ServerProviderCall {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum PlanExpr {
+    Pattern(Box<pattern::Matcher>),
     /// A statically resolved, acyclic pure specialization. Arguments are evaluated
     /// once in author order; the body has an isolated parameter environment.
     PureCall {
@@ -456,6 +468,8 @@ pub enum AssertionOperation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ValueMatcher {
+    ExplicitFail,
+    Check,
     Truthy,
     Equal,
     NotEqual,
@@ -467,11 +481,19 @@ pub enum ValueMatcher {
     Matches,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum Locator {
+    Dynamic {
+        template: Box<Locator>,
+        value: Box<PlanExpr>,
+        name: Option<Box<PlanExpr>>,
+    },
     Id(String),
-    Role { role: String, name: Option<String> },
+    Role {
+        role: String,
+        name: Option<String>,
+    },
     Label(String),
     Text(String),
     Placeholder(String),

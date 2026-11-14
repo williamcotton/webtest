@@ -155,6 +155,12 @@ pub(super) struct FixtureBody<'a> {
     close: tokio::sync::oneshot::Receiver<()>,
 }
 pub(super) enum BrowserBody<'a> {
+    Actor {
+        actor: webtest_model::ActorId,
+        sources: &'a [webtest_model::EventSource],
+        name: &'a str,
+        body: &'a webtest_plan::PlanNode,
+    },
     Node(&'a webtest_plan::PlanNode),
     Fixture(FixtureBody<'a>),
 }

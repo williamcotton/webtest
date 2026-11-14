@@ -12,7 +12,7 @@ use crate::{
         compare_values, decode_value, display_value, evaluate, string_value, value_contains,
         values_equal,
     },
-    execution::{bounded_timeout, browser_locator, browser_state},
+    execution::{bounded_timeout, browser_state, resolve_locator},
     url::resolve_browser_url,
 };
 
@@ -31,7 +31,7 @@ pub(crate) async fn execute_assertion(
         } => page
             .ok_or_else(|| StepError::Internal("locator assertion has no browser page".into()))?
             .wait_for_locator(
-                &browser_locator(locator),
+                &resolve_locator(locator, environment)?,
                 browser_state(*state),
                 bounded_timeout(timeout.unwrap_or(options.assertion_timeout), remaining),
             )
@@ -56,7 +56,25 @@ pub(crate) async fn execute_assertion(
             ..
         } => {
             let actual = evaluate(actual, environment)?;
-            if *matcher == ValueMatcher::Matches {
+            if *matcher == ValueMatcher::Matches && matches!(expected, Some(PlanExpr::Pattern(_))) {
+                let Some(PlanExpr::Pattern(pattern)) = expected else {
+                    return Err(StepError::Internal("missing pattern".into()));
+                };
+                let report = pattern
+                    .matches(&actual, environment)
+                    .map_err(StepError::from)?;
+                if report.mismatches.is_empty() {
+                    Ok(())
+                } else {
+                    Err(StepError::Assertion(Box::new(AssertionFailure {
+                        matcher: *matcher,
+                        expected: None,
+                        actual,
+                        message: "pattern mismatch".into(),
+                        diff: ValueDiff::Pattern { report },
+                    })))
+                }
+            } else if *matcher == ValueMatcher::Matches {
                 let expected_type = expected
                     .as_ref()
                     .and_then(|expression| match expression {
@@ -94,6 +112,7 @@ fn assertion_matches(
     expected: Option<&Value>,
 ) -> Result<bool, StepError> {
     match matcher {
+        ValueMatcher::Check | ValueMatcher::ExplicitFail => Ok(false),
         ValueMatcher::Truthy => Ok(matches!(actual, Value::Bool(true))),
         ValueMatcher::Equal => Ok(expected.is_some_and(|expected| values_equal(actual, expected))),
         ValueMatcher::NotEqual => {
@@ -136,6 +155,15 @@ pub(crate) fn assertion_message(
     actual: &Value,
     expected: Option<&Value>,
 ) -> String {
+    if matcher == ValueMatcher::ExplicitFail {
+        return match actual {
+            Value::String(message) => message.clone(),
+            _ => "explicit failure".into(),
+        };
+    }
+    if matcher == ValueMatcher::Check {
+        return "check assertions failed".into();
+    }
     match expected {
         Some(expected) => format!(
             "assertion {matcher:?} failed: expected {}, got {}",

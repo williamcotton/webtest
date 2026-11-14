@@ -15,8 +15,8 @@ use super::{ProviderSelection, Runner, finish_run, skip_tests, validate_plan};
 use crate::events::{EventBuffer, emit_event};
 use crate::execution::{ExecutedTest, execute_test};
 use crate::{
-    CancellationReason, FailureClass, PriorRunOutcome, PriorTestOutcome, RunControl, RunError,
-    RunOutcome, RunResult, TestOutcome, TestResult,
+    CancellationReason, PriorRunOutcome, PriorTestOutcome, RunControl, RunError, RunOutcome,
+    RunResult, TestOutcome, TestResult,
 };
 
 /// A bounded number of concurrently active test roots, including their teardown.
@@ -95,7 +95,7 @@ struct FileServices {
     providers: ProviderRegistry,
     started: Instant,
     primary_failure: crate::execution::FailureSignal,
-    failure_notice: tokio::sync::watch::Receiver<Option<FailureClass>>,
+    failure_notice: tokio::sync::watch::Receiver<Option<crate::execution::PrimarySignal>>,
 }
 
 struct FileResults {
@@ -301,138 +301,143 @@ async fn run_allocated(
     };
     let (client, coordinator) = crate::fixtures::FixtureCoordinator::new(&driver);
     let _ = driver.client.set(client.clone());
-    let root_work = async {
-        let mut roots = inputs
-            .iter()
-            .enumerate()
-            .flat_map(|(file, input)| (0..input.plan.tests.len()).map(move |test| (file, test)));
-        let mut available: std::collections::VecDeque<_> = (0..jobs.get()).collect();
-        let mut pending = FuturesUnordered::new();
-        loop {
-            while let Some(&worker) = available.front() {
-                let Some((file, test)) = roots.next() else {
+    let root_work =
+        async {
+            let mut roots = inputs.iter().enumerate().flat_map(|(file, input)| {
+                (0..input.plan.tests.len()).map(move |test| (file, test))
+            });
+            let mut available: std::collections::VecDeque<_> = (0..jobs.get()).collect();
+            let mut pending = FuturesUnordered::new();
+            loop {
+                while let Some(&worker) = available.front() {
+                    let Some((file, test)) = roots.next() else {
+                        break;
+                    };
+                    let input = &inputs[file];
+                    let state = &mut files[file];
+                    if matches!(state.outcome, RunOutcome::Completed)
+                        && input.control.is_some_and(RunControl::is_cancelled)
+                    {
+                        state.outcome = RunOutcome::Cancelled {
+                            reason: input.control.map_or(
+                                CancellationReason::UserCancelled,
+                                RunControl::cancellation_reason,
+                            ),
+                        };
+                    }
+                    let skip = if services[file].events.overflow().is_some() {
+                        Some((
+                            SkipReason::RunAborted,
+                            Some(crate::FailureClass::Infrastructure),
+                        ))
+                    } else {
+                        match &state.outcome {
+                            RunOutcome::Completed => services[file]
+                                .failure_notice
+                                .borrow()
+                                .and_then(|signal| match signal {
+                                    crate::execution::PrimarySignal::Failure(class) => {
+                                        Some((SkipReason::RunAborted, Some(class)))
+                                    }
+                                    crate::execution::PrimarySignal::Verdict { .. } => None,
+                                }),
+                            RunOutcome::Cancelled { .. } => Some((SkipReason::RunCancelled, None)),
+                            RunOutcome::Aborted { failure, .. } => {
+                                Some((SkipReason::RunAborted, Some(failure.failure_class())))
+                            }
+                        }
+                    };
+                    if let Some((reason, class)) = skip {
+                        let mut skipped = Vec::new();
+                        skip_tests(
+                            &input.plan.tests[test..test + 1],
+                            reason,
+                            class,
+                            services[file].execution_id,
+                            &mut skipped,
+                            &services[file].events,
+                            input.runner.event_sink.as_deref(),
+                        );
+                        state.tests[test] = skipped.pop();
+                    } else {
+                        available.pop_front();
+                        pending.push(run_root(
+                            file,
+                            test,
+                            worker,
+                            input,
+                            &services[file],
+                            workers.map(|workers| &workers[worker]),
+                            crate::execution::fixtures::FixtureAccess {
+                                client: client.clone(),
+                                invocation,
+                                contexts: contexts.clone(),
+                                test_owner: None,
+                                environment: crate::fixtures::FixtureRequestEnvironment {
+                                    execution: services[file].execution_id,
+                                    worker: worker as u32,
+                                },
+                            },
+                        ));
+                    }
+                }
+                let Some((file, test, worker, result, observations)) = pending.next().await else {
                     break;
                 };
-                let input = &inputs[file];
+                available.push_back(worker);
                 let state = &mut files[file];
-                if matches!(state.outcome, RunOutcome::Completed)
-                    && input.control.is_some_and(RunControl::is_cancelled)
-                {
-                    state.outcome = RunOutcome::Cancelled {
-                        reason: input.control.map_or(
-                            CancellationReason::UserCancelled,
-                            RunControl::cancellation_reason,
-                        ),
-                    };
-                }
-                let skip = if services[file].events.overflow().is_some() {
-                    Some((
-                        SkipReason::RunAborted,
-                        Some(crate::FailureClass::Infrastructure),
-                    ))
-                } else {
-                    match &state.outcome {
-                        RunOutcome::Completed => services[file]
-                            .failure_notice
-                            .borrow()
-                            .map(|class| (SkipReason::RunAborted, Some(class))),
-                        RunOutcome::Cancelled { .. } => Some((SkipReason::RunCancelled, None)),
-                        RunOutcome::Aborted { failure, .. } => {
-                            Some((SkipReason::RunAborted, Some(failure.failure_class())))
-                        }
+                // Every failure remains in its source-ordered test result. The run
+                // outcome is only a summary and never replaces the test aggregate.
+                match &result.outcome {
+                    TestOutcome::Aborted { failure, .. }
+                        if !matches!(state.outcome, RunOutcome::Aborted { .. }) =>
+                    {
+                        let prior_outcome = match state.outcome {
+                            RunOutcome::Cancelled { reason } => {
+                                Some(PriorRunOutcome::Cancelled { reason })
+                            }
+                            _ => None,
+                        };
+                        state.outcome = RunOutcome::Aborted {
+                            failure: failure.clone(),
+                            prior_outcome,
+                        };
                     }
-                };
-                if let Some((reason, class)) = skip {
-                    let mut skipped = Vec::new();
-                    skip_tests(
-                        &input.plan.tests[test..test + 1],
-                        reason,
-                        class,
-                        services[file].execution_id,
-                        &mut skipped,
-                        &services[file].events,
-                        input.runner.event_sink.as_deref(),
-                    );
-                    state.tests[test] = skipped.pop();
-                } else {
-                    available.pop_front();
-                    pending.push(run_root(
-                        file,
-                        test,
-                        worker,
-                        input,
-                        &services[file],
-                        workers.map(|workers| &workers[worker]),
-                        crate::execution::fixtures::FixtureAccess {
-                            client: client.clone(),
-                            invocation,
-                            contexts: contexts.clone(),
-                            test_owner: None,
-                            environment: crate::fixtures::FixtureRequestEnvironment {
-                                execution: services[file].execution_id,
-                                worker: worker as u32,
-                            },
-                        },
-                    ));
+                    TestOutcome::Cancelled { reason }
+                        if matches!(state.outcome, RunOutcome::Completed) =>
+                    {
+                        state.outcome = RunOutcome::Cancelled { reason: *reason };
+                    }
+                    _ => {}
                 }
+                state.tests[test] = Some(result);
+                state.observations[test] = observations;
             }
-            let Some((file, test, worker, result, observations)) = pending.next().await else {
-                break;
-            };
-            available.push_back(worker);
-            let state = &mut files[file];
-            // Every failure remains in its source-ordered test result. The run
-            // outcome is only a summary and never replaces the test aggregate.
-            match &result.outcome {
-                TestOutcome::Aborted { failure, .. }
-                    if !matches!(state.outcome, RunOutcome::Aborted { .. }) =>
-                {
-                    let prior_outcome = match state.outcome {
-                        RunOutcome::Cancelled { reason } => {
-                            Some(PriorRunOutcome::Cancelled { reason })
+            drop(pending);
+            for (owner, context) in contexts.iter() {
+                context
+                    .cancellation
+                    .start_cleanup_at(tokio::time::Instant::now());
+                let errors = client
+                    .close(*owner)
+                    .await
+                    .unwrap_or_else(|error| vec![error]);
+                let failure = fixture_run_failure(errors, context.scope_id);
+                if let Some(failure) = failure {
+                    for (service, state) in services.iter().zip(&mut files) {
+                        let relevant = match owner {
+                            crate::fixtures::FixtureOwnerKey::File { execution } => {
+                                service.execution_id == *execution
+                            }
+                            _ => true,
+                        };
+                        if relevant {
+                            state.fixture_failures.push(failure.clone());
                         }
-                        _ => None,
-                    };
-                    state.outcome = RunOutcome::Aborted {
-                        failure: failure.clone(),
-                        prior_outcome,
-                    };
-                }
-                TestOutcome::Cancelled { reason }
-                    if matches!(state.outcome, RunOutcome::Completed) =>
-                {
-                    state.outcome = RunOutcome::Cancelled { reason: *reason };
-                }
-                _ => {}
-            }
-            state.tests[test] = Some(result);
-            state.observations[test] = observations;
-        }
-        drop(pending);
-        for (owner, context) in contexts.iter() {
-            context
-                .cancellation
-                .start_cleanup_at(tokio::time::Instant::now());
-            let errors = client
-                .close(*owner)
-                .await
-                .unwrap_or_else(|error| vec![error]);
-            let failure = fixture_run_failure(errors, context.scope_id);
-            if let Some(failure) = failure {
-                for (service, state) in services.iter().zip(&mut files) {
-                    let relevant = match owner {
-                        crate::fixtures::FixtureOwnerKey::File { execution } => {
-                            service.execution_id == *execution
-                        }
-                        _ => true,
-                    };
-                    if relevant {
-                        state.fixture_failures.push(failure.clone());
                     }
                 }
             }
-        }
-    };
+        };
     let (_, drain_errors) = coordinator.drive(root_work).await;
     if let Some(failure) = fixture_run_failure(
         drain_errors,

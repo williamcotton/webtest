@@ -28,18 +28,22 @@ use self::{
     steps::execute_step,
 };
 
+mod actors;
 mod branch;
 mod browser;
 mod child;
 mod concurrent;
 mod failure;
 pub(crate) mod fixtures;
+mod guards;
 mod output;
 mod provider;
 pub(crate) mod resource;
 mod retry;
 mod scheduler;
 pub(crate) mod scopes;
+mod select;
+mod semantics;
 mod state;
 mod steps;
 pub(crate) mod temporary;
@@ -48,8 +52,8 @@ mod wait;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use browser::{bounded_timeout, browser_locator, browser_state};
-pub(crate) use scheduler::FailureSignal;
+pub(crate) use browser::{bounded_timeout, browser_state, resolve_locator};
+pub(crate) use scheduler::{FailureSignal, PrimarySignal};
 
 #[derive(Default)]
 pub(crate) struct RootExecutionPolicy<'a> {
@@ -654,6 +658,10 @@ impl TreeExecution<'_, '_> {
     ) -> std::pin::Pin<Box<dyn Future<Output = TestBodyOutcome> + Send + 'a>> {
         Box::pin(async move {
             match &node.kind {
+                webtest_plan::PlanNodeKind::Semantic {
+                    operation,
+                    children,
+                } => self.semantic_node(operation, children, scope).await,
                 webtest_plan::PlanNodeKind::Conditional {
                     condition,
                     branches,
@@ -748,9 +756,11 @@ impl TreeExecution<'_, '_> {
             }
         }
         let caller = std::mem::replace(&mut self.branch.bindings, locals);
+        let cursors = std::mem::take(&mut self.branch.cursors);
         let provided = self.branch.provided.take();
         let outcome = self.node(body, scope).await;
         let result = self.branch.provided.take();
+        self.branch.cursors = cursors;
         let locals = std::mem::replace(&mut self.branch.bindings, caller);
         self.branch.bindings.merge_metadata(locals);
         self.branch.provided = provided;
@@ -796,8 +806,12 @@ impl TreeExecution<'_, '_> {
         body: fixtures::BrowserBody<'_>,
         owner: &scopes::ExecutionScope,
     ) -> TestBodyOutcome {
+        let actor_owner = match &body {
+            fixtures::BrowserBody::Actor { actor, .. } => Some(*actor),
+            _ => None,
+        };
         let fixture_lifetime = matches!(&body, fixtures::BrowserBody::Fixture(_));
-        if self.branch.page.is_some() {
+        if self.branch.page.is_some() && !matches!(&body, fixtures::BrowserBody::Actor { .. }) {
             return TestBodyOutcome::Provisional(ProvisionalTestOutcome::Aborted {
                 failure: resource_invariant(crate::ResourceInvariant::AccessConflict),
             });
@@ -835,11 +849,49 @@ impl TreeExecution<'_, '_> {
                 context: None,
             },
             |created| async {
-                self.branch.page = Some(created);
                 let result = match body {
-                    fixtures::BrowserBody::Node(body) => self.node(body, owner).await,
+                    fixtures::BrowserBody::Actor {
+                        actor,
+                        sources,
+                        name,
+                        body,
+                    } => {
+                        let mut created = created;
+                        let journal = actors::ActorJournal::new(
+                            actor,
+                            owner.id(),
+                            services.options.reactive,
+                            self.branch.ingress.clone(),
+                        );
+                        if !sources.is_empty() {
+                            created.start_reactive(journal.clone(), sources).await?
+                        }
+                        let handle =
+                            actors::ActorHandle::new(created, journal, owner.event.clone());
+                        let _owned = actors::ActorOwner(handle.clone());
+                        self.branch.actors.insert(actor, handle);
+                        semantics::emit_semantic(
+                            services,
+                            owner,
+                            webtest_observation::SemanticEvent::ActorOpened {
+                                actor,
+                                name: name.into(),
+                            },
+                        );
+
+                        self.node(body, owner).await
+                    }
+                    fixtures::BrowserBody::Node(body) => {
+                        self.branch.page = Some(created);
+                        let result = self.node(body, owner).await;
+                        drop(self.branch.page.take());
+                        result
+                    }
                     fixtures::BrowserBody::Fixture(body) => {
-                        self.fixture_lifetime_body(body, owner).await
+                        self.branch.page = Some(created);
+                        let result = self.fixture_lifetime_body(body, owner).await;
+                        drop(self.branch.page.take());
+                        result
                     }
                 };
                 if context.cancellation.cause().is_some()
@@ -848,7 +900,6 @@ impl TreeExecution<'_, '_> {
                 {
                     interrupted_body_cleanup = Some(cause);
                 }
-                drop(self.branch.page.take());
                 Ok(result)
             },
             |event| match event {
@@ -896,6 +947,16 @@ impl TreeExecution<'_, '_> {
             },
         )
         .await;
+        if let Some(actor) = actor_owner
+            && let Some(handle) = self.branch.actors.remove(&actor)
+        {
+            self.flush_actor(actor, &handle);
+            semantics::emit_semantic(
+                self.services,
+                owner,
+                webtest_observation::SemanticEvent::ActorClosed { actor },
+            );
+        }
         if session.is_none()
             && let Some(key) = session_acquisition
             && let Err(error) = resource::finish_session_acquisition(
@@ -912,6 +973,22 @@ impl TreeExecution<'_, '_> {
             self.branch
                 .cleanup_failures
                 .push(resource_cleanup_invariant(error));
+        }
+        if let Some(mut nested) = self.branch.session.take()
+            && let Err(error) = nested
+                .close(
+                    crate::cleanup::CleanupDeadline::at(result.cleanup_deadline, cleanup_timeout),
+                    &temporary::ResourceEvents {
+                        registry: services.resources,
+                        execution_id: services.execution_id,
+                        events: services.events,
+                        sink: services.event_sink,
+                    },
+                    context.cancellation.cause(),
+                )
+                .await
+        {
+            self.branch.cleanup_failures.push(error);
         }
         self.branch.session = session;
         if fixture_lifetime {
@@ -1118,6 +1195,27 @@ impl TreeExecution<'_, '_> {
         let options = self.services.options;
         let providers = self.services.providers;
         let deadline = self.services.deadline;
+        let mut resource_debug = std::collections::BTreeMap::new();
+        if control.is_some() {
+            for (actor, handle) in &self.branch.actors {
+                resource_debug.insert(
+                    format!("$actor {actor}"),
+                    webtest_model::Value::String(format!(
+                        "BrowserActor {actor}; generation {}",
+                        handle.2.execution_context.scope_id.0
+                    )),
+                );
+            }
+            for cursor in self.branch.cursors.values() {
+                resource_debug.insert(
+                    format!("$cursor {}", cursor.name),
+                    webtest_model::Value::String(format!(
+                        "EventCursor actor {}; generation {}; sequence {}",
+                        cursor.actor, cursor.generation.0, cursor.sequence
+                    )),
+                );
+            }
+        }
         let state = &mut self.branch.bindings;
         let page = &mut self.branch.page;
         let active_step = &mut self.branch.active_step;
@@ -1151,7 +1249,9 @@ impl TreeExecution<'_, '_> {
                     .is_some_and(|fixture| control.should_capture_fixture_bindings(fixture, step))
             };
             let bindings = if capture {
-                Some(state.visible_step_bindings(step))
+                let mut bindings = state.visible_step_bindings(step);
+                bindings.extend(resource_debug.clone());
+                Some(bindings)
             } else {
                 None
             };
@@ -1207,7 +1307,47 @@ impl TreeExecution<'_, '_> {
             );
         }
         let step_started = StdInstant::now();
-        let completion = if let TestOperation::AcquireFixture(call) = &step.operation {
+        let completion = if let TestOperation::Reactive(
+            webtest_plan::semantics::ReactiveOperation::Checkpoint { actor, binding, .. },
+        ) = &step.operation
+        {
+            if let Some(handle) = self.branch.actors.get(actor).cloned() {
+                let barrier = if self.branch.current_actor == Some(*actor) {
+                    if let Some(page) = page.as_mut() {
+                        page.reactive_barrier().await
+                    } else {
+                        Err(webtest_browser::BrowserError::BrowserDisconnected)
+                    }
+                } else {
+                    let mut page = handle.0.lock().await;
+                    if let Some(page) = page.as_mut() {
+                        page.reactive_barrier().await
+                    } else {
+                        Err(webtest_browser::BrowserError::BrowserDisconnected)
+                    }
+                };
+                match barrier {
+                    Err(error) => Err(crate::StepError::Browser(error)),
+                    Ok(()) => handle
+                        .1
+                        .checkpoint()
+                        .map(|cursor| steps::StepCompletion::Checkpoint(*binding, cursor))
+                        .map_err(|error| {
+                            if let actors::JournalError::Closed(error) = error {
+                                return crate::StepError::Browser(error);
+                            }
+                            crate::StepError::Evaluation(crate::EvaluationFailure {
+                                kind: crate::EvaluationFailureKind::EventCursorExpired,
+                                message: "actor cursor expired".into(),
+                            })
+                        }),
+                }
+            } else {
+                Err(crate::StepError::Internal(
+                    "checkpoint actor is not owned".into(),
+                ))
+            }
+        } else if let TestOperation::AcquireFixture(call) = &step.operation {
             let Some(access) = self.services.fixture_access else {
                 return TestBodyOutcome::Provisional(ProvisionalTestOutcome::Aborted {
                     failure: RunError::Internal("fixture coordinator is absent".into()),
@@ -1289,6 +1429,27 @@ impl TreeExecution<'_, '_> {
                 }
                 Ok(steps::StepCompletion::Completed)
             }
+            Ok(steps::StepCompletion::Checkpoint(binding, mut cursor)) => {
+                cursor.attempt = scope.event.execution_context.attempt_id;
+                if let TestOperation::Reactive(
+                    webtest_plan::semantics::ReactiveOperation::Checkpoint { name, .. },
+                ) = &step.operation
+                {
+                    cursor.name = name.clone();
+                }
+                semantics::emit_semantic(
+                    self.services,
+                    scope,
+                    webtest_observation::SemanticEvent::Checkpoint {
+                        actor: cursor.actor,
+                        generation: cursor.generation,
+                        sequence: cursor.sequence,
+                        binding,
+                    },
+                );
+                self.branch.cursors.insert(binding, cursor);
+                Ok(steps::StepCompletion::Completed)
+            }
             Ok(steps::StepCompletion::Provided(value)) => {
                 self.branch.provided = Some(value);
                 Ok(steps::StepCompletion::Completed)
@@ -1311,6 +1472,43 @@ impl TreeExecution<'_, '_> {
             });
         }
         match completion {
+            Ok(steps::StepCompletion::Verdict(kind, message)) => {
+                let (_, secrets) = state.redaction();
+                let message = crate::redaction::redact_text(message, secrets);
+                let order = self
+                    .branch
+                    .ingress
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                for signal in &self.branch.failure_signals {
+                    signal.report_verdict(order);
+                }
+                semantics::emit_semantic(
+                    self.services,
+                    scope,
+                    webtest_observation::SemanticEvent::Verdict {
+                        verdict: kind,
+                        message: message.clone(),
+                    },
+                );
+                emit_event_in_scope(
+                    &scope.event,
+                    events,
+                    event_sink,
+                    ExecutionEvent::StepPassed {
+                        execution_id,
+                        test_id,
+                        step_id: step.id,
+                    },
+                );
+                return TestBodyOutcome::Provisional(ProvisionalTestOutcome::Finalized(Box::new(
+                    TestOutcome::Verdict { kind, message },
+                )));
+            }
+            Ok(steps::StepCompletion::Checkpoint(..)) => {
+                return TestBodyOutcome::Provisional(ProvisionalTestOutcome::Aborted {
+                    failure: RunError::Internal("uncommitted checkpoint".into()),
+                });
+            }
             Ok(steps::StepCompletion::ProviderOutput(_)) => {
                 return TestBodyOutcome::Provisional(ProvisionalTestOutcome::Aborted {
                     failure: RunError::Internal("provider output was not published".into()),
@@ -1395,6 +1593,32 @@ impl TreeExecution<'_, '_> {
                     secrets,
                     &options.inspection.redacted_query_parameters,
                 );
+                if let (
+                    TestOperation::Verdict {
+                        verdict: webtest_model::VerdictKind::Fail,
+                        ..
+                    },
+                    crate::StepError::Assertion(failure),
+                ) = (&step.operation, &error)
+                {
+                    semantics::emit_semantic(
+                        self.services,
+                        scope,
+                        webtest_observation::SemanticEvent::Verdict {
+                            verdict: webtest_model::VerdictKind::Fail,
+                            message: failure.message.clone(),
+                        },
+                    );
+                    if self.branch.check_depth == 0 {
+                        let order = self
+                            .branch
+                            .ingress
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        for signal in &self.branch.failure_signals {
+                            signal.report_verdict(order);
+                        }
+                    }
+                }
                 let primary_precedes_cancellation = host_context.cancellation.cause().is_none();
                 if primary_precedes_cancellation {
                     self.branch.primary_failure = Some(TestBodyOutcome::PendingFailure(Box::new(
@@ -1409,7 +1633,8 @@ impl TreeExecution<'_, '_> {
                 if host_context.cancellation.cause().is_none()
                     && let Some(control) = control
                 {
-                    let bindings = state.visible_step_bindings(step);
+                    let mut bindings = state.visible_step_bindings(step);
+                    bindings.extend(resource_debug.clone());
                     let debug_context = scope.debug_context(execution_id);
                     let after = async {
                         if let Some(test) = test {
@@ -1596,6 +1821,9 @@ fn combine_test_outcome(
                 prior_outcome,
             };
         }
+        TestOutcome::Verdict { kind, message } => {
+            Some(Box::new(PriorTestOutcome::Verdict { kind, message }))
+        }
         TestOutcome::Passed | TestOutcome::Skipped { .. } => None,
         TestOutcome::Failed(failure) => Some(Box::new(PriorTestOutcome::Failed(failure))),
         TestOutcome::TimedOut {
@@ -1646,6 +1874,10 @@ fn emit_scope_aborted(
     };
     use webtest_observation::PriorScopeOutcome as P;
     let prior_outcome = prior_outcome.as_deref().map(|prior| match prior {
+        PriorTestOutcome::Verdict { kind, message } => P::Verdict {
+            verdict: *kind,
+            message: message.clone(),
+        },
         PriorTestOutcome::Failed(failure) => P::Failed {
             step_id: failure.step.id,
             origin: failure.step.origin,
@@ -1675,6 +1907,12 @@ fn emit_scope_aborted(
 fn scope_outcome(outcome: &TestOutcome) -> webtest_observation::ScopeOutcome {
     use webtest_observation::ScopeOutcome;
     match outcome {
+        TestOutcome::Verdict { kind, .. } => match kind {
+            webtest_model::VerdictKind::Pass => ScopeOutcome::Passed,
+            webtest_model::VerdictKind::Fail => ScopeOutcome::Failed,
+            webtest_model::VerdictKind::Skipped => ScopeOutcome::Skipped,
+            webtest_model::VerdictKind::Inconclusive => ScopeOutcome::Inconclusive,
+        },
         TestOutcome::Passed => ScopeOutcome::Passed,
         TestOutcome::Failed(_) => ScopeOutcome::Failed,
         TestOutcome::TimedOut { .. } => ScopeOutcome::TimedOut,

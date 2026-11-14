@@ -171,6 +171,42 @@ For HTTP responses, query `type.Response` for the `status`, `headers`, `body`, `
 
 Use `webtest <command> --help` for CLI flags and reporters. `describe` documents the language and project-visible provider surface; it is not a duplicate CLI manual.
 
+## Model cases and reactive workflows
+
+Discover the installed contracts before authoring these constructs:
+
+```sh
+webtest describe language.cases
+webtest describe language.pattern
+webtest describe language.actor
+webtest describe builtin.checkpoint
+webtest describe control.select
+webtest describe language.guard
+webtest describe control.guards
+webtest describe control.check
+webtest describe statement.assume
+webtest describe statement.inconclusive
+webtest describe event.websocket.received_json
+```
+
+Use explicit `case` labels for stable independently runnable variants. Case rows are pure static transferable records with a common schema; they cannot call providers or acquire fixtures. `webtest test --test-id <id>` selects an authored declaration and `--variant <id>` selects a concrete variant. Obtain IDs from shared discovery rather than reconstructing them from names.
+
+```webtest
+pattern Named(expected: String) = subset {name: expected, password: absent}
+test "users" cases [case "Ada" {name: "Ada"}, case "Grace" {name: "Grace"}] as input {
+    check {
+        expect input matches Named(input.name)
+        expect input.name matches regex("^[A-Z][a-z]+$")
+    }
+}
+```
+
+Declare each participant with `actor alice browser`, then target its page with `alice { ... }`. Actors own isolated contexts; conflicting concurrent access to one actor is rejected. Capture `let mark = checkpoint(alice)` **before** an action that may emit the event, then use `select alice since mark within 5s`. Omitting `since` starts observation at select entry and cannot recover earlier events. A select scans one actor's bounded journal and executes one alternative; it does not start speculative race branches. A bound select uses `provide`; terminating alternatives need no value.
+
+Guards are typed exported/imported declarations activated by `with guards [clean(alice)] { ... }`. They are installed before the body, observe only normalized events, cancel and join body cleanup on a trigger, and end with the scope. Guard clauses permit pure local values followed by `fail` or `inconclusive`, never host effects or resource acquisition. Network events contain metadata; response bodies are not captured. Websocket JSON events require valid bounded JSON. Use `[reactive]` to bound actor event counts/bytes; required lost evidence fails explicitly with `event_overflow`.
+
+`check {}` collects eligible assertion failures sequentially, retaining nested source-mapped details. It stops on provider/action/infrastructure/internal failures, cancellation or timeout. `pass`, `fail`, `skip`, and `inconclusive` preserve distinct semantic outcomes; `assume <Bool> else skip/inconclusive <String>` declares a precondition. Inconclusive fails CI by default. All verdicts join cleanup, and teardown errors retain the prior verdict.
+
 ## Discover structured execution and its journal
 
 Query the installed contracts before composing control flow:

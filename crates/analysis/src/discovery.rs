@@ -65,7 +65,7 @@ fn module_tests(db: &dyn Db, file: SourceInput) -> Arc<DiscoveredModule> {
             .tests
             .iter()
             .map(|test| {
-                let required_capabilities = compiled
+                let _required_capabilities = compiled
                     .plan
                     .tests
                     .iter()
@@ -81,16 +81,36 @@ fn module_tests(db: &dyn Db, file: SourceInput) -> Arc<DiscoveredModule> {
                     } else {
                         StaticStatus::Errors
                     },
-                    variants: vec![DiscoveredVariant {
-                        id: test.variant_id,
-                        key: "default".into(),
-                        label: "default".into(),
-                        origin: test.origin,
-                        runnable: valid,
-                        debuggable: valid,
-                        tags: Vec::new(),
-                        required_capabilities,
-                    }],
+                    variants: compiled
+                        .plan
+                        .tests
+                        .iter()
+                        .filter(|planned| planned.test_declaration_id == test.declaration_id)
+                        .map(|planned| DiscoveredVariant {
+                            id: planned.variant_id,
+                            key: planned
+                                .case_label
+                                .clone()
+                                .unwrap_or_else(|| "default".into()),
+                            label: planned
+                                .case_label
+                                .clone()
+                                .unwrap_or_else(|| "default".into()),
+                            origin: test
+                                .cases
+                                .as_ref()
+                                .and_then(|cases| {
+                                    cases.iter().find(|case| {
+                                        Some(&case.label) == planned.case_label.as_ref()
+                                    })
+                                })
+                                .map_or(test.origin, |case| case.label_origin),
+                            runnable: valid,
+                            debuggable: valid,
+                            tags: Vec::new(),
+                            required_capabilities: planned.required_host_capabilities.clone(),
+                        })
+                        .collect(),
                 }
             })
             .collect(),

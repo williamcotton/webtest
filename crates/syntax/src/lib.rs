@@ -410,6 +410,10 @@ pub fn is_name_kind(kind: SyntaxKind) -> bool {
     matches!(
         kind,
         SyntaxKind::Ident
+            | SyntaxKind::ContainsKw
+            | SyntaxKind::ActorKw
+            | SyntaxKind::CaseKw
+            | SyntaxKind::CasesKw
             | SyntaxKind::ScopeKw
             | SyntaxKind::FileKw
             | SyntaxKind::WorkerKw
@@ -444,6 +448,10 @@ pub fn is_binding_name_kind(kind: SyntaxKind) -> bool {
     matches!(
         kind,
         SyntaxKind::Ident
+            | SyntaxKind::ContainsKw
+            | SyntaxKind::ActorKw
+            | SyntaxKind::CaseKw
+            | SyntaxKind::CasesKw
             | SyntaxKind::ScopeKw
             | SyntaxKind::FileKw
             | SyntaxKind::WorkerKw

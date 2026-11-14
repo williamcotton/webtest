@@ -1512,7 +1512,9 @@ impl BridgeClient {
                 let reason = match &interrupted {
                     Completion::Cancelled(cause) => match cause.reason {
                         webtest_host::CancellationReason::UserCancelled => "user_cancelled",
-                        webtest_host::CancellationReason::ParentFailed => "parent_failed",
+                        webtest_host::CancellationReason::Verdict
+                        | webtest_host::CancellationReason::GuardFailed
+                        | webtest_host::CancellationReason::ParentFailed => "parent_failed",
                         webtest_host::CancellationReason::RaceLost => "race_lost",
                         webtest_host::CancellationReason::Timeout => "deadline",
                         webtest_host::CancellationReason::DebugDisconnect => "debug_disconnect",

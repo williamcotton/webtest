@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+regex.workspace = true
+serde_json.workspace = true
 serde.workspace = true
 webtest-model.workspace = true
 webtest-text.workspace = true

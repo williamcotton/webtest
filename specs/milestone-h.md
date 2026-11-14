@@ -2,7 +2,7 @@
 
 ## 0. Status and dependencies
 
-This specification expands Milestone H following [`milestone-g.md`](./milestone-g.md). It depends on the typed expression/value/provider model from [`milestone-c.md`](./milestone-c.md), semantic inspection and machine-readable feedback from [`milestone-c5.md`](./milestone-c5.md), the typed application bridge from [`milestone-d.md`](./milestone-d.md), structured execution/resource ownership/event infrastructure from [`milestone-e.md`](./milestone-e.md), and workspace/declaration/test identity from [`milestone-f.md`](./milestone-f.md).
+This specification expands Milestone H following [`milestone-g.md`](./milestone-g.md). It depends on the typed expression/value/provider model from [`milestone-c.md`](./milestone-c.md), semantic inspection and machine-readable feedback from [`milestone-c5.md`](./milestone-c-5.md), the typed application bridge from [`milestone-d.md`](./milestone-d.md), structured execution/resource ownership/event infrastructure from [`milestone-e.md`](./milestone-e.md), and workspace/declaration/test identity from [`milestone-f.md`](./milestone-f.md).
 
 Milestone G is the expected delivery predecessor and must expose the portable static portions of Milestone H through the same native/WASM language services, but Milestone H's runtime semantics do not depend on browser-side WASM execution.
 
@@ -18,9 +18,98 @@ Milestone H moves WebTest beyond sequential browser automation into explicit mod
 
 The milestone preserves Milestone E's structured concurrency semantics. In particular, `race {}` remains a computation-racing primitive. Reactive event selection is introduced separately and does not redefine `race`.
 
-**Implementation status: proposed.**
+**Implementation status: complete (2026-11-14).**
 
-[`future-functionality.md`](./future-functionality.md) must be updated to add Milestone H and to treat test variants, actors, patterns, and reactive event selection as first-class long-term semantic concepts rather than editor/runtime conveniences.
+All 23 acceptance criteria are covered by the shared implementation and local
+verification below. The final workspace run passed **714 tests across 53 test/doc-test
+targets, with zero failures and zero ignored tests**.
+
+G’s external release acceptance is owned by [Milestone J](./milestone-j.md);
+it does not block H’s language/runtime implementation.
+
+### Implemented contract
+
+The canonical CST → HIR → analysis → plan path now owns cases, patterns, checks,
+verdicts/preconditions, actors, checkpoints, selection, and guards. Pure evaluation
+lives in `plan` and is reused by static case expansion, matcher/predicate execution,
+and the runtime. Adapters do not reinterpret source or CDP data.
+
+The executable format versions are plan **11**, runtime semantics **8**, native
+journal **11**, and report/event schema **15**. Native journal readers retain the
+bounded legacy 8/9/10 decoding paths. Portable editor API/worker protocol stay at 1.
+
+The public event schemas use typed URL component records (`value`, `path`, `query`,
+`host`, `scheme`), and actor-relative capture timestamps in seconds. They do not
+introduce a second URL evaluator or expose raw CDP messages. Network observation
+captures bounded metadata/headers, not response bodies. JSON WebSocket sources
+accept valid bounded JSON messages; binary frames remain outside JSON sources.
+Actor identities and cursors are owned resources, never transferable language
+values. Actor access through typed statement helpers preserves that ownership.
+
+Case expansion is limited to 1,024 rows per declaration and 10,000 variants per
+file. Matchers bound depth (64), visits (100,000), regex source/input/automaton size,
+and reported mismatch/alternative details. Select and guard alternatives are
+limited to 64. The default actor journal retains at most 10,000 events / 8 MiB,
+with a 256 KiB single-event cap; `[reactive]` validates configurable hard maxima.
+Retained event payloads are immutable shared storage across consumers. Overflow,
+wrong actor/generation/attempt, disconnect, timeout, and cancellation have explicit
+structured paths. Source callbacks never await consumers or write artifacts. Selection observations
+retain total observed/unmatched counts and at most `max_unmatched_evidence`
+sequence references into the redacted actor-event journal, with explicit truncation.
+
+Acceptance fixtures are maintained beside their owning layers:
+
+- [compiler cases/patterns](../crates/analysis/src/compiler/tests.rs),
+  [reactive/guard lowering](../crates/analysis/src/compiler/reactive.rs), and
+  [shared editor navigation/event services](../crates/analysis/src/workspace_editor.rs);
+- [runtime modeling and reactive tests](../crates/runtime/src/tests.rs),
+  [bounded journal stress](../crates/runtime/src/execution/actors/journal.rs), and
+  [sibling cancellation/teardown](../crates/runtime/src/execution/scheduler.rs);
+- [real Chrome and CLI selection/JUnit proof](../crates/app/tests/milestone_h.rs),
+  [DAP case selection](../crates/dap/src/concurrent.rs), and the existing lifecycle,
+  trace, LSP, protocol, resource, concurrency, and retry suites;
+- [real native/WASM parity corpus](../editors/monaco/test/corpus.mjs),
+  [authoring example](../examples/test-modeling/README.md), and the canonical
+  [installed agent skill](../.agents/skills/webtest/SKILL.md).
+
+
+
+### Verification record (2026-11-14)
+
+Local acceptance uses the following reproducible checks:
+
+- `cargo clippy --workspace --all-targets -- -D warnings` and
+  `cargo fmt --all -- --check`;
+- `cargo test --workspace --no-fail-fast -- --test-threads=1`, including real
+  Chrome, application/provider/bridge lifecycle, LSP/DAP, trace/replay, resource,
+  concurrency/retry, description completeness/examples, and initializer parity
+  (714 passed, 0 failed, 0 ignored);
+- real `wasm32-unknown-unknown` release build, then
+  `npm --prefix editors/monaco test` (8 passing tests: native/real-WASM DTO parity,
+  worker lifecycle/cancellation, packed ESM, TypeScript, and bundler checks) and
+  `npm --prefix editors/monaco run test:browser` (direct and bundled real-Chrome
+  Monaco/worker fixtures under CSP);
+- VS Code compilation, Testing API/release-selection tests (6 passing), VSIX
+  packaging/content checks, isolated VS Code 1.146 activation/run/debug (exit 0),
+  and `npm run smoke:cursor` (packaging plus Cursor installation/listing passed);
+- `python3 protocol/conformance/generate.py --check`, the shared protocol harness
+  against reference/Node/Ruby peers, Node SDK tests (3), Ruby SDK tests (3), and
+  `python3 -m unittest scripts/release/test_package.py` (2);
+- `webtest check examples/test-modeling/modeling.webtest` (zero diagnostics) and
+  its JSON test run (2 passing variants, 1 intentional skip, no failures).
+
+Release-profile fixtures measured 1,000 files / 5,000 declarations at 790.6 ms
+initial analysis, 469.7 ms graph analysis, 22.2 ms for 100 edits, and 230.5 µs
+completion p95. The G baseline on this machine was 825.2 ms / 458.9 ms / 61.3 ms /
+365.1 µs respectively; these local timings show no broad regression and are not
+cross-machine performance guarantees. The H fixture compiled 1,000 labeled
+variants in 62.1 ms and matched 10,000 regex values in 2.4 ms. Reproduce with
+`cargo run --release -p webtest-analysis --example workspace_benchmark` and
+`cargo run --release -p webtest-analysis --example modeling_benchmark`.
+
+All verification above is local. Signed multi-platform clean-install/upgrade,
+protected publication, marketplace/npm publication, package-manager submissions,
+and container release acceptance remain explicitly owned by Milestone J.
 
 ## 1. Outcome
 

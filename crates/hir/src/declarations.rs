@@ -95,6 +95,8 @@ pub(super) fn lower_declarations(
     next_binding: &mut u32,
     lowered: &mut HirFile,
 ) {
+    lower_patterns(file, &root, next_binding, lowered);
+    lower_guards(file, &root, next_binding, lowered);
     lowered.imports = root
         .imports()
         .filter_map(|import| {
@@ -387,5 +389,124 @@ test "consumer" { let result = use user(email: "é") }
                     .is_empty()
             );
         }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HirPattern {
+    pub id: webtest_model::PatternId,
+    pub name: String,
+    pub exported: bool,
+    pub documentation: String,
+    pub result_type: HirType,
+    pub parameters: Vec<HirParameter>,
+    pub matcher: HirExpr,
+    pub origin: SyntaxOrigin,
+    pub name_origin: SyntaxOrigin,
+}
+pub(super) fn lower_patterns(
+    file: FileId,
+    root: &ast::Root,
+    next_binding: &mut u32,
+    lowered: &mut HirFile,
+) {
+    let mut occurrences = HashMap::<String, u32>::new();
+    for pattern in root.patterns() {
+        let Some(name) = pattern.name() else {
+            continue;
+        };
+        let ordinal = occurrences.entry(name.text().into()).or_default();
+        let id = webtest_model::PatternId(semantic_key(
+            &lowered.module_id.0,
+            "pattern",
+            name.text(),
+            *ordinal,
+        ));
+        *ordinal += 1;
+        let mut context = LowerContext {
+            file,
+            bindings: HashMap::new(),
+            next_binding: *next_binding,
+        };
+        let mut parameters = parameters(&mut context, pattern.parameters());
+        for parameter in &mut parameters {
+            parameter.symbol_id = ParameterId(semantic_key(&id.0, "parameter", &parameter.name, 0));
+        }
+        let Some(matcher) = pattern
+            .expression()
+            .and_then(|expr| lower_expr(&context, expr))
+        else {
+            continue;
+        };
+        *next_binding = context.next_binding;
+        lowered.patterns.push(HirPattern {
+            result_type: HirType {
+                kind: HirTypeKind::Named("Bool".into()),
+                origin: origin(file, pattern.syntax()),
+            },
+            id,
+            name: name.text().into(),
+            exported: pattern.exported(),
+            documentation: pattern.documentation(),
+            parameters,
+            matcher,
+            origin: origin(file, pattern.syntax()),
+            name_origin: SyntaxOrigin::new(file, name.text_range()),
+        });
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HirGuard {
+    pub id: webtest_model::GuardId,
+    pub name: String,
+    pub exported: bool,
+    pub documentation: String,
+    pub parameters: Vec<HirParameter>,
+    pub result_type: HirType,
+    pub clauses: Vec<HirEventArm>,
+    pub origin: SyntaxOrigin,
+    pub name_origin: SyntaxOrigin,
+}
+fn lower_guards(file: FileId, root: &ast::Root, next_binding: &mut u32, lowered: &mut HirFile) {
+    let mut occurrences = HashMap::<String, u32>::new();
+    for guard in root.guards() {
+        let Some(name) = guard.name() else { continue };
+        let ordinal = occurrences.entry(name.text().into()).or_default();
+        let id = webtest_model::GuardId(semantic_key(
+            &lowered.module_id.0,
+            "guard",
+            name.text(),
+            *ordinal,
+        ));
+        *ordinal += 1;
+        let mut context = LowerContext {
+            file,
+            bindings: HashMap::new(),
+            next_binding: *next_binding,
+        };
+        let mut parameters = parameters(&mut context, guard.parameters());
+        for p in &mut parameters {
+            p.symbol_id = ParameterId(semantic_key(&id.0, "parameter", &p.name, 0));
+        }
+        let clauses = guard
+            .clauses()
+            .filter_map(|arm| lower_event_arm(&mut context, arm, true))
+            .collect();
+        *next_binding = context.next_binding;
+        lowered.guards.push(HirGuard {
+            id,
+            name: name.text().into(),
+            exported: guard.exported(),
+            documentation: guard.documentation(),
+            parameters,
+            clauses,
+            result_type: HirType {
+                kind: HirTypeKind::Named("Null".into()),
+                origin: origin(file, guard.syntax()),
+            },
+            origin: origin(file, guard.syntax()),
+            name_origin: SyntaxOrigin::new(file, name.text_range()),
+        });
     }
 }

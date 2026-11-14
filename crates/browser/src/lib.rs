@@ -1,5 +1,6 @@
 //! Protocol-independent browser semantics used by the test runtime.
 
+pub mod reactive;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -457,6 +458,21 @@ impl BrowserContext for SinglePageContext {
 
 #[async_trait]
 pub trait Page: Send {
+    async fn start_reactive(
+        &mut self,
+        _observer: std::sync::Arc<dyn reactive::ReactiveObserver>,
+        _sources: &[webtest_model::EventSource],
+    ) -> Result<(), BrowserError> {
+        Err(BrowserError::UnsupportedCapability {
+            capability: "reactive browser events".into(),
+        })
+    }
+    async fn reactive_barrier(&mut self) -> Result<(), BrowserError> {
+        Err(BrowserError::UnsupportedCapability {
+            capability: "reactive checkpoint barrier".into(),
+        })
+    }
+
     /// Supplies the owning operation's cancellation and remaining-deadline context.
     fn set_operation_context(
         &mut self,

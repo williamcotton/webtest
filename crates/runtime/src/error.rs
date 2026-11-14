@@ -101,6 +101,10 @@ pub enum EvaluationFailureKind {
     DivisionByZero,
     IntegerOverflow,
     ResponseDecodeFailed,
+    SelectionTimeout,
+    EventOverflow,
+    EventCursorExpired,
+    PatternLimitExceeded,
 }
 
 impl EvaluationFailureKind {
@@ -109,6 +113,10 @@ impl EvaluationFailureKind {
             Self::DivisionByZero => RuntimeFailureCode::DivisionByZero,
             Self::IntegerOverflow => RuntimeFailureCode::IntegerOverflow,
             Self::ResponseDecodeFailed => RuntimeFailureCode::ResponseDecodeFailed,
+            Self::SelectionTimeout => RuntimeFailureCode::SelectionTimeout,
+            Self::EventOverflow => RuntimeFailureCode::EventOverflow,
+            Self::EventCursorExpired => RuntimeFailureCode::EventCursorExpired,
+            Self::PatternLimitExceeded => RuntimeFailureCode::PatternLimitExceeded,
         }
     }
 }

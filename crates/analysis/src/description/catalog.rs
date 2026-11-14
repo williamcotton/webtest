@@ -4,6 +4,7 @@ pub(super) fn core_constructs() -> BTreeMap<String, ConstructDescription> {
     let mut constructs = BTreeMap::new();
     for construct in [
         declaration_test(),
+        cases_construct(),
         scope_construct("server", Capability::Server),
         scope_construct("browser", Capability::Browser),
         let_construct(),
@@ -24,6 +25,8 @@ pub(super) fn core_constructs() -> BTreeMap<String, ConstructDescription> {
         .chain(capability_constructs())
         .chain(super::app_bridge::constructs())
         .chain(super::workspace_catalog::constructs())
+        .chain(h_constructs())
+        .chain(reactive_constructs())
     {
         constructs.insert(construct.id.clone(), construct);
     }
@@ -1782,7 +1785,7 @@ fn assertion_constructs() -> Vec<ConstructDescription> {
             "structural_matches_pattern",
             "analysis",
             "matches right operand",
-            "The matches operator decodes Json or record data against a type name, record shape, or one-element list shape; it does not interpret a regular expression.",
+            "The matches operator evaluates a typed matcher against any transferable value. Type names, subset records, and legacy one-element type-list shapes remain supported; explicit regex(...) enables bounded Rust regular expressions. It returns Bool in expressions and a path-specific mismatch in assertions.",
         ),
         constraint(
             "exact_numeric_relation",
@@ -2569,6 +2572,8 @@ fn example_value(ty: &Type) -> ExampleArgument {
         Type::TempDirectory => binding_example("temp_directory", "TempDirectory"),
         Type::Locator => binding_example("locator_value", "Locator"),
         Type::BrowserPage => binding_example("browser_page", "BrowserPage"),
+        Type::BrowserActor => binding_example("actor", "BrowserActor"),
+        Type::EventCursor => binding_example("cursor", "EventCursor"),
         Type::Unknown => binding_example("value", "the required type"),
     };
     ExampleArgument {
@@ -2702,4 +2707,486 @@ fn sanitize_documentation(value: &str) -> String {
         .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
         .take(1_024)
         .collect()
+}
+
+fn cases_construct() -> ConstructDescription {
+    let mut value = base_construct(
+        "language.cases",
+        "cases",
+        "declaration",
+        "test <name> cases [case <label> <record>, ...] as <binding> { <flow_statement>* }",
+        "Statically expand an authored test into independently runnable variants. Cases are not a runtime loop.",
+    );
+    value.search_terms = vec!["data driven".into(), "variant".into(), "case".into()];
+    value.requires_capabilities = vec![Capability::Test];
+    value.allowed_contexts = vec!["source_file".into()];
+    value.produces_value = Some(false);
+    value.effects=vec!["Each labeled case has independent test resource/fixture ownership. Identity depends on the explicit label, never row order or case values.".into()];
+    value.constraints = vec![constraint(
+        "constant_case_values",
+        "analysis",
+        "cases",
+        "Use 1–1024 uniquely labeled deterministic transferable record constants with one compatible schema; at most 10000 variants per file. Pure imported expression helpers are allowed; providers and native execution are not.",
+    )];
+    value.failure_modes = vec![
+        "semantic.duplicate_case_label".into(),
+        "semantic.case_type_mismatch".into(),
+        "semantic.nonconstant_case".into(),
+        "semantic.variant_limit".into(),
+    ];
+    value.examples = vec![
+        example(
+            "single case",
+            "test \"one\" cases [case \"only\" {value: 1}] as input { expect input.value == 1 }",
+            "declaration_fragment",
+            "source_file",
+        ),
+        example(
+            "two stable variants",
+            "test \"cases\" cases [case \"one\" {value: 1}, case \"two\" {value: 2}] as input { expect input.value > 0 }",
+            "declaration_fragment",
+            "source_file",
+        ),
+    ];
+    value.related = vec!["declaration.test".into(), "language.fixture".into()];
+    value
+}
+
+fn h_constructs() -> Vec<ConstructDescription> {
+    let mut entries = Vec::new();
+    let mut pattern = base_construct(
+        "language.pattern",
+        "pattern",
+        "declaration",
+        "[export] pattern <name>[(<parameter>: <type>, ...)] = <matcher>",
+        "Declare a typed, pure, reusable matcher. Exported patterns can be imported through the shared workspace graph.",
+    );
+    pattern.allowed_contexts = vec!["source_file".into()];
+    pattern.search_terms = vec!["matcher".into(), "shape".into(), "schema".into()];
+    pattern.produces_value = Some(false);
+    pattern.constraints = vec![constraint(
+        "acyclic_patterns",
+        "analysis",
+        "matcher",
+        "Patterns cannot capture lexical values, recurse, call providers, or accept nontransferable arguments. Specialization and matching are bounded to depth 64; matching visits at most 100000 nodes and retains at most 32 primary mismatch paths and eight alternative summaries of four reasons each.",
+    )];
+    pattern.failure_modes = vec![
+        "semantic.recursive_pattern".into(),
+        "semantic.pattern_argument".into(),
+        "semantic.pattern_limit".into(),
+        "assertion_failed".into(),
+    ];
+    pattern.examples = vec![
+        example(
+            "reusable record",
+            "pattern User = subset {name: String, password: absent}\ntest \"user\" { expect {name: \"Ada\"} matches User }",
+            "source_file",
+            "source_file",
+        ),
+        example(
+            "typed parameter",
+            "pattern Named(name: String) = exact {name: name}\ntest \"named\" { expect {name: \"Ada\"} matches Named(\"Ada\") }",
+            "source_file",
+            "source_file",
+        ),
+    ];
+    entries.push(pattern);
+    for (name, syntax, summary, first, second) in [
+        (
+            "any",
+            "any",
+            "Match any transferable value.",
+            "expect 1 matches any",
+            "expect null matches any",
+        ),
+        (
+            "literal",
+            "<expression>",
+            "Match a transferable literal or pure value expression by equality.",
+            "expect 1 matches 1",
+            "expect \"a\" matches \"a\"",
+        ),
+        (
+            "type",
+            "<type>",
+            "Match a value using the shared typed decoding contract.",
+            "expect 1 matches Int",
+            "expect \"a\" matches String",
+        ),
+        (
+            "subset",
+            "subset {<field>: <matcher>, ...}",
+            "Match required fields while allowing additional record fields.",
+            "expect {id: 1, extra: true} matches subset {id: Int}",
+            "expect {name: \"Ada\"} matches subset {name: String}",
+        ),
+        (
+            "exact",
+            "exact {<field>: <matcher>, ...}",
+            "Match fields and reject unexpected record fields.",
+            "expect {id: 1} matches exact {id: Int}",
+            "expect {} matches exact {}",
+        ),
+        (
+            "list",
+            "[<matcher>, ...]",
+            "Match a positional list of the same length. The legacy [Type] form matches every element.",
+            "expect [1, 2] matches [1, range(1, 3)]",
+            "let values: List<Int> = [] expect values matches []",
+        ),
+        (
+            "each",
+            "each(<matcher>)",
+            "Match every element of a list, including an empty list.",
+            "expect [1, 2] matches each(Int)",
+            "expect [\"a\"] matches each(String)",
+        ),
+        (
+            "contains",
+            "contains(<matcher>)",
+            "Match at least one list element or a literal substring.",
+            "expect [1, 2] matches contains(2)",
+            "expect \"abc\" matches contains(\"b\")",
+        ),
+        (
+            "optional",
+            "optional(<matcher>)",
+            "Allow an absent record field; match its value when present.",
+            "expect {} matches subset {id: optional(Int)}",
+            "expect {id: 1} matches subset {id: optional(Int)}",
+        ),
+        (
+            "absent",
+            "absent",
+            "Require a record field to be absent.",
+            "expect {} matches subset {password: absent}",
+            "expect {id: 1} matches subset {password: absent}",
+        ),
+        (
+            "regex",
+            "regex(<String>)",
+            "Match a String with a statically known, bounded Rust regular expression. Patterns are at most 4096 bytes; input is at most 262144 bytes.",
+            "expect \"abc\" matches regex(\"^a.*$\")",
+            "expect \"42\" matches regex(\"^[0-9]+$\")",
+        ),
+        (
+            "range",
+            "range(<lower>, <upper>)",
+            "Match an inclusive numeric or Duration range with compatible bounds.",
+            "expect 2 matches range(1, 3)",
+            "expect 2s matches range(1s, 3s)",
+        ),
+        (
+            "one_of",
+            "one_of(<matcher>, ...)",
+            "Match any of 1–64 alternatives in source order.",
+            "expect 1 matches one_of(1, 2)",
+            "expect \"a\" matches one_of(Int, String)",
+        ),
+        (
+            "all_of",
+            "all_of(<matcher>, ...)",
+            "Match all of 1–64 matchers in source order.",
+            "expect 2 matches all_of(Int, range(1, 3))",
+            "expect \"a\" matches all_of(String, regex(\"^a$\"))",
+        ),
+        (
+            "not",
+            "not(<matcher>)",
+            "Match when the nested matcher does not match.",
+            "expect 1 matches not(2)",
+            "expect \"a\" matches not(Int)",
+        ),
+    ] {
+        let mut entry = base_construct(format!("pattern.{name}"), name, "matcher", syntax, summary);
+        entry.allowed_contexts = vec!["matches right operand".into(), "pattern declaration".into()];
+        entry.return_type = Some(Type::Bool);
+        entry.requires_capabilities = vec![Capability::Pure];
+        entry.produces_value = Some(false);
+        entry.search_terms = vec!["match".into(), "pattern".into(), name.into()];
+        entry.constraints = vec![constraint(
+            "bounded_matcher",
+            "analysis and runtime",
+            "matcher",
+            "Use only pure transferable values. optional and absent are record-field matchers. A mismatch is false in an expression and assertion_failed in an expectation; diffs retain bounded structural paths.",
+        )];
+        entry.failure_modes = vec![
+            "semantic.pattern_arity".into(),
+            "semantic.invalid_pattern_position".into(),
+            "semantic.invalid_regex".into(),
+            "assertion_failed".into(),
+        ];
+        entry.examples = vec![
+            example(
+                "first form",
+                &format!("test \"matcher\" {{ {first} }}"),
+                "source_file",
+                "source_file",
+            ),
+            example(
+                "second form",
+                &format!("test \"matcher\" {{ {second} }}"),
+                "source_file",
+                "source_file",
+            ),
+        ];
+        entry.related = vec!["language.pattern".into(), "assertion.value".into()];
+        entries.push(entry);
+    }
+    for (id, name, syntax, summary, first, second) in [
+        (
+            "control.check",
+            "check",
+            "check { <statement>* }",
+            "Run statements sequentially and accumulate assertion-class failures. Provider, browser action, infrastructure, internal, cancellation, timeout and cleanup failures terminate the check immediately.",
+            "check { expect 1 == 1 expect true }",
+            "server { check { expect \"a\" matches String } }",
+        ),
+        (
+            "statement.pass",
+            "pass",
+            "pass",
+            "Terminate the current variant successfully after owned cleanup.",
+            "pass",
+            "server { pass }",
+        ),
+        (
+            "statement.fail",
+            "fail",
+            "fail <String>",
+            "Raise an explicit assertion-class failure. Inside check it is collected; elsewhere it terminates the variant.",
+            "fail \"explicit reason\"",
+            "check { fail \"first\" fail \"second\" }",
+        ),
+        (
+            "statement.skip",
+            "skip",
+            "skip <String>",
+            "Terminate the variant as skipped with a reason after owned cleanup.",
+            "skip \"not applicable\"",
+            "server { skip \"platform unavailable\" }",
+        ),
+        (
+            "statement.inconclusive",
+            "inconclusive",
+            "inconclusive <String>",
+            "Terminate the variant as inconclusive with a reason. The default CLI policy fails the suite; JUnit preserves the verdict as a property on a skipped testcase.",
+            "inconclusive \"precondition unavailable\"",
+            "server { inconclusive \"external system offline\" }",
+        ),
+        (
+            "statement.assume",
+            "assume",
+            "assume <Bool> else (skip | inconclusive) <String>",
+            "Evaluate a pure Boolean precondition. Continue when true; otherwise execute the explicit skip or inconclusive verdict.",
+            "assume true else skip \"not applicable\" expect true",
+            "assume false else inconclusive \"precondition unavailable\"",
+        ),
+    ] {
+        let mut entry = base_construct(id, name, "control", syntax, summary);
+        entry.requires_capabilities = vec![Capability::Test];
+        entry.produces_value = Some(false);
+        entry.allowed_contexts = vec![
+            "test flow".into(),
+            "server block".into(),
+            "browser block".into(),
+            "helper body".into(),
+            "fixture setup".into(),
+        ];
+        entry.effects=vec!["All owned work and teardown are joined. Cleanup errors dominate semantic verdicts while preserving the prior verdict. Terminating verdicts are forbidden in fixture teardown.".into()];
+        entry.constraints = vec![constraint(
+            "typed_control",
+            "analysis",
+            "statement",
+            "Messages must be String and assume conditions Bool. Check retains at most 32 failure details while counting all failures; nested aggregates preserve source revisions.",
+        )];
+        entry.failure_modes = vec!["assertion_failed".into(), "cleanup_failed".into()];
+        entry.examples = vec![
+            example(
+                "first form",
+                &format!("test \"control\" {{ {first} }}"),
+                "source_file",
+                "source_file",
+            ),
+            example(
+                "second form",
+                &format!("test \"control\" {{ {second} }}"),
+                "source_file",
+                "source_file",
+            ),
+        ];
+        entries.push(entry);
+    }
+    entries
+}
+
+fn reactive_constructs() -> Vec<ConstructDescription> {
+    let mut entries = Vec::new();
+    for (id, name, syntax, summary, first, second) in [
+        (
+            "language.actor",
+            "actor",
+            "actor <name> browser",
+            "Own an isolated browser actor through the remainder of the lexical scope. Actor references are resources and cannot escape as values.",
+            "test \"actor\" {actor alice browser alice {open \"http://example.test\"}}",
+            "test \"actors\" {actor alice browser actor bob browser parallel {alice {expect true} bob {expect true}}}",
+        ),
+        (
+            "scope.actor",
+            "actor block",
+            "<actor> { <browser_statement>* }",
+            "Execute browser operations against the named actor. Each actor has exclusive action access; separate actors can run in parallel.",
+            "test \"actor\" {actor alice browser alice {open \"http://example.test\"}}",
+            "test \"sequential access\" {actor alice browser alice {expect true} alice {expect 1 == 1}}",
+        ),
+        (
+            "builtin.checkpoint",
+            "checkpoint",
+            "let <cursor> = checkpoint(<actor>)",
+            "Establish a backend barrier and pin an actor-relative event cursor before an operation that can emit the event being selected.",
+            "test \"checkpoint\" {actor alice browser let mark = checkpoint(alice) alice {open \"http://example.test\"} select alice since mark within 1s {when console.error(e) {fail e.message} timeout {pass}}}",
+            "test \"cursor\" {actor alice browser let mark = checkpoint(alice) select alice since mark within 1ms {when navigation(n) {expect n.same_document == false} timeout {skip \"no navigation\"}}}",
+        ),
+        (
+            "control.select",
+            "reactive select",
+            "[let <result> =] select <actor> [since <cursor>] within <Duration> { when <source>(<event>) [if <Bool>] { <body> } [timeout { <body> }] }",
+            "Scan one actor's ordered event journal, then execute exactly one matching alternative. Earlier journal events win; ties use source alternative order. Without since, observation starts at select entry.",
+            "test \"selection\" {actor alice browser select alice within 1ms {when console.error(e) {fail e.message} timeout {skip \"no error\"}}}",
+            "test \"selected value\" {actor alice browser let result = select alice within 1ms {when network.response(r) if r.status == 200 {provide r.status} timeout {fail \"no response\"}} expect result == 200}",
+        ),
+        (
+            "language.guard",
+            "guard",
+            "[export] guard <name>(<parameter>: <type>, ...) { when <actor>.<source>(<event>) [if <Bool>] { <failure_body> } }",
+            "Declare a reusable observational guard. Guard parameters are actors or transferable values; clauses use typed normalized event payloads.",
+            "guard quiet(actor: BrowserActor) {when actor.console.error(e) {fail e.message}} test \"guard\" {actor alice browser with guards [quiet(alice)] {expect true}}",
+            "guard unavailable(actor: BrowserActor) {when actor.network.response(r) if r.status >= 500 {inconclusive \"service unavailable\"}} test \"guard\" {actor alice browser with guards [unavailable(alice)] {expect true}}",
+        ),
+        (
+            "control.guards",
+            "with guards",
+            "with guards [<guard>(<arguments>), ...] { <body> }",
+            "Install observational guards before body execution. A trigger cancels the owned body with guard_failed, awaits cleanup, and executes the guard's failure body. Guards end with their lexical scope.",
+            "guard quiet(actor: BrowserActor) {when actor.console.error(e) {fail e.message}} test \"guard\" {actor alice browser with guards [quiet(alice)] {alice {open \"http://example.test\"}}}",
+            "guard undecided(actor: BrowserActor) {when actor.console.error(e) {inconclusive e.message}} test \"guard\" {actor alice browser with guards [undecided(alice)] {expect true}}",
+        ),
+        (
+            "type.BrowserActor",
+            "BrowserActor",
+            "BrowserActor",
+            "A nontransferable lexical browser resource. Only actor access, checkpoint, select and explicit guard activation can use it.",
+            "test \"actor type\" {actor alice browser alice {expect true}}",
+            "guard quiet(actor: BrowserActor) {when actor.console.error(e) {fail e.message}}",
+        ),
+        (
+            "type.EventCursor",
+            "EventCursor",
+            "EventCursor",
+            "A nontransferable actor/execution/generation-bound observation cursor. It cannot be constructed as ordinary data, aliased, serialized, or carried across retry generations.",
+            "test \"cursor type\" {actor alice browser let mark = checkpoint(alice)}",
+            "test \"cursor replay\" {actor alice browser let mark = checkpoint(alice) select alice since mark within 1ms {when console.error(e) {fail e.message} timeout {pass}}}",
+        ),
+    ] {
+        let mut value = base_construct(
+            id,
+            name,
+            if id.starts_with("type.") {
+                "type"
+            } else {
+                "control"
+            },
+            syntax,
+            summary,
+        );
+        value.requires_capabilities = vec![Capability::Browser];
+        value.allowed_contexts = vec![
+            if id == "language.guard" {
+                "source_file"
+            } else {
+                "test flow / capability block"
+            }
+            .into(),
+        ];
+        value.search_terms = vec![
+            "reactive".into(),
+            "events".into(),
+            "actor".into(),
+            name.into(),
+        ];
+        value.produces_value = Some(id == "builtin.checkpoint" || id == "control.select");
+        value.constraints = vec![constraint(
+            "bounded_reactive_ownership",
+            "analysis and runtime",
+            "scope",
+            "Selections require a positive duration up to 24 hours and 1–64 alternatives; parent deadlines and cancellation still apply. Guard activation lists and the total active clauses in one scope are bounded to 64. Guards allow only pure local bindings followed by fail or inconclusive. Actors and cursors cannot escape or be used as ordinary values. Concurrent exclusive access to the same actor is rejected.",
+        )];
+        value.effects=vec!["Event capture activates only sources required by the actor plan. Response bodies are not captured. Actor journals enforce count, total byte and per-event byte limits. Required lost/truncated data yields event_overflow; source closure is infrastructure. Cleanup failures retain precedence over semantic verdicts.".into()];
+        value.failure_modes = vec![
+            "semantic.expected_actor".into(),
+            "semantic.invalid_event_cursor".into(),
+            "semantic.guard_effect_not_allowed".into(),
+            "selection_timeout".into(),
+            "event_overflow".into(),
+            "event_cursor_expired".into(),
+            "browser_disconnected".into(),
+        ];
+        value.examples = vec![
+            example("first form", first, "source_file", "source_file"),
+            example("second form", second, "source_file", "source_file"),
+        ];
+        value.related = vec![
+            "language.actor".into(),
+            "control.select".into(),
+            "language.guard".into(),
+            "builtin.checkpoint".into(),
+        ];
+        entries.push(value);
+    }
+    for source in webtest_model::EventSource::ALL {
+        let mut value = base_construct(
+            format!("event.{}", source.name()),
+            source.name(),
+            "event source",
+            format!("when {}(<event>) [if <Bool>] {{ <body> }}", source.name()),
+            "Observe a typed normalized browser event from the selected actor's bounded journal.",
+        );
+        value.return_type = Some(source.payload_type());
+        value.requires_capabilities = vec![Capability::Browser];
+        value.allowed_contexts = vec![
+            "select alternative".into(),
+            "guard clause with actor prefix".into(),
+        ];
+        value.search_terms = vec![source.name().into(), "event".into(), "reactive".into()];
+        value.produces_value = Some(false);
+        value.constraints = vec![constraint(
+            "normalized_event_schema",
+            "runtime",
+            "payload",
+            "Payload fields are declared by the shared EventSource schema. URL components are normalized records. Timestamp is seconds on the actor capture clock. Network capture includes metadata only; websocket JSON events are derived only from valid bounded text JSON. Captured values drive predicates before public evidence redaction.",
+        )];
+        value.failure_modes = vec!["event_overflow".into(), "browser_disconnected".into()];
+        value.examples = vec![
+            example(
+                "select event",
+                &format!(
+                    "test \"event\" {{actor alice browser select alice within 1ms {{when {}(e) {{pass}} timeout {{skip \"no event\"}}}}}}",
+                    source.name()
+                ),
+                "source_file",
+                "source_file",
+            ),
+            example(
+                "guard event",
+                &format!(
+                    "guard observed(actor: BrowserActor) {{when actor.{}(e) {{fail \"forbidden event\"}}}} test \"guard event\" {{actor alice browser with guards [observed(alice)] {{expect true}}}}",
+                    source.name()
+                ),
+                "source_file",
+                "source_file",
+            ),
+        ];
+        entries.push(value);
+    }
+    entries
 }

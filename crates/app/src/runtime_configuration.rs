@@ -51,6 +51,7 @@ pub(crate) fn runner_options(project: &Project) -> RunnerOptions {
             },
         },
         inspection: inspection_options(project),
+        reactive: project.config.reactive,
         journal_max_events: project.config.journal.max_events,
     }
 }
@@ -130,6 +131,7 @@ pub(crate) fn resolved_runtime_configuration(project: &Project) -> ResolvedRunti
         provider_call_timeout_ms: duration_millis(project.config.timeouts.provider_call),
         cleanup_timeout_ms: duration_millis(project.config.timeouts.cleanup),
         journal_max_events: project.config.journal.max_events.get(),
+        reactive: project.config.reactive,
         trace_mode: match project.config.trace.mode {
             webtest_project::TraceMode::Off => "off",
             webtest_project::TraceMode::On => "on",

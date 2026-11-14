@@ -304,7 +304,8 @@ impl Runner {
                         SkipReason::RunAborted,
                         Some(failure.failure_class()),
                     )),
-                    TestOutcome::Passed
+                    TestOutcome::Verdict { .. }
+                    | TestOutcome::Passed
                     | TestOutcome::Failed(_)
                     | TestOutcome::TimedOut { .. }
                     | TestOutcome::Skipped { .. } => None,

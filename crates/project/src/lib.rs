@@ -41,6 +41,7 @@ pub struct ProjectConfig {
     pub browser: BrowserSection,
     pub timeouts: TimeoutSection,
     pub journal: JournalSection,
+    pub reactive: webtest_model::ReactiveLimits,
     pub trace: TraceSection,
     pub artifacts: ArtifactSection,
     pub evidence: EvidenceSection,
@@ -286,6 +287,7 @@ impl Default for ProjectConfig {
                 cleanup: Duration::from_secs(5),
             },
             journal: JournalSection::default(),
+            reactive: Default::default(),
             trace: TraceSection::default(),
             artifacts: ArtifactSection {
                 directory: PathBuf::from(".webtest/artifacts"),
@@ -383,6 +385,8 @@ struct RawConfig {
     timeouts: RawTimeouts,
     #[serde(default)]
     journal: RawJournal,
+    #[serde(default)]
+    reactive: webtest_model::ReactiveLimits,
     #[serde(default)]
     trace: RawTrace,
     #[serde(default)]
@@ -939,6 +943,12 @@ fn parse_config(
             message: format!("evidence.{key} must be `off` or `on-failure`, got `{value}`"),
         }),
     };
+    if !raw.reactive.valid() {
+        return Err(ProjectError::InvalidConfig {
+            path: path.to_path_buf(),
+            message: "reactive limits are outside their bounded ranges".into(),
+        });
+    }
     let journal_max_events = NonZeroUsize::new(
         raw.journal
             .max_events
@@ -1032,6 +1042,7 @@ fn parse_config(
                     .unwrap_or(defaults.browser.test_id_attribute),
             },
             timeouts: resolved_timeouts,
+            reactive: raw.reactive,
             journal: JournalSection {
                 max_events: journal_max_events,
             },

@@ -33,6 +33,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/williamcotton/webtest"
 
 [workspace.dependencies]
+regex = "1"
 unicode-ident = "1.0"
 salsa = { version = "=0.26.2", default-features = false, features = ["macros", "inventory", "accumulator", "salsa_unstable"] }
 webtest-text = { path = "crates/text" }
