@@ -32,6 +32,8 @@ Do not claim unimplemented roadmap features such as runtime-generated cases, mul
 
 DAP now projects explicit runtime task/scope identities into separate test, sibling, and retry-attempt threads, nested frames, and redacted variable snapshots. Cooperative pause/breakpoints stop tasks at operation safe points; continue broadcasts to all, while step in/over/out follow the selected task's scope ancestry. Single-thread resume is rejected. Exception filters cover assertion/provider/infrastructure/internal failures. Restart and disconnect join runner-owned cleanup, and paused frames expire on resume, deadline, or cancellation. Restart retains the launched source snapshot. In-flight host operations are not frozen and pause time counts toward deadlines. Newly captured failure evidence is available after the exception hook rather than at its pause.
 
+Editor Run actions use a protocol-neutral host lifecycle lease captured with their runtime provider configuration. Native composition owns application startup, per-project serialization, and awaited shutdown at each run boundary, including failed and cancelled runs. A completed editor run must not leave an application bound to its port and block a subsequent DAP or CLI invocation. DAP retains its application until the debug session ends. Keep native lifecycle mechanics in `app`; editor services only orchestrate the injected ownership contract.
+
 ## Crate Ownership and Dependency Direction
 
 - `crates/text`: `FileId`, BLAKE3 `SourceRevision`, `DocumentVersion`, `SyntaxOrigin`, and Rowan ranges. All long-lived source mappings use these primitives.

@@ -642,6 +642,15 @@ fn lsp_resolves_app_provider_from_the_open_documents_nearest_project() {
         "{diagnostics:#?}"
     );
 
+    lsp.send(
+        json!({"jsonrpc":"2.0","id":99,"method":"webtest/discoverTests","params":{"uri":uri}}),
+    );
+    let discovered = lsp.receive(|message| message["id"] == 99);
+    let test = &discovered["result"]["modules"][0]["tests"][0];
+    assert_eq!(test["static_status"], "ready", "{discovered:#?}");
+    assert_eq!(test["variants"][0]["runnable"], true);
+    assert_eq!(test["variants"][0]["debuggable"], true);
+
     let partial = "test \"app\" { server { let user = app. } }";
     lsp.send(json!({
         "jsonrpc":"2.0","method":"textDocument/didChange",
@@ -1036,9 +1045,31 @@ fn dap_project_path_loads_the_test_files_nearest_configuration() {
         request(
             &mut dap,
             "launch",
-            json!({"program":path,"stopOnEntry":false,"headed":false})
+            json!({"program":path,"stopOnEntry":false,"headed":false,"sources":{(directory.path().join("unrelated.webtest").display().to_string()):"broken source from an unrelated open project"}})
         )["success"],
         true
+    );
+    let captured = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, "test \"changed on disk\" {}").unwrap();
+    let source = request(
+        &mut dap,
+        "source",
+        json!({"source":{"path":path},"sourceReference":0}),
+    );
+    assert_eq!(source["success"], true);
+    assert_eq!(
+        source["body"]["content"], captured,
+        "DAP serves the launched snapshot, not a later disk edit"
+    );
+    std::fs::write(&path, &captured).unwrap();
+    let outside = request(
+        &mut dap,
+        "source",
+        json!({"source":{"path":directory.path().join("unrelated.webtest")},"sourceReference":0}),
+    );
+    assert_eq!(
+        outside["success"], false,
+        "arbitrary paths cannot be read through DAP"
     );
     assert_eq!(
         request(&mut dap, "configurationDone", json!({}))["success"],

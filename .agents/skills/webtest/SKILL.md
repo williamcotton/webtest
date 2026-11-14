@@ -48,6 +48,8 @@ schema = ".webtest/app-schema.json"
 
 These sections have distinct roles. `[app]` launches the application process that WebTest owns for test runs and project-mode inspection. `[server.app]` configures that application's bridge protocol, transport, and offline schema so server blocks can call typed `app.*` operations. `[browser]` tells browser steps and inspection where the runner-managed application is reachable; it does not launch an external development server.
 
+Editor Run actions start the configured application for each run and await its shutdown before reporting completion, including failed or cancelled runs. Runs in one editor project serialize application ownership. DAP owns the application through the debug session and joins shutdown when the session ends. Wait for a run or debug session to finish before switching execution modes on the same configured port.
+
 For the scaffolded socket bridge, `[app]` owns the command, arguments, working directory, environment, process ownership, and health check. Configure it to start the complete test application—for example, a command that serves the built frontend and its API—and have that application read the bridge environment variables. Expose deterministic setup through typed bridge operations (for example, SQLite setup) rather than public test-only HTTP routes. A stdio bridge instead puts its dedicated protocol command under `[server.app]`; query `app.configuration` before moving command settings between sections.
 
 The generated bridge smoke test is:
@@ -260,7 +262,7 @@ pending. Use `webtest describe runtime.configuration` for publication guidance.
 
 ### Debug concurrent flows
 
-DAP exposes separate threads for tests, parallel/race branches, and retry attempts.
+DAP exposes separate threads for tests, parallel/race branches, and retry attempts. Variables are grouped into Locals, Actors and checkpoints, Failure (on exception pauses), and Execution context. Actor/cursor summaries use authored names; expand Details or Internal for IDs and generations. Execution context includes the active case label, so a breakpoint reached again for a different case is distinguishable.
 Use the stopped event's thread ID and request its stack/scopes before inspecting
 variables; frame and variable references expire on resume. Pause and breakpoints
 park managed tasks at their next operation safe point. Continue resumes all tasks;

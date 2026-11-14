@@ -1,0 +1,20 @@
+// Match the application payload inside the normalized WebSocket event envelope.
+export pattern Message(sender: String, body: String) = subset { "type": "message", id: range(1, 100000), "from": sender, body: body }
+export guard healthy(actor: BrowserActor) {
+    when actor.console.error(event) {
+        fail event.message
+    }
+    when actor.network.response(response) if response.status >= 500 {
+        fail "The chat application returned a server error"
+    }
+}
+// BrowserActor parameters preserve the caller's owned browser identity.
+export fn sign_in(actor: BrowserActor, path: String, email: String, password: String) -> Null {
+    actor {
+        open path
+        fill label("Email") with email
+        fill label("Password") with password
+        click role("button", name: "Join conversation")
+        wait role("button", name: "Send message").enabled within 5s
+    }
+}

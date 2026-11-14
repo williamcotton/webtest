@@ -28,8 +28,16 @@ export function registerTesting(context: vscode.ExtensionContext, client: Langua
     let refreshTimer: ReturnType<typeof setTimeout> | undefined;
     let refreshCancellation: vscode.CancellationTokenSource | undefined;
     let disposed = false;
-    const workspaceUri = (): vscode.Uri | undefined => vscode.workspace.workspaceFolders?.[0]?.uri
-        ?? vscode.window.activeTextEditor?.document.uri;
+    let lastProjectUri: vscode.Uri | undefined;
+    const workspaceUri = (): vscode.Uri | undefined => {
+        const document = vscode.window.activeTextEditor?.document;
+        if (document?.languageId === "webtest" && document.uri.scheme === "file") {
+            lastProjectUri = document.uri;
+        }
+        // Rust resolves the document's nearest project and provider schema. A
+        // parent editor folder can contain examples with unrelated schemas.
+        return lastProjectUri ?? vscode.workspace.workspaceFolders?.[0]?.uri;
+    };
     const item = (id: string, label: string, uri?: vscode.Uri): vscode.TestItem => {
         let value = items.get(id);
         if (!value) { value = controller.createTestItem(id, label, uri); items.set(id, value); }
@@ -191,6 +199,7 @@ export function registerTesting(context: vscode.ExtensionContext, client: Langua
     context.subscriptions.push(controller,
         controller.createRunProfile("Run", vscode.TestRunProfileKind.Run, execute, true),
         controller.createRunProfile("Debug", vscode.TestRunProfileKind.Debug, debug, true),
+        vscode.window.onDidChangeActiveTextEditor(() => { schedule(); }),
         vscode.workspace.onDidChangeTextDocument(event => { if (event.document.languageId === "webtest") { schedule(); } }),
         vscode.workspace.onDidOpenTextDocument(document => { if (document.languageId === "webtest") { schedule(); } }),
         vscode.workspace.onDidCloseTextDocument(document => { if (document.languageId === "webtest") { schedule(); } }),

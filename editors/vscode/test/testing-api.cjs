@@ -9,7 +9,7 @@ class Collection extends Map {
 }
 function harness() {
     const profiles = new Map(), runs = [], requests = [], notifications = [];
-    const uri = value => ({ fsPath: value.replace("file://", ""), toString: () => value });
+    const uri = value => ({ scheme: value.split(":")[0], fsPath: value.replace("file://", ""), toString: () => value });
     const controller = {
         items: new Collection(), dispose() {},
         createTestItem(id, label, uri) { const item = { id, label, uri }; item.children = new Collection(item); return item; },
@@ -27,7 +27,7 @@ function harness() {
         CancellationTokenSource: class { constructor() { this.token = {}; } cancel() {} dispose() {} },
         TestRunProfileKind: { Run: 1, Debug: 2 },
         tests: { createTestController: () => controller },
-        window: {},
+        window: { onDidChangeActiveTextEditor: disposable },
         workspace: {
             workspaceFolders: [{ uri: uri("file:///workspace"), name: "Workspace" }],
             getWorkspaceFolder: () => ({ name: "Workspace" }), asRelativePath: value => value.fsPath,
@@ -53,7 +53,7 @@ function harness() {
     finally { Module._load = original; }
     let cancel;
     const token = { isCancellationRequested: false, onCancellationRequested: callback => { cancel = callback; return disposable(); } };
-    return { controller, profiles, requests, notifications, runs, token, setSummary: value => summary = value, onRun: callback => onRun = callback, cancel: () => { token.isCancellationRequested = true; cancel(); }, get debugLaunch() { return debugLaunch; }, dispose: () => context.subscriptions.forEach(value => value.dispose()) };
+    return { controller, profiles, requests, notifications, runs, token, setActive: path => { vscode.window.activeTextEditor = path ? { document: { languageId: "webtest", uri: uri(path) } } : undefined; }, setSummary: value => summary = value, onRun: callback => onRun = callback, cancel: () => { token.isCancellationRequested = true; cancel(); }, get debugLaunch() { return debugLaunch; }, dispose: () => context.subscriptions.forEach(value => value.dispose()) };
 }
 
 test("Testing API selects stable variants, deduplicates parents, honors exclusions, and routes Debug", async () => {
@@ -93,5 +93,18 @@ test("Testing API cancellation is correlated with the owned run request", async 
         const run = h.requests.find(([method]) => method === "webtest/runVariants")[1];
         assert.deepEqual(h.notifications[0], ["webtest/cancelRun", { run_id: run.run_id }]);
         assert.ok(h.runs[0].some(([method]) => method === "end"));
+    } finally { h.dispose(); }
+});
+
+test("Testing API discovers through the active source's native project context and retains it outside the editor", async () => {
+    const h = harness();
+    try {
+        const chat = "file:///workspace/examples/chat/tests/conversation.webtest";
+        h.setActive(chat);
+        await h.controller.refreshHandler();
+        assert.equal(h.requests.at(-1)[1].uri, chat);
+        h.setActive(undefined);
+        await h.controller.refreshHandler();
+        assert.equal(h.requests.at(-1)[1].uri, chat);
     } finally { h.dispose(); }
 });

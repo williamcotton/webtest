@@ -154,6 +154,19 @@ are still pending.
 
 ## Examples
 
+The [two-person chat example](examples/chat/README.md) demonstrates Alice and Bob
+using isolated browser sessions to exchange WebSocket messages. It includes a
+working app, private typed fixture setup, concurrent sign-in/reload, reusable
+patterns and guards, pre-action event checkpoints, and two labeled cases:
+
+```sh
+npm --prefix examples/chat ci
+target/debug/webtest test examples/chat --headed
+```
+
+WebTest starts and stops this app automatically. Its README also explains how to
+try it manually with two browser profiles and inspect the resulting actor traces.
+
 Each directory under `examples` is an independent WebTest project with its own configuration. For the plain HTML browser example, serve the fixture in one terminal:
 
 ```sh

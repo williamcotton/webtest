@@ -11,12 +11,15 @@ use webtest_provider::ProviderRegistry;
 use webtest_runtime::RunnerOptions;
 
 use crate::{
-    error::AppError, project_context::project, provider_composition::runtime_provider_registry,
+    error::AppError,
+    project_context::project,
+    provider_composition::{RuntimeApplication, runtime_application, runtime_provider_registry},
     runtime_configuration::runner_options,
 };
 
 #[derive(Clone)]
 struct LspProjectEditor {
+    run_gate: Arc<tokio::sync::Mutex<()>>,
     editor: Arc<EditorService>,
     app_provider: Option<Arc<AppProvider>>,
     schema_path: Option<PathBuf>,
@@ -78,6 +81,7 @@ impl LspProjectEditors {
             database.configure_workspace(configuration);
         }
         let candidate = LspProjectEditor {
+            run_gate: Arc::new(tokio::sync::Mutex::new(())),
             editor: Arc::new(EditorService::with_analysis_database(
                 options.clone(),
                 runtime_providers.registry,
@@ -87,6 +91,11 @@ impl LspProjectEditors {
             schema_path: configured_app_schema_path(project),
             runner_options: options,
         };
+        candidate.editor.set_run_lifecycle(editor_lifecycle(
+            project,
+            candidate.app_provider.clone(),
+            candidate.run_gate.clone(),
+        ));
         let mut projects = self.lock();
         let project = projects.entry(project.root.clone()).or_insert(candidate);
         Ok(Arc::clone(&project.editor))
@@ -210,12 +219,13 @@ impl LspProjectEditors {
                 })?;
                 cached
                     .editor
-                    .reconfigure_workspace_inputs(
+                    .reconfigure_workspace_inputs_with_lifecycle(
                         options.clone(),
                         providers.registry,
                         inputs.workspace_configuration(),
                         inputs.source_inputs(),
                         inputs.source_aliases(),
+                        editor_lifecycle(&project, providers.app.clone(), cached.run_gate.clone()),
                     )
                     .map_err(AppError::internal)?;
                 cached.schema_path = configured_app_schema_path(&project);
@@ -239,6 +249,7 @@ impl LspProjectEditors {
                 .editor
                 .reconfigure(cached.runner_options.clone(), providers);
             cached.editor.invalidate_project_inputs();
+            cached.editor.set_run_lifecycle(None);
             cached.app_provider.take()
         };
         shutdown_replaced_provider(previous_provider);
@@ -289,6 +300,65 @@ fn canonical_event_path(path: &Path) -> PathBuf {
     })
 }
 
+struct EditorApplicationLifecycle {
+    project: Project,
+    application: RuntimeApplication,
+    gate: Arc<tokio::sync::Mutex<()>>,
+}
+struct EditorApplicationLease {
+    application: RuntimeApplication,
+    _permit: tokio::sync::OwnedMutexGuard<()>,
+}
+#[async_trait::async_trait]
+impl webtest_editor::RunLifecycle for EditorApplicationLifecycle {
+    async fn begin(
+        &self,
+    ) -> Result<Box<dyn webtest_editor::RunLease>, webtest_provider::ProviderError> {
+        let permit = self.gate.clone().lock_owned().await;
+        if let Err(primary) = self.application.start(&self.project).await {
+            if let Err(cleanup) = self.application.shutdown().await {
+                tracing::warn!(%cleanup, "editor application startup cleanup failed");
+                return Err(match self.application {
+                    RuntimeApplication::Provider(_) => {
+                        webtest_provider::ProviderError::BridgeCleanup {
+                            primary: Box::new(primary),
+                        }
+                    }
+                    RuntimeApplication::Process(_) => {
+                        webtest_provider::ProviderError::ProcessCleanup {
+                            primary: Some(Box::new(primary)),
+                        }
+                    }
+                });
+            }
+            return Err(primary);
+        }
+        Ok(Box::new(EditorApplicationLease {
+            application: self.application.clone(),
+            _permit: permit,
+        }))
+    }
+}
+#[async_trait::async_trait]
+impl webtest_editor::RunLease for EditorApplicationLease {
+    async fn finish(self: Box<Self>) -> Result<(), webtest_provider::ProviderError> {
+        self.application.shutdown().await
+    }
+}
+fn editor_lifecycle(
+    project: &Project,
+    provider: Option<Arc<AppProvider>>,
+    gate: Arc<tokio::sync::Mutex<()>>,
+) -> Option<Arc<dyn webtest_editor::RunLifecycle>> {
+    runtime_application(project, provider).map(|application| {
+        Arc::new(EditorApplicationLifecycle {
+            project: project.clone(),
+            application,
+            gate,
+        }) as Arc<dyn webtest_editor::RunLifecycle>
+    })
+}
+
 fn shutdown_replaced_provider(provider: Option<Arc<AppProvider>>) {
     if let Some(provider) = provider {
         tokio::spawn(async move {
@@ -302,6 +372,95 @@ fn shutdown_replaced_provider(provider: Option<Arc<AppProvider>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct NoBrowser;
+    #[async_trait::async_trait]
+    impl webtest_browser::BrowserHost for NoBrowser {
+        async fn start(
+            &self,
+        ) -> Result<Box<dyn webtest_browser::BrowserSession>, webtest_browser::BrowserError>
+        {
+            panic!("pure lifecycle test must not start Chrome");
+        }
+    }
+
+    #[tokio::test]
+    async fn editor_runs_join_application_shutdown_before_reusing_the_port() {
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = reservation.local_addr().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("app.py"),
+            r#"import http.server, os, sys
+server = http.server.HTTPServer(('127.0.0.1', int(sys.argv[1])), http.server.BaseHTTPRequestHandler)
+with open('starts', 'a') as output: output.write(str(os.getpid()) + '\n')
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.end_headers(); self.wfile.write(b'ok')
+    def log_message(self, *args): pass
+server.RequestHandlerClass = Handler
+server.serve_forever()
+"#,
+        )
+        .unwrap();
+        std::fs::write(directory.path().join("webtest.toml"),format!("[project]\ntest_roots=[\"test.webtest\"]\n[app]\ncommand=\"python3\"\nargs=[\"app.py\",\"{}\"]\nworking_directory=\".\"\n[app.health]\nurl=\"http://{address}/health\"\ntimeout=\"5s\"\n",address.port())).unwrap();
+        let path = directory.path().join("test.webtest");
+        std::fs::write(&path, "test \"lifecycle\" {expect true}").unwrap();
+        drop(reservation);
+        let editors = LspProjectEditors::default();
+        let editor = editors.editor_for_path(&path).unwrap();
+        let canonical = std::fs::canonicalize(&path).unwrap();
+        let file = editor.open_document(
+            canonical.display().to_string(),
+            "test \"lifecycle\" {expect true}",
+        );
+        assert_eq!(editor.run_file(file, &NoBrowser).await.unwrap().passed(), 1);
+        drop(
+            std::net::TcpListener::bind(address)
+                .expect("successful file run releases its app port"),
+        );
+        editor.update_document(file, "test \"lifecycle\" {expect false}");
+        assert_eq!(editor.run_file(file, &NoBrowser).await.unwrap().failed(), 1);
+        drop(std::net::TcpListener::bind(address).expect("failed file run releases its app port"));
+        let discovery = editor.snapshot().discover_tests(100).unwrap();
+        let selected = discovery
+            .modules
+            .iter()
+            .flat_map(|m| &m.tests)
+            .flat_map(|t| &t.variants)
+            .map(|v| v.id)
+            .collect();
+        let first = editor
+            .prepare_variants(discovery.workspace_revision, &selected)
+            .unwrap();
+        let second = editor
+            .prepare_variants(discovery.workspace_revision, &selected)
+            .unwrap();
+        let (first, second) = tokio::join!(
+            first.execute(&NoBrowser, None),
+            second.execute(&NoBrowser, None)
+        );
+        for run in [first, second] {
+            assert!(
+                run.failures.is_empty(),
+                "lifecycle failures: {:?}",
+                run.failures
+            );
+            assert_eq!(run.tests.len(), 1);
+        }
+        drop(
+            std::net::TcpListener::bind(address)
+                .expect("selected variant runs release their app port"),
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("starts"))
+                .unwrap()
+                .lines()
+                .count(),
+            4
+        );
+        editors.shutdown().await.unwrap();
+    }
 
     #[test]
     fn canonicalizes_existing_parent_for_half_written_inputs() {

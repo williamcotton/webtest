@@ -533,12 +533,6 @@ impl CommandReport {
                 plural(self.summary.files)
             )?;
         }
-        for record in &self.application_events {
-            write_json_line(
-                output,
-                &serde_json::json!({ "schema_version": REPORT_SCHEMA_VERSION, "type": "application_event", "record": record }),
-            )?;
-        }
         for file in &self.files {
             for diagnostic in &file.diagnostics {
                 write_source_diagnostic(
@@ -701,6 +695,12 @@ impl CommandReport {
                     "schema_version": REPORT_SCHEMA_VERSION,
                     "type": "trace_export", "trace": trace,
                 }),
+            )?;
+        }
+        for record in &self.application_events {
+            write_json_line(
+                output,
+                &serde_json::json!({ "schema_version": REPORT_SCHEMA_VERSION, "type": "application_event", "record": record }),
             )?;
         }
         for warning in &self.warnings {
@@ -1311,6 +1311,47 @@ mod tests {
         assert!(output.contains("tests/a.webtest:2:7"));
         assert!(output.contains("2 | click id(\"missing\")"));
         assert!(output.contains("      ^^^^^^^^^^^^^"));
+    }
+
+    #[test]
+    fn application_journal_is_preserved_in_machine_reporters_without_polluting_human_output() {
+        let mut report = sample();
+        let mut journal = webtest_observation::EventJournal::default();
+        report.application_events.push(
+            journal
+                .record(
+                    ExecutionEvent::RunStarted {
+                        execution_id: ExecutionId::from_u128(77),
+                    },
+                    webtest_observation::EventTime {
+                        since_unix_epoch: std::time::Duration::from_secs(1),
+                        elapsed: std::time::Duration::ZERO,
+                    },
+                )
+                .clone(),
+        );
+        let mut human = Vec::new();
+        report.write(Reporter::Human, &mut human).unwrap();
+        let human = String::from_utf8(human).unwrap();
+        assert!(human.contains("error[runtime.locator_not_found]"));
+        assert!(!human.contains("application_event"));
+        let mut events = Vec::new();
+        report.write(Reporter::Events, &mut events).unwrap();
+        let application = String::from_utf8(events)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|record| record["type"] == "application_event")
+            .collect::<Vec<_>>();
+        assert_eq!(application.len(), 1);
+        assert_eq!(
+            application[0]["record"],
+            serde_json::to_value(&report.application_events[0]).unwrap()
+        );
+        let mut json = Vec::new();
+        report.write(Reporter::Json, &mut json).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(json["application_events"][0], application[0]["record"]);
     }
 
     #[test]

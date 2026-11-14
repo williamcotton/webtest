@@ -1,0 +1,78 @@
+{
+  "manifest_version": 1,
+  "protocol": 1,
+  "provider": "app",
+  "sdk": "@webtest/node",
+  "sdk_version": "0.1.0",
+  "schema_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+  "functions": {
+    "prepare_room": {
+      "documentation": "Create a private in-memory chat room and independent Alice/Bob credentials. Available only on the authenticated test bridge.",
+      "retry_safe": false,
+      "params": {
+        "type": "object",
+        "fields": {
+          "label": {
+            "type": "string",
+            "optional": false,
+            "secret": false
+          }
+        }
+      },
+      "returns": {
+        "type": "object",
+        "fields": {
+          "path": {
+            "type": "string",
+            "optional": false,
+            "secret": false
+          },
+          "alice": {
+            "type": "object",
+            "fields": {
+              "name": {
+                "type": "string",
+                "optional": false,
+                "secret": false
+              },
+              "email": {
+                "type": "string",
+                "optional": false,
+                "secret": false
+              },
+              "password": {
+                "type": "string",
+                "optional": false,
+                "secret": true
+              }
+            },
+            "optional": false,
+            "secret": false
+          },
+          "bob": {
+            "type": "object",
+            "fields": {
+              "name": {
+                "type": "string",
+                "optional": false,
+                "secret": false
+              },
+              "email": {
+                "type": "string",
+                "optional": false,
+                "secret": false
+              },
+              "password": {
+                "type": "string",
+                "optional": false,
+                "secret": true
+              }
+            },
+            "optional": false,
+            "secret": false
+          }
+        }
+      }
+    }
+  }
+}

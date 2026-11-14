@@ -866,8 +866,12 @@ impl TreeExecution<'_, '_> {
                         if !sources.is_empty() {
                             created.start_reactive(journal.clone(), sources).await?
                         }
-                        let handle =
-                            actors::ActorHandle::new(created, journal, owner.event.clone());
+                        let handle = actors::ActorHandle::new(
+                            created,
+                            journal,
+                            owner.event.clone(),
+                            name.into(),
+                        );
                         let _owned = actors::ActorOwner(handle.clone());
                         self.branch.actors.insert(actor, handle);
                         semantics::emit_semantic(
@@ -1195,25 +1199,22 @@ impl TreeExecution<'_, '_> {
         let options = self.services.options;
         let providers = self.services.providers;
         let deadline = self.services.deadline;
-        let mut resource_debug = std::collections::BTreeMap::new();
+        let mut resource_debug = Vec::new();
         if control.is_some() {
             for (actor, handle) in &self.branch.actors {
-                resource_debug.insert(
-                    format!("$actor {actor}"),
-                    webtest_model::Value::String(format!(
-                        "BrowserActor {actor}; generation {}",
-                        handle.2.execution_context.scope_id.0
-                    )),
-                );
+                resource_debug.push(crate::DebugResource::BrowserActor {
+                    name: handle.3.clone(),
+                    actor: *actor,
+                    generation: handle.2.execution_context.scope_id,
+                });
             }
             for cursor in self.branch.cursors.values() {
-                resource_debug.insert(
-                    format!("$cursor {}", cursor.name),
-                    webtest_model::Value::String(format!(
-                        "EventCursor actor {}; generation {}; sequence {}",
-                        cursor.actor, cursor.generation.0, cursor.sequence
-                    )),
-                );
+                resource_debug.push(crate::DebugResource::EventCursor {
+                    name: cursor.name.clone(),
+                    actor: cursor.actor,
+                    generation: cursor.generation,
+                    sequence: cursor.sequence,
+                });
             }
         }
         let state = &mut self.branch.bindings;
@@ -1241,7 +1242,8 @@ impl TreeExecution<'_, '_> {
             state.prepare_provider_arguments(call);
         }
         if let Some(control) = control {
-            let debug_context = scope.debug_context(execution_id);
+            let mut debug_context = scope.debug_context(execution_id);
+            debug_context.resources = resource_debug.clone();
             let capture = if let Some(test) = test {
                 control.should_capture_bindings(test, step)
             } else {
@@ -1249,9 +1251,7 @@ impl TreeExecution<'_, '_> {
                     .is_some_and(|fixture| control.should_capture_fixture_bindings(fixture, step))
             };
             let bindings = if capture {
-                let mut bindings = state.visible_step_bindings(step);
-                bindings.extend(resource_debug.clone());
-                Some(bindings)
+                Some(state.visible_step_bindings(step))
             } else {
                 None
             };
@@ -1633,9 +1633,9 @@ impl TreeExecution<'_, '_> {
                 if host_context.cancellation.cause().is_none()
                     && let Some(control) = control
                 {
-                    let mut bindings = state.visible_step_bindings(step);
-                    bindings.extend(resource_debug.clone());
-                    let debug_context = scope.debug_context(execution_id);
+                    let bindings = state.visible_step_bindings(step);
+                    let mut debug_context = scope.debug_context(execution_id);
+                    debug_context.resources = resource_debug.clone();
                     let after = async {
                         if let Some(test) = test {
                             control

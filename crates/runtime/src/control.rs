@@ -13,6 +13,23 @@ pub struct DebugContext {
     pub task_id: webtest_model::ExecutionScopeId,
     pub parent_task_id: Option<webtest_model::ExecutionScopeId>,
     pub frames: Vec<DebugScope>,
+    pub resources: Vec<DebugResource>,
+}
+
+/// Read-only resource identity for debugger hosts, never a language value or handle.
+#[derive(Clone, Debug)]
+pub enum DebugResource {
+    BrowserActor {
+        name: String,
+        actor: webtest_model::ActorId,
+        generation: webtest_model::ExecutionScopeId,
+    },
+    EventCursor {
+        name: String,
+        actor: webtest_model::ActorId,
+        generation: webtest_model::ExecutionScopeId,
+        sequence: u64,
+    },
 }
 
 #[derive(Clone, Debug)]

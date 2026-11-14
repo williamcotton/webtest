@@ -392,6 +392,7 @@ impl DebugState {
                     .await?;
             }
             "launch" => self.launch(&request).await?,
+            "source" => self.source(&request).await?,
             "setBreakpoints" => self.set_breakpoints(&request).await?,
             "setExceptionBreakpoints" => {
                 *lock(&self.exception_breakpoints) = request
@@ -532,6 +533,36 @@ impl DebugState {
         self.writer.response(request, json!({})).await?;
         self.writer.event("initialized", json!({})).await?;
         self.start_if_ready();
+        Ok(())
+    }
+
+    async fn source(&self, request: &Request) -> Result<(), DapError> {
+        let content = request
+            .arguments
+            .get("source")
+            .and_then(|source| source.get("path"))
+            .and_then(Value::as_str)
+            .and_then(|path| {
+                lock(&self.program)
+                    .as_ref()
+                    .and_then(|program| program.source_at_path(&normalize_path(Path::new(path))))
+                    .map(|source| source.text.clone())
+            });
+        match content {
+            Some(content) => {
+                self.writer
+                    .response(
+                        request,
+                        json!({"content":content.as_ref(),"mimeType":"text/plain"}),
+                    )
+                    .await?
+            }
+            None => {
+                self.writer
+                    .failure(request, "requested source is not in the launched snapshot")
+                    .await?
+            }
+        }
         Ok(())
     }
 
@@ -1067,6 +1098,7 @@ fn unverified_breakpoints(requested: &[SourceBreakpoint], message: &str) -> Vec<
 }
 
 struct DapVariableStore {
+    root_presentations: HashMap<String, (String, String)>,
     variables: HashMap<i64, Vec<Value>>,
     targets: HashMap<i64, Arc<webtest_model::Value>>,
     root: Vec<(String, Arc<webtest_model::Value>)>,
@@ -1084,6 +1116,7 @@ impl DapVariableStore {
         handles: Arc<AtomicI64>,
     ) -> Self {
         Self {
+            root_presentations: HashMap::new(),
             variables: HashMap::new(),
             targets: HashMap::new(),
             root: bindings
@@ -1109,7 +1142,17 @@ impl DapVariableStore {
         };
         let variables = values
             .into_iter()
-            .map(|(name, value)| self.provider_variable(&name, value))
+            .map(|(name, value)| {
+                let mut variable = self.provider_variable(&name, value);
+                if reference == self.root_reference
+                    && let Some((summary, kind)) = self.root_presentations.get(&name)
+                {
+                    variable["value"] = summary.clone().into();
+                    variable["type"] = kind.clone().into();
+                    variable["presentationHint"] = json!({"attributes":["readOnly"]});
+                }
+                variable
+            })
             .collect::<Vec<_>>();
         self.variables.insert(reference, variables.clone());
         variables

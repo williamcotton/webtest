@@ -58,6 +58,11 @@ struct Frame {
     location: StepLocation,
     path: PathBuf,
     variables: DapVariableStore,
+    extra_scopes: Vec<VariableScope>,
+}
+struct VariableScope {
+    name: &'static str,
+    variables: DapVariableStore,
 }
 struct Snapshot {
     context: DebugContext,
@@ -209,8 +214,11 @@ impl DebugState {
             .flat_map(|snapshot| &snapshot.frames)
             .find(|frame| Some(frame.id) == id)
             .map(|frame| {
-                vec![json!({"name":"WebTest", "presentationHint":"locals",
-                "variablesReference":frame.variables.root_reference,"expensive":false})]
+                let mut scopes = vec![json!({"name":"Locals", "presentationHint":"locals",
+                    "variablesReference":frame.variables.root_reference,"namedVariables":frame.variables.root.len(),"expensive":false})];
+                scopes.extend(frame.extra_scopes.iter().map(|scope| json!({"name":scope.name,
+                    "variablesReference":scope.variables.root_reference,"namedVariables":scope.variables.root.len(),"expensive":false})));
+                scopes
             })
             .unwrap_or_default();
         self.writer
@@ -221,17 +229,29 @@ impl DebugState {
         let reference = request.arguments["variablesReference"]
             .as_i64()
             .unwrap_or(0);
-        let variables = lock(&self.tasks)
-            .tasks
-            .values_mut()
-            .filter_map(|task| task.snapshot.as_mut())
-            .flat_map(|snapshot| &mut snapshot.frames)
-            .find(|frame| {
-                frame.variables.root_reference == reference
-                    || frame.variables.targets.contains_key(&reference)
-            })
-            .map(|frame| frame.variables.variables(reference))
-            .unwrap_or_default();
+        let variables = {
+            let mut tasks = lock(&self.tasks);
+            let mut variables = Vec::new();
+            'frames: for frame in tasks
+                .tasks
+                .values_mut()
+                .filter_map(|task| task.snapshot.as_mut())
+                .flat_map(|snapshot| &mut snapshot.frames)
+            {
+                for store in std::iter::once(&mut frame.variables).chain(
+                    frame
+                        .extra_scopes
+                        .iter_mut()
+                        .map(|scope| &mut scope.variables),
+                ) {
+                    if store.root_reference == reference || store.targets.contains_key(&reference) {
+                        variables = store.variables(reference);
+                        break 'frames;
+                    }
+                }
+            }
+            variables
+        };
         self.writer
             .response(request, json!({"variables":variables}))
             .await
@@ -346,78 +366,16 @@ impl DebugState {
                     .scope
                     .execution_context
                     .actor
-                    .map_or(name.clone(), |actor| format!("{name} [actor {actor}]"));
-                let mut values = if index == 0 {
+                    .filter(|_| index == 0 || scope.display_name.is_none())
+                    .map_or(name.clone(), |actor| {
+                        let label = actor_label(context, actor);
+                        format!("{name} [{label}]")
+                    });
+                let values = if index == 0 {
                     bindings.take().unwrap_or_default()
                 } else {
                     BTreeMap::new()
                 };
-                if let Some(actor) = scope.scope.execution_context.actor {
-                    values.insert(
-                        "$actor".into(),
-                        webtest_model::Value::String(actor.to_string()),
-                    );
-                }
-                // Ancestor frames expose their own metadata, never a child's lexical locals.
-                values.insert(
-                    "$scope".into(),
-                    webtest_model::Value::String(
-                        scope.scope.execution_context.scope_id.0.to_string(),
-                    ),
-                );
-                if let Some(attempt) = scope.attempt {
-                    values.insert(
-                        "$attempt".into(),
-                        webtest_model::Value::Int(attempt.ordinal.into()),
-                    );
-                    values.insert(
-                        "$maxAttempts".into(),
-                        webtest_model::Value::Int(attempt.max_attempts.into()),
-                    );
-                }
-                if index == 0 {
-                    values.insert(
-                        if scope.scope.execution_context.fixture.is_some() {
-                            "fixture"
-                        } else {
-                            "test"
-                        }
-                        .into(),
-                        webtest_model::Value::String(test_name.to_owned()),
-                    );
-                    values.insert(
-                        "operation".into(),
-                        webtest_model::Value::String(name.clone()),
-                    );
-                    values.insert(
-                        "line".into(),
-                        webtest_model::Value::Int(location.line.into()),
-                    );
-                    values.insert(
-                        "source".into(),
-                        webtest_model::Value::String(
-                            program
-                                .source
-                                .lines()
-                                .nth(location.line.saturating_sub(1) as usize)
-                                .unwrap_or_default()
-                                .trim()
-                                .into(),
-                        ),
-                    );
-                    if let Some(error) = error {
-                        values.insert(
-                            "$failureCode".into(),
-                            webtest_model::Value::String(error.code().short_code().into()),
-                        );
-                        if let StepError::Assertion(assertion) = error {
-                            values.insert("$actual".into(), assertion.actual.clone());
-                            if let Some(expected) = &assertion.expected {
-                                values.insert("$expected".into(), expected.clone());
-                            }
-                        }
-                    }
-                }
                 let values = values
                     .into_iter()
                     .map(|(key, value)| {
@@ -428,6 +386,125 @@ impl DebugState {
                     })
                     .collect();
                 let variables = DapVariableStore::with_handles(values, self.handles.clone());
+                let mut metadata = BTreeMap::new();
+                let mut internal = BTreeMap::from([
+                    (
+                        "Scope ID".into(),
+                        webtest_model::Value::String(
+                            scope.scope.execution_context.scope_id.0.to_string(),
+                        ),
+                    ),
+                    (
+                        "Task ID".into(),
+                        webtest_model::Value::String(context.task_id.0.to_string()),
+                    ),
+                ]);
+                if let Some(actor) = scope.scope.execution_context.actor {
+                    metadata.insert(
+                        "Actor".into(),
+                        webtest_model::Value::String(actor_label(context, actor)),
+                    );
+                    internal.insert(
+                        "Actor ID".into(),
+                        webtest_model::Value::String(actor.to_string()),
+                    );
+                }
+                if let Some(attempt) = scope.attempt {
+                    metadata.insert(
+                        "Attempt".into(),
+                        webtest_model::Value::String(format!(
+                            "{} of {}",
+                            attempt.ordinal, attempt.max_attempts
+                        )),
+                    );
+                }
+                metadata.insert(
+                    "Location".into(),
+                    webtest_model::Value::String(format!(
+                        "{}:{}",
+                        source_name(&path),
+                        location.line
+                    )),
+                );
+                metadata.insert("Internal".into(), webtest_model::Value::Record(internal));
+                if index == 0 {
+                    if let Some(planned) = program.plan.tests.iter().find(|test| {
+                        Some(test.variant_id) == scope.scope.execution_context.variant_id
+                    }) && let Some(label) = &planned.case_label
+                    {
+                        metadata.insert("Case".into(), webtest_model::Value::String(label.clone()));
+                    }
+                    metadata.insert(
+                        if scope.scope.execution_context.fixture.is_some() {
+                            "Fixture"
+                        } else {
+                            "Test"
+                        }
+                        .into(),
+                        webtest_model::Value::String(test_name.to_owned()),
+                    );
+                    metadata.insert(
+                        "Operation".into(),
+                        webtest_model::Value::String(name.clone()),
+                    );
+                    metadata.insert(
+                        "Source".into(),
+                        webtest_model::Value::String(
+                            source
+                                .map_or(program.source.as_ref(), |source| source.text.as_ref())
+                                .lines()
+                                .nth(location.line.saturating_sub(1) as usize)
+                                .unwrap_or_default()
+                                .trim()
+                                .into(),
+                        ),
+                    );
+                }
+                let mut extra_scopes = Vec::new();
+                if index == 0 && !context.resources.is_empty() {
+                    extra_scopes.push(VariableScope {
+                        name: "Actors and checkpoints",
+                        variables: resource_variables(context, self.handles.clone()),
+                    });
+                }
+                if index == 0
+                    && let Some(error) = error
+                {
+                    let mut failure = BTreeMap::from([(
+                        "code".into(),
+                        webtest_model::Value::String(error.code().short_code().into()),
+                    )]);
+                    if let StepError::Assertion(assertion) = error {
+                        failure.insert("actual".into(), assertion.actual.clone());
+                        if let Some(expected) = &assertion.expected {
+                            failure.insert("expected".into(), expected.clone());
+                        }
+                    }
+                    extra_scopes.push(VariableScope {
+                        name: "Failure",
+                        variables: DapVariableStore::with_handles(
+                            failure
+                                .into_iter()
+                                .map(|(key, value)| {
+                                    (
+                                        key,
+                                        value.redacted(&self.runner_options.redacted_json_fields),
+                                    )
+                                })
+                                .collect(),
+                            self.handles.clone(),
+                        ),
+                    });
+                }
+                let mut execution = DapVariableStore::with_handles(metadata, self.handles.clone());
+                execution.root_presentations.insert(
+                    "Internal".into(),
+                    ("Execution identifiers".into(), "ExecutionDetails".into()),
+                );
+                extra_scopes.push(VariableScope {
+                    name: "Execution context",
+                    variables: execution,
+                });
                 let id = self.handles.fetch_add(1, Ordering::Relaxed);
                 Frame {
                     id,
@@ -435,6 +512,7 @@ impl DebugState {
                     location,
                     path,
                     variables,
+                    extra_scopes,
                 }
             })
             .collect();
@@ -690,6 +768,64 @@ impl RunControl for DebugState {
     }
 }
 
+fn actor_label(context: &DebugContext, actor: webtest_model::ActorId) -> String {
+    context
+        .resources
+        .iter()
+        .find_map(|resource| match resource {
+            webtest_runtime::DebugResource::BrowserActor {
+                name, actor: owner, ..
+            } if *owner == actor => Some(name.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            format!(
+                "actor {}",
+                actor.to_string().chars().take(8).collect::<String>()
+            )
+        })
+}
+
+fn resource_variables(context: &DebugContext, handles: Arc<AtomicI64>) -> DapVariableStore {
+    use webtest_model::Value as V;
+    use webtest_runtime::DebugResource;
+    let mut values = BTreeMap::new();
+    let mut presentations = HashMap::new();
+    for resource in &context.resources {
+        let (name, actor, generation, sequence) = match resource {
+            DebugResource::BrowserActor {
+                name,
+                actor,
+                generation,
+            } => (name, actor, generation, None),
+            DebugResource::EventCursor {
+                name,
+                actor,
+                generation,
+                sequence,
+            } => (name, actor, generation, Some(*sequence)),
+        };
+        let details = V::Record(BTreeMap::from([
+            ("Actor ID".into(), V::String(actor.to_string())),
+            ("Generation".into(), V::String(generation.0.to_string())),
+        ]));
+        let mut fields = BTreeMap::from([("Details".into(), details)]);
+        let (summary, kind) = if let Some(sequence) = sequence {
+            let label = actor_label(context, *actor);
+            fields.insert("Actor".into(), V::String(label.clone()));
+            fields.insert("After event".into(), V::String(sequence.to_string()));
+            (format!("{label} · after event {sequence}"), "EventCursor")
+        } else {
+            ("Browser actor".into(), "BrowserActor")
+        };
+        values.insert(name.clone(), V::Record(fields));
+        presentations.insert(name.clone(), (summary, kind.into()));
+    }
+    let mut store = DapVariableStore::with_handles(values, handles);
+    store.root_presentations = presentations;
+    store
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -799,6 +935,157 @@ mod tests {
         assert_eq!(result.tests.len(), 1);
         assert_eq!(result.tests[0].variant_id, selected);
         assert_eq!(result.passed(), 1);
+    }
+
+    #[tokio::test]
+    async fn variable_groups_preserve_locals_and_keep_resource_identifiers_in_details() {
+        use webtest_model::{ActorId, Value as V};
+        use webtest_runtime::DebugResource;
+        let state = state(
+            "test \"presentation\" cases [case \"one\" {message: \"hello\"}] as input {\n let line = 7\n let operation = \"authored operation\"\n let source = \"authored source\"\n let literal = \"BrowserActor is ordinary text\"\n expect true\n}",
+        );
+        lock(&state.breakpoints).insert(PathBuf::from("/debug.webtest"), HashSet::from([6]));
+        let running = run(&state);
+        parked(&state, 1).await;
+        let (mut context, bindings) = {
+            let tasks = lock(&state.tasks);
+            let paused = tasks
+                .tasks
+                .values()
+                .find_map(|task| task.snapshot.as_ref())
+                .unwrap();
+            (
+                paused.context.clone(),
+                paused.frames[0]
+                    .variables
+                    .root
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.as_ref().clone()))
+                    .collect(),
+            )
+        };
+        let alice = ActorId([0x11; 32]);
+        let bob = ActorId([0x22; 32]);
+        context.resources = vec![
+            DebugResource::BrowserActor {
+                name: "alice".into(),
+                actor: alice,
+                generation: ExecutionScopeId(8),
+            },
+            DebugResource::BrowserActor {
+                name: "bob".into(),
+                actor: bob,
+                generation: ExecutionScopeId(10),
+            },
+            DebugResource::EventCursor {
+                name: "beforeReply".into(),
+                actor: bob,
+                generation: ExecutionScopeId(10),
+                sequence: 9,
+            },
+        ];
+        context
+            .frames
+            .last_mut()
+            .unwrap()
+            .scope
+            .execution_context
+            .actor = Some(bob);
+        let program = lock(&state.program).clone().unwrap();
+        let step = program.plan.tests[0].steps().last().copied().unwrap();
+        let mut snapshot = state.snapshot(
+            &program,
+            &program.plan.tests[0].name,
+            step,
+            &context,
+            bindings,
+            None,
+        );
+        let frame = &mut snapshot.frames[0];
+        assert!(frame.name.ends_with("[bob]"));
+        assert!(!frame.name.contains(&bob.to_string()));
+        let locals = frame.variables.variables(frame.variables.root_reference);
+        assert!(
+            locals
+                .iter()
+                .any(|value| value["name"] == "line" && value["value"] == "7")
+        );
+        assert!(locals.iter().any(
+            |value| value["name"] == "operation" && value["value"] == "\"authored operation\""
+        ));
+        assert!(
+            locals
+                .iter()
+                .any(|value| value["name"] == "source" && value["value"] == "\"authored source\"")
+        );
+        assert!(locals.iter().any(|value| value["name"] == "literal"));
+        assert!(
+            !locals
+                .iter()
+                .any(|value| value["name"].as_str().unwrap().starts_with('$'))
+        );
+        assert_eq!(
+            frame
+                .extra_scopes
+                .iter()
+                .map(|scope| scope.name)
+                .collect::<Vec<_>>(),
+            ["Actors and checkpoints", "Execution context"]
+        );
+        let resources = &mut frame.extra_scopes[0].variables;
+        let values = resources.variables(resources.root_reference);
+        assert_eq!(values.len(), 3);
+        assert!(
+            values
+                .iter()
+                .all(|value| !value["value"].as_str().unwrap().contains(&bob.to_string()))
+        );
+        let cursor = values
+            .iter()
+            .find(|value| value["name"] == "beforeReply")
+            .unwrap();
+        assert_eq!(cursor["value"], "bob · after event 9");
+        assert_eq!(
+            cursor["presentationHint"]["attributes"],
+            json!(["readOnly"])
+        );
+        let children = resources.variables(cursor["variablesReference"].as_i64().unwrap());
+        let details = children
+            .iter()
+            .find(|value| value["name"] == "Details")
+            .unwrap();
+        let identities = resources.variables(details["variablesReference"].as_i64().unwrap());
+        assert!(
+            identities
+                .iter()
+                .any(|value| value["name"] == "Actor ID" && value["value"] == format!("\"{bob}\""))
+        );
+        let execution = &mut frame.extra_scopes[1].variables;
+        let metadata = execution.variables(execution.root_reference);
+        assert!(
+            metadata
+                .iter()
+                .any(|value| value["name"] == "Case" && value["value"] == "\"one\"")
+        );
+        assert!(
+            metadata
+                .iter()
+                .any(|value| value["name"] == "Internal"
+                    && value["value"] == "Execution identifiers")
+        );
+        assert!(matches!(
+            frame
+                .variables
+                .root
+                .iter()
+                .find(|(name, _)| name == "input")
+                .unwrap()
+                .1
+                .as_ref(),
+            V::Record(_)
+        ));
+        resume(&state, ResumeCommand::Continue).await;
+        assert_eq!(running.await.unwrap().passed(), 1);
     }
 
     #[tokio::test]
@@ -1013,16 +1300,23 @@ mod tests {
                         .any(|f| f.attempt.is_some_and(|a| a.ordinal == ordinal))
                 );
                 let frame = &mut snapshot.frames[0];
-                let values = frame.variables.variables(frame.variables.root_reference);
+                let failure = frame
+                    .extra_scopes
+                    .iter_mut()
+                    .find(|scope| scope.name == "Failure")
+                    .unwrap();
+                let values = failure
+                    .variables
+                    .variables(failure.variables.root_reference);
                 assert!(
                     values
                         .iter()
-                        .any(|v| v["name"] == "$actual" && v["value"] == "1")
+                        .any(|v| v["name"] == "actual" && v["value"] == "1")
                 );
                 assert!(
                     values
                         .iter()
-                        .any(|v| v["name"] == "$expected" && v["value"] == "2")
+                        .any(|v| v["name"] == "expected" && v["value"] == "2")
                 );
             }
             resume(&state, ResumeCommand::Continue).await;

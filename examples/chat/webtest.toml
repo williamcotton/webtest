@@ -1,0 +1,36 @@
+[project]
+name = "two-person-chat"
+test_roots = ["tests"]
+source_roots = ["tests", "support"]
+
+[app]
+command = "node"
+args = ["server.mjs"]
+working_directory = "."
+
+[app.environment]
+WEBTEST = "1"
+
+[app.health]
+url = "http://127.0.0.1:3110/health"
+timeout = "10s"
+
+[server.app]
+adapter = "bridge"
+transport = "tcp"
+schema = ".webtest/app-schema.json"
+startup_timeout = "10s"
+
+[browser]
+base_url = "http://127.0.0.1:3110"
+viewport = { width = 1280, height = 1000 }
+
+[timeouts]
+test = "10m"
+
+[artifacts]
+directory = ".webtest/artifacts"
+
+[trace]
+mode = "on"
+sources = true

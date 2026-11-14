@@ -3,6 +3,9 @@
 !examples/application-bridge/*/.webtest/
 examples/application-bridge/*/.webtest/*
 !examples/application-bridge/*/.webtest/app-schema.json
+!examples/chat/.webtest/
+examples/chat/.webtest/*
+!examples/chat/.webtest/app-schema.json
 **/node_modules
 **/out
 **/.vscode-test

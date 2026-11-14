@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Side by Side · WebTest chat</title>
+    <link rel="stylesheet" href="/style.css" />
+    <script type="module" src="/client.js"></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <a class="brand" href="/">s/s<span>side by side</span></a
+        ><span class="badge">A WEBTEST EXAMPLE</span>
+      </header>
+      <section class="intro">
+        <p class="eyebrow">TWO PEOPLE. ONE CONVERSATION.</p>
+        <h1>Good things happen<br />on the other side.</h1>
+        <p>
+          Two independent sessions. Messages that cross between them.<br />A
+          little room to see the whole system working.
+        </p>
+      </section>
+      <div class="workspace">
+        <aside>
+          <div class="room-icon" aria-hidden="true">↗</div>
+          <p class="eyebrow">YOUR ROOM</p>
+          <h2 id="room-name">The conversation room</h2>
+          <p>Real people, separate browsers,<br />one shared connection.</p>
+          <div class="people">
+            <div>
+              <span class="avatar alice">A</span
+              ><span>Alice<small id="alice-status">Offline</small></span
+              ><i id="alice-dot"></i>
+            </div>
+            <div>
+              <span class="avatar bob">B</span
+              ><span>Bob<small id="bob-status">Offline</small></span
+              ><i id="bob-dot"></i>
+            </div>
+          </div>
+          <div class="note">
+            <span>01 — THE EXPERIMENT</span>
+            <p>Send a thought.<br />See it arrive somewhere else.</p>
+          </div>
+        </aside>
+        <section class="panel" aria-label="Chat room">
+          <div class="panel-head">
+            <div>
+              <span class="eyebrow">LIVE CONVERSATION</span>
+              <h2 id="identity" data-testid="identity">Come on in.</h2>
+            </div>
+            <span id="connection" role="status">Not connected</span>
+          </div>
+          <section id="login">
+            <p class="login-copy">Pick a side and join the conversation.</p>
+            <form id="login-form">
+              <label
+                >Email<input
+                  name="email"
+                  type="email"
+                  autocomplete="username"
+                  required
+                  placeholder="alice@chat.test" /></label
+              ><label
+                >Password<input
+                  name="password"
+                  type="password"
+                  autocomplete="current-password"
+                  required
+                  placeholder="Your room password"
+              /></label>
+              <p id="login-error" role="alert"></p>
+              <button type="submit" aria-label="Join conversation">
+                Join conversation <span aria-hidden="true">↗</span>
+              </button>
+            </form>
+            <p class="demo-hint">
+              Trying it by hand? Use <b>alice@chat.test</b> or
+              <b>bob@chat.test</b> with password <b>hello-chat</b>. Open another
+              browser profile for the other person.
+            </p>
+          </section>
+          <section id="conversation" hidden>
+            <div class="transcript">
+              <p class="start-note">THE START OF SOMETHING GOOD</p>
+              <p id="empty">Your conversation starts with a hello.</p>
+              <ol id="messages" aria-label="Messages" aria-live="polite"></ol>
+            </div>
+            <form id="message-form">
+              <label class="sr-only" for="message">Message</label
+              ><input
+                id="message"
+                name="message"
+                maxlength="512"
+                autocomplete="off"
+                placeholder="Say something nice…"
+                required
+              /><button
+                id="send"
+                type="submit"
+                disabled
+                aria-label="Send message"
+              >
+                Send <span aria-hidden="true">↑</span>
+              </button>
+            </form>
+            <p class="compose-note">
+              ENTER TO SEND · MESSAGES STAY IN THIS ROOM
+            </p>
+          </section>
+        </section>
+      </div>
+      <footer>
+        <span>Built to be shared. Tested from both sides.</span
+        ><span>WEBTEST / ACTORS + EVENTS</span>
+      </footer>
+    </main>
+  </body>
+</html>

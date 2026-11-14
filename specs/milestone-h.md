@@ -76,6 +76,73 @@ Acceptance fixtures are maintained beside their owning layers:
 
 ### Verification record (2026-11-14)
 
+The runnable [two-person chat example](../examples/chat/README.md) extends the
+initial echo fixture with authenticated Alice/Bob sessions, actual cross-user
+WebSocket delivery, concurrent actor-aware sign-in and reload, room history,
+typed private fixture setup, and two labeled text/Unicode cases. Its Node
+regression test binds an ephemeral port and checks session separation, presence,
+bidirectional delivery, sender identity, and history replay. The shared formatter
+also preserves readable actor headers, case rows, and bound select statements.
+Both chat cases passed in real Chrome, sequentially and with `--jobs 2`, and the
+app regression test passed. Clippy, formatting, the real WASM rebuild, and all
+8 native/WASM package tests passed. The follow-up workspace run passed 670 tests
+outside the CDP target; that target had one `Page.enable` startup timeout. Its
+isolated rerun passed all 45 tests (715 tests verified overall, none ignored).
+
+A subsequent headed-only sign-in failure exposed dropped text input when another
+browser window took desktop focus. A real-Chrome multi-context regression passed
+headlessly but failed with `WEBTEST_HEADED_TESTS=1`; managed CDP page setup now
+enables per-page focus emulation, and the same headed test passes with independent
+trusted input in both contexts. DOM element focus still comes from normal physical
+actions. The setup-order test checks the command on every new page. Reproduce with
+`WEBTEST_HEADED_TESTS=1 cargo test -p webtest-browser-cdp concurrent_contexts_keep_independent_page_focus_for_physical_text_input`.
+Application lifecycle journals also now render through JSON/events reporters
+instead of leaking raw JSON into the human reporter; a regression checks that the
+machine records are retained unchanged.
+Five consecutive headed chat runs passed both variants, followed by a successful
+run of the exact human-reporter command using the replaced installed release
+binary. Clippy and formatting passed. The follow-up workspace run passed 698 tests
+outside the protocol target; that target hit one `Target.createBrowserContext`
+startup timeout and then passed all 19 tests in an isolated rerun (717 tests
+verified overall, none ignored).
+
+Live Cursor debugging of the chat additionally verified entry pause and Step Into
+to `app.prepare_room` at line 8 while unrelated example buffers remained open.
+The native DAP workspace loader now ignores buffers outside the selected project's
+source roots while retaining its unsaved imports and still rejecting an external
+launch program. Testing API discovery routes the active source URI to Rust's
+nearest-project resolution instead of using the parent editor folder's schema.
+Captured DAP source requests return the immutable launch snapshot and reject
+unrelated paths. Regression coverage includes the loader, native LSP discovery,
+native DAP source responses, all 21 DAP core tests, and 7 extension tests. Clippy
+passed; protocol tests passed with the worker/Chrome startup-timeout case rerun
+individually. The example's ten-minute root deadline permits manual stepping
+without changing its five-second event/UI waits.
+
+A repeated Run → Debug failure was traced to the language server retaining its
+application between editor runs, occupying the chat port after the browser had
+closed. Editor execution now accepts a protocol-neutral host lifecycle lease;
+native composition starts the application per run, serializes application ownership
+within that project, and awaits shutdown before returning successful, failed, or
+cancelled results. Application mechanics remain in `app`, not editor or LSP code.
+Lifecycle configuration is captured atomically with the provider registry and plans.
+The regression covers successful and failed file runs plus concurrent selected
+variant requests, verifying that the process is reaped and its ephemeral port is
+reusable after completion. A real chat Editor Run → DAP → Editor Run sequence
+passed while retaining the same language server, with port 3110 released at every
+boundary. The native app/editor/LSP/protocol suites, description/initializer checks,
+Clippy, the real WASM build, and all 8 native/WASM package tests passed.
+
+DAP variable presentation separates Locals, Actors and checkpoints, Failure, and
+Execution context. Typed runtime resource snapshots preserve authored actor and
+checkpoint names; full identifiers remain expandable details. The active case is
+explicit. Regression coverage verifies local-name collisions, read-only resource
+summaries, redaction, and grouped failure values. All 22 DAP tests, runtime/editor
+suites, 19 native protocol tests, description/initializer checks, workspace Clippy,
+and 8 Monaco tests passed. A real headless chat DAP run hit room setup exactly once
+for each of the two cases, verified the resource groups in both, completed both
+cases successfully, and released the application port.
+
 Local acceptance uses the following reproducible checks:
 
 - `cargo clippy --workspace --all-targets -- -D warnings` and

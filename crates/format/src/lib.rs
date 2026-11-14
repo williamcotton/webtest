@@ -17,7 +17,10 @@ pub fn format_file(parse: &Parse) -> String {
         let structural_brace = token.parent().is_some_and(|parent| {
             matches!(
                 parent.kind(),
-                SyntaxKind::RecordExpr | SyntaxKind::RecordType | SyntaxKind::ImportDecl
+                SyntaxKind::RecordExpr
+                    | SyntaxKind::PatternRecordExpr
+                    | SyntaxKind::RecordType
+                    | SyntaxKind::ImportDecl
             )
         });
         match kind {
@@ -107,11 +110,30 @@ pub fn format_file(parse: &Parse) -> String {
                     output.push(' ');
                 }
                 output.push('[');
-                line_start = false;
+                if token
+                    .parent()
+                    .is_some_and(|p| p.kind() == SyntaxKind::CaseList)
+                {
+                    output.push('\n');
+                    indent += 1;
+                    line_start = true;
+                } else {
+                    line_start = false;
+                }
             }
             SyntaxKind::RBracket => {
                 while output.ends_with(' ') {
                     output.pop();
+                }
+                if token
+                    .parent()
+                    .is_some_and(|p| p.kind() == SyntaxKind::CaseList)
+                {
+                    if !line_start {
+                        output.push('\n');
+                    }
+                    indent = indent.saturating_sub(1);
+                    push_indent(&mut output, indent);
                 }
                 output.push(']');
                 line_start = false;
@@ -136,6 +158,14 @@ pub fn format_file(parse: &Parse) -> String {
                 }
                 output.push(if kind == SyntaxKind::Comma { ',' } else { ':' });
                 line_start = false;
+                if kind == SyntaxKind::Comma
+                    && token
+                        .parent()
+                        .is_some_and(|p| p.kind() == SyntaxKind::CaseList)
+                {
+                    output.push('\n');
+                    line_start = true;
+                }
             }
             _ => {
                 let declaration_header = token.parent().is_some_and(|parent| {
@@ -143,30 +173,61 @@ pub fn format_file(parse: &Parse) -> String {
                         parent.kind(),
                         SyntaxKind::FixtureDecl
                             | SyntaxKind::FunctionDecl
+                            | SyntaxKind::ActorDecl
                             | SyntaxKind::FixtureSetup
                             | SyntaxKind::FixtureTeardown
                     )
                 });
-                let starts_statement = (!declaration_header
-                    && matches!(
-                        kind,
-                        SyntaxKind::TestKw
-                            | SyntaxKind::BrowserKw
-                            | SyntaxKind::ServerKw
-                            | SyntaxKind::LetKw
-                            | SyntaxKind::OpenKw
-                            | SyntaxKind::EvaluateKw
-                            | SyntaxKind::ClickKw
-                            | SyntaxKind::FillKw
-                            | SyntaxKind::TypeKw
-                            | SyntaxKind::PressKw
-                            | SyntaxKind::CheckKw
-                            | SyntaxKind::UncheckKw
-                            | SyntaxKind::SelectKw
-                            | SyntaxKind::HoverKw
-                            | SyntaxKind::WaitKw
-                            | SyntaxKind::ExpectKw
-                    ))
+                let bound_select = token.parent().is_some_and(|parent| {
+                    parent.kind() == SyntaxKind::ReactiveSelect
+                        && parent
+                            .parent()
+                            .is_some_and(|p| p.kind() == SyntaxKind::LetStmt)
+                });
+                let modeling_statement = token.parent().is_some_and(|parent| {
+                    matches!(
+                        parent.kind(),
+                        SyntaxKind::ActorDecl
+                            | SyntaxKind::ActorBlock
+                            | SyntaxKind::GuardScope
+                            | SyntaxKind::PatternDecl
+                            | SyntaxKind::GuardDecl
+                            | SyntaxKind::CheckBlock
+                            | SyntaxKind::AssumeStmt
+                            | SyntaxKind::VerdictStmt
+                            | SyntaxKind::EventArm
+                            | SyntaxKind::SelectTimeout
+                            | SyntaxKind::CaseDecl
+                    ) && parent
+                        .children_with_tokens()
+                        .filter_map(|element| element.into_token())
+                        .find(|candidate| !candidate.kind().is_trivia())
+                        .as_ref()
+                        == Some(&token)
+                        && previous != Some(SyntaxKind::ExportKw)
+                });
+                let starts_statement = modeling_statement
+                    || (!declaration_header
+                        && !bound_select
+                        && matches!(
+                            kind,
+                            SyntaxKind::TestKw
+                                | SyntaxKind::BrowserKw
+                                | SyntaxKind::ServerKw
+                                | SyntaxKind::LetKw
+                                | SyntaxKind::OpenKw
+                                | SyntaxKind::EvaluateKw
+                                | SyntaxKind::ClickKw
+                                | SyntaxKind::FillKw
+                                | SyntaxKind::TypeKw
+                                | SyntaxKind::PressKw
+                                | SyntaxKind::CheckKw
+                                | SyntaxKind::UncheckKw
+                                | SyntaxKind::SelectKw
+                                | SyntaxKind::HoverKw
+                                | SyntaxKind::WaitKw
+                                | SyntaxKind::ExpectKw
+                        ))
                     || matches!(
                         kind,
                         SyntaxKind::ImportKw
@@ -248,6 +309,38 @@ fn needs_space(previous: Option<SyntaxKind>, current: SyntaxKind) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn modeling_constructs_keep_headers_and_source_boundaries_idempotently() {
+        let source = "export pattern Message(body:String)=subset{\"type\":\"message\",body:body} guard healthy(actor:BrowserActor){when actor.console.error(event){fail event.message}} test \"chat\" cases[case \"one\"{body:\"hello\"},case \"two\"{body:\"☕\"}]as input{actor alice browser actor bob browser with guards[healthy(bob)]{let mark=checkpoint(bob) alice{open \"/\"}let received=select bob since mark within 5s{when websocket.received_json(event)if event.value matches Message(input.body){provide event.value}timeout{fail \"missing\"}}expect received matches Message(input.body)pass}}";
+        let parsed = webtest_syntax::parse(source);
+        assert!(parsed.errors().is_empty(), "{:?}", parsed.errors());
+        let formatted = format_file(&parsed);
+        for boundary in [
+            "export pattern Message(body: String)",
+            "\n    case \"one\"",
+            "\n    case \"two\"",
+            "\n    actor alice browser\n    actor bob browser\n",
+            "let received = select bob",
+            "\n        alice {",
+            "\n        pass\n",
+        ] {
+            assert!(formatted.contains(boundary), "{boundary}: {formatted}");
+        }
+        let reparsed = webtest_syntax::parse(&formatted);
+        assert!(reparsed.errors().is_empty(), "{:?}", reparsed.errors());
+        assert_eq!(format_file(&reparsed), formatted);
+        let tokens = |parse: &Parse| {
+            parse
+                .syntax()
+                .descendants_with_tokens()
+                .filter_map(|element| element.into_token())
+                .filter(|token| !token.kind().is_trivia())
+                .map(|token| (token.kind(), token.text().to_string()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(tokens(&parsed), tokens(&reparsed));
+    }
 
     #[test]
     fn workspace_declarations_preserve_documentation_and_inline_headers() {

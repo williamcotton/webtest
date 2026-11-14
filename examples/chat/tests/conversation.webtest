@@ -1,0 +1,85 @@
+import { Message, healthy, sign_in } from "../support/chat.webtest"
+test "Alice and Bob exchange messages in separate browser sessions" cases [
+    case "a friendly hello" { greeting: "Hello, Bob!", reply: "Hi, Alice! Good to see you." },
+    case "Unicode and literal HTML" { greeting: "Coffee, Bob? ☕ <hello>", reply: "Yes! Tea & cake for Alice 🍰" },
+] as conversation {
+    // Fixture setup uses authenticated local IPC, never a public test HTTP route.
+    server {
+        let room = app.prepare_room(label: "Alice & Bob · a private conversation")
+    }
+    actor alice browser
+    actor bob browser
+    with guards [ healthy(alice), healthy(bob)] {
+        // Each helper targets a different actor: no shared page, cookie, or login.
+        parallel {
+            alice {
+                sign_in(alice, room.path, room.alice.email, room.alice.password)
+            }
+            bob {
+                sign_in(bob, room.path, room.bob.email, room.bob.password)
+            }
+        }
+        alice {
+            check {
+                expect text("Signed in as Alice").visible
+                expect text("Bob is online").visible
+            }
+        }
+        bob {
+            check {
+                expect text("Signed in as Bob").visible
+                expect text("Alice is online").visible
+            }
+        }
+        // Subscribe BEFORE Alice sends. Bob may receive the event immediately.
+        let bobBeforeGreeting = checkpoint(bob)
+        alice {
+            fill label("Message") with conversation.greeting
+            click role("button", name: "Send message")
+        }
+        let deliveredToBob = select bob since bobBeforeGreeting within 5s {
+            when websocket.received_json(event) if event.value matches Message("Alice", conversation.greeting) {
+                provide event.value
+            }
+            timeout {
+                fail "Bob never received Alice's greeting"
+            }
+        }
+        expect deliveredToBob matches Message("Alice", conversation.greeting)
+        bob {
+            wait text(conversation.greeting).visible within 5s
+        }
+        // Bob replies from his own authenticated session; Alice observes it.
+        let aliceBeforeReply = checkpoint(alice)
+        bob {
+            fill label("Message") with conversation.reply
+            click role("button", name: "Send message")
+        }
+        select alice since aliceBeforeReply within 5s {
+            when websocket.received_json(event) if event.value matches Message("Bob", conversation.reply) {
+                expect event.value matches Message("Bob", conversation.reply)
+            }
+            timeout {
+                fail "Alice never received Bob's reply"
+            }
+        }
+        alice {
+            wait text(conversation.reply).visible within 5s
+        }
+        // Reload both pages concurrently: their separate login cookies persist,
+        // and the server replays this room's history to both new sockets.
+        parallel {
+            alice {
+                open room.path
+                wait text("Signed in as Alice").visible within 5s
+                wait text(conversation.reply).visible within 5s
+            }
+            bob {
+                open room.path
+                wait text("Signed in as Bob").visible within 5s
+                wait text(conversation.greeting).visible within 5s
+            }
+        }
+        pass
+    }
+}

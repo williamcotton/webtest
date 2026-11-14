@@ -16,6 +16,7 @@ pub(crate) struct RuntimeProviders {
     pub(crate) app: Option<Arc<AppProvider>>,
 }
 
+#[derive(Clone)]
 pub(crate) enum RuntimeApplication {
     Provider(Arc<AppProvider>),
     Process(Arc<ApplicationLifecycle>),

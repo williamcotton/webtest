@@ -13,14 +13,16 @@ pub(super) struct ActorHandle(
     pub Arc<Mutex<Option<Box<dyn Page>>>>,
     pub Arc<ActorJournal>,
     pub webtest_observation::ScopeEvent,
+    pub String,
 );
 impl ActorHandle {
     pub fn new(
         page: Box<dyn Page>,
         journal: Arc<ActorJournal>,
         scope: webtest_observation::ScopeEvent,
+        name: String,
     ) -> Self {
-        Self(Arc::new(Mutex::new(Some(page))), journal, scope)
+        Self(Arc::new(Mutex::new(Some(page))), journal, scope, name)
     }
 }
 pub(super) struct ActorOwner(pub ActorHandle);

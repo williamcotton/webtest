@@ -9,6 +9,76 @@ use webtest_browser::{
 use crate::ChromeHost;
 
 #[tokio::test]
+async fn concurrent_contexts_keep_independent_page_focus_for_physical_text_input() {
+    let host =
+        ChromeHost::default().with_headed(std::env::var_os("WEBTEST_HEADED_TESTS").is_some());
+    if host.locate().is_none() {
+        return;
+    }
+    let Ok(listener) = tokio::net::TcpListener::bind("127.0.0.1:0").await else {
+        return;
+    };
+    let address = listener.local_addr().expect("fixture address");
+    let fixture = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = [0u8; 2048];
+                let _ = stream.read(&mut request).await;
+                let body = "<!doctype html><input id=email value=old oninput=\"window.trustedInput=event.isTrusted\">";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    let mut browser = host.start().await.expect("start Chrome");
+    let mut alice = browser
+        .new_context(&BrowserContextOptions::default())
+        .await
+        .expect("Alice context");
+    let mut bob = browser
+        .new_context(&BrowserContextOptions::default())
+        .await
+        .expect("Bob context");
+    let mut alice_page = alice.new_page().await.expect("Alice page");
+    let mut bob_page = bob.new_page().await.expect("Bob page");
+    let url = format!("http://{address}");
+    alice_page.open(&url).await.expect("Alice navigation");
+    bob_page.open(&url).await.expect("Bob navigation");
+    for page in [&mut alice_page, &mut bob_page] {
+        page.evaluate(
+            "if (!document.hasFocus()) throw new Error('managed page lost browser focus')",
+        )
+        .await
+        .expect("each managed context remains active");
+    }
+    let alice_fill = Action::Fill {
+        locator: Locator::Id("email".into()),
+        value: "alice@chat.test".into(),
+    };
+    let bob_fill = Action::Fill {
+        locator: Locator::Id("email".into()),
+        value: "bob@chat.test".into(),
+    };
+    let (left, right) = tokio::join!(
+        alice_page.perform(&alice_fill, Duration::from_secs(5)),
+        bob_page.perform(&bob_fill, Duration::from_secs(5))
+    );
+    left.expect("Alice fill");
+    right.expect("Bob fill");
+    alice_page.evaluate("if (document.getElementById('email').value !== 'alice@chat.test' || !window.trustedInput) throw new Error('Alice input was lost')").await.expect("Alice trusted input");
+    bob_page.evaluate("if (document.getElementById('email').value !== 'bob@chat.test' || !window.trustedInput) throw new Error('Bob input was lost')").await.expect("Bob trusted input");
+    drop(alice_page);
+    drop(bob_page);
+    alice.close().await.expect("close Alice");
+    bob.close().await.expect("close Bob");
+    browser.close().await.expect("close browser");
+    fixture.abort();
+}
+
+#[tokio::test]
 async fn real_chrome_clicks_and_checks_visible_text_when_available() {
     let host = ChromeHost::default();
     if host.locate().is_none() {

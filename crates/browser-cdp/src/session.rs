@@ -172,6 +172,16 @@ async fn create_page(
     connection
         .command("Runtime.enable", None, Some(&session_id))
         .await?;
+    // Each managed page must receive its own input even when another headed
+    // actor or desktop window has OS focus. This changes page activation, not
+    // DOM element focus: actions still resolve and physically click their target.
+    connection
+        .command(
+            "Emulation.setFocusEmulationEnabled",
+            Some(json!({ "enabled": true })),
+            Some(&session_id),
+        )
+        .await?;
     connection
         .command(
             "Emulation.setDeviceMetricsOverride",
@@ -335,6 +345,12 @@ mod tests {
             assert!(command.get("params").is_none());
             respond(&mut server, &command, json!({})).await;
         }
+
+        let focus = receive_command(&mut server).await;
+        assert_eq!(focus["method"], "Emulation.setFocusEmulationEnabled");
+        assert_eq!(focus["sessionId"], "page-session");
+        assert_eq!(focus["params"], json!({"enabled": true}));
+        respond(&mut server, &focus, json!({})).await;
 
         let viewport = receive_command(&mut server).await;
         assert_eq!(viewport["method"], "Emulation.setDeviceMetricsOverride");

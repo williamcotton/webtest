@@ -52,6 +52,7 @@ impl ExecutionScope {
             task_id: self.task_id,
             parent_task_id: self.parent_task_id,
             frames: self.debug_frames.clone(),
+            resources: Vec::new(),
         }
     }
     pub fn cleanup_timeout(&self, default: std::time::Duration) -> std::time::Duration {
@@ -297,8 +298,23 @@ impl ScopeFactory {
         let mut debug_frames = parent.map_or_else(Vec::new, |parent| parent.debug_frames.clone());
         debug_frames.push(crate::DebugScope {
             display_name: match &node.kind {
-                PlanNodeKind::Semantic{operation:webtest_plan::semantics::SemanticOperation::ActorAccess{actor,name}|webtest_plan::semantics::SemanticOperation::ActorScope{actor,name,..},..}=>Some(format!("actor {name} ({actor})")),
-                PlanNodeKind::Semantic { operation, .. } => Some(operation.identity().into()),
+                PlanNodeKind::Semantic {
+                    operation:
+                        webtest_plan::semantics::SemanticOperation::ActorAccess { name, .. }
+                        | webtest_plan::semantics::SemanticOperation::ActorScope { name, .. },
+                    ..
+                } => Some(format!("actor {name}")),
+                PlanNodeKind::Semantic { operation, .. } => Some(
+                    match operation {
+                        webtest_plan::semantics::SemanticOperation::Check { .. } => "check",
+                        webtest_plan::semantics::SemanticOperation::Assume { .. } => "assume",
+                        webtest_plan::semantics::SemanticOperation::Select { .. } => "select",
+                        webtest_plan::semantics::SemanticOperation::Guards { .. } => "with guards",
+                        webtest_plan::semantics::SemanticOperation::ActorAccess { .. }
+                        | webtest_plan::semantics::SemanticOperation::ActorScope { .. } => "actor",
+                    }
+                    .into(),
+                ),
                 PlanNodeKind::Helper { call, .. } => Some(format!("helper {}", call.name)),
                 _ => None,
             },

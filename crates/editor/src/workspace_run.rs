@@ -8,6 +8,7 @@ use webtest_plan::TestPlan;
 use webtest_runtime::{RunControl, Runner, TestOutcome};
 
 pub struct PreparedWorkspaceRun {
+    pub(crate) lifecycle: Option<Arc<dyn crate::RunLifecycle>>,
     pub workspace_revision: u64,
     pub(crate) plans: Vec<Arc<TestPlan>>,
     pub(crate) runner: Runner,
@@ -47,6 +48,35 @@ impl PreparedWorkspaceRun {
     ) -> WorkspaceRunSummary {
         let mut tests = Vec::new();
         let mut failures = Vec::new();
+        let lifecycle_failure = |failure: webtest_provider::ProviderError| {
+            self.plans.first().map(|plan| {
+                let failure = webtest_runtime::RunError::Provider(failure);
+                WorkspaceRunFailure {
+                    variants: self
+                        .plans
+                        .iter()
+                        .flat_map(|plan| plan.tests.iter().map(|test| test.variant_id))
+                        .collect(),
+                    file: plan.file,
+                    message: failure.to_string(),
+                    failure: failure.to_execution_failure(),
+                }
+            })
+        };
+        let lease = match &self.lifecycle {
+            Some(lifecycle) => match lifecycle.begin().await {
+                Ok(lease) => Some(lease),
+                Err(error) => {
+                    failures.extend(lifecycle_failure(error));
+                    return WorkspaceRunSummary {
+                        workspace_revision: self.workspace_revision,
+                        tests,
+                        failures,
+                    };
+                }
+            },
+            None => None,
+        };
         let inputs = self
             .plans
             .iter()
@@ -165,6 +195,11 @@ impl PreparedWorkspaceRun {
                     artifacts,
                 });
             }
+        }
+        if let Some(lease) = lease
+            && let Err(error) = lease.finish().await
+        {
+            failures.extend(lifecycle_failure(error));
         }
         WorkspaceRunSummary {
             workspace_revision: self.workspace_revision,

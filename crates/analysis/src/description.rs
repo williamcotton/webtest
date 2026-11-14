@@ -1800,7 +1800,10 @@ mod tests {
             .unwrap();
         for fact in [
             "retry attempt",
-            "redacted lexical bindings",
+            "redacted Locals",
+            "Actors and checkpoints",
+            "current case explicitly",
+            "Internal",
             "next operation safe point",
             "Single-thread resume is rejected",
             "await runner-owned cleanup",

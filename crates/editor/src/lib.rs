@@ -1,6 +1,8 @@
 //! Protocol-independent editor services used by both LSP and future WASM hosts.
 
+mod lifecycle;
 mod workspace_run;
+pub use lifecycle::{RunLease, RunLifecycle};
 pub use workspace_run::{PreparedWorkspaceRun, WorkspaceRunSummary, WorkspaceTestResult};
 
 use std::sync::{Arc, Mutex, RwLock};
@@ -36,6 +38,11 @@ pub enum EditorError {
     StaleDiscovery,
     #[error("selected variants are missing, exceed the query limit, or have static errors")]
     InvalidVariants,
+    #[error("editor execution lifecycle failed: {failure}")]
+    ExecutionLifecycle {
+        failure: webtest_provider::ProviderError,
+        result: Option<Box<RunResult>>,
+    },
 }
 
 pub struct EditorService {
@@ -55,6 +62,7 @@ struct DiskInputs {
 
 #[derive(Clone)]
 struct RuntimeConfiguration {
+    lifecycle: Option<Arc<dyn RunLifecycle>>,
     runner_options: RunnerOptions,
     providers: ProviderRegistry,
 }
@@ -102,6 +110,7 @@ impl EditorService {
             database: Mutex::new(database),
             observations: Arc::new(ObservationStore::default()),
             runtime: RwLock::new(RuntimeConfiguration {
+                lifecycle: None,
                 runner_options,
                 providers,
             }),
@@ -112,11 +121,16 @@ impl EditorService {
     pub fn provider_registry(&self) -> ProviderRegistry {
         self.read_runtime().providers.clone()
     }
+    pub fn set_run_lifecycle(&self, lifecycle: Option<Arc<dyn RunLifecycle>>) {
+        let _configuration = self.lock_configuration();
+        self.write_runtime().lifecycle = lifecycle;
+    }
     pub fn reconfigure(&self, runner_options: RunnerOptions, providers: ProviderRegistry) {
         let _configuration = self.lock_configuration();
         self.write_database()
             .set_provider_registry(providers.clone());
         *self.write_runtime() = RuntimeConfiguration {
+            lifecycle: None,
             runner_options,
             providers,
         };
@@ -295,12 +309,31 @@ impl EditorService {
         sources: Vec<(String, Arc<str>)>,
         aliases: Vec<(String, String)>,
     ) -> Result<(), EditorError> {
+        self.reconfigure_workspace_inputs_with_lifecycle(
+            runner_options,
+            providers,
+            configuration,
+            sources,
+            aliases,
+            None,
+        )
+    }
+    pub fn reconfigure_workspace_inputs_with_lifecycle(
+        &self,
+        runner_options: RunnerOptions,
+        providers: ProviderRegistry,
+        configuration: webtest_analysis::WorkspaceConfiguration,
+        sources: Vec<(String, Arc<str>)>,
+        aliases: Vec<(String, String)>,
+        lifecycle: Option<Arc<dyn RunLifecycle>>,
+    ) -> Result<(), EditorError> {
         let _configuration = self.lock_configuration();
         self.replace_disk_inputs(sources, aliases)?;
         let mut database = self.write_database();
         database.configure_workspace(configuration);
         database.set_provider_registry(providers.clone());
         *self.write_runtime() = RuntimeConfiguration {
+            lifecycle,
             runner_options,
             providers,
         };
@@ -453,7 +486,7 @@ impl EditorService {
         file: FileId,
         browser: &dyn BrowserHost,
     ) -> Result<RunResult, EditorError> {
-        let (plan, runner_options, providers) = {
+        let (plan, runner_options, providers, lifecycle) = {
             let _configuration = self.lock_configuration();
             let mut database = self.write_database();
             if database
@@ -470,12 +503,32 @@ impl EditorService {
                 plan,
                 runtime.runner_options.clone(),
                 runtime.providers.clone(),
+                runtime.lifecycle.clone(),
             )
         };
         let runner = Runner::new(Arc::clone(&self.observations))
             .with_provider_registry(providers)
             .with_options(runner_options);
-        Ok(runner.run(&plan, browser).await)
+        let lease = match lifecycle {
+            Some(lifecycle) => Some(lifecycle.begin().await.map_err(|failure| {
+                EditorError::ExecutionLifecycle {
+                    failure,
+                    result: None,
+                }
+            })?),
+            None => None,
+        };
+        let result = runner.run(&plan, browser).await;
+        if let Some(lease) = lease {
+            lease
+                .finish()
+                .await
+                .map_err(|failure| EditorError::ExecutionLifecycle {
+                    failure,
+                    result: Some(Box::new(result.clone())),
+                })?;
+        }
+        Ok(result)
     }
 
     fn read_database(&self) -> std::sync::MutexGuard<'_, AnalysisDatabase> {
@@ -586,6 +639,7 @@ impl EditorSnapshot {
             .plans_for_variants(variants)?
             .ok_or(EditorError::InvalidVariants)?;
         Ok(PreparedWorkspaceRun {
+            lifecycle: self.runtime.lifecycle.clone(),
             workspace_revision: expected_revision,
             plans,
             runner: Runner::new(self.observations.clone())

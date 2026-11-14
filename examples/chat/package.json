@@ -1,0 +1,16 @@
+{
+  "name": "webtest-chat-example",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test server.test.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@webtest/node": "file:../../sdks/node",
+    "ws": "8.23.0"
+  }
+}
