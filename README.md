@@ -167,30 +167,29 @@ target/debug/webtest test examples/chat --headed
 WebTest starts and stops this app automatically. Its README also explains how to
 try it manually with two browser profiles and inspect the resulting actor traces.
 
-Each directory under `examples` is an independent WebTest project with its own configuration. For the plain HTML browser example, serve the fixture in one terminal:
+Each directory under `examples` is an independent WebTest project with its own configuration. The plain HTML example requires Python 3; WebTest starts its static server, waits for readiness, and stops it after the run:
 
 ```sh
 cd examples/plain-html
-python3 -m http.server 3000 --bind 127.0.0.1
+webtest test
 ```
 
-Then run from the repository root:
+Or run from the repository root with visible Chrome:
 
 ```sh
 target/debug/webtest test examples/plain-html/sign-in.webtest --headed
 ```
 
-The server-backed example uses only the Python standard library. Start its application in one terminal:
-
-```sh
-python3 examples/simple-server/server.py
-```
-
-Then run its typed server-to-browser workflow:
+The server-backed example also uses only the Python standard library, with automatic application startup and shutdown. Run its typed server-to-browser workflow:
 
 ```sh
 target/debug/webtest test examples/simple-server/created-user.webtest --headed
 ```
+
+To debug, open `created-user.webtest`, set a breakpoint on the HTTP call, and choose
+**WebTest: Debug Current File**. Use **Step Over (F10)** to pause before each
+statement. **Continue (F5)** runs until another breakpoint or completion; block
+headers and closing braces have no execution stops.
 
 The [application-bridge matrix](examples/application-bridge/README.md) runs the same typed
 `app.create_user` flow against Node, Ruby, Go, Python, Elixir, Java, .NET, Rust, and PHP applications.

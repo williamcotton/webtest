@@ -3,6 +3,15 @@ name = "plain-html"
 test_roots = ["."]
 exclude = ["failure-cases.webtest"]
 
+[app]
+command = "python3"
+args = ["server.py"]
+working_directory = "."
+
+[app.health]
+url = "http://127.0.0.1:3000/"
+timeout = "10s"
+
 [browser]
 headless = true
 channel = "managed"

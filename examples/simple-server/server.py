@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
@@ -228,7 +229,7 @@ class AppHandler(BaseHTTPRequestHandler):
 def main():
     parser = argparse.ArgumentParser(description="Run the WebTest simple server example")
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", default=3001, type=int)
+    parser.add_argument("--port", default=int(os.environ.get("WEBTEST_APP_PORT", "3001")), type=int)
     args = parser.parse_args()
 
     server = AppServer((args.host, args.port))

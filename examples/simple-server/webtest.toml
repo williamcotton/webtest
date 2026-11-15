@@ -2,6 +2,15 @@
 name = "simple-server"
 test_roots = ["."]
 
+[app]
+command = "python3"
+args = ["server.py"]
+working_directory = "."
+
+[app.health]
+url = "http://127.0.0.1:3001/login"
+timeout = "10s"
+
 [browser]
 headless = true
 channel = "managed"
