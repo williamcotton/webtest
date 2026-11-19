@@ -126,6 +126,7 @@ export function registerTesting(context: vscode.ExtensionContext, client: Langua
                 run.errored(value, new vscode.TestMessage("The test has static errors.")); return false;
             });
             if (!ready.length) { return; }
+            run.appendOutput(`Running ${ready.length} WebTest variant${ready.length === 1 ? "" : "s"}...\r\n`);
             ready.forEach(value => run.started(value));
             const result = await client.sendRequest<RunSummary>("webtest/runVariants", {
                 uri: variants.get(ready[0].id)!.uri.toString(), workspace_revision: discovery.workspace_revision,
@@ -137,8 +138,10 @@ export function registerTesting(context: vscode.ExtensionContext, client: Langua
                 const value = ready.find(value => value.id === test.variant_id);
                 if (!value) { continue; }
                 completed.add(value.id);
+                const label = `${value.parent?.label ?? value.label}${value.label === "default" ? "" : ` [${value.label}]`}`;
+                run.appendOutput(`${label}: ${test.outcome} (${test.duration_ms} ms)${test.message ? ` — ${test.message}` : ""}\r\n`, undefined, value);
                 if (test.outcome === "passed") { run.passed(value, test.duration_ms); }
-                else if (test.outcome === "cancelled") { run.skipped(value); }
+                else if (test.outcome === "cancelled" || test.outcome === "skipped" || test.outcome === "inconclusive") { run.skipped(value); }
                 else {
                     const message = new vscode.TestMessage(test.message ?? test.outcome);
                     messages.set(value.id, [message]);
@@ -150,6 +153,7 @@ export function registerTesting(context: vscode.ExtensionContext, client: Langua
             }
             if (result.failures?.length) {
                 for (const failure of result.failures) {
+                    run.appendOutput(`${failure.message}\r\n`);
                     for (const value of ready.filter(value => failure.variants.includes(value.id))) {
                         const combined = [...(messages.get(value.id) ?? []), new vscode.TestMessage(failure.message)];
                         messages.set(value.id, combined);
@@ -159,6 +163,7 @@ export function registerTesting(context: vscode.ExtensionContext, client: Langua
             }
             ready.filter(value => !completed.has(value.id)).forEach(value => run.errored(value, new vscode.TestMessage("The runner returned no result for this variant.")));
         } catch (error) {
+            run.appendOutput(`${String(error)}\r\n`);
             selection.forEach(value => token.isCancellationRequested ? run.skipped(value) : run.errored(value, new vscode.TestMessage(String(error))));
         } finally { cancellation.dispose(); run.end(); }
     };

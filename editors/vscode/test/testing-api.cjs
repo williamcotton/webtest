@@ -53,7 +53,7 @@ function harness() {
     finally { Module._load = original; }
     let cancel;
     const token = { isCancellationRequested: false, onCancellationRequested: callback => { cancel = callback; return disposable(); } };
-    return { controller, profiles, requests, notifications, runs, token, setActive: path => { vscode.window.activeTextEditor = path ? { document: { languageId: "webtest", uri: uri(path) } } : undefined; }, setSummary: value => summary = value, onRun: callback => onRun = callback, cancel: () => { token.isCancellationRequested = true; cancel(); }, get debugLaunch() { return debugLaunch; }, dispose: () => context.subscriptions.forEach(value => value.dispose()) };
+    return { controller, profiles, requests, notifications, runs, token, setActive: path => { vscode.window.activeTextEditor = path ? { document: { languageId: "webtest", uri: uri(path) } } : undefined; }, setVariantLabel: (test, label) => { discovery.modules[0].tests.find(value => value.id === test).variants[0].label = label; }, setSummary: value => summary = value, onRun: callback => onRun = callback, cancel: () => { token.isCancellationRequested = true; cancel(); }, get debugLaunch() { return debugLaunch; }, dispose: () => context.subscriptions.forEach(value => value.dispose()) };
 }
 
 test("Testing API selects stable variants, deduplicates parents, honors exclusions, and routes Debug", async () => {
@@ -106,5 +106,32 @@ test("Testing API discovers through the active source's native project context a
         h.setActive(undefined);
         await h.controller.refreshHandler();
         assert.equal(h.requests.at(-1)[1].uri, chat);
+    } finally { h.dispose(); }
+});
+
+test("gutter runs show named case results and preserve skipped and inconclusive verdicts", async () => {
+    const h = harness();
+    try {
+        h.setSummary({ tests: [
+            { variant_id: "first-variant", outcome: "passed", duration_ms: 2, artifacts: [] },
+            { variant_id: "second-variant", outcome: "skipped", duration_ms: 0, message: "example is intentionally not applicable", artifacts: [] },
+        ] });
+        await h.controller.refreshHandler();
+        const module = h.controller.items.get("workspace").children.get("module");
+        const first = module.children.get("first");
+        h.setVariantLabel("first", "Ada");
+        await h.profiles.get("Run")({ include: [first, module.children.get("second")] }, h.token);
+        const calls = h.runs[0];
+        const output = calls.filter(([method]) => method === "appendOutput").map(([, text]) => text).join("");
+        assert.match(output, /Running 2 WebTest variants/);
+        assert.match(output, /same label \[Ada\]: passed \(2 ms\)/);
+        assert.match(output, /same label: skipped.*example is intentionally not applicable/);
+        assert.ok(calls.some(([method, item]) => method === "skipped" && item.id === "second-variant"));
+        assert.ok(!calls.some(([method]) => method === "errored" || method === "failed"));
+
+        h.setSummary({ tests: [{ variant_id: "first-variant", outcome: "inconclusive", duration_ms: 0, message: "insufficient evidence", artifacts: [] }] });
+        await h.profiles.get("Run")({ include: [first] }, h.token);
+        assert.ok(h.runs[1].some(([method, item]) => method === "skipped" && item.id === "first-variant"));
+        assert.ok(h.runs[1].some(([method, text]) => method === "appendOutput" && text.includes("inconclusive")));
     } finally { h.dispose(); }
 });
