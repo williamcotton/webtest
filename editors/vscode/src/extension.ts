@@ -9,6 +9,7 @@ import {
 
 import { installRelease, managedBinary } from "./releases";
 import { registerTesting } from "./testing";
+import { configuredEnvironment, debugStopOnEntry } from "./configuration";
 
 let client: LanguageClient | undefined;
 
@@ -27,11 +28,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const serverPath = await resolveServerPath(context.globalStorageUri.fsPath);
 
     const debugProvider: vscode.DebugConfigurationProvider = {
-        provideDebugConfigurations: () => [defaultDebugConfiguration()],
+        provideDebugConfigurations: folder => [defaultDebugConfiguration(folder?.uri)],
         resolveDebugConfiguration: (_folder, configuration) => {
             const editor = vscode.window.activeTextEditor;
+            const resource = typeof configuration.program === "string" && path.isAbsolute(configuration.program)
+                ? vscode.Uri.file(configuration.program) : editor?.document.uri ?? _folder?.uri;
             if (!configuration.type && !configuration.request && !configuration.name) {
-                configuration = defaultDebugConfiguration();
+                configuration = defaultDebugConfiguration(resource);
             }
             configuration.type ??= "webtest";
             configuration.request ??= "launch";
@@ -41,7 +44,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                     ? editor.document.uri.fsPath
                     : "${file}";
             configuration.headed ??= true;
-            configuration.stopOnEntry ??= false;
+            configuration.stopOnEntry ??= debugStopOnEntry(resource);
             return configuration;
         },
         resolveDebugConfigurationWithSubstitutedVariables: (folder, configuration) => {
@@ -88,6 +91,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 cwd: program
                     ? path.dirname(program)
                     : session.workspaceFolder?.uri.fsPath,
+                env: { ...configuredEnvironment(), ...session.configuration.env },
             });
         },
     };
@@ -100,6 +104,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const serverOptions: ServerOptions = {
         command: serverPath,
         args: ["lsp"],
+        options: { env: configuredEnvironment() },
     };
     const projectConfigurationWatcher = vscode.workspace.createFileSystemWatcher(
         "**/webtest.toml",
@@ -149,7 +154,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             await vscode.debug.startDebugging(
                 vscode.workspace.getWorkspaceFolder(editor.document.uri),
                 {
-                    ...defaultDebugConfiguration(),
+                    ...defaultDebugConfiguration(editor.document.uri),
                     program: editor.document.uri.fsPath,
                     sourceText: editor.document.getText(),
                 },
@@ -178,14 +183,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
 }
 
-function defaultDebugConfiguration(): vscode.DebugConfiguration {
+function defaultDebugConfiguration(resource?: vscode.Uri): vscode.DebugConfiguration {
     return {
         type: "webtest",
         request: "launch",
         name: "Debug WebTest",
         program: "${file}",
         headed: true,
-        stopOnEntry: false,
+        stopOnEntry: debugStopOnEntry(resource),
     };
 }
 

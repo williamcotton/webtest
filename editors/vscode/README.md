@@ -35,6 +35,31 @@ Workspace language services include import-path and auto-import completion, type
 
 Incremental edits validate UTF-16 boundaries and document versions. Invalid edits request a full buffer resynchronization through `webtest/resyncRequired`. Configuration/schema and source-file changes refresh explicit project inputs while preserving unsaved buffers, including newly added imports. Multiple workspace folders are rejected explicitly. Static project metadata is also available through `webtest describe project.declarations` and `webtest/describeProject`; it never runs the application.
 
+No repository `launch.json` is required. Set `webtest.debug.stopOnEntry` to `true`
+to pause before the first operation in current-file and Testing view debug
+sessions. Use Step Into (F11) to enter nested scopes and helpers.
+
+`webtest.environment` sets environment overrides for the language server, debug
+adapter, and their owned applications. Values can reference the editor's inherited
+environment with `${env:NAME}`. For example, these **user settings** let an editor
+opened from the macOS Dock find Homebrew's Node.js and pause at entry:
+
+```json
+{
+  "webtest.debug.stopOnEntry": true,
+  "webtest.environment": {
+    "PATH": "/opt/homebrew/bin:/usr/local/bin:${env:PATH}"
+  }
+}
+```
+
+Adjust the PATH for your installation and reload the window after environment
+changes. These settings apply to normal Run actions as well as Debug. Optional
+launch configurations can override `stopOnEntry` and individual `env` entries.
+Application startup failures are returned through DAP so the editor can display
+the actual cause. `npm run test:configuration` checks zero-config launch defaults,
+environment expansion, and explicit launch precedence.
+
 ## Verified release installation
 
 Run **WebTest: Install/Update Server**, enter an exact release version, and confirm

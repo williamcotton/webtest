@@ -965,6 +965,17 @@ pub async fn serve(browser: Arc<dyn BrowserHost>) -> Result<(), DapError> {
     serve_with_options(browser, RunnerOptions::default()).await
 }
 
+/// Reject the client's first request when native composition cannot start.
+/// Startup diagnostics must reach the protocol client, which may hide stderr.
+pub async fn reject_startup(message: &str) -> Result<(), DapError> {
+    if let Some(request) = request_channel().recv().await {
+        ProtocolWriter::new(tokio::io::stdout())
+            .failure(&request?, message)
+            .await?;
+    }
+    Ok(())
+}
+
 pub async fn serve_with_options(
     browser: Arc<dyn BrowserHost>,
     options: RunnerOptions,

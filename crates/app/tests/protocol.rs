@@ -946,6 +946,32 @@ fn dap_stdio_covers_launch_breakpoint_continue_and_disconnect() {
     dap.wait_for_exit();
 }
 
+#[test]
+fn dap_reports_application_startup_failure_to_the_protocol_client() {
+    let directory = tempfile::tempdir().expect("temp directory");
+    std::fs::write(
+        directory.path().join("webtest.toml"),
+        "[app]\ncommand = \"webtest-intentionally-missing-executable\"\n",
+    )
+    .expect("write project configuration");
+    let mut dap = ProtocolProcess::spawn(&["dap", "--headless"], directory.path());
+    dap.send(json!({
+        "seq":1,"type":"request","command":"initialize",
+        "arguments":{"adapterID":"webtest"}
+    }));
+    let response =
+        dap.receive(|message| message["type"] == "response" && message["request_seq"] == 1);
+    assert_eq!(response["success"], false, "{response}");
+    let message = response["message"].as_str().expect("startup diagnostic");
+    assert!(message.contains("application startup failed"), "{response}");
+    assert!(
+        message.contains("webtest-intentionally-missing-executable"),
+        "{response}"
+    );
+    dap.wait_for_exit();
+    assert_eq!(dap.child.wait().expect("server status").code(), Some(3));
+}
+
 #[cfg(unix)]
 #[test]
 fn dap_starts_and_stops_the_project_application() {

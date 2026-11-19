@@ -117,7 +117,44 @@ pub(crate) fn tokens(db: &dyn Db, file: SourceInput) -> Vec<SemanticToken> {
                 });
             }
             let parent = token.parent().map(|node| node.kind());
+            let matcher_context = token.parent_ancestors().any(|node| {
+                matches!(
+                    node.kind(),
+                    SyntaxKind::PatternDecl | SyntaxKind::PatternRecordExpr
+                ) || (node.kind() == SyntaxKind::BinaryExpr
+                    && node
+                        .children_with_tokens()
+                        .any(|element| element.kind() == SyntaxKind::MatchesKw))
+            });
             let kind = match token.kind() {
+                SyntaxKind::Ident
+                    if matcher_context
+                        && token.text() == "absent"
+                        && parent == Some(SyntaxKind::NameExpr) =>
+                {
+                    SemanticTokenKind::Keyword
+                }
+                SyntaxKind::Ident | SyntaxKind::ContainsKw
+                    if matcher_context
+                        && parent == Some(SyntaxKind::NameExpr)
+                        && token
+                            .parent_ancestors()
+                            .nth(1)
+                            .is_some_and(|node| node.kind() == SyntaxKind::CallExpr)
+                        && matches!(
+                            token.text(),
+                            "each"
+                                | "contains"
+                                | "optional"
+                                | "not"
+                                | "regex"
+                                | "range"
+                                | "one_of"
+                                | "all_of"
+                        ) =>
+                {
+                    SemanticTokenKind::Function
+                }
                 SyntaxKind::RetryKw | SyntaxKind::BackoffKw | SyntaxKind::MaxKw
                     if parent == Some(SyntaxKind::RetryStmt) =>
                 {
@@ -136,6 +173,23 @@ pub(crate) fn tokens(db: &dyn Db, file: SourceInput) -> Vec<SemanticToken> {
                     SemanticTokenKind::Keyword
                 }
                 SyntaxKind::ImportKw
+                | SyntaxKind::PatternKw
+                | SyntaxKind::SubsetKw
+                | SyntaxKind::ExactKw
+                | SyntaxKind::CasesKw
+                | SyntaxKind::CaseKw
+                | SyntaxKind::PassKw
+                | SyntaxKind::FailKw
+                | SyntaxKind::SkipKw
+                | SyntaxKind::InconclusiveKw
+                | SyntaxKind::AssumeKw
+                | SyntaxKind::ElseKw
+                | SyntaxKind::ActorKw
+                | SyntaxKind::SinceKw
+                | SyntaxKind::WhenKw
+                | SyntaxKind::IfKw
+                | SyntaxKind::GuardKw
+                | SyntaxKind::GuardsKw
                 | SyntaxKind::ExportKw
                 | SyntaxKind::FnKw
                 | SyntaxKind::FixtureKw

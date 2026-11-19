@@ -34,6 +34,10 @@ verdicts/preconditions, actors, checkpoints, selection, and guards. Pure evaluat
 lives in `plan` and is reused by static case expansion, matcher/predicate execution,
 and the runtime. Adapters do not reinterpret source or CDP data.
 
+Shared CST-backed semantic highlighting includes H modeling/reactive keywords
+and built-in matcher names in matcher contexts. Resolved parameters, fields,
+patterns, and user-defined functions retain their semantic classifications.
+
 The executable format versions are plan **11**, runtime semantics **8**, native
 journal **11**, and report/event schema **15**. Native journal readers retain the
 bounded legacy 8/9/10 decoding paths. Portable editor API/worker protocol stay at 1.

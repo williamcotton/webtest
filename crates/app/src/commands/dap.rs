@@ -87,6 +87,9 @@ pub(crate) async fn run_dap(
         && let Err(error) = application.start(&project).await
     {
         let _ = application.shutdown().await;
+        let _ =
+            webtest_dap::reject_startup(&format!("WebTest application startup failed: {error}"))
+                .await;
         return Err(AppError::infrastructure(error));
     }
     let loader = Arc::new(ProjectWorkspaceLoader {

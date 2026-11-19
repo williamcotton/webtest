@@ -105,6 +105,13 @@
               "chromePath": {
                 "type": "string",
                 "description": "Optional Chrome executable override."
+              },
+              "env": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "description": "Environment overrides for the debug adapter and its owned application, merged with the editor environment."
               }
             }
           }
@@ -115,8 +122,7 @@
             "request": "launch",
             "name": "Debug WebTest",
             "program": "${file}",
-            "headed": true,
-            "stopOnEntry": false
+            "headed": true
           }
         ],
         "configurationSnippets": [
@@ -128,8 +134,7 @@
               "request": "launch",
               "name": "Debug WebTest",
               "program": "${file}",
-              "headed": true,
-              "stopOnEntry": false
+              "headed": true
             }
           }
         ]
@@ -194,6 +199,21 @@
           "default": "",
           "scope": "resource",
           "description": "Optional Chrome executable used by WebTest debug sessions."
+        },
+        "webtest.debug.stopOnEntry": {
+          "type": "boolean",
+          "default": false,
+          "scope": "resource",
+          "description": "Pause before the first operation for current-file and Testing view debug sessions. An explicit launch stopOnEntry overrides this setting."
+        },
+        "webtest.environment": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "scope": "window",
+          "description": "Environment overrides for the language server, debug adapter, and their owned applications. Supports ${env:NAME} from the editor environment. Reload the window after changes. Explicit debug launch env entries take precedence."
         }
       }
     }
@@ -207,6 +227,7 @@
     "smoke:cursor": "npm run smoke && node ./scripts/cursor-smoke.mjs",
     "smoke:activation": "npm run compile && node ./test/run.mjs",
     "test:testing": "npm run compile && node --test test/testing-api.cjs",
+    "test:configuration": "npm run compile && node --test test/configuration.cjs",
     "test:releases": "npm run compile && node --test test/releases.cjs"
   },
   "dependencies": {

@@ -1318,6 +1318,65 @@ mod tests {
     }
 
     #[test]
+    fn modeling_highlighting_uses_shared_cst_and_resolved_names() {
+        let editor = EditorService::new();
+        let source = include_str!("../../../examples/test-modeling/modeling.webtest");
+        let file = editor.open_document("file:///modeling.webtest", source);
+        assert!(editor.diagnostics(file).unwrap().is_empty());
+        let tokens = editor.semantic_tokens(file).unwrap();
+        let rendered: Vec<_> = tokens
+            .iter()
+            .map(|token| {
+                (
+                    &source[usize::from(token.range.start())..usize::from(token.range.end())],
+                    token.kind,
+                )
+            })
+            .collect();
+        for word in [
+            "pattern", "subset", "absent", "cases", "case", "as", "check", "matches", "assume",
+            "false", "else", "skip",
+        ] {
+            assert!(
+                rendered.contains(&(word, SemanticTokenKind::Keyword)),
+                "missing keyword {word}"
+            );
+        }
+        for word in ["regex", "each", "range", "label"] {
+            assert!(
+                rendered.contains(&(word, SemanticTokenKind::Function)),
+                "missing function {word}"
+            );
+        }
+        for word in ["Named", "String"] {
+            assert!(
+                rendered.contains(&(word, SemanticTokenKind::Type)),
+                "missing type {word}"
+            );
+        }
+        assert!(rendered.contains(&("expected", SemanticTokenKind::Parameter)));
+        for word in ["name", "password"] {
+            assert!(
+                rendered.contains(&(word, SemanticTokenKind::Property)),
+                "missing property {word}"
+            );
+        }
+
+        let file = editor.open_document(
+            "file:///context.webtest",
+            "test \"context\" { let absent = 1 let regex = 2 expect absent == regex }",
+        );
+        let tokens = editor.semantic_tokens(file).unwrap();
+        let source = "test \"context\" { let absent = 1 let regex = 2 expect absent == regex }";
+        for token in tokens {
+            let text = &source[usize::from(token.range.start())..usize::from(token.range.end())];
+            if matches!(text, "absent" | "regex") {
+                assert_eq!(token.kind, SemanticTokenKind::Variable);
+            }
+        }
+    }
+
+    #[test]
     fn semantic_tokens_are_views_over_cst_tokens() {
         let editor = EditorService::new();
         let source = "test \"x\" { // note\n parallel { server { let parallel = 7 expect parallel == 7 } } browser { open \"about:blank\" click id(\"submit\") expect text(\"submitted\").visible } }";
